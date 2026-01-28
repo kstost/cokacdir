@@ -1,0 +1,15 @@
+pub mod app;
+pub mod draw;
+pub mod panel;
+pub mod dialogs;
+pub mod file_viewer;
+pub mod file_editor;
+pub mod file_info;
+pub mod process_manager;
+pub mod theme;
+pub mod ai_screen;
+pub mod system_info;
+pub mod advanced_search;
+pub mod syntax;
+pub mod image_viewer;
+pub mod search_result;

@@ -1,0 +1,36 @@
+[package]
+name = "cokacdir"
+version = "0.4.1"
+edition = "2021"
+authors = ["cokac <monogatree@gmail.com>"]
+description = "Norton Commander style dual-panel file manager for terminal with AI-powered natural language commands"
+license = "MIT"
+repository = "https://github.com/kstost/cokacdir"
+homepage = "https://cokacdir.cokac.com"
+keywords = ["terminal", "cli", "file-manager", "norton-commander", "dual-panel", "tui"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+ratatui = "0.28"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dirs = "5"
+unicode-width = "0.2"
+textwrap = "0.16"
+image = "0.25"
+libc = "0.2"
+regex = "1"
+rand = "0.8"
+
+[[bin]]
+name = "cokacdir"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

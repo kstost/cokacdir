@@ -1,1 +1,0 @@
-{"version":3,"file":"AlertDialog.d.ts","sourceRoot":"","sources":["../../src/components/AlertDialog.tsx"],"names":[],"mappings":"AAIA,UAAU,gBAAgB;IACxB,KAAK,EAAE,MAAM,CAAC;IACd,OAAO,EAAE,MAAM,CAAC;IAChB,OAAO,EAAE,MAAM,IAAI,CAAC;CACrB;AAED,MAAM,CAAC,OAAO,UAAU,WAAW,CAAC,EAClC,KAAK,EACL,OAAO,EACP,OAAO,GACR,EAAE,gBAAgB,2CA+BlB"}

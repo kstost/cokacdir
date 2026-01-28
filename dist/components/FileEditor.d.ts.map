@@ -1,1 +1,0 @@
-{"version":3,"file":"FileEditor.d.ts","sourceRoot":"","sources":["../../src/components/FileEditor.tsx"],"names":[],"mappings":"AAMA,UAAU,eAAe;IACvB,QAAQ,EAAE,MAAM,CAAC;IACjB,OAAO,EAAE,MAAM,IAAI,CAAC;IACpB,MAAM,CAAC,EAAE,MAAM,IAAI,CAAC;CACrB;AAED,MAAM,CAAC,OAAO,UAAU,UAAU,CAAC,EAAE,QAAQ,EAAE,OAAO,EAAE,MAAM,EAAE,EAAE,eAAe,2CAkRhF"}
