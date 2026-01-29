@@ -124,6 +124,9 @@ pub struct FileOperationProgress {
     pub completed_bytes: u64,
 
     pub result: Option<FileOperationResult>,
+
+    // Store last error before result is created
+    last_error: Option<String>,
 }
 
 impl FileOperationProgress {
@@ -140,6 +143,7 @@ impl FileOperationProgress {
             total_bytes: 0,
             completed_bytes: 0,
             result: None,
+            last_error: None,
         }
     }
 
@@ -182,15 +186,14 @@ impl FileOperationProgress {
                                 self.result = Some(FileOperationResult {
                                     success_count: success,
                                     failure_count: failure,
-                                    last_error: None,
+                                    last_error: self.last_error.take(),
                                 });
                                 self.is_active = false;
                                 return false;
                             }
                             ProgressMessage::Error(_, err) => {
-                                if let Some(ref mut result) = self.result {
-                                    result.last_error = Some(err);
-                                }
+                                // Store error for later (result is created on Completed)
+                                self.last_error = Some(err);
                             }
                         }
                     }

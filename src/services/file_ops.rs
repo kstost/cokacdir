@@ -15,6 +15,7 @@ pub enum FileOperationType {
 
 /// Progress message for file operations
 #[derive(Debug, Clone)]
+#[allow(dead_code)]  // Fields are used for debugging/logging, not always read
 pub enum ProgressMessage {
     /// File operation started (filename)
     FileStarted(String),
@@ -40,6 +41,46 @@ pub struct FileOperationResult {
 
 /// Buffer size for file copy (64KB)
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Try to clone file using APFS clonefile (macOS only)
+/// Returns Ok(true) if clone succeeded, Ok(false) if should fallback to regular copy
+#[cfg(target_os = "macos")]
+fn try_clonefile(src: &Path, dest: &Path) -> io::Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(
+            src: *const libc::c_char,
+            dst: *const libc::c_char,
+            flags: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let src_cstr = CString::new(src.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+    let dest_cstr = CString::new(dest.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid destination path"))?;
+
+    let result = unsafe { clonefile(src_cstr.as_ptr(), dest_cstr.as_ptr(), 0) };
+
+    if result == 0 {
+        Ok(true) // Clone succeeded
+    } else {
+        let err = io::Error::last_os_error();
+        // ENOTSUP (45) or EXDEV (18) means clonefile not supported - fallback to regular copy
+        // Other errors should also fallback gracefully
+        match err.raw_os_error() {
+            Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::EACCES) => Ok(false),
+            _ => Ok(false), // Fallback for any other error
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_clonefile(_src: &Path, _dest: &Path) -> io::Result<bool> {
+    Ok(false) // Not supported on non-macOS
+}
 
 /// Calculate total size of files to be copied/moved
 pub fn calculate_total_size(files: &[PathBuf], cancel_flag: &Arc<AtomicBool>) -> io::Result<(u64, usize)> {
@@ -96,6 +137,7 @@ fn calculate_dir_size(path: &Path, cancel_flag: &Arc<AtomicBool>) -> io::Result<
 }
 
 /// Copy a single file with progress callback
+/// On macOS with APFS, tries clonefile first for instant copy
 pub fn copy_file_with_progress<F>(
     src: &Path,
     dest: &Path,
@@ -108,7 +150,19 @@ where
     let metadata = fs::metadata(src)?;
     let total_size = metadata.len();
 
-    // Open source and destination files
+    // Check for cancellation before starting
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
+    }
+
+    // Try APFS clonefile first (macOS only)
+    if try_clonefile(src, dest)? {
+        // Clone succeeded - report 100% progress immediately
+        progress_callback(total_size, total_size);
+        return Ok(total_size);
+    }
+
+    // Fallback to regular copy with progress
     let mut src_file = File::open(src)?;
     let mut dest_file = File::create(dest)?;
 
@@ -278,8 +332,13 @@ pub fn copy_files_with_progress(
     let mut success_count = 0;
     let mut failure_count = 0;
 
+    // Build full paths for size calculation
+    let full_paths: Vec<PathBuf> = files.iter()
+        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+        .collect();
+
     // Calculate total size
-    let (total_bytes, total_files) = match calculate_total_size(&files, &cancel_flag) {
+    let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
         Ok((size, count)) => (size, count),
         Err(e) => {
             let _ = progress_tx.send(ProgressMessage::Error("".to_string(), e.to_string()));
@@ -394,8 +453,26 @@ pub fn move_files_with_progress(
     let mut success_count = 0;
     let mut failure_count = 0;
 
+    // Build full paths for size calculation
+    let full_paths: Vec<PathBuf> = files.iter()
+        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+        .collect();
+
+    // Calculate total size upfront for accurate progress
+    let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
+        Ok((size, count)) => (size, count),
+        Err(e) => {
+            let _ = progress_tx.send(ProgressMessage::Error("".to_string(), e.to_string()));
+            let _ = progress_tx.send(ProgressMessage::Completed(0, files.len()));
+            return;
+        }
+    };
+
+    let mut completed_bytes: u64 = 0;
+    let mut completed_files: usize = 0;
+
     // First, try simple rename for each file (fast path for same filesystem)
-    let mut needs_copy: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut needs_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new();  // (src, dest, size)
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -414,6 +491,13 @@ pub fn move_files_with_progress(
 
         let dest = target_dir.join(&filename);
 
+        // Get file/dir size for progress tracking
+        let (item_size, item_files) = if src.is_dir() {
+            calculate_dir_size(&src, &cancel_flag).unwrap_or((0, 1))
+        } else {
+            (fs::metadata(&src).map(|m| m.len()).unwrap_or(0), 1)
+        };
+
         // Check if destination already exists
         if dest.exists() {
             failure_count += 1;
@@ -430,12 +514,20 @@ pub fn move_files_with_progress(
         match fs::rename(&src, &dest) {
             Ok(_) => {
                 success_count += 1;
+                completed_bytes += item_size;
+                completed_files += item_files;
                 let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
+                let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                    completed_files,
+                    total_files,
+                    completed_bytes,
+                    total_bytes,
+                ));
             }
             Err(e) => {
                 // If cross-device, we need to copy+delete
                 if e.raw_os_error() == Some(libc::EXDEV) {
-                    needs_copy.push((src, dest));
+                    needs_copy.push((src, dest, item_size));
                 } else {
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -446,17 +538,7 @@ pub fn move_files_with_progress(
 
     // Handle cross-device moves (copy + delete)
     if !needs_copy.is_empty() && !cancel_flag.load(Ordering::Relaxed) {
-        // Calculate total size for cross-device copies
-        let copy_paths: Vec<PathBuf> = needs_copy.iter().map(|(src, _)| src.clone()).collect();
-        let (total_bytes, total_files) = match calculate_total_size(&copy_paths, &cancel_flag) {
-            Ok((size, count)) => (size, count),
-            Err(_) => (0, needs_copy.len()),
-        };
-
-        let mut completed_bytes: u64 = 0;
-        let mut completed_files: usize = 0;
-
-        for (src, dest) in needs_copy {
+        for (src, dest, _) in needs_copy {
             if cancel_flag.load(Ordering::Relaxed) {
                 break;
             }
