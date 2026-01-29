@@ -75,8 +75,7 @@ Note: All tools are installed locally in builder/tools/ directory.
     mode_group.add_argument(
         "--release",
         action="store_true",
-        default=True,
-        help="Build in release mode (default, optimized)",
+        help="Build in release mode (optimized)",
     )
     mode_group.add_argument(
         "--clean",
