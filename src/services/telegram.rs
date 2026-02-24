@@ -10,6 +10,8 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use sha2::{Sha256, Digest};
 
+// Future: Replace direct claude:: calls with Backend trait dispatch
+// use crate::services::backend::{Backend, ClaudeBackend, CodexBackend};
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 

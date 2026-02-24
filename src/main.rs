@@ -40,7 +40,10 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
+    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s) (alias: --openclaude)");
+    println!("    --openclaude <TOKEN>... Start Telegram bot with Claude backend");
+    println!("    --opencodex <TOKEN>...  Start Telegram bot with Codex backend (uses omx if available)");
+    println!("    --madmax                Skip all AI permission checks (use with caution)");
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
     println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
     println!("    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)");
@@ -313,9 +316,19 @@ fn main() -> io::Result<()> {
     let mut design_mode = false;
     let mut start_paths: Vec<std::path::PathBuf> = Vec::new();
 
+    // Pre-scan for --madmax flag (can appear anywhere in args)
+    if args.iter().any(|a| a == "--madmax") {
+        services::backend::set_madmax(true);
+    }
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--madmax" => {
+                // Already handled in pre-scan above
+                i += 1;
+                continue;
+            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(());
@@ -340,14 +353,34 @@ fn main() -> io::Result<()> {
                 handle_base64(&args[i + 1]);
                 return Ok(());
             }
-            "--ccserver" => {
+            "--ccserver" | "--openclaude" => {
                 let tokens: Vec<String> = args[i + 1..].iter()
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
                 if tokens.is_empty() {
-                    eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
+                    eprintln!("Error: {} requires at least one token argument", args[i]);
+                    eprintln!("Usage: cokacdir {} <TOKEN> [TOKEN2] ...", args[i]);
+                    return Ok(());
+                }
+                handle_ccserver(tokens);
+                return Ok(());
+            }
+            "--opencodex" => {
+                let tokens: Vec<String> = args[i + 1..].iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .cloned()
+                    .collect();
+                if tokens.is_empty() {
+                    eprintln!("Error: --opencodex requires at least one token argument");
+                    eprintln!("Usage: cokacdir --opencodex <TOKEN> [TOKEN2] ...");
+                    return Ok(());
+                }
+                if !services::backend::CodexBackend::is_available() {
+                    eprintln!("Error: Neither omx (Oh My Codex) nor codex CLI found.");
+                    eprintln!("Install one of:");
+                    eprintln!("  npm install -g @openai/codex");
+                    eprintln!("  or install omx (https://github.com/WOULDU-pres/omx)");
                     return Ok(());
                 }
                 handle_ccserver(tokens);
