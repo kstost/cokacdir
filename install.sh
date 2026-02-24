@@ -177,15 +177,30 @@ main() {
 
     # Verify installation
     if [ -x "$install_path" ]; then
-        # Check if in PATH
-        if ! echo "$PATH" | grep -q "$install_dir"; then
-            warn "Add to PATH: export PATH=\"$install_dir:\$PATH\""
-        fi
-
         # Setup shell wrapper
         setup_shell
 
-        success "Installed! Run 'cokacdir' to start."
+        # Check if install location is in PATH
+        if ! echo "$PATH" | tr ':' '\n' | grep -q "^${install_dir}$"; then
+            warn "Installation directory is not in your PATH"
+            info "Add this to your shell profile (~/.bashrc or ~/.zshrc):"
+            echo "  export PATH=\"${install_dir}:\$PATH\""
+        fi
+
+        # Check for Claude CLI (optional dependency for AI features)
+        if ! command -v claude >/dev/null 2>&1; then
+            warn "Claude CLI not found. AI features require Claude CLI."
+            info "Install Claude CLI: npm install -g @anthropic-ai/claude-code"
+        fi
+
+        success "Installation complete!"
+        echo ""
+        echo "  Get started:"
+        echo "    cokacdir                          Open file manager"
+        echo "    cokacdir ~/projects ~/downloads   Open multiple panels"
+        echo "    cokacdir --setup                  Setup Telegram bot"
+        echo "    cokacdir --help                   Show all options"
+        echo ""
     else
         error "Installation failed"
     fi
