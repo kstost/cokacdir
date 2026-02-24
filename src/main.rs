@@ -4,6 +4,7 @@ mod utils;
 mod config;
 mod keybindings;
 mod enc;
+mod setup;
 
 use std::io;
 use std::env;
@@ -40,7 +41,8 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
+    println!("    --setup                 Run interactive Telegram bot setup wizard");
+    println!("    --ccserver [TOKEN]...   Start Telegram bot server(s) (token optional if --setup was run)");
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
     println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
     println!("    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)");
@@ -340,15 +342,32 @@ fn main() -> io::Result<()> {
                 handle_base64(&args[i + 1]);
                 return Ok(());
             }
+            "--setup" => {
+                if let Err(e) = setup::run_setup() {
+                    eprintln!("Setup failed: {}", e);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             "--ccserver" => {
-                let tokens: Vec<String> = args[i + 1..].iter()
-                    .filter(|a| !a.starts_with('-'))
-                    .cloned()
-                    .collect();
+                let mut tokens: Vec<String> = if i + 1 < args.len() {
+                    args[i + 1..].iter()
+                        .filter(|a| !a.starts_with('-'))
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // If no tokens provided via CLI, try loading from config
                 if tokens.is_empty() {
-                    eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
-                    return Ok(());
+                    if let Some(saved_token) = setup::load_saved_token() {
+                        tokens.push(saved_token);
+                    } else {
+                        eprintln!("Error: --ccserver requires at least one token argument");
+                        eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
+                        eprintln!("       or run 'cokacdir --setup' to configure a token");
+                        return Ok(());
+                    }
                 }
                 handle_ccserver(tokens);
                 return Ok(());
