@@ -11,6 +11,7 @@ use teloxide::types::ParseMode;
 use sha2::{Sha256, Digest};
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::i18n::{self, Lang, resolve_lang};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
 /// Global debug log flag for Telegram API calls
@@ -71,6 +72,8 @@ struct BotSettings {
     owner_user_id: Option<u64>,
     /// chat_id (string) → true if group chat is public (non-owner users allowed)
     as_public_for_group_chat: HashMap<String, bool>,
+    /// chat_id (string) → language code ("ko" or "en")
+    chat_language: HashMap<String, String>,
 }
 
 impl Default for BotSettings {
@@ -80,6 +83,7 @@ impl Default for BotSettings {
             last_sessions: HashMap::new(),
             owner_user_id: None,
             as_public_for_group_chat: HashMap::new(),
+            chat_language: HashMap::new(),
         }
     }
 }
@@ -91,6 +95,14 @@ fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
     settings.allowed_tools.get(&key)
         .cloned()
         .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect())
+}
+
+/// Get language for a specific chat_id. Defaults to Korean.
+fn get_chat_lang(settings: &BotSettings, chat_id: ChatId) -> Lang {
+    let key = chat_id.0.to_string();
+    settings.chat_language.get(&key)
+        .map(|code| resolve_lang(code))
+        .unwrap_or_default()
 }
 
 /// Shared state: per-chat sessions + bot settings
@@ -191,7 +203,16 @@ fn load_bot_settings(token: &str) -> BotSettings {
         })
         .unwrap_or_default();
 
-    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat }
+    let chat_language: HashMap<String, String> = entry.get("chat_language")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, chat_language }
 }
 
 /// Save bot settings to bot_settings.json
@@ -213,6 +234,7 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "allowed_tools": settings.allowed_tools,
         "last_sessions": settings.last_sessions,
         "as_public_for_group_chat": settings.as_public_for_group_chat,
+        "chat_language": settings.chat_language,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
@@ -540,6 +562,9 @@ async fn handle_message(
     } else if text.starts_with("/setpollingtime") {
         println!("  [{timestamp}] ◀ [{user_name}] /setpollingtime {}", text.strip_prefix("/setpollingtime").unwrap_or("").trim());
         handle_setpollingtime_command(&bot, chat_id, &text, &state).await?;
+    } else if text.starts_with("/lang") {
+        println!("  [{timestamp}] ◀ [{user_name}] /lang {}", text.strip_prefix("/lang").unwrap_or("").trim());
+        handle_lang_command(&bot, chat_id, &text, &state, token).await?;
     } else if text.starts_with("/debug") {
         println!("  [{timestamp}] ◀ [{user_name}] /debug");
         handle_debug_command(&bot, chat_id, &state).await?;
@@ -571,49 +596,8 @@ async fn handle_help_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let help = "\
-<b>cokacdir Telegram Bot</b>
-Manage server files &amp; chat with Claude AI.
-
-<b>Session</b>
-<code>/start &lt;path&gt;</code> — Start session at directory
-<code>/start</code> — Start with auto-generated workspace
-<code>/pwd</code> — Show current working directory
-<code>/clear</code> — Clear AI conversation history
-<code>/stop</code> — Stop current AI request
-
-<b>File Transfer</b>
-<code>/down &lt;file&gt;</code> — Download file from server
-Send a file/photo — Upload to session directory
-
-<b>Shell</b>
-<code>!&lt;command&gt;</code> — Run shell command directly
-  e.g. <code>!ls -la</code>, <code>!git status</code>
-
-<b>AI Chat</b>
-Any other message is sent to Claude AI.
-AI can read, edit, and run commands in your session.
-
-<b>Tool Management</b>
-<code>/availabletools</code> — List all available tools
-<code>/allowedtools</code> — Show currently allowed tools
-<code>/allowed +name</code> — Add tool (e.g. <code>/allowed +Bash</code>)
-<code>/allowed -name</code> — Remove tool
-<code>/allowed +a -b +c</code> — Multiple at once
-
-<b>Group Chat</b>
-<code>;</code><i>message</i> — Send message to AI
-<code>;</code><i>caption</i> — Upload file with AI prompt
-<code>/public on</code> — Allow all members to use bot
-<code>/public off</code> — Owner only (default)
-
-<b>Settings</b>
-<code>/setpollingtime &lt;ms&gt;</code> — Set API polling interval
-  Too low may cause Telegram API rate limits.
-  Minimum 2500ms, recommended 3000ms+.
-<code>/debug</code> — Toggle API debug logging
-
-<code>/help</code> — Show this help";
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
+    let help = i18n::help_text(lang);
 
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, help)
@@ -634,11 +618,13 @@ async fn handle_start_command(
     // Extract path from "/start <path>"
     let path_str = text.strip_prefix("/start").unwrap_or("").trim();
 
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
+
     let canonical_path = if path_str.is_empty() {
         // Create random workspace directory
         let Some(home) = dirs::home_dir() else {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Error: cannot determine home directory.")
+            tg!("send_message", bot.send_message(chat_id, i18n::msg_error_home(lang))
                 .await)?;
             return Ok(());
         };
@@ -652,7 +638,7 @@ async fn handle_start_command(
         let new_dir = workspace_dir.join(&random_name);
         if let Err(e) = fs::create_dir_all(&new_dir) {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Error: failed to create workspace: {}", e))
+            tg!("send_message", bot.send_message(chat_id, i18n::msg_error_create_workspace(lang, &e.to_string()))
                 .await)?;
             return Ok(());
         }
@@ -672,7 +658,7 @@ async fn handle_start_command(
         let path = Path::new(&expanded);
         if !path.exists() || !path.is_dir() {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Error: '{}' is not a valid directory.", expanded))
+            tg!("send_message", bot.send_message(chat_id, i18n::msg_error_invalid_dir(lang, &expanded))
                 .await)?;
             return Ok(());
         }
@@ -780,8 +766,9 @@ async fn handle_clear_command(
         data.stop_message_ids.remove(&chat_id);
     }
 
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, "Session cleared.")
+    tg!("send_message", bot.send_message(chat_id, i18n::msg_session_cleared(lang))
         .await)?;
 
     Ok(())
@@ -798,10 +785,11 @@ async fn handle_pwd_command(
         data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
     };
 
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     shared_rate_limit_wait(state, chat_id).await;
     match current_path {
         Some(path) => tg!("send_message", bot.send_message(chat_id, &path).await)?,
-        None => tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.").await)?,
+        None => tg!("send_message", bot.send_message(chat_id, i18n::msg_no_session(lang)).await)?,
     };
 
     Ok(())
@@ -813,6 +801,7 @@ async fn handle_stop_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     let token = {
         let data = state.lock().await;
         data.cancel_tokens.get(&chat_id).cloned()
@@ -827,7 +816,7 @@ async fn handle_stop_command(
 
             // Send immediate feedback to user
             shared_rate_limit_wait(state, chat_id).await;
-            let stop_msg = tg!("send_message", bot.send_message(chat_id, "Stopping...").await)?;
+            let stop_msg = tg!("send_message", bot.send_message(chat_id, i18n::msg_stopping(lang)).await)?;
 
             // Store the stop message ID so the polling loop can update it later
             {
@@ -854,7 +843,7 @@ async fn handle_stop_command(
         }
         None => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "No active request to stop.")
+            tg!("send_message", bot.send_message(chat_id, i18n::msg_no_active_request(lang))
                 .await)?;
         }
     }
@@ -869,11 +858,12 @@ async fn handle_down_command(
     text: &str,
     state: &SharedState,
 ) -> ResponseResult<()> {
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     let file_path = text.strip_prefix("/down").unwrap_or("").trim();
 
     if file_path.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Usage: /down <filepath>\nExample: /down /home/kst/file.txt")
+        tg!("send_message", bot.send_message(chat_id, i18n::msg_down_usage(lang))
             .await)?;
         return Ok(());
     }
@@ -890,7 +880,7 @@ async fn handle_down_command(
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), file_path),
             None => {
                 shared_rate_limit_wait(state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, "No active session. Use absolute path or /start <path> first.")
+                tg!("send_message", bot.send_message(chat_id, i18n::msg_down_no_session(lang))
                     .await)?;
                 return Ok(());
             }
@@ -929,9 +919,10 @@ async fn handle_file_upload(
         data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
     };
 
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     let Some(save_dir) = current_path else {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.")
+        tg!("send_message", bot.send_message(chat_id, i18n::msg_no_session(lang))
             .await)?;
         return Ok(());
     };
@@ -986,7 +977,7 @@ async fn handle_file_upload(
         }
         Err(e) => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, &format!("Failed to save file: {}", e)).await)?;
+            tg!("send_message", bot.send_message(chat_id, &i18n::msg_file_save_failed(lang, &e.to_string())).await)?;
             return Ok(());
         }
     }
@@ -1025,11 +1016,12 @@ async fn handle_shell_command(
     text: &str,
     state: &SharedState,
 ) -> ResponseResult<()> {
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
 
     if cmd_str.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Usage: !<command>\nExample: !mkdir /home/kst/testcode")
+        tg!("send_message", bot.send_message(chat_id, i18n::msg_shell_usage(lang))
             .await)?;
         return Ok(());
     }
@@ -1049,7 +1041,7 @@ async fn handle_shell_command(
     // Send placeholder message
     let cmd_display = cmd_str.to_string();
     shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = tg!("send_message", bot.send_message(chat_id, format!("!{}에 대해서 처리중입니다.", &cmd_display)).await)?;
+    let placeholder = tg!("send_message", bot.send_message(chat_id, i18n::msg_shell_processing(lang, &cmd_display)).await)?;
     let placeholder_msg_id = placeholder.id;
 
     // Register cancel token (lock) — must be AFTER placeholder send succeeds,
@@ -1562,16 +1554,18 @@ async fn handle_public_command(
     is_group_chat: bool,
     is_owner: bool,
 ) -> ResponseResult<()> {
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
+
     if !is_group_chat {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "This command is only available in group chats.")
+        tg!("send_message", bot.send_message(chat_id, i18n::msg_group_only(lang))
             .await)?;
         return Ok(());
     }
 
     if !is_owner {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Only the bot owner can change public access settings.")
+        tg!("send_message", bot.send_message(chat_id, i18n::msg_public_owner_only(lang))
             .await)?;
         return Ok(());
     }
@@ -1584,32 +1578,59 @@ async fn handle_public_command(
             let mut data = state.lock().await;
             data.settings.as_public_for_group_chat.insert(chat_key, true);
             save_bot_settings(token, &data.settings);
-            "✅ Public access <b>enabled</b> for this group.\nAll members can now use the bot.".to_string()
+            i18n::msg_public_enabled(lang).to_string()
         }
         "off" => {
             let mut data = state.lock().await;
             data.settings.as_public_for_group_chat.remove(&chat_key);
             save_bot_settings(token, &data.settings);
-            "❌ Public access <b>disabled</b> for this group.\nOnly the owner can use the bot.".to_string()
+            i18n::msg_public_disabled(lang).to_string()
         }
         "" => {
             let data = state.lock().await;
             let is_public = data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(false);
-            let status = if is_public { "enabled" } else { "disabled" };
-            format!(
-                "Public access is currently <b>{}</b> for this group.\n\n\
-                 <code>/public on</code> — Allow all members\n\
-                 <code>/public off</code> — Owner only",
-                status
-            )
+            let status = i18n::msg_public_status_label(lang, is_public);
+            i18n::msg_public_status(lang, status)
         }
         _ => {
-            "Usage:\n<code>/public on</code> — Allow all group members\n<code>/public off</code> — Owner only".to_string()
+            i18n::msg_public_usage(lang).to_string()
         }
     };
 
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, &response_msg)
+        .parse_mode(ParseMode::Html)
+        .await)?;
+
+    Ok(())
+}
+
+/// Handle /lang command - change language for this chat
+async fn handle_lang_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg = text.strip_prefix("/lang").unwrap_or("").trim().to_lowercase();
+
+    let (lang, response) = if arg == "ko" || arg == "en" {
+        let new_lang = resolve_lang(&arg);
+        {
+            let mut data = state.lock().await;
+            data.settings.chat_language.insert(chat_id.0.to_string(), arg.clone());
+            save_bot_settings(token, &data.settings);
+        }
+        (new_lang, i18n::msg_lang_changed(new_lang).to_string())
+    } else {
+        let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
+        (lang, i18n::msg_lang_usage(lang).to_string())
+    };
+    let _ = lang; // lang used for response selection above
+
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, &response)
         .parse_mode(ParseMode::Html)
         .await)?;
 
@@ -1642,11 +1663,12 @@ async fn handle_text_message(
         (info, tools, uploads)
     };
 
+    let lang = { let d = state.lock().await; get_chat_lang(&d.settings, chat_id) };
     let (session_id, current_path) = match session_info {
         Some(info) => info,
         None => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.")
+            tg!("send_message", bot.send_message(chat_id, i18n::msg_no_session(lang))
                 .await)?;
             return Ok(());
         }
