@@ -285,6 +285,9 @@ pub async fn run_bot(token: &str) {
     let bot = Bot::new(token);
     let bot_settings = load_bot_settings(token);
 
+    // Clean up session files older than 30 days on startup
+    cleanup_stale_sessions(30);
+
     // Register bot commands for autocomplete
     let commands = vec![
         teloxide::types::BotCommand::new("help", "Show help"),
@@ -768,8 +771,10 @@ async fn handle_clear_command(
         }
     }
 
-    {
+    let session_id_to_delete = {
         let mut data = state.lock().await;
+        let session_id = data.sessions.get(&chat_id)
+            .and_then(|s| s.session_id.clone());
         if let Some(session) = data.sessions.get_mut(&chat_id) {
             session.session_id = None;
             session.history.clear();
@@ -778,6 +783,12 @@ async fn handle_clear_command(
         }
         data.cancel_tokens.remove(&chat_id);
         data.stop_message_ids.remove(&chat_id);
+        session_id
+    };
+
+    // Also remove the session file from disk
+    if let Some(ref sid) = session_id_to_delete {
+        delete_session_file(sid);
     }
 
     shared_rate_limit_wait(state, chat_id).await;
@@ -2180,6 +2191,52 @@ fn save_session_to_file(session: &ChatSession, current_path: &str) {
 
     if let Ok(json) = serde_json::to_string_pretty(&session_data) {
         let _ = fs::write(file_path, json);
+    }
+}
+
+/// Remove session files older than `max_age_days` days from the sessions directory.
+/// Silently ignores all errors (missing directory, unreadable metadata, etc.).
+fn cleanup_stale_sessions(max_age_days: u64) {
+    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+        return;
+    };
+    let cutoff = std::time::Duration::from_secs(max_age_days * 24 * 60 * 60);
+    let mut deleted = 0u32;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(metadata) = path.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(age) = std::time::SystemTime::now().duration_since(modified) {
+                        if age > cutoff {
+                            if fs::remove_file(&path).is_ok() {
+                                deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if deleted > 0 {
+        println!("  ✓ Cleaned up {deleted} stale session file(s) older than {max_age_days} days");
+    }
+}
+
+/// Delete a specific session file by session_id.
+/// Silently ignores errors (file may already be gone).
+fn delete_session_file(session_id: &str) {
+    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
+        return;
+    };
+    let file_path = sessions_dir.join(format!("{}.json", session_id));
+    if let Some(parent) = file_path.parent() {
+        if parent == sessions_dir {
+            let _ = fs::remove_file(file_path);
+        }
     }
 }
 
