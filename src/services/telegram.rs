@@ -10,6 +10,7 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use sha2::{Sha256, Digest};
 
+use crate::services::audit;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -508,6 +509,21 @@ async fn handle_message(
             return Ok(());
         }
     }
+
+    // Audit log: record every command with risk classification
+    {
+        let risk_str = if text.starts_with("!") {
+            "Dangerous"
+        } else if text.starts_with("/allowed") || text.starts_with("/public") {
+            "Dangerous"
+        } else if text.starts_with("/start") || text.starts_with("/cd") || text.starts_with("/down") {
+            "Elevated"
+        } else {
+            "Safe"
+        };
+        audit::log_command(uid, chat_id.0, risk_str, &text);
+    }
+
 
     if text.starts_with("/stop") {
         println!("  [{timestamp}] ◀ [{user_name}] /stop");
