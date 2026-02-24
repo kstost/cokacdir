@@ -10,6 +10,7 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use sha2::{Sha256, Digest};
 
+use crate::services::auth::{classify_command, can_execute, is_path_within_sandbox, CommandRisk};
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -509,6 +510,23 @@ async fn handle_message(
         }
     }
 
+    // Auth check: classify command risk and verify the user has permission
+    {
+        let chat_key = chat_id.0.to_string();
+        let is_public = {
+            let data = state.lock().await;
+            is_group_chat && data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(false)
+        };
+        let risk = classify_command(&text);
+        if !can_execute(is_owner, is_public, risk) {
+            println!("  [{timestamp}] ✗ Permission denied: [{user_name}] {:?} -> {:?}", text.split_whitespace().next().unwrap_or(""), risk);
+            shared_rate_limit_wait(&state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, "Permission denied.")
+                .await)?;
+            return Ok(());
+        }
+    }
+
     if text.starts_with("/stop") {
         println!("  [{timestamp}] ◀ [{user_name}] /stop");
         handle_stop_command(&bot, chat_id, &state).await?;
@@ -680,6 +698,17 @@ async fn handle_start_command(
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| expanded)
     };
+
+    // Sandbox check: path must be within user's home directory
+    if let Some(home) = dirs::home_dir() {
+        let target = std::path::Path::new(&canonical_path);
+        if !is_path_within_sandbox(target, &home) {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, "Error: path is outside the allowed sandbox (home directory).")
+                .await)?;
+            return Ok(());
+        }
+    }
 
     // Try to load existing session for this path
     let existing = load_existing_session(&canonical_path);
@@ -896,6 +925,17 @@ async fn handle_down_command(
             }
         }
     };
+
+    // Sandbox check: file must be within user's home directory
+    if let Some(home) = dirs::home_dir() {
+        let target = Path::new(&resolved_path);
+        if !is_path_within_sandbox(target, &home) {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, "Error: path is outside the allowed sandbox (home directory).")
+                .await)?;
+            return Ok(());
+        }
+    }
 
     let path = Path::new(&resolved_path);
     if !path.exists() {
