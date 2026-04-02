@@ -2070,9 +2070,55 @@ fn risk_badge(destructive: bool) -> &'static str {
     if destructive { "!!!" } else { "" }
 }
 
+fn configured_telegram_proxy_url(app_settings: &crate::config::Settings) -> Option<String> {
+    if let Some(proxy_url) = app_settings.telegram_proxy_url() {
+        return Some(proxy_url.to_string());
+    }
+    std::env::var("TELOXIDE_PROXY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn display_telegram_proxy_url(proxy_url: &str) -> String {
+    match reqwest::Url::parse(proxy_url) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("?");
+            let port = url.port().map(|value| format!(":{value}")).unwrap_or_default();
+            format!("{}://{}{}", url.scheme(), host, port)
+        }
+        Err(_) => "configured".to_string(),
+    }
+}
+
+fn build_telegram_bot(
+    token: &str,
+    app_settings: &crate::config::Settings,
+) -> Result<(Bot, Option<String>), String> {
+    let Some(proxy_url) = configured_telegram_proxy_url(app_settings) else {
+        return Ok((Bot::new(token), None));
+    };
+
+    let proxy = reqwest::Proxy::all(&proxy_url)
+        .map_err(|e| format!("Invalid Telegram proxy URL in settings/env: {e}"))?;
+    let client = teloxide::net::default_reqwest_settings()
+        .proxy(proxy)
+        .build()
+        .map_err(|e| format!("Failed to build Telegram HTTP client: {e}"))?;
+
+    Ok((Bot::with_client(token, client), Some(display_telegram_proxy_url(&proxy_url))))
+}
+
 /// Entry point: start the Telegram bot with long polling
 pub async fn run_bot(token: &str) {
-    let bot = Bot::new(token);
+    let app_settings = crate::config::Settings::load();
+    let (bot, proxy_display) = match build_telegram_bot(token, &app_settings) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("  ✗ {e}");
+            return;
+        }
+    };
     let mut bot_settings = load_bot_settings(token);
 
     // Get bot's own username and display name for @mention filtering in group chats
@@ -2142,8 +2188,9 @@ pub async fn run_bot(token: &str) {
         Some(owner_id) => println!("  ✓ Owner: {owner_id}"),
         None => println!("  ⚠ No owner registered — first user will be registered as owner"),
     }
-
-    let app_settings = crate::config::Settings::load();
+    if let Some(proxy_display) = proxy_display {
+        println!("  ✓ Telegram proxy: {proxy_display}");
+    }
     let polling_time_ms = app_settings.telegram_polling_time.max(2500);
 
     let state: SharedState = Arc::new(Mutex::new(SharedData {
@@ -4922,7 +4969,7 @@ async fn handle_file_upload(
     shared_rate_limit_wait(state, chat_id).await;
     let file = tg!("get_file", bot.get_file(&file_id).await)?;
     let url = format!("https://api.telegram.org/file/bot{}/{}", bot.token(), file.path);
-    let buf = match reqwest::get(&url).await {
+    let buf = match bot.client().get(&url).send().await {
         Ok(resp) => match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
