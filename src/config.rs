@@ -106,6 +106,9 @@ pub struct Settings {
     /// Telegram API polling interval in milliseconds (minimum 2500, default 3000)
     #[serde(default = "default_telegram_polling_time")]
     pub telegram_polling_time: u64,
+    /// Optional proxy URL for Telegram bot API traffic (e.g. socks5h://127.0.0.1:1080)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_proxy_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -175,6 +178,7 @@ impl Default for Settings {
             keybindings: KeybindingsConfig::default(),
             encrypt_split_size: default_encrypt_split_size(),
             telegram_polling_time: default_telegram_polling_time(),
+            telegram_proxy_url: None,
         }
     }
 }
@@ -356,6 +360,14 @@ impl Settings {
         }
         None
     }
+
+    /// Returns the configured Telegram proxy URL when present and non-empty.
+    pub fn telegram_proxy_url(&self) -> Option<&str> {
+        self.telegram_proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +391,12 @@ mod tests {
         let settings: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings.panels[0].start_path, Some(test_path));
         assert_eq!(settings.panels[0].sort_by, "name");
+    }
+
+    #[test]
+    fn test_parse_telegram_proxy_url() {
+        let settings: Settings = serde_json::from_str(r#"{"telegram_proxy_url":"socks5h://127.0.0.1:1080"}"#).unwrap();
+        assert_eq!(settings.telegram_proxy_url(), Some("socks5h://127.0.0.1:1080"));
     }
 
     #[test]
