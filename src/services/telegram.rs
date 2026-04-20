@@ -6831,8 +6831,8 @@ async fn handle_text_message(
     // It will be added together with the assistant response in the spawned task,
     // only on successful completion. On cancel, nothing is recorded.
 
-    // Send placeholder message (update shared timestamp so spawned task knows)
-    shared_rate_limit_wait(state, chat_id).await;
+    // Send placeholder message (use fast rate limit to minimize initial delay)
+    shared_rate_limit_wait_ms(state, chat_id, Some(500)).await;
     let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
         Ok(m) => m,
         Err(e) => {
@@ -7045,6 +7045,7 @@ async fn handle_text_message(
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
+        let mut last_tool_start: Option<std::time::Instant> = None;
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
@@ -7061,8 +7062,9 @@ async fn handle_text_message(
                 break;
             }
 
-            // Sleep as polling interval (without reserving a rate limit slot)
-            tokio::time::sleep(tokio::time::Duration::from_millis(polling_time_ms)).await;
+            // Sleep: use shorter interval during AI streaming for responsive updates
+            let sleep_ms = if !done { polling_time_ms.min(500) } else { polling_time_ms };
+            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
 
             // Check cancel token again after sleep
             if cancel_token.cancelled.load(Ordering::Relaxed) {
@@ -7096,6 +7098,7 @@ async fn handle_text_message(
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
                                     suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
+                                    last_tool_start = Some(std::time::Instant::now());
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}]   ⚙ {name}: {summary}");
@@ -7123,6 +7126,7 @@ async fn handle_text_message(
                                     }
                                 }
                                 StreamMessage::ToolResult { content, is_error } => {
+                                    last_tool_start = None;
                                     msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if is_error {
                                         msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -7256,14 +7260,14 @@ async fn handle_text_message(
                         } else {
                             msg_debug(&format!("[rolling_ph] EDIT delta: placeholder_msg_id={}, delta_len={}, html_len={}, confirmed={}→{}",
                                 placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, full_response.len()));
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                            shared_rate_limit_wait_ms(&state_owned, chat_id, Some(500)).await;
                             if html_delta.len() <= TELEGRAM_MSG_LIMIT {
                                 let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_delta)
                                     .parse_mode(ParseMode::Html).await);
                             } else {
                                 // Delta too large for single edit — send via send_long_message
                                 if send_long_message(&bot_owned, chat_id, &html_delta, Some(ParseMode::Html), &state_owned).await.is_ok() {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
+                                    shared_rate_limit_wait_ms(&state_owned, chat_id, Some(500)).await;
                                     let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
                                 } else {
                                     let truncated_delta = truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
@@ -7273,7 +7277,7 @@ async fn handle_text_message(
                             last_confirmed_len = delta_end;
                             // Create new placeholder for next cycle
                             let old_ph_id = placeholder_msg_id;
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                            shared_rate_limit_wait_ms(&state_owned, chat_id, Some(500)).await;
                             match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
                                 Ok(new_ph) => {
                                     placeholder_msg_id = new_ph.id;
@@ -7290,11 +7294,21 @@ async fn handle_text_message(
                         }
                     } else {
                         // No new content — spinner update on current placeholder
-                        let indicator = SPINNER[spin_idx % SPINNER.len()];
-                        spin_idx += 1;
-                        let display_text = indicator.to_string();
+                        // Show tool status with elapsed time, or spinner
+                        let display_text = if !last_tool_name.is_empty() {
+                            if let Some(start) = last_tool_start {
+                                let elapsed = start.elapsed().as_secs();
+                                format!("⚙️ {}... {}s", last_tool_name, elapsed)
+                            } else {
+                                format!("⚙️ {}...", last_tool_name)
+                            }
+                        } else {
+                            let indicator = SPINNER[spin_idx % SPINNER.len()];
+                            spin_idx += 1;
+                            indicator.to_string()
+                        };
                         if display_text != last_edit_text {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                            shared_rate_limit_wait_ms(&state_owned, chat_id, Some(500)).await;
                             let html_text = markdown_to_telegram_html(&display_text);
                             if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
                                 .parse_mode(ParseMode::Html).await)
@@ -7304,7 +7318,7 @@ async fn handle_text_message(
                             }
                             last_edit_text = display_text;
                         } else {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                            shared_rate_limit_wait_ms(&state_owned, chat_id, Some(500)).await;
                             let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
                         }
                     }
@@ -8152,9 +8166,15 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
 /// then releases the lock and sleeps until the reserved time.
 /// This ensures that even concurrent tasks for the same chat maintain 3s gaps.
 async fn shared_rate_limit_wait(state: &SharedState, chat_id: ChatId) {
+    shared_rate_limit_wait_ms(state, chat_id, None).await;
+}
+
+/// Rate-limit wait with optional custom minimum gap (in ms).
+/// When `custom_gap_ms` is Some, uses that instead of the global polling_time_ms.
+async fn shared_rate_limit_wait_ms(state: &SharedState, chat_id: ChatId, custom_gap_ms: Option<u64>) {
     let sleep_until = {
         let mut data = state.lock().await;
-        let min_gap = tokio::time::Duration::from_millis(data.polling_time_ms);
+        let min_gap = tokio::time::Duration::from_millis(custom_gap_ms.unwrap_or(data.polling_time_ms));
         let last = data.api_timestamps.entry(chat_id).or_insert_with(||
             tokio::time::Instant::now() - tokio::time::Duration::from_secs(10)
         );
