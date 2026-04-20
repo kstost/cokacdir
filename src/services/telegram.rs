@@ -1803,8 +1803,10 @@ fn should_attach_response_as_file(response_len: usize, provider_str: &str) -> bo
 }
 /// Maximum number of messages that can be queued per chat in queue mode
 const MAX_QUEUE_SIZE: usize = 20;
-/// Default queue mode state for chats without explicit setting
-const QUEUE_MODE_DEFAULT: bool = true;
+/// Default queue mode state for chats without explicit setting.
+/// When false (default), new messages cancel the current task and redirect (redirect mode).
+/// Use /queue to enable queue mode per chat.
+const QUEUE_MODE_DEFAULT: bool = false;
 /// Default silent mode state for chats without explicit setting
 const SILENT_MODE_DEFAULT: bool = true;
 /// Default direct mode state for chats without explicit setting
@@ -2607,60 +2609,59 @@ async fn handle_message(
             };
             if let Some(text) = text_part {
                 if !text.is_empty() {
-                    // Block if an AI request is already in progress
-                    // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-                    let (ai_busy, queue_enabled, queue_result) = {
+                    // If AI is busy: redirect or queue depending on mode
+                    {
                         let mut data = state.lock().await;
-                        let busy = data.cancel_tokens.contains_key(&chat_id);
-                        let qkey = chat_id.0.to_string();
-                        let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                        msg_debug(&format!("[queue:media] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
-                        let qr = if busy && qmode {
-                            let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
-                            let queue_full = cur_len >= MAX_QUEUE_SIZE;
-                            if queue_full {
-                                msg_debug(&format!("[queue:media] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
-                                None // queue full
-                            } else {
-                                // Capture pending_uploads so they stay associated with this caption
+                        if data.cancel_tokens.contains_key(&chat_id) {
+                            let qkey = chat_id.0.to_string();
+                            let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
+                            if queue_enabled {
+                                // Queue mode
                                 let uploads = data.sessions.get_mut(&chat_id)
                                     .map(|s| std::mem::take(&mut s.pending_uploads))
                                     .unwrap_or_default();
-                                let qid = generate_queue_id();
-                                let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
-                                q.push_back(QueuedMessage {
-                                    id: qid.clone(),
-                                    text: text.to_string(),
-                                    user_display_name: user_name.clone(),
-                                    pending_uploads: uploads.clone(),
-                                });
-                                msg_debug(&format!("[queue:media] chat_id={}, QUEUED id={}, pos={}, text={:?}, uploads={}", chat_id.0, qid, q.len(), truncate_str(text, 60), uploads.len()));
-                                Some((qid, text.to_string()))
-                            }
-                        } else {
-                            None
-                        };
-                        (busy, qmode, qr)
-                    };
-                    if ai_busy {
-                        if queue_enabled {
-                            shared_rate_limit_wait(&state, chat_id).await;
-                            if let Some((qid, qtxt)) = queue_result {
-                                let preview = truncate_str(&qtxt, 30);
-                                tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
-                                    .await)?;
+                                let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
+                                if cur_len < MAX_QUEUE_SIZE {
+                                    let qid = generate_queue_id();
+                                    let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+                                    q.push_back(QueuedMessage {
+                                        id: qid.clone(),
+                                        text: text.to_string(),
+                                        user_display_name: user_name.clone(),
+                                        pending_uploads: uploads,
+                                    });
+                                    drop(data);
+                                    shared_rate_limit_wait(&state, chat_id).await;
+                                    let preview = truncate_str(text, 30);
+                                    tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
+                                        .await)?;
+                                } else {
+                                    drop(data);
+                                    shared_rate_limit_wait(&state, chat_id).await;
+                                    tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
+                                        .await)?;
+                                }
+                                return Ok(());
                             } else {
-                                tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
-                                    .await)?;
+                                // Redirect mode (default): cancel current task
+                                msg_debug(&format!("[redirect:media] chat_id={}, AI busy — cancelling for redirect", chat_id.0));
+                                if let Some(existing_token) = data.cancel_tokens.get(&chat_id) {
+                                    existing_token.cancelled.store(true, Ordering::Relaxed);
+                                    if let Ok(guard) = existing_token.child_pid.lock() {
+                                        if let Some(pid) = *guard {
+                                            #[cfg(unix)]
+                                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                                        }
+                                    }
+                                }
+                                data.message_queues.remove(&chat_id);
+                                data.cancel_tokens.remove(&chat_id);
+                                drop(data);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                             }
-                        } else {
-                            shared_rate_limit_wait(&state, chat_id).await;
-                            tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                                .await)?;
                         }
-                    } else {
-                        handle_text_message(&bot, chat_id, text, &state, &user_name, false).await?;
                     }
+                    handle_text_message(&bot, chat_id, text, &state, &user_name, false).await?;
                 }
             }
         }
@@ -2880,24 +2881,18 @@ async fn handle_message(
         };
         msg_debug(&format!("[queue:text] chat_id={}, text={:?}, queue_text={:?}", chat_id.0, truncate_str(&text, 60), queue_text.map(|s| truncate_str(s, 60))));
 
-        // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-        // Returns: Option<(can_queue, queue_on, queue_result)>
-        //   queue_result: Some((id, text)) if queued, None if full/non-queueable
-        let busy_info: Option<(bool, bool, Option<(String, String)>)> = {
+        // If AI is busy: redirect (cancel+restart) or queue depending on queue mode
+        {
             let mut data = state.lock().await;
             if data.cancel_tokens.contains_key(&chat_id) {
                 let qkey = chat_id.0.to_string();
                 let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}", chat_id.0, queue_enabled, queue_text.is_some()));
-                let qr = if queue_enabled {
+                if queue_enabled {
+                    // Queue mode: original behavior — push to queue
+                    msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode=true", chat_id.0));
                     if let Some(qt) = queue_text {
                         let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
-                        let queue_full = cur_len >= MAX_QUEUE_SIZE;
-                        if queue_full {
-                            msg_debug(&format!("[queue:text] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
-                            None // queue full
-                        } else {
-                            // Capture pending_uploads so they stay associated with this message
+                        if cur_len < MAX_QUEUE_SIZE {
                             let uploads = data.sessions.get_mut(&chat_id)
                                 .map(|s| std::mem::take(&mut s.pending_uploads))
                                 .unwrap_or_default();
@@ -2907,47 +2902,45 @@ async fn handle_message(
                                 id: qid.clone(),
                                 text: qt.to_string(),
                                 user_display_name: user_name.clone(),
-                                pending_uploads: uploads.clone(),
+                                pending_uploads: uploads,
                             });
-                            msg_debug(&format!("[queue:text] chat_id={}, QUEUED id={}, pos={}, text={:?}, uploads={}", chat_id.0, qid, q.len(), truncate_str(qt, 60), uploads.len()));
-                            Some((qid, qt.to_string()))
+                            drop(data);
+                            shared_rate_limit_wait(&state, chat_id).await;
+                            let preview = truncate_str(qt, 30);
+                            tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
+                                .await)?;
+                        } else {
+                            drop(data);
+                            shared_rate_limit_wait(&state, chat_id).await;
+                            tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
+                                .await)?;
                         }
                     } else {
-                        msg_debug(&format!("[queue:text] chat_id={}, non-queueable command, rejecting", chat_id.0));
-                        None // non-queueable
+                        drop(data);
+                        shared_rate_limit_wait(&state, chat_id).await;
+                        tg!("send_message", bot.send_message(chat_id, "AI request in progress. This command cannot be queued. Use /stop to cancel current, /stopall to cancel all.")
+                            .await)?;
                     }
+                    return Ok(());
                 } else {
-                    None
-                };
-                Some((queue_enabled && queue_text.is_some(), queue_enabled, qr))
-            } else {
-                msg_debug(&format!("[queue:text] chat_id={}, AI not busy, proceeding normally", chat_id.0));
-                None // not busy
-            }
-        };
-
-        if let Some((can_queue, queue_on, queue_result)) = busy_info {
-            if can_queue {
-                shared_rate_limit_wait(&state, chat_id).await;
-                if let Some((qid, qtxt)) = queue_result {
-                    let preview = truncate_str(&qtxt, 30);
-                    tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
-                        .await)?;
-                } else {
-                    tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
-                        .await)?;
-                }
-            } else {
-                shared_rate_limit_wait(&state, chat_id).await;
-                if queue_on {
-                    tg!("send_message", bot.send_message(chat_id, "AI request in progress. This command cannot be queued. Use /stop to cancel current, /stopall to cancel all.")
-                        .await)?;
-                } else {
-                    tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                        .await)?;
+                    // Redirect mode (default): cancel current task, proceed with new message
+                    msg_debug(&format!("[redirect] chat_id={}, AI busy — cancelling current task for redirect", chat_id.0));
+                    if let Some(existing_token) = data.cancel_tokens.get(&chat_id) {
+                        existing_token.cancelled.store(true, Ordering::Relaxed);
+                        if let Ok(guard) = existing_token.child_pid.lock() {
+                            if let Some(pid) = *guard {
+                                msg_debug(&format!("[redirect] killing child process pid={}", pid));
+                                #[cfg(unix)]
+                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                            }
+                        }
+                    }
+                    data.message_queues.remove(&chat_id);
+                    data.cancel_tokens.remove(&chat_id);
+                    drop(data);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 }
             }
-            return Ok(());
         }
     }
 
