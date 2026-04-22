@@ -2153,14 +2153,25 @@ pub fn messages_dir() -> Option<std::path::PathBuf> {
     result
 }
 
-/// Normalize tool name: first letter uppercase, rest lowercase
+/// Normalize a tool name to the canonical camelCase form defined in
+/// `ALL_TOOLS`, by case-insensitive match. This lets users type any casing
+/// (`bash`, `BASH`, `Bash`, `taskoutput`, `TaskOutput`) and still end up with
+/// the exact string used internally — essential for camelCase tools such as
+/// `TaskOutput`, `WebSearch`, `NotebookEdit`, etc., which the previous
+/// "first-letter uppercase, rest lowercase" rule corrupted (e.g. input
+/// `TaskOutput` → `Taskoutput`, breaking removal with `/allowed -TaskOutput`).
+///
+/// If the name is not a known tool, it is returned as typed and the caller
+/// will simply fail membership checks — matching the previous behaviour for
+/// unknown tools.
 fn normalize_tool_name(name: &str) -> String {
     let lower = name.to_lowercase();
-    let mut chars = lower.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
+    for (canonical, _, _) in ALL_TOOLS {
+        if canonical.to_lowercase() == lower {
+            return canonical.to_string();
+        }
     }
+    name.to_string()
 }
 
 /// All available tools with (description, is_destructive)
