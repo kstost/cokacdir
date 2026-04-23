@@ -40,8 +40,10 @@ russh-keys = "0.46"
 async-trait = "0.1"
 ratatui-image = { version = "2.0", default-features = false, features = ["rustix", "image-defaults", "crossterm"] }
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart", "json"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "http", "model", "builder", "cache", "rustls_backend"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 fs2 = "0.4"
 filetime = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }

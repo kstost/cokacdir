@@ -69,7 +69,8 @@ fn print_help() {
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --bridge <BACKEND>     Run as AI bridge (internal use, e.g. --bridge gemini)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord)");
+    println!("    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord/Slack)");
+    println!("                            Slack: slack:<xoxb-bot-token>:<xapp-app-token>");
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
     println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
     println!("    --currenttime            Print current server time");
@@ -653,13 +654,26 @@ fn handle_ccserver(tokens: Vec<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     // Classify tokens by format:
+    //   "slack:<xoxb-...>:<xapp-...>" → Slack (needs both bot + app tokens)
     //   "discord:<token>" → explicit Discord
     //   "<digits>:<hash>" → Telegram  (e.g. 8603189801:AAHOgQ5z...)
     //   "<base64>.<ts>.<hmac>" → Discord (e.g. MTQ4OTA3..._zZ5-.fAh9...)
     let mut tg_tokens: Vec<String> = Vec::new();
     let mut discord_tokens: Vec<String> = Vec::new();
+    let mut slack_tokens: Vec<(String, String)> = Vec::new(); // (bot, app)
     for token in &tokens {
-        if let Some(dt) = token.strip_prefix("discord:") {
+        if let Some(rest) = token.strip_prefix("slack:") {
+            // Expect "<xoxb-...>:<xapp-...>"
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                slack_tokens.push((parts[0].to_string(), parts[1].to_string()));
+            } else {
+                eprintln!(
+                    "Error: Slack token must be 'slack:<xoxb-bot-token>:<xapp-app-token>'"
+                );
+                return;
+            }
+        } else if let Some(dt) = token.strip_prefix("discord:") {
             discord_tokens.push(dt.to_string());
         } else if is_telegram_token(token) {
             tg_tokens.push(token.clone());
@@ -673,7 +687,9 @@ fn handle_ccserver(tokens: Vec<String>) {
 
     // Log token classification
     for (i, token) in tokens.iter().enumerate() {
-        let kind = if token.starts_with("discord:") {
+        let kind = if token.starts_with("slack:") {
+            "slack (explicit)"
+        } else if token.starts_with("discord:") {
             "discord (explicit)"
         } else if is_telegram_token(token) {
             "telegram (auto)"
@@ -687,7 +703,7 @@ fn handle_ccserver(tokens: Vec<String>) {
         eprintln!("  [ccserver] token #{}: {} → {}", i + 1, kind, format!("{}...", masked));
     }
 
-    let total = tg_tokens.len() + discord_tokens.len();
+    let total = tg_tokens.len() + discord_tokens.len() + slack_tokens.len();
     let title = format!("  cokacdir v{}  |  Bot Server  ", VERSION);
     let width = title.chars().count();
     println!();
@@ -717,15 +733,23 @@ fn handle_ccserver(tokens: Vec<String>) {
     if !discord_tokens.is_empty() {
         println!("  ▸ Discord      : {} bot(s)", discord_tokens.len());
     }
+    if !slack_tokens.is_empty() {
+        println!("  ▸ Slack        : {} bot(s)", slack_tokens.len());
+    }
     println!();
 
-    if total == 1 && discord_tokens.is_empty() {
+    if total == 1 && discord_tokens.is_empty() && slack_tokens.is_empty() {
         // Single Telegram bot — run directly
         rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
-    } else if total == 1 && tg_tokens.is_empty() {
+    } else if total == 1 && tg_tokens.is_empty() && slack_tokens.is_empty() {
         // Single Discord bot — run bridge directly
         let args = vec![discord_tokens[0].clone()];
         rt.block_on(services::messenger_bridge::run_bridge("discord", &args));
+    } else if total == 1 && tg_tokens.is_empty() && discord_tokens.is_empty() {
+        // Single Slack bot — run bridge directly
+        let (bot, app) = slack_tokens[0].clone();
+        let args = vec![bot, app];
+        rt.block_on(services::messenger_bridge::run_bridge("slack", &args));
     } else {
         // Multiple bots — spawn all concurrently
         rt.block_on(async {
@@ -739,6 +763,12 @@ fn handle_ccserver(tokens: Vec<String>) {
                 handles.push(tokio::spawn(async move {
                     let args = vec![dt];
                     services::messenger_bridge::run_bridge("discord", &args).await;
+                }));
+            }
+            for (bot, app) in slack_tokens {
+                handles.push(tokio::spawn(async move {
+                    let args = vec![bot, app];
+                    services::messenger_bridge::run_bridge("slack", &args).await;
                 }));
             }
             for handle in handles {
