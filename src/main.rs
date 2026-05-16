@@ -125,10 +125,10 @@ fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
     };
 
     // Create upload queue directory
-    let queue_dir = match dirs::home_dir() {
-        Some(h) => h.join(".cokacdir").join("upload_queue"),
+    let queue_dir = match config::state_root_dir() {
+        Some(root) => root.join("upload_queue"),
         None => {
-            eprintln!("{}", serde_json::json!({"status":"error","message":"cannot determine home directory"}));
+            eprintln!("{}", serde_json::json!({"status":"error","message":"cannot determine state root"}));
             std::process::exit(1);
         }
     };
@@ -335,8 +335,10 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
     output.as_object_mut().unwrap().insert("hint".to_string(), serde_json::json!(hint));
     cron_debug(&format!("  Output: {}", output));
     // Write result to temp file so the bot can read it even if Bash tool misses stdout
-    if let Some(home) = dirs::home_dir() {
-        let result_path = home.join(".cokacdir").join("schedule").join(format!("{}.result", id));
+    if let Some(state_root) = config::state_root_dir() {
+        let result_dir = state_root.join("schedule");
+        let _ = std::fs::create_dir_all(&result_dir);
+        let result_path = result_dir.join(format!("{}.result", id));
         let _ = std::fs::write(&result_path, output.to_string());
         cron_debug(&format!("  Result file written: {}", result_path.display()));
     }
@@ -443,8 +445,8 @@ fn handle_cron_context(args: &[String]) {
             cron_debug(&format!("  Context summary extracted in {:?}, len={}", extract_start.elapsed(), summary.len()));
 
             // 실행 중 삭제된 스케줄 부활 방지: 파일이 아직 존재하는지 확인
-            if let Some(home) = dirs::home_dir() {
-                let path = home.join(".cokacdir").join("schedule").join(format!("{}.json", ctx.id));
+            if let Some(state_root) = config::state_root_dir() {
+                let path = state_root.join("schedule").join(format!("{}.json", ctx.id));
                 if !path.exists() {
                     cron_debug(&format!("  Schedule {} already deleted, skipping context_summary write", ctx.id));
                     cron_debug("=== handle_cron_context END ===");
@@ -1419,8 +1421,8 @@ fn deploy_docs() {
         ("how-to-use-shell-commands.md", include_str!("../docs/how-to-use-shell-commands.md")),
         ("how-to-share-bot-with-others.md", include_str!("../docs/how-to-share-bot-with-others.md")),
     ];
-    if let Some(home) = dirs::home_dir() {
-        let docs_dir = home.join(".cokacdir").join("docs");
+    if let Some(state_root) = config::state_root_dir() {
+        let docs_dir = state_root.join("docs");
         let _ = std::fs::create_dir_all(&docs_dir);
         for (name, content) in DOCS {
             let path = docs_dir.join(name);
@@ -1429,11 +1431,11 @@ fn deploy_docs() {
     }
 }
 
-/// Load ~/.cokacdir/.env.json and set environment variables.
+/// Load COKACDIR_STATE_ROOT/.env.json (or ~/.cokacdir/.env.json) and set environment variables.
 /// Values from this file take priority over the existing environment.
 fn load_dot_env() {
-    let env_path = match dirs::home_dir() {
-        Some(h) => h.join(".cokacdir").join(".env.json"),
+    let env_path = match config::state_root_dir() {
+        Some(root) => root.join(".env.json"),
         None => return,
     };
     let content = match std::fs::read_to_string(&env_path) {
@@ -1443,7 +1445,7 @@ fn load_dot_env() {
     let map: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&content) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("Warning: failed to parse ~/.cokacdir/.env.json: {}", e);
+            eprintln!("Warning: failed to parse state-root .env.json: {}", e);
             return;
         }
     };
@@ -1468,9 +1470,9 @@ fn main() -> io::Result<()> {
     // Initialize debug flag from environment variable
     claude::init_debug_from_env();
 
-    // Ensure home directory is available (~/.cokacdir is required)
-    if dirs::home_dir().is_none() {
-        eprintln!("Error: Cannot determine home directory. ~/.cokacdir is required.");
+    // Ensure state root is available (COKACDIR_STATE_ROOT or ~/.cokacdir is required)
+    if config::state_root_dir().is_none() {
+        eprintln!("Error: Cannot determine state root. COKACDIR_STATE_ROOT or ~/.cokacdir is required.");
         std::process::exit(1);
     }
 

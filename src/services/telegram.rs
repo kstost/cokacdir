@@ -85,12 +85,12 @@ fn refresh_global_debug_flags() -> bool {
     enabled
 }
 
-/// Log Telegram API call result to ~/.cokacdir/debug/ file
+/// Log Telegram API call result to the effective state-root debug/ file.
 fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
     if !TG_DEBUG.load(Ordering::Relaxed) {
         return;
     }
-    let Some(debug_dir) = dirs::home_dir().map(|h| h.join(".cokacdir").join("debug")) else {
+    let Some(debug_dir) = crate::config::state_root_dir().map(|root| root.join("debug")) else {
         return;
     };
     let _ = fs::create_dir_all(&debug_dir);
@@ -233,10 +233,10 @@ pub fn parse_payload_auto(text: &str) -> Vec<RawPayloadEntry> {
 /// Maximum content length before truncation and offloading to a separate file.
 const PAYLOAD_TRUNCATE_LIMIT: usize = 500;
 
-/// Save long content to ~/.cokacdir/values/<unique>.txt and return the file path.
+/// Save long content to state-root values/<unique>.txt and return the file path.
 /// Returns None if saving fails.
 fn save_payload_value(content: &str) -> Option<String> {
-    let dir = dirs::home_dir()?.join(".cokacdir").join("values");
+    let dir = crate::config::state_root_dir()?.join("values");
     if fs::create_dir_all(&dir).is_err() { return None; }
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
     use rand::Rng;
@@ -290,7 +290,7 @@ struct GroupChatLock {
 async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
     use fs2::FileExt;
     if chat_id >= 0 { return None; }
-    let dir = dirs::home_dir()?.join(".cokacdir").join("chat_locks");
+    let dir = crate::config::state_root_dir()?.join("chat_locks");
     let _ = std::fs::create_dir_all(&dir);
     let lock_path = dir.join(format!("{}.lock", chat_id));
     let file = std::fs::OpenOptions::new()
@@ -319,9 +319,9 @@ async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
     }
 }
 
-/// Return the directory for group chat logs: ~/.cokacdir/group_chat/
+/// Return the directory for group chat logs under the effective state root.
 fn group_chat_log_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("group_chat"))
+    crate::config::state_root_dir().map(|root| root.join("group_chat"))
 }
 
 /// Return the JSONL file path for a specific group chat.
@@ -812,9 +812,9 @@ fn live_schedule_key_verifier(schedule_id: &str, chat_id: i64, bot_key: &str) ->
     hex::encode(hasher.finalize())
 }
 
-/// Directory for schedule files: ~/.cokacdir/schedule/
+/// Directory for schedule files under the effective state root.
 fn schedule_dir() -> Option<std::path::PathBuf> {
-    let result = dirs::home_dir().map(|h| h.join(".cokacdir").join("schedule"));
+    let result = crate::config::state_root_dir().map(|root| root.join("schedule"));
     sched_debug(&format!("[schedule_dir] → {:?}", result));
     result
 }
@@ -833,12 +833,12 @@ fn msg_debug(msg: &str) {
 }
 
 /// Always-on debug log (independent of /debug toggle).
-/// Writes to ~/.cokacdir/debug/ai_trace.log for diagnosing AI execution issues.
+/// Writes to state-root debug/ai_trace.log for diagnosing AI execution issues.
 /// AI provider stream errors can include URLs with the bot token; redact
 /// before persisting so this always-on log stays safe to share.
 fn ai_trace(msg: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let debug_dir = home.join(".cokacdir").join("debug");
+    if let Some(state_root) = crate::config::state_root_dir() {
+        let debug_dir = state_root.join("debug");
         let _ = std::fs::create_dir_all(&debug_dir);
         let log_path = debug_dir.join("ai_trace.log");
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -854,14 +854,14 @@ fn ai_trace(msg: &str) {
     }
 }
 
-/// Log an incoming Telegram message to ~/.cokacdir/logs/telegram_YYYY-MM-DD.jsonl
+/// Log an incoming Telegram message to state-root logs/telegram_YYYY-MM-DD.jsonl
 fn log_incoming_message(msg: &Message, accepted: bool, reject_reason: &str) {
     let now = chrono::Local::now();
     let date_str = now.format("%Y-%m-%d").to_string();
     let ts = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
 
-    let logs_dir = match dirs::home_dir() {
-        Some(h) => h.join(".cokacdir").join("logs"),
+    let logs_dir = match crate::config::state_root_dir() {
+        Some(root) => root.join("logs"),
         None => return,
     };
     let _ = fs::create_dir_all(&logs_dir);
@@ -1236,10 +1236,10 @@ fn delete_schedule_entry(id: &str) -> bool {
     ok
 }
 
-/// Directory for schedule run history files: ~/.cokacdir/schedule_history/
+/// Directory for schedule run history files under the effective state root.
 /// Each schedule keeps one JSONL file (`<id>.log`) with one record per execution.
 fn schedule_history_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("schedule_history"))
+    crate::config::state_root_dir().map(|root| root.join("schedule_history"))
 }
 
 /// Public access to the schedule history file path (for `--cron-history` in main.rs).
@@ -2158,11 +2158,11 @@ BREVITY RULE:
 You are a participant in a group chat. Writing long messages alone is inconsiderate to other participants.
 Keep your answers short and concise — ideally one or two sentences.";
 
-/// Load co-work guidelines from ~/.cokacdir/prompt/cowork.md.
+/// Load co-work guidelines from state-root prompt/cowork.md.
 /// If the file does not exist, creates it with default content.
 fn load_cowork_guidelines() -> String {
-    if let Some(home) = dirs::home_dir() {
-        let prompt_dir = home.join(".cokacdir").join("prompt");
+    if let Some(state_root) = crate::config::state_root_dir() {
+        let prompt_dir = state_root.join("prompt");
         let cowork_path = prompt_dir.join("cowork.md");
         if cowork_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&cowork_path) {
@@ -2767,7 +2767,7 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
     }
 }
 
-/// Auto-create a workspace session under ~/.cokacdir/workspace/<random>.
+/// Auto-create a workspace session under the effective state-root workspace/<random>.
 /// Returns (session_id, path) on success; None if filesystem fails.
 ///
 /// Sends a Telegram notification with the new workspace path so the user
@@ -2783,14 +2783,14 @@ async fn auto_create_workspace_session(
 ) -> Option<(Option<String>, String)> {
     msg_debug(&format!("[auto_workspace] chat_id={}, auto-creating workspace", chat_id.0));
     let auto_path = {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
+        let state_root = match crate::config::state_root_dir() {
+            Some(root) => root,
             None => {
-                msg_debug(&format!("[auto_workspace] chat_id={}, home_dir() returned None", chat_id.0));
+                msg_debug(&format!("[auto_workspace] chat_id={}, state_root_dir() returned None", chat_id.0));
                 return None;
             }
         };
-        let workspace_dir = home.join(".cokacdir").join("workspace");
+        let workspace_dir = state_root.join("workspace");
         use rand::Rng;
         let random_name: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -2916,9 +2916,9 @@ fn capitalize_platform(name: &str) -> String {
     }
 }
 
-/// Path to bot settings file: ~/.cokacdir/bot_settings.json
+/// Path to bot settings file under the effective state root.
 fn bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("bot_settings.json"))
+    crate::config::state_root_dir().map(|root| root.join("bot_settings.json"))
 }
 
 /// Load bot settings from bot_settings.json
@@ -3264,9 +3264,9 @@ pub fn resolve_display_name_by_username(username: &str) -> Option<String> {
     None
 }
 
-/// Directory for bot-to-bot message files: ~/.cokacdir/messages/
+/// Directory for bot-to-bot message files under the effective state root.
 pub fn messages_dir() -> Option<std::path::PathBuf> {
-    let result = dirs::home_dir().map(|h| h.join(".cokacdir").join("messages"));
+    let result = crate::config::state_root_dir().map(|root| root.join("messages"));
     msg_debug(&format!("[messages_dir] result={:?}", result));
     result
 }
@@ -5623,13 +5623,13 @@ async fn handle_start_command(
     let mut is_path_intent = false;
     let canonical_path = if path_str.is_empty() {
         // Create random workspace directory
-        let Some(home) = dirs::home_dir() else {
+        let Some(state_root) = crate::config::state_root_dir() else {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Error: cannot determine home directory.")
+            tg!("send_message", bot.send_message(chat_id, "Error: cannot determine state root.")
                 .await)?;
             return Ok(());
         };
-        let workspace_dir = home.join(".cokacdir").join("workspace");
+        let workspace_dir = state_root.join("workspace");
         use rand::Rng;
         let random_name: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -5927,8 +5927,8 @@ async fn handle_start_command(
             response_lines.push(format!("[{}] Session restored at `{}`.", provider_str, canonical_path));
             if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
                 if is_workspace_id(folder_name)
-                    && dirs::home_dir()
-                        .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                    && crate::config::state_root_dir()
+                        .map(|root| root.join("workspace").join(folder_name).is_dir())
                         .unwrap_or(false)
                 {
                     response_lines.push(format!("Use /{} to resume this session.", folder_name));
@@ -5953,8 +5953,8 @@ async fn handle_start_command(
             // Show workspace ID shortcut if this is a workspace directory
             if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
                 if is_workspace_id(folder_name)
-                    && dirs::home_dir()
-                        .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                    && crate::config::state_root_dir()
+                        .map(|root| root.join("workspace").join(folder_name).is_dir())
                         .unwrap_or(false)
                 {
                     response_lines.push(format!("Use /{} to resume this session.", folder_name));
@@ -6916,14 +6916,14 @@ async fn handle_workspace_resume(
     token: &str,
 ) -> ResponseResult<()> {
     msg_debug(&format!("[workspace_resume] chat_id={}, workspace_id={}", chat_id.0, workspace_id));
-    let Some(home) = dirs::home_dir() else {
+    let Some(state_root) = crate::config::state_root_dir() else {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Error: cannot determine home directory.")
+        tg!("send_message", bot.send_message(chat_id, "Error: cannot determine state root.")
             .await)?;
         return Ok(());
     };
 
-    let workspace_path = home.join(".cokacdir").join("workspace").join(workspace_id);
+    let workspace_path = state_root.join("workspace").join(workspace_id);
     if !workspace_path.exists() || !workspace_path.is_dir() {
         shared_rate_limit_wait(state, chat_id).await;
         tg!("send_message", bot.send_message(chat_id, format!("Error: no workspace found for '{}'.", workspace_id))
@@ -8096,8 +8096,8 @@ async fn handle_shell_command(
                                 .parse_mode(ParseMode::Html).await);
 
                             let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                            if let Some(home) = dirs::home_dir() {
-                                let tmp_dir = home.join(".cokacdir").join("tmp");
+                            if let Some(state_root) = crate::config::state_root_dir() {
+                                let tmp_dir = state_root.join("tmp");
                                 let _ = std::fs::create_dir_all(&tmp_dir);
                                 let tmp_path = tmp_dir
                                     .join(format!("cokacdir_shell_{}_{}.txt", chat_id.0, timestamp))
@@ -10882,12 +10882,12 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 }
 
 /// Process one pending upload queue file for the given chat.
-/// Scans ~/.cokacdir/upload_queue/ for .queue files matching the current bot and chat_id,
+/// Scans state-root upload_queue/ for .queue files matching the current bot and chat_id,
 /// sends the oldest one, and deletes the queue file on success.
 /// Returns true if a file was processed (rate limit slot consumed).
 async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -> bool {
-    let queue_dir = match dirs::home_dir() {
-        Some(h) => h.join(".cokacdir").join("upload_queue"),
+    let queue_dir = match crate::config::state_root_dir() {
+        Some(root) => root.join("upload_queue"),
         None => return false,
     };
     if !queue_dir.is_dir() {
@@ -11103,8 +11103,8 @@ async fn send_response_as_file(
     state: &SharedState,
     label: &str,
 ) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
-    let tmp_dir = home.join(".cokacdir").join("tmp");
+    let Some(state_root) = crate::config::state_root_dir() else { return false };
+    let tmp_dir = state_root.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let tmp_path = tmp_dir.join(format!("cokacdir_{}_{}.txt", label, timestamp));
@@ -11897,9 +11897,9 @@ async fn execute_schedule(
     println!("  [{ts}] ⏰ Schedule Starting: {user_prompt}");
 
     // Create persistent workspace directory for this schedule execution
-    let Some(home) = dirs::home_dir() else {
+    let Some(state_root) = crate::config::state_root_dir() else {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] ⚠ [Schedule] Failed to get home directory");
+        println!("  [{ts}] ⚠ [Schedule] Failed to get state root");
         {
             let mut data = state.lock().await;
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
@@ -11917,7 +11917,7 @@ async fn execute_schedule(
         process_next_queued_message(bot, chat_id, state).await;
         return;
     };
-    let workspace_dir = home.join(".cokacdir").join("workspace").join(&schedule_id);
+    let workspace_dir = state_root.join("workspace").join(&schedule_id);
     sched_debug(&format!("[execute_schedule] id={}, creating workspace: {}", schedule_id, workspace_dir.display()));
     if let Err(e) = fs::create_dir_all(&workspace_dir) {
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -13903,4 +13903,107 @@ async fn scheduler_cycle(
             msg_debug("[scheduler_loop] checking message timeouts");
             check_message_timeouts(&bot, &bot_username, &state).await;
         }
+}
+
+#[cfg(test)]
+mod state_root_leak_tests {
+    use super::{
+        bot_settings_path, group_chat_log_dir, load_cowork_guidelines, messages_dir,
+        save_payload_value, schedule_dir, schedule_history_path_pub,
+    };
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn with_home_and_state_root<T>(f: impl FnOnce(PathBuf, PathBuf) -> T) -> T {
+        let home = tempdir().unwrap();
+        let state_root = tempdir().unwrap();
+        let previous_home = std::env::var_os("HOME");
+        let previous_state_root = std::env::var_os("COKACDIR_STATE_ROOT");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("COKACDIR_STATE_ROOT", state_root.path());
+        let result = f(home.path().to_path_buf(), state_root.path().to_path_buf());
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_state_root {
+            Some(value) => std::env::set_var("COKACDIR_STATE_ROOT", value),
+            None => std::env::remove_var("COKACDIR_STATE_ROOT"),
+        }
+        result
+    }
+
+    #[test]
+    fn save_payload_value_uses_state_root_override() {
+        with_home_and_state_root(|home, state_root| {
+            let saved = save_payload_value("payload content").expect("should save payload");
+            let saved_path = PathBuf::from(saved);
+            let expected_prefix = state_root.join("values");
+            assert!(
+                saved_path.starts_with(&expected_prefix),
+                "saved path should stay under state root: {}",
+                saved_path.display()
+            );
+            assert!(
+                !home.join(".cokacdir").join("values").exists(),
+                "home-root values dir should remain unused"
+            );
+        });
+    }
+
+    #[test]
+    fn group_chat_log_dir_uses_state_root_override() {
+        with_home_and_state_root(|_home, state_root| {
+            assert_eq!(
+                group_chat_log_dir(),
+                Some(state_root.join("group_chat"))
+            );
+        });
+    }
+
+    #[test]
+    fn bot_settings_path_uses_state_root_override() {
+        with_home_and_state_root(|_home, state_root| {
+            assert_eq!(
+                bot_settings_path(),
+                Some(state_root.join("bot_settings.json"))
+            );
+        });
+    }
+
+    #[test]
+    fn messages_dir_uses_state_root_override() {
+        with_home_and_state_root(|_home, state_root| {
+            assert_eq!(
+                messages_dir(),
+                Some(state_root.join("messages"))
+            );
+        });
+    }
+
+    #[test]
+    fn load_cowork_guidelines_reads_state_root_prompt() {
+        with_home_and_state_root(|home, state_root| {
+            let home_prompt_dir = home.join(".cokacdir").join("prompt");
+            let state_prompt_dir = state_root.join("prompt");
+            std::fs::create_dir_all(&home_prompt_dir).unwrap();
+            std::fs::create_dir_all(&state_prompt_dir).unwrap();
+            std::fs::write(home_prompt_dir.join("cowork.md"), "from-home").unwrap();
+            std::fs::write(state_prompt_dir.join("cowork.md"), "from-state-root").unwrap();
+
+            let loaded = load_cowork_guidelines();
+            assert_eq!(loaded, "from-state-root");
+        });
+    }
+
+    #[test]
+    fn schedule_dirs_use_state_root_override() {
+        with_home_and_state_root(|_home, state_root| {
+            assert_eq!(schedule_dir(), Some(state_root.join("schedule")));
+            assert_eq!(
+                schedule_history_path_pub("ABCDEF12"),
+                Some(state_root.join("schedule_history").join("ABCDEF12.log"))
+            );
+        });
+    }
 }
