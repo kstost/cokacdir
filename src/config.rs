@@ -40,6 +40,21 @@ fn default_telegram_polling_time() -> u64 {
     3000
 }
 
+/// Environment variable that overrides the default ~/.cokacdir state root.
+pub const STATE_ROOT_ENV_VAR: &str = "COKACDIR_STATE_ROOT";
+
+/// Returns the effective state root directory.
+///
+/// Resolution order:
+/// 1. `COKACDIR_STATE_ROOT`
+/// 2. `~/.cokacdir`
+pub fn state_root_dir() -> Option<PathBuf> {
+    std::env::var_os(STATE_ROOT_ENV_VAR)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cokacdir")))
+}
+
 impl Default for PanelSettings {
     fn default() -> Self {
         Self {
@@ -180,9 +195,9 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Returns the config directory path (~/.cokacdir)
+    /// Returns the config directory path (COKACDIR_STATE_ROOT or ~/.cokacdir)
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".cokacdir"))
+        state_root_dir()
     }
 
     /// Returns the themes directory path (~/.cokacdir/themes)
@@ -361,6 +376,21 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn with_state_root_env<T>(value: Option<&std::path::Path>, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os(STATE_ROOT_ENV_VAR);
+        match value {
+            Some(path) => std::env::set_var(STATE_ROOT_ENV_VAR, path),
+            None => std::env::remove_var(STATE_ROOT_ENV_VAR),
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var(STATE_ROOT_ENV_VAR, value),
+            None => std::env::remove_var(STATE_ROOT_ENV_VAR),
+        }
+        result
+    }
 
     #[test]
     fn test_default_settings() {
@@ -397,5 +427,28 @@ mod tests {
         assert!(json.contains("\"name\": \"light\""));
         assert!(json.contains("\"palette\""));
         assert!(json.contains("\"panel\""));
+    }
+
+    #[test]
+    fn test_state_root_dir_prefers_env_override() {
+        let dir = tempdir().unwrap();
+        let expected = dir.path().join("isolated-cokacdir");
+        with_state_root_env(Some(&expected), || {
+            assert_eq!(state_root_dir(), Some(expected.clone()));
+            assert_eq!(Settings::config_dir(), Some(expected.clone()));
+        });
+    }
+
+    #[test]
+    fn test_ensure_config_exists_uses_env_override() {
+        let dir = tempdir().unwrap();
+        let state_root = dir.path().join("state-root");
+        with_state_root_env(Some(&state_root), || {
+            Settings::ensure_config_exists();
+            assert!(state_root.is_dir(), "state root should exist");
+            assert!(state_root.join("themes").is_dir(), "themes directory should exist");
+            assert!(state_root.join("themes").join("light.json").exists(), "light.json should exist");
+            assert!(state_root.join("settings.json").exists(), "settings.json should exist");
+        });
     }
 }

@@ -1099,15 +1099,27 @@ fn target_is_sensitive(target: &str) -> bool {
     const SEP: char = '/';
     #[cfg(windows)]
     const SEP: char = '\\';
-    for sensitive in SENSITIVE_PATHS {
-        if target == *sensitive {
-            return true;
+    let normalized_target = {
+        #[cfg(unix)]
+        {
+            target.strip_prefix("/private").unwrap_or(target)
         }
-        let mut boundary = String::with_capacity(sensitive.len() + 1);
-        boundary.push_str(sensitive);
-        boundary.push(SEP);
-        if target.starts_with(&boundary) {
-            return true;
+        #[cfg(not(unix))]
+        {
+            target
+        }
+    };
+    for candidate in [target, normalized_target] {
+        for sensitive in SENSITIVE_PATHS {
+            if candidate == *sensitive {
+                return true;
+            }
+            let mut boundary = String::with_capacity(sensitive.len() + 1);
+            boundary.push_str(sensitive);
+            boundary.push(SEP);
+            if candidate.starts_with(&boundary) {
+                return true;
+            }
         }
     }
     false
@@ -1549,6 +1561,14 @@ mod tests {
         assert!(result.is_err());
 
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_target_is_sensitive_private_prefix() {
+        assert!(target_is_sensitive("/private/etc"));
+        assert!(target_is_sensitive("/private/var/log"));
+        assert!(target_is_sensitive("/private/dev/null"));
     }
 
     // ========== move_file tests ==========
