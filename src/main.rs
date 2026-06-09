@@ -23,6 +23,7 @@ use crate::ui::app::{App, Screen};
 use crate::services::claude;
 use crate::services::codex;
 use crate::services::gemini;
+use crate::services::gjc;
 use crate::services::opencode;
 use crate::utils::markdown::{render_markdown, MarkdownTheme, is_line_empty};
 use crate::keybindings::PanelAction;
@@ -881,9 +882,17 @@ fn handle_ccserver(tokens: Vec<String>) {
     let has_claude = claude::is_claude_available();
     let has_codex = codex::is_codex_available();
     let has_gemini = gemini::is_gemini_available();
+    let has_gjc = gjc::is_gjc_available();
     let has_opencode = opencode::is_opencode_available();
     let mark = |available: bool| if available { "✓" } else { "✗" };
-    println!("  ▸ Providers    : claude {}  codex {}  gemini {}  opencode {}", mark(has_claude), mark(has_codex), mark(has_gemini), mark(has_opencode));
+    println!(
+        "  ▸ Providers    : claude {}  codex {}  gemini {}  gjc {}  opencode {}",
+        mark(has_claude),
+        mark(has_codex),
+        mark(has_gemini),
+        mark(has_gjc),
+        mark(has_opencode)
+    );
 
     if has_gemini {
         let skip_trust = gemini::gemini_supports_skip_trust();
@@ -891,10 +900,10 @@ fn handle_ccserver(tokens: Vec<String>) {
         println!("  ▸ Gemini       : v{} ({}--skip-trust)", ver, if skip_trust { "+" } else { "−" });
     }
 
-    if !has_claude && !has_codex && !has_gemini && !has_opencode {
+    if !has_claude && !has_codex && !has_gemini && !has_gjc && !has_opencode {
         eprintln!();
         eprintln!("  Error: No AI provider available.");
-        eprintln!("  Install Claude CLI, Codex CLI, Gemini CLI, or OpenCode.");
+        eprintln!("  Install Claude CLI, Codex CLI, Gemini CLI, Gajae-Code, or OpenCode.");
         return;
     }
 

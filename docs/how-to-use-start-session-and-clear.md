@@ -14,7 +14,7 @@ Starts a session at the specified filesystem path. If the directory does not exi
 
 ### /start \<session_id or name\>
 
-Resolves a session by ID (UUID) or name. The bot searches across all providers (Claude, Codex, Gemini, OpenCode) for a matching session. If the session was created with a different provider than the currently active one, the bot automatically switches the model to that provider.
+Resolves a session by ID (UUID) or name. The bot searches across all providers (Claude, Codex, Gemini, Gajae-Code, OpenCode) for a matching session. If the session was created with a different provider than the currently active one, the bot automatically switches the model to that provider.
 
 ## Session Lifecycle
 
@@ -70,6 +70,7 @@ cd "/home/user/project"; claude --resume 550e8400-e29b-41d4-a716-446655440000
 | Claude | `claude --resume <session_id>` |
 | Codex | `codex resume <session_id>` |
 | Gemini | `gemini --resume <session_id>` |
+| Gajae-Code | `gjc --resume <session_id>` |
 | OpenCode | `opencode -s <session_id>` |
 
 ### No Active Session

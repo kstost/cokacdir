@@ -18,6 +18,7 @@ Example `~/.cokacdir/.env.json`:
 {
   "COKAC_CLAUDE_PATH": "/home/alice/.local/bin/claude",
   "COKAC_CODEX_PATH": "/opt/codex/codex",
+  "COKAC_GJC_PATH": "/home/alice/.bun/bin/gjc",
   "COKAC_FILE_ATTACH_THRESHOLD": "16384",
   "COKACDIR_DEBUG": "1"
 }
@@ -37,6 +38,7 @@ You can also export variables the usual way before launching `cokacdir` or `coka
 
 ```bash
 export COKAC_CLAUDE_PATH=/home/alice/.local/bin/claude
+export COKAC_GJC_PATH=/home/alice/.bun/bin/gjc
 cokacctl
 ```
 
@@ -70,6 +72,14 @@ Override the path to the Gemini CLI binary. Same semantics as above but for Gemi
 - **Type:** absolute path to an existing executable
 - **Default:** not set (automatic resolution)
 - **Example:** `COKAC_GEMINI_PATH=/usr/local/bin/gemini`
+
+### `COKAC_GJC_PATH`
+
+Override the path to the Gajae-Code CLI binary. Same semantics as above but for `gjc`. On Windows, the fallback resolver prefers `.cmd` over `.exe`.
+
+- **Type:** absolute path to an existing executable
+- **Default:** not set (automatic resolution)
+- **Example:** `COKAC_GJC_PATH=/home/alice/.bun/bin/gjc`
 
 ### `COKAC_OPENCODE_PATH`
 

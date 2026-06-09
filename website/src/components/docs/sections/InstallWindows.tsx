@@ -16,8 +16,8 @@ export default function InstallWindows() {
       <SubSection title={String(t('Step 1. Install AI Agent', 'Step 1. AI 에이전트 설치'))}>
         <P>
           {t(
-            <>cokacdir requires <strong className="text-white">Claude Code</strong> or <strong className="text-white">Codex CLI</strong> (or both). Install at least one.</>,
-            <>cokacdir은 <strong className="text-white">Claude Code</strong> 또는 <strong className="text-white">Codex CLI</strong> (또는 둘 다)가 필요합니다. 최소 하나를 설치하세요.</>
+            <>cokacdir requires at least one supported AI agent, such as <strong className="text-white">Claude Code</strong>, <strong className="text-white">Codex CLI</strong>, or <strong className="text-white">Gajae-Code</strong>.</>,
+            <>cokacdir은 <strong className="text-white">Claude Code</strong>, <strong className="text-white">Codex CLI</strong>, <strong className="text-white">Gajae-Code</strong> 같은 지원 AI 에이전트가 하나 이상 필요합니다.</>
           )}
         </P>
 
@@ -67,6 +67,19 @@ export default function InstallWindows() {
           </StepItem>
           <StepItem number={4} title={String(t('Login', '로그인'))}>
             {t('Log in to your OpenAI account to complete the setup.', 'OpenAI 계정에 로그인하여 설정을 완료하세요.')}
+          </StepItem>
+        </StepList>
+
+        <div className="mt-8 mb-2 text-white font-semibold">{t('Option C: Gajae-Code', '옵션 C: Gajae-Code')}</div>
+        <StepList>
+          <StepItem number={1} title={String(t('Install Bun', 'Bun 설치'))}>
+            {t('Install Bun from bun.sh, then open a new terminal.', 'bun.sh에서 Bun을 설치한 뒤 새 터미널을 여세요.')}
+          </StepItem>
+          <StepItem number={2} title={String(t('Install Gajae-Code', 'Gajae-Code 설치'))}>
+            <CodeBlock code="bun install -g gajae-code" />
+          </StepItem>
+          <StepItem number={3} title={String(t('Run Gajae-Code', 'Gajae-Code 실행'))}>
+            <CodeBlock code="gjc" />
           </StepItem>
         </StepList>
       </SubSection>

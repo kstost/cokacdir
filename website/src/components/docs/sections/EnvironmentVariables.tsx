@@ -22,6 +22,7 @@ export default function EnvironmentVariables() {
         <CodeBlock code={`{
   "COKAC_CLAUDE_PATH": "/home/alice/.local/bin/claude",
   "COKAC_CODEX_PATH": "/opt/codex/codex",
+  "COKAC_GJC_PATH": "/home/alice/.bun/bin/gjc",
   "COKAC_FILE_ATTACH_THRESHOLD": "16384",
   "COKACDIR_DEBUG": "1"
 }`} />
@@ -58,6 +59,7 @@ export default function EnvironmentVariables() {
           <><IC>cokacdir</IC> 또는 <IC>cokacctl</IC>을 실행하기 전에 일반적인 방법으로 변수를 export할 수도 있습니다:</>
         )}</P>
         <CodeBlock code={`export COKAC_CLAUDE_PATH=/home/alice/.local/bin/claude
+export COKAC_GJC_PATH=/home/alice/.bun/bin/gjc
 cokacctl`} />
         <P>{t(
           <>This works, but any keys that also appear in <IC>~/.cokacdir/.env.json</IC> will be overwritten when the program starts.</>,
@@ -94,12 +96,17 @@ cokacctl`} />
               String(t('auto-resolved', '자동 탐색')),
             ],
             [
-              <IC key="5">COKAC_FILE_ATTACH_THRESHOLD</IC>,
+              <IC key="5">COKAC_GJC_PATH</IC>,
+              String(t('Override path to Gajae-Code CLI binary', 'Gajae-Code CLI 바이너리 경로 재지정')),
+              String(t('auto-resolved', '자동 탐색')),
+            ],
+            [
+              <IC key="6">COKAC_FILE_ATTACH_THRESHOLD</IC>,
               String(t('Byte threshold for switching to .txt file attachment', '.txt 파일 첨부로 전환할 바이트 임계값')),
               '8192',
             ],
             [
-              <IC key="6">COKACDIR_DEBUG</IC>,
+              <IC key="7">COKACDIR_DEBUG</IC>,
               String(t('Set to "1" to enable debug logging at startup', '"1"로 설정 시 시작 시점부터 디버그 로깅 활성화')),
               String(t('off', '꺼짐')),
             ],
@@ -134,6 +141,13 @@ cokacctl`} />
           <>Gemini CLI 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 Gemini용입니다.</>
         )}</P>
         <CodeBlock code="COKAC_GEMINI_PATH=/usr/local/bin/gemini" />
+
+        <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_GJC_PATH</IC></h3>
+        <P>{t(
+          <>Override the path to the Gajae-Code CLI binary. Same semantics as above but for <IC>gjc</IC>. On Windows, the fallback resolver prefers <IC>.cmd</IC> over <IC>.exe</IC>.</>,
+          <>Gajae-Code CLI 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 <IC>gjc</IC>용입니다. Windows에서 폴백 탐색기는 <IC>.exe</IC>보다 <IC>.cmd</IC>를 우선합니다.</>
+        )}</P>
+        <CodeBlock code="COKAC_GJC_PATH=/home/alice/.bun/bin/gjc" />
 
         <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_OPENCODE_PATH</IC></h3>
         <P>{t(

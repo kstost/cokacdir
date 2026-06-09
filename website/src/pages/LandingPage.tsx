@@ -126,8 +126,8 @@ export default function LandingPage() {
             </p>
             <p className="text-zinc-500 text-lg max-w-2xl mx-auto mb-10 leading-relaxed">
               {t(
-        'Run AI coding agents like Claude Code and Codex through Telegram, Discord, and Slack bots. Code from your phone, tablet, or any device with a chat app.',
-                'Claude Code, Codex 등 AI 코딩 에이전트를 텔레그램, 디스코드, Slack 봇으로 실행하세요. 스마트폰, 태블릿, 채팅 앱이 있는 어떤 기기에서든 코딩하세요.'
+        'Run AI coding agents like Claude Code, Codex, and Gajae-Code through Telegram, Discord, and Slack bots. Code from your phone, tablet, or any device with a chat app.',
+                'Claude Code, Codex, Gajae-Code 등 AI 코딩 에이전트를 텔레그램, 디스코드, Slack 봇으로 실행하세요. 스마트폰, 태블릿, 채팅 앱이 있는 어떤 기기에서든 코딩하세요.'
               )}
             </p>
           </div>

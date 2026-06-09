@@ -29,8 +29,8 @@ export default function SessionManagement() {
 
       <SubSection title={String(t('/start <session_id or name>', '/start <세션_id 또는 이름>'))}>
         <P>{t(
-          'Resolves a session by UUID or name across all providers (Claude, Codex, Gemini, OpenCode). Automatically switches model if the session belongs to a different provider.',
-          '모든 제공자(Claude, Codex, Gemini, OpenCode)에서 UUID 또는 이름으로 세션을 찾습니다. 세션이 다른 제공자에 속하면 자동으로 모델을 전환합니다.'
+          'Resolves a session by UUID or name across all providers (Claude, Codex, Gemini, Gajae-Code, OpenCode). Automatically switches model if the session belongs to a different provider.',
+          '모든 제공자(Claude, Codex, Gemini, Gajae-Code, OpenCode)에서 UUID 또는 이름으로 세션을 찾습니다. 세션이 다른 제공자에 속하면 자동으로 모델을 전환합니다.'
         )}</P>
       </SubSection>
 
@@ -77,6 +77,7 @@ export default function SessionManagement() {
             ['Claude', 'claude --resume <session_id>'],
             ['Codex', 'codex resume <session_id>'],
             ['Gemini', 'gemini --resume <session_id>'],
+            ['Gajae-Code', 'gjc --resume <session_id>'],
             ['OpenCode', 'opencode -s <session_id>'],
           ]}
         />

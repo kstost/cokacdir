@@ -8,8 +8,8 @@ export default function EC2Setup() {
       <SectionTitle>{t('Install on AWS EC2', 'AWS EC2에 설치하기')}</SectionTitle>
       <P>
         {t(
-          'A guide to setting up a cokacdir & AI agent (Claude Code / Codex CLI) environment on AWS EC2 and using it anywhere via Telegram, Discord, or Slack.',
-          'AWS EC2 위에 cokacdir & AI 에이전트 (Claude Code / Codex CLI) 환경을 만들고, 텔레그램, 디스코드 또는 Slack으로 어디서나 사용하는 가이드입니다.'
+          'A guide to setting up a cokacdir & AI agent (Claude Code / Codex CLI / Gajae-Code) environment on AWS EC2 and using it anywhere via Telegram, Discord, or Slack.',
+          'AWS EC2 위에 cokacdir & AI 에이전트 (Claude Code / Codex CLI / Gajae-Code) 환경을 만들고, 텔레그램, 디스코드 또는 Slack으로 어디서나 사용하는 가이드입니다.'
         )}
       </P>
 

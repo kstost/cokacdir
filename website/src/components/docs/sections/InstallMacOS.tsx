@@ -16,14 +16,16 @@ export default function InstallMacOS() {
       <SubSection title={String(t('Before You Begin: Install AI Agent', '시작 전: AI 에이전트 설치'))}>
         <P>
           {t(
-            <>cokacdir requires <strong className="text-white">Claude Code</strong> or <strong className="text-white">Codex CLI</strong> (or both). Make sure at least one is installed before proceeding.</>,
-            <>cokacdir은 <strong className="text-white">Claude Code</strong> 또는 <strong className="text-white">Codex CLI</strong> (또는 둘 다)가 필요합니다. 진행하기 전에 최소 하나가 설치되어 있는지 확인하세요.</>
+            <>cokacdir requires at least one supported AI agent, such as <strong className="text-white">Claude Code</strong>, <strong className="text-white">Codex CLI</strong>, or <strong className="text-white">Gajae-Code</strong>.</>,
+            <>cokacdir은 <strong className="text-white">Claude Code</strong>, <strong className="text-white">Codex CLI</strong>, <strong className="text-white">Gajae-Code</strong> 같은 지원 AI 에이전트가 하나 이상 필요합니다.</>
           )}
         </P>
         <div className="mt-4 mb-2 text-white font-semibold">Claude Code</div>
         <CodeBlock code="curl -fsSL https://claude.ai/install.sh | bash" />
         <div className="mt-4 mb-2 text-white font-semibold">Codex CLI</div>
         <CodeBlock code="npm i -g @openai/codex" />
+        <div className="mt-4 mb-2 text-white font-semibold">Gajae-Code</div>
+        <CodeBlock code="bun install -g gajae-code" />
       </SubSection>
 
       <SubSection title={String(t('Step 1. Install cokacdir', 'Step 1. cokacdir 설치'))}>

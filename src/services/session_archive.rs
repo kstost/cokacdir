@@ -424,6 +424,7 @@ pub fn archive_and_save_session(
         "claude"   => parse_claude(source_path, session_id, cwd),
         "codex"    => parse_codex(source_path, session_id, cwd),
         "gemini"   => parse_gemini(source_path, session_id, cwd),
+        "gjc"      => parse_gjc(source_path, session_id, cwd),
         "opencode" => parse_opencode(source_path, session_id, cwd),
         _ => {
             dbg(&format!("[archive] unknown provider: {}", provider));
@@ -1252,6 +1253,141 @@ fn gemini_parse_usage(t: &Value) -> Option<Usage> {
         cache_read_input_tokens: g("cached"),
         extra: t.clone(),
     })
+}
+
+fn parse_gjc(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    let mut idx: u32 = 0;
+    let mut created_at = None;
+    let mut updated_at = None;
+    let mut session_model = None;
+    let mut session_meta = serde_json::Map::new();
+
+    for line in reader.lines().flatten() {
+        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let outer_type = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if outer_type == "session" {
+            for k in ["id", "cwd", "model", "createdAt", "updatedAt"] {
+                if let Some(v) = val.get(k) {
+                    session_meta.insert(k.into(), v.clone());
+                }
+            }
+            if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                session_model = Some(m.to_string());
+            }
+            created_at = val
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            updated_at = val
+                .get("updatedAt")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            continue;
+        }
+        if outer_type != "message" {
+            continue;
+        }
+        let Some(message) = val.get("message") else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("assistant")
+            .to_string();
+        let content = gjc_content_blocks(message.get("content"));
+        if content.is_empty() {
+            continue;
+        }
+        let mut meta = BTreeMap::new();
+        if let Some(id) = message.get("id").and_then(|v| v.as_str()) {
+            meta.insert("message_id".into(), json!(id));
+        }
+        if let Some(m) = message.get("model").and_then(|v| v.as_str()) {
+            session_model.get_or_insert_with(|| m.to_string());
+        }
+        let timestamp = message
+            .get("timestamp")
+            .or_else(|| val.get("timestamp"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        messages.push(Message {
+            index: idx,
+            timestamp,
+            role,
+            source: "gjc:message".into(),
+            content,
+            model: session_model.clone(),
+            usage: None,
+            stop_reason: None,
+            meta,
+            raw: val,
+        });
+        idx += 1;
+    }
+
+    if messages.is_empty() && session_meta.is_empty() {
+        return None;
+    }
+    Some(FullSession {
+        session_id: session_id.to_string(),
+        provider: "gjc".into(),
+        cwd: cwd.to_string(),
+        created_at,
+        updated_at,
+        source_path: path.display().to_string(),
+        model: session_model,
+        git: None,
+        session_meta: (!session_meta.is_empty()).then_some(Value::Object(session_meta)),
+        messages,
+    })
+}
+
+fn gjc_content_blocks(content: Option<&Value>) -> Vec<ContentBlock> {
+    match content {
+        Some(Value::String(s)) if !s.is_empty() => vec![ContentBlock::text(s)],
+        Some(Value::Array(items)) => items.iter().map(gjc_content_block).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn gjc_content_block(item: &Value) -> ContentBlock {
+    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+        return ContentBlock::text(text);
+    }
+    if item.get("type").and_then(|v| v.as_str()) == Some("tool-call") {
+        let name = item
+            .get("toolName")
+            .or_else(|| item.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("tool")
+            .to_string();
+        let id = item
+            .get("toolCallId")
+            .or_else(|| item.get("id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let input = item
+            .get("args")
+            .or_else(|| item.get("input"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return ContentBlock::tool_use(name, id, input);
+    }
+    let kind = item
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    ContentBlock::other(kind, item.clone())
 }
 
 // =====================================================================

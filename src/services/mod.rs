@@ -4,6 +4,12 @@ pub mod cgroup;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod gjc;
+mod gjc_events;
+mod gjc_path;
+mod gjc_sessions;
+#[cfg(test)]
+mod gjc_tests;
 pub mod opencode;
 pub mod bridge;
 pub mod messenger_bridge;

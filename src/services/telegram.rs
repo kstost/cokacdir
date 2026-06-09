@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
 use crate::services::gemini;
+use crate::services::gjc;
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -9500,7 +9501,7 @@ Ask in natural language to manage schedules.
 
 <b>Settings</b>
 <code>/model</code> — Show current AI model
-<code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini or provider:model)
+<code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini/gjc or provider:model)
 <code>/stt_model</code> — Show current speech recognition model
 <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
@@ -9671,22 +9672,32 @@ async fn handle_start_command(
             SessionProvider::Claude => &[
                 SessionProvider::Codex,
                 SessionProvider::Gemini,
+                SessionProvider::Gjc,
                 SessionProvider::OpenCode,
             ],
             SessionProvider::Codex => &[
                 SessionProvider::Claude,
                 SessionProvider::Gemini,
+                SessionProvider::Gjc,
                 SessionProvider::OpenCode,
             ],
             SessionProvider::Gemini => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
+                SessionProvider::Gjc,
+                SessionProvider::OpenCode,
+            ],
+            SessionProvider::Gjc => &[
+                SessionProvider::Claude,
+                SessionProvider::Codex,
+                SessionProvider::Gemini,
                 SessionProvider::OpenCode,
             ],
             SessionProvider::OpenCode => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::Gemini,
+                SessionProvider::Gjc,
             ],
         };
 
@@ -9777,6 +9788,7 @@ async fn handle_start_command(
                     SessionProvider::Claude => claude::is_claude_available(),
                     SessionProvider::Codex => codex::is_codex_available(),
                     SessionProvider::Gemini => gemini::is_gemini_available(),
+                    SessionProvider::Gjc => gjc::is_gjc_available(),
                     SessionProvider::OpenCode => opencode::is_opencode_available(),
                 };
                 if !available {
@@ -10237,6 +10249,7 @@ enum SessionProvider {
     Claude,
     Codex,
     Gemini,
+    Gjc,
     OpenCode,
 }
 
@@ -10247,6 +10260,8 @@ fn provider_from_model(model: Option<&str>) -> &'static str {
         "codex"
     } else if gemini::is_gemini_model(model) {
         "gemini"
+    } else if gjc::is_gjc_model(model) {
+        "gjc"
     } else if opencode::is_opencode_model(model) {
         "opencode"
     } else {
@@ -10262,6 +10277,8 @@ fn detect_provider(model: Option<&str>) -> &'static str {
         "codex"
     } else if !claude::is_claude_available() && gemini::is_gemini_available() {
         "gemini"
+    } else if !claude::is_claude_available() && gjc::is_gjc_available() {
+        "gjc"
     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
         "opencode"
     } else {
@@ -10274,6 +10291,7 @@ fn provider_to_session(provider: &str) -> SessionProvider {
     match provider {
         "codex" => SessionProvider::Codex,
         "gemini" => SessionProvider::Gemini,
+        "gjc" => SessionProvider::Gjc,
         "opencode" => SessionProvider::OpenCode,
         _ => SessionProvider::Claude,
     }
@@ -10285,6 +10303,7 @@ fn session_provider_str(provider: SessionProvider) -> &'static str {
         SessionProvider::Claude => "claude",
         SessionProvider::Codex => "codex",
         SessionProvider::Gemini => "gemini",
+        SessionProvider::Gjc => "gjc",
         SessionProvider::OpenCode => "opencode",
     }
 }
@@ -10315,6 +10334,7 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
         }
         SessionProvider::Codex => resolve_codex_by_id(query),
         SessionProvider::Gemini => resolve_gemini_by_id(query),
+        SessionProvider::Gjc => resolve_gjc_by_id(query),
         SessionProvider::OpenCode => resolve_opencode_by_id(query),
     };
     msg_debug(&format!(
@@ -10584,6 +10604,81 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
     })
 }
 
+fn gjc_agent_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("GJC_CODING_AGENT_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    Some(dirs::home_dir()?.join(".gjc").join("agent"))
+}
+
+fn gjc_header(path: &Path) -> Option<(String, String)> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(8).flatten() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("session") {
+            continue;
+        }
+        let id = val.get("id").and_then(|v| v.as_str())?.to_string();
+        let cwd = val.get("cwd").and_then(|v| v.as_str())?.to_string();
+        if !id.is_empty() && !cwd.is_empty() {
+            return Some((id, cwd));
+        }
+    }
+    None
+}
+
+fn walk_gjc_sessions(
+    dir: &Path,
+    visit: &mut dyn FnMut(&Path, &str, &str) -> bool,
+) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            if let Some(found) = walk_gjc_sessions(&path, visit) {
+                return Some(found);
+            }
+        } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Some((id, cwd)) = gjc_header(&path) {
+                if visit(&path, &id, &cwd) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_gjc_by_id(session_id: &str) -> Option<ResolvedSession> {
+    let sessions_dir = gjc_agent_dir()?.join("sessions");
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut cwd = String::new();
+    let path = walk_gjc_sessions(&sessions_dir, &mut |_, id, found_cwd| {
+        if id == session_id {
+            cwd = found_cwd.to_string();
+            true
+        } else {
+            false
+        }
+    })?;
+    Some(ResolvedSession {
+        cwd,
+        jsonl_path: path,
+        session_id: session_id.to_string(),
+        provider: SessionProvider::Gjc,
+    })
+}
+
 /// Convert an external JSONL session to cokacdir SessionData and save it.
 /// Re-converts if the source JSONL is newer than the existing JSON, or if the
 /// existing JSON is a cleared/incomplete placeholder.
@@ -10638,6 +10733,7 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
         SessionProvider::Claude => parse_claude_jsonl,
         SessionProvider::Codex => parse_codex_jsonl,
         SessionProvider::Gemini => parse_gemini_json,
+        SessionProvider::Gjc => parse_gjc_jsonl,
         SessionProvider::OpenCode => parse_opencode_session,
     };
     msg_debug(&format!(
@@ -10811,6 +10907,7 @@ fn find_latest_session_by_cwd(
         SessionProvider::Claude => find_latest_claude_by_cwd(canonical_path),
         SessionProvider::Codex => find_latest_codex_by_cwd(canonical_path),
         SessionProvider::Gemini => find_latest_gemini_by_cwd(canonical_path),
+        SessionProvider::Gjc => find_latest_gjc_by_cwd(canonical_path),
         SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
     };
     msg_debug(&format!(
@@ -11070,6 +11167,94 @@ fn find_latest_opencode_by_cwd(canonical_path: &str) -> Option<ResolvedSession> 
         jsonl_path: db_path,
         session_id,
         provider: SessionProvider::OpenCode,
+    })
+}
+
+fn find_latest_gjc_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
+    let sessions_dir = gjc_agent_dir()?.join("sessions");
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut best: Option<(PathBuf, String, std::time::SystemTime)> = None;
+    let _ = walk_gjc_sessions(&sessions_dir, &mut |path, id, cwd| {
+        if cwd != canonical_path {
+            return false;
+        }
+        let mtime = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let replace = best
+            .as_ref()
+            .map(|(_, _, best_time)| mtime > *best_time)
+            .unwrap_or(true);
+        if replace {
+            best = Some((path.to_path_buf(), id.to_string(), mtime));
+        }
+        false
+    });
+    let (jsonl_path, session_id, _) = best?;
+    Some(ResolvedSession {
+        cwd: canonical_path.to_string(),
+        jsonl_path,
+        session_id,
+        provider: SessionProvider::Gjc,
+    })
+}
+
+fn gjc_content_text(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    content
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+fn parse_gjc_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(jsonl_path).ok()?;
+    let reader = BufReader::new(file);
+    let mut history = Vec::new();
+    for line in reader.lines().flatten() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        let Some(message) = val.get("message") else {
+            continue;
+        };
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = message
+            .get("content")
+            .map(gjc_content_text)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
+        let item_type = match role {
+            "user" => HistoryType::User,
+            "assistant" => HistoryType::Assistant,
+            _ => continue,
+        };
+        history.push(HistoryItem { item_type, content });
+    }
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "gjc".to_string(),
     })
 }
 
@@ -14215,6 +14400,12 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         } else {
             Err("gemini")
         }
+    } else if gjc::is_gjc_model(Some(clean)) {
+        if gjc::is_gjc_available() {
+            Ok(clean.to_string())
+        } else {
+            Err("gjc")
+        }
     } else if opencode::is_opencode_model(Some(clean)) {
         if opencode::is_opencode_available() {
             Ok(clean.to_string())
@@ -14400,6 +14591,7 @@ async fn handle_fast_command(
         let provider_label = match provider {
             "claude" => "Claude",
             "gemini" => "Gemini",
+            "gjc" => "Gajae-Code",
             "opencode" => "OpenCode",
             _ => provider,
         };
@@ -14590,6 +14782,7 @@ async fn handle_model_command(
         let has_claude = claude::is_claude_available();
         let has_codex = codex::is_codex_available();
         let has_gemini = gemini::is_gemini_available();
+        let has_gjc = gjc::is_gjc_available();
         let has_opencode = opencode::is_opencode_available();
 
         let mut msg = match &current {
@@ -14601,6 +14794,8 @@ async fn handle_model_command(
                     "codex"
                 } else if has_gemini {
                     "gemini"
+                } else if has_gjc {
+                    "gjc"
                 } else {
                     "opencode"
                 };
@@ -14643,6 +14838,14 @@ async fn handle_model_command(
             msg.push_str("<code>/model gemini:gemini-2.5-flash</code> — Gemini 2.5 Flash\n");
             msg.push_str(
                 "<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n",
+            );
+        }
+        if has_gjc {
+            msg.push_str("\n<b>Gajae-Code:</b>\n");
+            msg.push_str("<code>/model gjc</code> — default\n");
+            msg.push_str("<code>/model gjc:openai/gpt-5.2</code> — OpenAI GPT model via GJC\n");
+            msg.push_str(
+                "<code>/model gjc:anthropic/claude-sonnet-4.5</code> — Claude model via GJC\n",
             );
         }
         if has_opencode {
@@ -14804,6 +15007,7 @@ async fn handle_model_command(
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
                  <code>/model gemini</code> or <code>/model gemini:&lt;model&gt;</code>\n\
+                 <code>/model gjc</code> or <code>/model gjc:&lt;model&gt;</code>\n\
                  <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
                 )
                 .parse_mode(ParseMode::Html)
@@ -15694,6 +15898,21 @@ async fn handle_text_message(
                     gemini_model,
                     false,
                 )
+            } else if provider == "gjc" {
+                let gjc_model = model_clone.as_deref().and_then(gjc::strip_gjc_prefix);
+                msg_debug(&format!("[handle_text_message] → gjc::execute, gjc_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    gjc_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
+                gjc::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    gjc_model,
+                    false,
+                )
             } else if provider == "codex" {
                 let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
                 let codex_system_prompt =
@@ -16496,7 +16715,11 @@ async fn handle_text_message(
                 }
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ▶ Response sent");
+                if was_originally_empty {
+                    println!("  [{ts}]   ⚠ Provider returned empty response");
+                } else {
+                    println!("  [{ts}] ▶ Response sent");
+                }
 
                 // Send end hook message if configured
                 if !cancelled {
@@ -18949,6 +19172,23 @@ async fn execute_schedule(
                 gemini_model,
                 false,
             )
+        } else if provider == "gjc" {
+            let gjc_model = model_clone_for_exec
+                .as_deref()
+                .and_then(gjc::strip_gjc_prefix);
+            sched_debug(&format!("[execute_schedule] → gjc::execute, gjc_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
+                gjc_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            gjc::execute_command_streaming(
+                &prompt,
+                resume_ref,
+                &workspace_path_for_claude,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+                gjc_model,
+                false,
+            )
         } else if provider == "codex" {
             let codex_model = model_clone_for_exec
                 .as_deref()
@@ -20325,6 +20565,21 @@ async fn process_bot_message(
                 gemini_model,
                 false,
             )
+        } else if provider == "gjc" {
+            let gjc_model = model_clone.as_deref().and_then(gjc::strip_gjc_prefix);
+            msg_debug(&format!("[process_bot_message] → gjc::execute, gjc_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                gjc_model, session_id_clone, current_path_clone, prompt_for_ai.len(), system_prompt_owned.len()));
+            gjc::execute_command_streaming(
+                &prompt_for_ai,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+                gjc_model,
+                false,
+            )
         } else if provider == "codex" {
             let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
             let codex_system_prompt =
@@ -21112,7 +21367,11 @@ async fn process_bot_message(
                 }
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ▶ [BotMsg] Response sent");
+                if was_originally_empty {
+                    println!("  [{ts}]   ⚠ [BotMsg] Provider returned empty response");
+                } else {
+                    println!("  [{ts}] ▶ [BotMsg] Response sent");
+                }
                 msg_debug(&format!(
                     "[botmsg_poll:{}] response sent, final_response_len={}",
                     bmsg_id_for_log,
