@@ -22,6 +22,7 @@ export default function EnvironmentVariables() {
         <CodeBlock code={`{
   "COKAC_CLAUDE_PATH": "/home/alice/.local/bin/claude",
   "COKAC_CODEX_PATH": "/opt/codex/codex",
+  "COKAC_KIRO_PATH": "/usr/local/bin/kiro-cli",
   "COKAC_FILE_ATTACH_THRESHOLD": "16384",
   "COKACDIR_DEBUG": "1"
 }`} />
@@ -89,17 +90,22 @@ cokacctl`} />
               String(t('auto-resolved', '자동 탐색')),
             ],
             [
-              <IC key="4">COKAC_OPENCODE_PATH</IC>,
+              <IC key="4">COKAC_KIRO_PATH</IC>,
+              String(t('Override path to Kiro CLI binary', 'Kiro CLI 바이너리 경로 재지정')),
+              String(t('auto-resolved', '자동 탐색')),
+            ],
+            [
+              <IC key="5">COKAC_OPENCODE_PATH</IC>,
               String(t('Override path to Opencode CLI binary (Unix only)', 'Opencode CLI 바이너리 경로 재지정 (Unix 전용)')),
               String(t('auto-resolved', '자동 탐색')),
             ],
             [
-              <IC key="5">COKAC_FILE_ATTACH_THRESHOLD</IC>,
+              <IC key="6">COKAC_FILE_ATTACH_THRESHOLD</IC>,
               String(t('Byte threshold for switching to .txt file attachment', '.txt 파일 첨부로 전환할 바이트 임계값')),
               '8192',
             ],
             [
-              <IC key="6">COKACDIR_DEBUG</IC>,
+              <IC key="7">COKACDIR_DEBUG</IC>,
               String(t('Set to "1" to enable debug logging at startup', '"1"로 설정 시 시작 시점부터 디버그 로깅 활성화')),
               String(t('off', '꺼짐')),
             ],
@@ -134,6 +140,14 @@ cokacctl`} />
           <>Gemini CLI 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 Gemini용입니다.</>
         )}</P>
         <CodeBlock code="COKAC_GEMINI_PATH=/usr/local/bin/gemini" />
+
+        <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_KIRO_PATH</IC></h3>
+        <P>{t(
+          <>Override the path to the standalone Kiro CLI binary. Same semantics as above but for Kiro, with one extra rule: if the path points to a Kiro CLI JavaScript entrypoint such as <IC>.js</IC>, <IC>.mjs</IC>, or <IC>.cjs</IC>, cokacdir launches it through <IC>node</IC>. On Unix, cokacdir first checks common standalone install locations such as <IC>~/.local/bin/kiro-cli</IC>, <IC>~/bin/kiro-cli</IC>, <IC>/opt/homebrew/bin/kiro-cli</IC>, and <IC>/usr/local/bin/kiro-cli</IC>, then falls back to <IC>which kiro-cli</IC> and <IC>bash -lc "which kiro-cli"</IC> for non-interactive sessions. On Windows, the fallback resolver prefers <IC>.cmd</IC> over <IC>.exe</IC>. The packaged <IC>Kiro.app</IC> launcher is not auto-detected because it opens the GUI instead of providing compatible headless chat output for cokacdir.</>,
+          <>Standalone Kiro CLI 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 Kiro용이며, 한 가지 규칙이 더 있습니다. 경로가 <IC>.js</IC>, <IC>.mjs</IC>, <IC>.cjs</IC> 같은 Kiro CLI JavaScript 엔트리포인트를 가리키면 cokacdir는 이를 <IC>node</IC>로 실행합니다. Unix에서는 cokacdir가 먼저 <IC>~/.local/bin/kiro-cli</IC>, <IC>~/bin/kiro-cli</IC>, <IC>/opt/homebrew/bin/kiro-cli</IC>, <IC>/usr/local/bin/kiro-cli</IC> 같은 일반적인 standalone 설치 경로를 확인하고, 그다음 비대화형 세션을 위해 <IC>which kiro-cli</IC>와 <IC>bash -lc "which kiro-cli"</IC>로 폴백합니다. Windows에서는 폴백 탐색기가 <IC>.exe</IC>보다 <IC>.cmd</IC>를 우선합니다. 패키지된 <IC>Kiro.app</IC> 런처는 GUI를 띄우기 때문에 cokacdir와 호환되는 headless 채팅 출력을 제공하지 않아 자동 탐지 대상에서 제외됩니다.</>
+        )}</P>
+        <CodeBlock code={`COKAC_KIRO_PATH=/usr/local/bin/kiro-cli
+COKAC_KIRO_PATH=$HOME/.local/bin/kiro-cli`} />
 
         <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_OPENCODE_PATH</IC></h3>
         <P>{t(
@@ -281,8 +295,8 @@ cokacctl`} />
             <><strong><IC>.env.json</IC>이 로드되지 않는 것 같아요.</strong> 파일이 정확히 <IC>~/.cokacdir/.env.json</IC> 경로(앞의 점 주의)에 있는지, 유효한 JSON인지, 루트가 <strong>JSON 객체</strong>(<IC>{`{ ... }`}</IC>, 배열이나 단일 스칼라가 아님)인지 확인하세요. 그 객체의 각 키에 대한 값은 문자열, 숫자, 불리언 중 하나여야 합니다 — 객체, 배열, <IC>null</IC> 값은 경고와 함께 건너뜁니다. <IC>/envvars</IC>를 실행해서 실제로 프로세스 환경에 어떤 변수가 있는지 확인할 수 있습니다.</>
           )}</li>
           <li>{t(
-            <><strong><IC>COKAC_CLAUDE_PATH</IC> is set but Claude still uses the wrong binary.</strong> The override is only used if the file at that path exists. If the path is wrong or the file is missing, cokacdir silently falls back to <IC>which claude</IC>. Double-check the path and file permissions.</>,
-            <><strong><IC>COKAC_CLAUDE_PATH</IC>가 설정되었는데도 Claude가 잘못된 바이너리를 사용합니다.</strong> 해당 경로의 파일이 존재할 때만 재지정이 적용됩니다. 경로가 잘못되었거나 파일이 없으면, cokacdir는 조용히 <IC>which claude</IC>로 폴백합니다. 경로와 파일 권한을 다시 확인하세요.</>
+            <><strong>A provider path override is set but the wrong binary is still used.</strong> The override is only used if the file at that path exists. If the path is wrong or the file is missing, cokacdir silently falls back to its normal resolver (<IC>which ...</IC>, shell fallback, or <IC>SearchPathW</IC> on Windows depending on provider). Double-check the path and file permissions.</>,
+            <><strong>provider 경로 override를 설정했는데도 잘못된 바이너리가 사용됩니다.</strong> 해당 경로의 파일이 존재할 때만 재지정이 적용됩니다. 경로가 잘못되었거나 파일이 없으면, cokacdir는 provider에 따라 기본 탐색기(<IC>which ...</IC>, 셸 폴백, 또는 Windows의 <IC>SearchPathW</IC>)로 조용히 폴백합니다. 경로와 파일 권한을 다시 확인하세요.</>
           )}</li>
           <li>{t(
             <><strong><IC>/envvars</IC> returns "Only the bot owner can use /envvars."</strong> You are not registered as the owner of this bot. The owner is the Telegram user ID that first successfully interacted with the bot after it started; see the token management and first-chat guides for how ownership is established.</>,

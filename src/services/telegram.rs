@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
 use crate::services::gemini;
+use crate::services::kiro;
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -3523,7 +3524,7 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
             session_data.history.len()
         ));
         if session_data_has_active_session(&session_data) {
-            session.session_id = Some(session_data.session_id.clone());
+            session.session_id = stored_session_id_or_none(&session_data);
             session.history = session_data.history.clone();
             restored_active_session = true;
         } else {
@@ -9452,14 +9453,14 @@ async fn handle_help_command(
     let platform = capitalize_platform(detect_platform(bot.token()));
     let help = format!("\
 <b>cokacdir {} Bot</b>
-Manage server files &amp; chat with Claude AI.
+Manage server files &amp; chat with your AI provider.
 
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
-<code>/start &lt;name|id&gt;</code> — Resume Claude Code session
+<code>/start &lt;name|id&gt;</code> — Resume saved session
 <code>/start</code> — Start with auto-generated workspace
 <code>/pwd</code> — Show current working directory
-<code>/session</code> — Show current session ID
+<code>/session</code> — Show current session resume info
 <code>/clear</code> — Clear AI conversation history
 <code>/stop</code> — Stop current AI request
 <code>/stop_&lt;ID&gt;</code> — Cancel a specific queued message
@@ -9476,7 +9477,7 @@ Send a file/photo — Upload to session directory
   e.g. <code>!ls -la</code>, <code>!git status</code>
 
 <b>AI Chat</b>
-Any other message is sent to Claude AI.
+Any other message is sent to the current AI provider.
 AI can read, edit, and run commands in your session.
 
 <b>Tool Management</b>
@@ -9500,7 +9501,7 @@ Ask in natural language to manage schedules.
 
 <b>Settings</b>
 <code>/model</code> — Show current AI model
-<code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini or provider:model)
+<code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini/opencode/kiro or provider:model where supported)
 <code>/stt_model</code> — Show current speech recognition model
 <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
@@ -9672,21 +9673,31 @@ async fn handle_start_command(
                 SessionProvider::Codex,
                 SessionProvider::Gemini,
                 SessionProvider::OpenCode,
+                SessionProvider::Kiro,
             ],
             SessionProvider::Codex => &[
                 SessionProvider::Claude,
                 SessionProvider::Gemini,
                 SessionProvider::OpenCode,
+                SessionProvider::Kiro,
             ],
             SessionProvider::Gemini => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::OpenCode,
+                SessionProvider::Kiro,
             ],
             SessionProvider::OpenCode => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::Gemini,
+                SessionProvider::Kiro,
+            ],
+            SessionProvider::Kiro => &[
+                SessionProvider::Claude,
+                SessionProvider::Codex,
+                SessionProvider::Gemini,
+                SessionProvider::OpenCode,
             ],
         };
 
@@ -9778,6 +9789,7 @@ async fn handle_start_command(
                     SessionProvider::Codex => codex::is_codex_available(),
                     SessionProvider::Gemini => gemini::is_gemini_available(),
                     SessionProvider::OpenCode => opencode::is_opencode_available(),
+                    SessionProvider::Kiro => kiro::is_kiro_available(),
                 };
                 if !available {
                     msg_debug(&format!(
@@ -10015,7 +10027,7 @@ async fn handle_start_command(
 
         if let Some((session_data, _)) = &existing {
             if session_data_has_active_session(session_data) {
-                session.session_id = Some(session_data.session_id.clone());
+                session.session_id = stored_session_id_or_none(session_data);
                 session.current_path = Some(canonical_path.clone());
                 session.history = session_data.history.clone();
                 is_restored = true;
@@ -10238,6 +10250,7 @@ enum SessionProvider {
     Codex,
     Gemini,
     OpenCode,
+    Kiro,
 }
 
 /// Detect provider from model prefix only (no availability fallback).
@@ -10247,6 +10260,8 @@ fn provider_from_model(model: Option<&str>) -> &'static str {
         "codex"
     } else if gemini::is_gemini_model(model) {
         "gemini"
+    } else if kiro::is_kiro_model(model) {
+        "kiro"
     } else if opencode::is_opencode_model(model) {
         "opencode"
     } else {
@@ -10264,6 +10279,8 @@ fn detect_provider(model: Option<&str>) -> &'static str {
         "gemini"
     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
         "opencode"
+    } else if !claude::is_claude_available() && kiro::is_kiro_available() {
+        "kiro"
     } else {
         "claude"
     }
@@ -10275,6 +10292,7 @@ fn provider_to_session(provider: &str) -> SessionProvider {
         "codex" => SessionProvider::Codex,
         "gemini" => SessionProvider::Gemini,
         "opencode" => SessionProvider::OpenCode,
+        "kiro" => SessionProvider::Kiro,
         _ => SessionProvider::Claude,
     }
 }
@@ -10286,6 +10304,7 @@ fn session_provider_str(provider: SessionProvider) -> &'static str {
         SessionProvider::Codex => "codex",
         SessionProvider::Gemini => "gemini",
         SessionProvider::OpenCode => "opencode",
+        SessionProvider::Kiro => "kiro",
     }
 }
 
@@ -10316,6 +10335,7 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
         SessionProvider::Codex => resolve_codex_by_id(query),
         SessionProvider::Gemini => resolve_gemini_by_id(query),
         SessionProvider::OpenCode => resolve_opencode_by_id(query),
+        SessionProvider::Kiro => None,
     };
     msg_debug(&format!(
         "[resolve_session] result={}",
@@ -10639,6 +10659,7 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
         SessionProvider::Codex => parse_codex_jsonl,
         SessionProvider::Gemini => parse_gemini_json,
         SessionProvider::OpenCode => parse_opencode_session,
+        SessionProvider::Kiro => parse_kiro_session,
     };
     msg_debug(&format!(
         "[convert_session] parsing with provider={:?}",
@@ -10691,15 +10712,26 @@ fn converted_session_file_is_complete(
         .unwrap_or(false)
 }
 
+fn stored_session_id_or_none(session_data: &SessionData) -> Option<String> {
+    if session_data.session_id.trim().is_empty() {
+        None
+    } else {
+        Some(session_data.session_id.clone())
+    }
+}
+
 fn session_data_has_active_session(session_data: &SessionData) -> bool {
     !session_data.session_id.is_empty()
+        || (session_data.provider == "kiro"
+            && !session_data.current_path.is_empty()
+            && !session_data.history.is_empty())
 }
 
 #[cfg(test)]
 mod session_conversion_tests {
     use super::{
-        converted_session_file_is_complete, session_data_has_active_session, HistoryItem,
-        HistoryType, SessionData,
+        converted_session_file_is_complete, session_data_has_active_session,
+        stored_session_id_or_none, HistoryItem, HistoryType, SessionData,
     };
 
     fn write_session_file(path: &std::path::Path, data: &SessionData) {
@@ -10789,12 +10821,481 @@ mod session_conversion_tests {
     }
 
     #[test]
-    fn active_session_requires_non_empty_session_id() {
+    fn active_session_requires_non_empty_session_id_except_kiro() {
         let mut data = valid_session_data();
         assert!(session_data_has_active_session(&data));
 
         data.session_id.clear();
         assert!(!session_data_has_active_session(&data));
+
+        data.provider = "kiro".to_string();
+        assert!(session_data_has_active_session(&data));
+    }
+
+    #[test]
+    fn stored_session_id_maps_empty_string_to_none() {
+        let mut data = valid_session_data();
+        assert_eq!(
+            stored_session_id_or_none(&data),
+            Some(data.session_id.clone())
+        );
+
+        data.session_id.clear();
+        assert_eq!(stored_session_id_or_none(&data), None);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod kiro_smoke_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, Instant};
+
+    #[derive(Clone, Debug)]
+    struct MockTelegramCall {
+        method: String,
+        text: Option<String>,
+    }
+
+    struct MockTelegramApi {
+        api_url: String,
+        calls: Arc<StdMutex<Vec<MockTelegramCall>>>,
+    }
+
+    impl MockTelegramApi {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let calls = Arc::new(StdMutex::new(Vec::<MockTelegramCall>::new()));
+            let next_message_id = Arc::new(AtomicI32::new(1));
+
+            let calls_bg = calls.clone();
+            let next_message_id_bg = next_message_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let calls = calls_bg.clone();
+                    let next_message_id = next_message_id_bg.clone();
+                    tokio::spawn(async move {
+                        let Some((path, content_type, body)) = read_http_request(&mut stream).await
+                        else {
+                            return;
+                        };
+                        let method = path.rsplit('/').next().unwrap_or("").to_string();
+                        let method_key = method.to_ascii_lowercase();
+                        let text = extract_text_field(&content_type, &body);
+                        calls.lock().unwrap().push(MockTelegramCall {
+                            method: method_key.clone(),
+                            text,
+                        });
+
+                        let response = match method_key.as_str() {
+                            "sendmessage" | "editmessagetext" => json!({
+                                "ok": true,
+                                "result": make_bot_message_json(
+                                    next_message_id.fetch_add(1, AtomicOrdering::Relaxed),
+                                    1,
+                                    "ok"
+                                ),
+                            }),
+                            "deletemessage" | "sendchataction" => {
+                                json!({"ok": true, "result": true})
+                            }
+                            other => panic!("unexpected Telegram API method in test: {other}"),
+                        };
+                        let _ = write_http_json(&mut stream, &response).await;
+                    });
+                }
+            });
+
+            Self {
+                api_url: format!("http://{}", addr),
+                calls,
+            }
+        }
+
+        fn calls_snapshot(&self) -> Vec<MockTelegramCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn make_bot_message_json(msg_id: i32, chat_id: i64, text: &str) -> Value {
+        json!({
+            "message_id": msg_id,
+            "from": {
+                "id": 99,
+                "is_bot": true,
+                "first_name": "MockBot",
+                "username": "mock_bot",
+            },
+            "chat": {
+                "id": chat_id,
+                "type": "private",
+                "first_name": "MockBot",
+            },
+            "date": chrono::Local::now().timestamp(),
+            "text": text,
+        })
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+        let mut buffer = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let header_end = loop {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            if buffer.len() > 64 * 1024 {
+                return None;
+            }
+        };
+
+        let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next()?;
+        let path = request_line.split_whitespace().nth(1)?.to_string();
+
+        let mut content_length = 0usize;
+        let mut content_type = String::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if name == "content-length" {
+                    content_length = value.parse().ok()?;
+                } else if name == "content-type" {
+                    content_type = value.to_string();
+                }
+            }
+        }
+
+        let mut body = buffer[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+
+        Some((path, content_type, body))
+    }
+
+    async fn write_http_json(stream: &mut TcpStream, body: &Value) -> std::io::Result<()> {
+        let payload = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        stream.write_all(response.as_bytes()).await
+    }
+
+    fn extract_text_field(content_type: &str, body: &[u8]) -> Option<String> {
+        if content_type
+            .to_ascii_lowercase()
+            .contains("application/json")
+        {
+            if let Ok(value) = serde_json::from_slice::<Value>(body) {
+                if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
+        let raw = String::from_utf8_lossy(body).to_string();
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
+    fn test_bot(api_url: &str) -> Bot {
+        let client = teloxide::net::default_reqwest_settings()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = reqwest::Url::parse(api_url).unwrap();
+        Bot::with_client("123:TEST_TOKEN", client).set_api_url(url)
+    }
+
+    fn test_state(api_url: &str) -> SharedState {
+        Arc::new(Mutex::new(SharedData {
+            sessions: HashMap::new(),
+            settings: BotSettings::default(),
+            cancel_tokens: HashMap::new(),
+            request_tokens: new_request_tokens(),
+            request_tasks: new_request_tasks(),
+            stop_message_ids: HashMap::new(),
+            api_timestamps: HashMap::new(),
+            polling_time_ms: 1,
+            pending_schedules: HashMap::new(),
+            message_queues: HashMap::new(),
+            bot_username: "mock_bot".to_string(),
+            bot_display_name: "Mock Bot".to_string(),
+            api_base_url: api_url.to_string(),
+            loop_states: HashMap::new(),
+            loop_feedback: HashMap::new(),
+            clear_epoch: HashMap::new(),
+        }))
+    }
+
+    async fn wait_for_idle(state: &SharedState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (cancel_empty, request_tasks) = {
+                let data = state.lock().await;
+                (data.cancel_tokens.is_empty(), data.request_tasks.clone())
+            };
+            let tasks_empty = request_tasks.lock().map(|m| m.is_empty()).unwrap_or(true);
+            if cancel_empty && tasks_empty {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for background tasks to finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                std::env::set_var(self.key, old);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn write_fake_kiro_cli(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let script_path = dir.join("fake-kiro.sh");
+        let args_path = dir.join("fake-kiro-args.txt");
+        let stdin_path = dir.join("fake-kiro-stdin.txt");
+
+        let script = format!(
+            "#!/bin/sh\n\
+set -eu\n\
+: > \"{args}\"\n\
+for arg in \"$@\"; do\n\
+  printf '%s\\0' \"$arg\" >> \"{args}\"\n\
+done\n\
+input=\"$(cat)\"\n\
+printf '%s' \"$input\" > \"{stdin}\"\n\
+if [ \"${{1:-}}\" != \"chat\" ]; then\n\
+  echo \"unexpected subcommand: ${{1:-}}\" >&2\n\
+  exit 64\n\
+fi\n\
+if [ \"${{2:-}}\" = \"-\" ]; then\n\
+  echo \"unexpected stdin marker\" >&2\n\
+  exit 65\n\
+fi\n\
+if [ \"${{2:-}}\" != \"--trust-all-tools\" ]; then\n\
+  echo \"missing --trust-all-tools\" >&2\n\
+  exit 66\n\
+fi\n\
+if [ \"${{3:-}}\" != \"--no-interactive\" ]; then\n\
+  echo \"missing --no-interactive\" >&2\n\
+  exit 67\n\
+fi\n\
+if [ \"${{4:-}}\" != \"--wrap\" ] || [ \"${{5:-}}\" != \"never\" ]; then\n\
+  echo \"missing --wrap never\" >&2\n\
+  exit 68\n\
+fi\n\
+printf 'fake kiro output\\n'\n",
+            args = args_path.display(),
+            stdin = stdin_path.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        (script_path, args_path, stdin_path)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kiro_model_message_and_session_resume_flow() {
+        let _env_guard = env_lock().lock().unwrap();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.path());
+        let (fake_kiro, args_path, stdin_path) = write_fake_kiro_cli(home.path());
+        let _kiro_guard = EnvVarGuard::set("COKAC_KIRO_PATH", &fake_kiro);
+
+        let api = MockTelegramApi::start().await;
+        let bot = test_bot(&api.api_url);
+        let state = test_state(&api.api_url);
+        let chat_id = ChatId(1);
+        let token = bot.token().to_string();
+
+        handle_model_command(&bot, chat_id, "/model kiro", &state, &token)
+            .await
+            .unwrap();
+
+        {
+            let data = state.lock().await;
+            assert_eq!(get_model(&data.settings, chat_id), Some("kiro".to_string()));
+        }
+        let model_calls = api.calls_snapshot();
+        assert!(
+            model_calls.iter().any(|call| {
+                call.method == "sendmessage"
+                    && call
+                        .text
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("Model set to <b>kiro</b>.")
+            }),
+            "expected /model kiro confirmation, calls={:#?}",
+            model_calls
+        );
+
+        handle_text_message(
+            &bot,
+            chat_id,
+            "say hi from the smoke test",
+            &state,
+            "Tester",
+            false,
+        )
+        .await
+        .unwrap();
+        wait_for_idle(&state).await;
+
+        let current_path = {
+            let data = state.lock().await;
+            let session = data.sessions.get(&chat_id).expect("session should exist");
+            assert_eq!(session.session_id, None);
+            assert!(session.current_path.is_some());
+            assert!(session.history.iter().any(|item| {
+                item.item_type == HistoryType::User
+                    && item.content.contains("say hi from the smoke test")
+            }));
+            assert!(session.history.iter().any(|item| {
+                item.item_type == HistoryType::Assistant
+                    && item.content.contains("fake kiro output")
+            }));
+            session.current_path.clone().unwrap()
+        };
+
+        let smoke_calls = api.calls_snapshot();
+        assert!(
+            smoke_calls.iter().any(|call| {
+                call.text
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("fake kiro output")
+            }),
+            "expected streamed Kiro output, calls={:#?}",
+            smoke_calls
+        );
+
+        let args_raw = std::fs::read(&args_path).unwrap();
+        let args = args_raw
+            .split(|b| *b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "chat");
+        assert_eq!(args[1], "--trust-all-tools");
+        assert_eq!(args[2], "--no-interactive");
+        assert_eq!(args[3], "--wrap");
+        assert_eq!(args[4], "never");
+        assert!(
+            args[5].contains("say hi from the smoke test"),
+            "expected prompt as CLI arg, got: {:?}",
+            args
+        );
+        assert!(
+            args[5].contains("<user_request>"),
+            "expected wrapped prompt as CLI arg, got: {:?}",
+            args
+        );
+
+        let stdin = std::fs::read_to_string(&stdin_path).unwrap();
+        assert!(
+            stdin.is_empty(),
+            "expected empty stdin for fake Kiro CLI, got: {:?}",
+            stdin
+        );
+
+        let file_stem = session_storage_file_stem(None, &current_path, "kiro").unwrap();
+        let sessions_dir = crate::ui::ai_screen::ai_sessions_dir().unwrap();
+        let session_file = sessions_dir.join(format!("{}.json", file_stem));
+        assert!(
+            session_file.is_file(),
+            "expected saved Kiro session snapshot"
+        );
+        let saved: SessionData =
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap();
+        assert_eq!(saved.provider, "kiro");
+        assert_eq!(saved.current_path, current_path);
+        assert!(saved.session_id.is_empty());
+
+        handle_session_command(&bot, chat_id, &state).await.unwrap();
+
+        let session_calls = api.calls_snapshot();
+        assert!(
+            session_calls.iter().any(|call| {
+                call.method == "sendmessage"
+                    && call
+                        .text
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("Current Kiro session is directory-based.")
+            }),
+            "expected Kiro /session response, calls={:#?}",
+            session_calls
+        );
+        assert!(
+            session_calls.iter().any(|call| {
+                call.method == "sendmessage"
+                    && call
+                        .text
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("kiro-cli chat --resume")
+                    && call.text.as_deref().unwrap_or("").contains(&current_path)
+            }),
+            "expected Kiro resume command with current path, calls={:#?}",
+            session_calls
+        );
     }
 }
 
@@ -10812,6 +11313,7 @@ fn find_latest_session_by_cwd(
         SessionProvider::Codex => find_latest_codex_by_cwd(canonical_path),
         SessionProvider::Gemini => find_latest_gemini_by_cwd(canonical_path),
         SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
+        SessionProvider::Kiro => None,
     };
     msg_debug(&format!(
         "[find_latest_by_cwd] result={}",
@@ -11442,6 +11944,12 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
     })
 }
 
+/// Kiro uses directory-based persistence; cokacdir currently relies on its own
+/// local `ai_sessions` snapshots rather than parsing Kiro's internal storage.
+fn parse_kiro_session(_path: &Path, _session_id: &str, _cwd: &str) -> Option<SessionData> {
+    None
+}
+
 /// Truncate a string at a valid UTF-8 boundary.
 fn truncate_utf8(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -11647,7 +12155,7 @@ async fn handle_workspace_resume(
 
         if let Some((session_data, _)) = &existing {
             if session_data_has_active_session(session_data) {
-                session.session_id = Some(session_data.session_id.clone());
+                session.session_id = stored_session_id_or_none(session_data);
                 session.current_path = Some(canonical_path.clone());
                 session.history = session_data.history.clone();
 
@@ -11928,17 +12436,35 @@ async fn handle_session_command(
                 "codex" => format!("codex resume {}", id),
                 "gemini" => format!("gemini --resume {}", id),
                 "opencode" => format!("opencode -s {}", id),
+                "kiro" => format!("kiro-cli chat --resume-id {}", id),
                 _ => format!("claude --resume {}", id),
             };
             let provider = match session_prov {
                 "codex" => "Codex",
                 "gemini" => "Gemini",
                 "opencode" => "OpenCode",
+                "kiro" => "Kiro",
                 _ => "Claude",
             };
+            let escaped_id = html_escape(&id);
+            let escaped_resume_cmd = html_escape(&resume_cmd);
+            let escaped_path = html_escape(&path);
             let msg = format!(
                 "Current {} session ID:\n<code>{}</code>\n\nTo resume this session from your terminal:\n<code>cd \"{}\"; {}</code>",
-                provider, id, path, resume_cmd
+                provider, escaped_id, escaped_path, escaped_resume_cmd
+            );
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            )?
+        }
+        (None, Some(path)) if session_prov == "kiro" => {
+            let escaped_path = html_escape(&path);
+            let msg = format!(
+                "Current Kiro session is directory-based.\n\nTo resume this session from your terminal:\n<code>cd \"{}\"; kiro-cli chat --resume</code>",
+                escaped_path
             );
             tg!(
                 "send_message",
@@ -14215,6 +14741,12 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         } else {
             Err("gemini")
         }
+    } else if kiro::is_kiro_model(Some(clean)) {
+        if kiro::is_kiro_available() {
+            Ok(clean.to_string())
+        } else {
+            Err("kiro")
+        }
     } else if opencode::is_opencode_model(Some(clean)) {
         if opencode::is_opencode_available() {
             Ok(clean.to_string())
@@ -14251,6 +14783,7 @@ async fn handle_effort_command(
     let provider_label = match provider {
         "claude" => "Claude",
         "codex" => "Codex",
+        "kiro" => "Kiro",
         _ => provider,
     };
 
@@ -14400,6 +14933,7 @@ async fn handle_fast_command(
         let provider_label = match provider {
             "claude" => "Claude",
             "gemini" => "Gemini",
+            "kiro" => "Kiro",
             "opencode" => "OpenCode",
             _ => provider,
         };
@@ -14590,6 +15124,7 @@ async fn handle_model_command(
         let has_claude = claude::is_claude_available();
         let has_codex = codex::is_codex_available();
         let has_gemini = gemini::is_gemini_available();
+        let has_kiro = kiro::is_kiro_available();
         let has_opencode = opencode::is_opencode_available();
 
         let mut msg = match &current {
@@ -14601,8 +15136,12 @@ async fn handle_model_command(
                     "codex"
                 } else if has_gemini {
                     "gemini"
-                } else {
+                } else if has_kiro {
+                    "kiro"
+                } else if has_opencode {
                     "opencode"
+                } else {
+                    "claude"
                 };
                 format!("Current model: <b>default</b> ({})\n", default_provider)
             }
@@ -14643,6 +15182,13 @@ async fn handle_model_command(
             msg.push_str("<code>/model gemini:gemini-2.5-flash</code> — Gemini 2.5 Flash\n");
             msg.push_str(
                 "<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n",
+            );
+        }
+        if has_kiro {
+            msg.push_str("\n<b>Kiro:</b>\n");
+            msg.push_str("<code>/model kiro</code> — default\n");
+            msg.push_str(
+                "Kiro currently uses the CLI default model and directory-based persistence.\n",
             );
         }
         if has_opencode {
@@ -14804,6 +15350,7 @@ async fn handle_model_command(
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
                  <code>/model gemini</code> or <code>/model gemini:&lt;model&gt;</code>\n\
+                 <code>/model kiro</code>\n\
                  <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
                 )
                 .parse_mode(ParseMode::Html)
@@ -15677,6 +16224,25 @@ async fn handle_text_message(
                     Some(&allowed_tools),
                     Some(cancel_token_clone),
                     opencode_model,
+                    false,
+                )
+            } else if provider == "kiro" {
+                msg_debug(&format!(
+                    "[handle_text_message] → kiro::execute, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    session_id_clone,
+                    current_path_clone,
+                    context_prompt.len(),
+                    system_prompt_owned.len()
+                ));
+                kiro::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    None,
                     false,
                 )
             } else if provider == "gemini" {
@@ -17362,10 +17928,47 @@ fn cleanup_session_files(current_path: &str, provider: &str) {
     }
 }
 
+fn session_id_is_safe_filename(session_id: &str) -> bool {
+    session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn session_storage_file_stem(
+    session_id: Option<&str>,
+    current_path: &str,
+    provider: &str,
+) -> Option<String> {
+    if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if session_id_is_safe_filename(session_id) {
+            return Some(session_id.to_string());
+        }
+        if provider != "kiro" {
+            return None;
+        }
+    } else if provider != "kiro" {
+        return None;
+    }
+
+    if provider == "kiro" && !current_path.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(current_path.as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        return Some(format!("kiro-{}", &hash[..16]));
+    }
+
+    None
+}
+
 /// Save session to file in the ai_sessions directory
 fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &str) {
-    let Some(ref session_id) = session.session_id else {
-        msg_debug("[save_session] skipped: no session_id");
+    let stored_session_id = session.session_id.clone().unwrap_or_default();
+    let Some(file_stem) =
+        session_storage_file_stem(session.session_id.as_deref(), current_path, provider)
+    else {
+        msg_debug("[save_session] skipped: no storable session handle");
         return;
     };
 
@@ -17397,26 +18000,18 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
     }
 
     let session_data = SessionData {
-        session_id: session_id.clone(),
+        session_id: stored_session_id.clone(),
         history: saveable_history,
         current_path: current_path.to_string(),
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         provider: provider.to_string(),
     };
     msg_debug(&format!(
-        "[save_session] provider={}, session_id={}, path={}",
-        provider, session_id, current_path
+        "[save_session] provider={}, stored_session_id={:?}, file_stem={}, path={}",
+        provider, session.session_id, file_stem, current_path
     ));
 
-    // Security: whitelist session_id to alphanumeric, hyphens, underscores only
-    if !session_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return;
-    }
-
-    let file_path = sessions_dir.join(format!("{}.json", session_id));
+    let file_path = sessions_dir.join(format!("{}.json", file_stem));
 
     if let Ok(json) = serde_json::to_string_pretty(&session_data) {
         let _ = fs::write(&file_path, json);
@@ -18932,6 +19527,22 @@ async fn execute_schedule(
                 opencode_model,
                 false,
             )
+        } else if provider == "kiro" {
+            sched_debug(&format!(
+                "[execute_schedule] → kiro::execute, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
+                resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()
+            ));
+            kiro::execute_command_streaming(
+                &prompt,
+                resume_ref,
+                &workspace_path_for_claude,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+                None,
+                false,
+            )
         } else if provider == "gemini" {
             let gemini_model = model_clone_for_exec
                 .as_deref()
@@ -20308,6 +20919,25 @@ async fn process_bot_message(
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
                 opencode_model,
+                false,
+            )
+        } else if provider == "kiro" {
+            msg_debug(&format!(
+                "[process_bot_message] → kiro::execute, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                session_id_clone,
+                current_path_clone,
+                prompt_for_ai.len(),
+                system_prompt_owned.len()
+            ));
+            kiro::execute_command_streaming(
+                &prompt_for_ai,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+                None,
                 false,
             )
         } else if provider == "gemini" {

@@ -18,6 +18,7 @@ Example `~/.cokacdir/.env.json`:
 {
   "COKAC_CLAUDE_PATH": "/home/alice/.local/bin/claude",
   "COKAC_CODEX_PATH": "/opt/codex/codex",
+  "COKAC_KIRO_PATH": "/usr/local/bin/kiro-cli",
   "COKAC_FILE_ATTACH_THRESHOLD": "16384",
   "COKACDIR_DEBUG": "1"
 }
@@ -70,6 +71,18 @@ Override the path to the Gemini CLI binary. Same semantics as above but for Gemi
 - **Type:** absolute path to an existing executable
 - **Default:** not set (automatic resolution)
 - **Example:** `COKAC_GEMINI_PATH=/usr/local/bin/gemini`
+
+### `COKAC_KIRO_PATH`
+
+Override the path to the standalone Kiro CLI binary. Same semantics as above but for Kiro, with one extra rule: if the path points to a Kiro CLI JavaScript entrypoint such as `.js`, `.mjs`, or `.cjs`, cokacdir launches it through `node`.
+
+On Unix, cokacdir first checks common standalone install locations such as `~/.local/bin/kiro-cli`, `~/bin/kiro-cli`, `/opt/homebrew/bin/kiro-cli`, and `/usr/local/bin/kiro-cli`, then falls back to `which kiro-cli` and `bash -lc "which kiro-cli"` for non-interactive sessions. On Windows, the fallback resolver prefers `.cmd` over `.exe`.
+
+The packaged `Kiro.app` launcher is not auto-detected because it opens the GUI instead of providing compatible headless chat output for cokacdir.
+
+- **Type:** absolute path to an existing standalone executable, or to an explicit Kiro CLI `.js`/`.mjs`/`.cjs` entrypoint with `node` available
+- **Default:** not set (automatic resolution)
+- **Examples:** `COKAC_KIRO_PATH=/usr/local/bin/kiro-cli`, `COKAC_KIRO_PATH=$HOME/.local/bin/kiro-cli`
 
 ### `COKAC_OPENCODE_PATH`
 
@@ -176,5 +189,5 @@ Treat `/envvars` as a diagnostic tool for verifying configuration — for exampl
 ## Troubleshooting
 
 - **My `.env.json` doesn't seem to load.** Confirm the file is at exactly `~/.cokacdir/.env.json` (note the leading dot), that it is valid JSON, and that the root is a **JSON object** (`{ ... }`, not an array or a bare scalar). The values of that object's keys must each be a string, number, or boolean — objects, arrays, and `null` values are skipped with a warning. Run `/envvars` to see which variables are actually in the process environment.
-- **`COKAC_CLAUDE_PATH` is set but Claude still uses the wrong binary.** The override is only used if the file at that path exists. If the path is wrong or the file is missing, cokacdir silently falls back to `which claude`. Double-check the path and file permissions.
+- **`COKAC_CLAUDE_PATH` (or another provider path override) is set but the wrong binary is still used.** The override is only used if the file at that path exists. If the path is wrong or the file is missing, cokacdir silently falls back to its normal resolver (`which ...`, shell fallback, or `SearchPathW` on Windows depending on provider). Double-check the path and file permissions.
 - **`/envvars` returns "Only the bot owner can use /envvars."** You are not registered as the owner of this bot. The owner is the Telegram user ID that first successfully interacted with the bot after it started; see the token management and first-chat guides for how ownership is established.
