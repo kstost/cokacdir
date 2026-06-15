@@ -71,7 +71,7 @@ For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 
 ## Configuration
 
-cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_GEMINI_PATH`, `COKAC_GJC_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
+cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_GEMINI_PATH`, `COKAC_GJC_PATH`, `COKAC_GJC_SOURCE_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
 
 ## Supported Platforms
 

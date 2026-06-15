@@ -10,8 +10,14 @@ use crate::services::gjc_sessions::resumable_session_id;
 
 static GJC_BIN: OnceLock<Option<String>> = OnceLock::new();
 
-fn gjc_bin() -> Option<&'static String> {
-    GJC_BIN.get_or_init(resolve_gjc_path).as_ref()
+#[cfg(not(test))]
+fn gjc_bin() -> Option<String> {
+    GJC_BIN.get_or_init(resolve_gjc_path).clone()
+}
+
+#[cfg(test)]
+fn gjc_bin() -> Option<String> {
+    resolve_gjc_path()
 }
 
 pub fn is_gjc_available() -> bool {
@@ -127,7 +133,7 @@ pub fn execute_command_streaming(
         no_session_persistence,
     );
     args.push(format!("@{}", prompt_path.to_string_lossy()));
-    let bin = gjc_bin().cloned().unwrap_or_else(|| "gjc".to_string());
+    let bin = gjc_bin().unwrap_or_else(|| "gjc".to_string());
     let mut logged_args = args.clone();
     if let Some(last) = logged_args.last_mut() {
         *last = format!("<prompt:{} chars>", prompt.chars().count());
@@ -206,7 +212,7 @@ pub fn execute_command_streaming(
         .unwrap_or_default();
     if !status.success() {
         let _ = sender.send(StreamMessage::Error {
-            message: format!("Gajae-Code exited with code {:?}", status.code()),
+            message: format_gjc_exit_message(status.code(), &bin, &stderr),
             stdout: final_text,
             stderr,
             exit_code: status.code(),
@@ -223,4 +229,23 @@ pub fn execute_command_streaming(
         session_id: None,
     });
     Ok(())
+}
+
+pub(crate) fn format_gjc_exit_message(
+    exit_code: Option<i32>,
+    bin_path: &str,
+    stderr: &str,
+) -> String {
+    let base = format!("Gajae-Code exited with code {:?}", exit_code);
+    if !is_bunfs_native_module_failure(stderr) {
+        return base;
+    }
+
+    format!(
+        "{base}\n\nDetected a broken Bun-compiled Gajae-Code standalone binary while loading @gajae-code/natives.\nSelected GJC: {bin_path}\nFix: relink a source-linked Gajae-Code CLI with `bun --cwd=/path/to/gajae-code/packages/coding-agent link`, or set COKAC_GJC_PATH to the source-linked CLI. If you want an automatic fallback for auto-discovered standalone binaries, set COKAC_GJC_SOURCE_PATH to the source-linked CLI path."
+    )
+}
+
+fn is_bunfs_native_module_failure(stderr: &str) -> bool {
+    stderr.contains("@gajae-code/natives") && stderr.contains("/$bunfs/root/gjc-")
 }

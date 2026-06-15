@@ -81,6 +81,28 @@ Override the path to the Gajae-Code CLI binary. Same semantics as above but for 
 - **Default:** not set (automatic resolution)
 - **Example:** `COKAC_GJC_PATH=/home/alice/.bun/bin/gjc`
 
+If an updated Gajae-Code standalone binary fails in prompt mode with an error such as `Cannot find module '@gajae-code/natives' from '/$bunfs/root/gjc-darwin-arm64'`, prefer a source-linked Bun CLI instead of the compiled standalone. For a local Gajae-Code checkout, relink it with:
+
+```bash
+bun --cwd=/path/to/gajae-code/packages/coding-agent link
+```
+
+Then either let `gjc` resolve from `~/.bun/bin/gjc`, or pin the linked source CLI explicitly:
+
+```json
+{
+  "COKAC_GJC_PATH": "/home/alice/.bun/install/global/node_modules/@gajae-code/coding-agent/src/cli.ts"
+}
+```
+
+### `COKAC_GJC_SOURCE_PATH`
+
+Optional source-linked Gajae-Code fallback used only when `cokacdir` auto-discovers a suspicious Bun-compiled standalone `gjc` on `PATH`. `COKAC_GJC_PATH` still wins when set.
+
+- **Type:** absolute path to an existing executable source-linked Gajae-Code CLI
+- **Default:** not set; automatic fallback checks `~/.bun/install/global/node_modules/@gajae-code/coding-agent/src/cli.ts`
+- **Example:** `COKAC_GJC_SOURCE_PATH=/home/alice/.bun/install/global/node_modules/@gajae-code/coding-agent/src/cli.ts`
+
 ### `COKAC_OPENCODE_PATH`
 
 Override the path to the Opencode CLI binary. Same semantics as above but for Opencode. Note that Opencode is not supported on Windows — setting this variable on Windows has no effect.
