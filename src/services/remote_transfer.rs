@@ -1,11 +1,11 @@
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Arc};
-use std::io::BufReader;
 
-use tokio::runtime::Runtime;
 use russh::{client, ChannelMsg, Disconnect};
+use tokio::runtime::Runtime;
 
 use crate::services::file_ops::ProgressMessage;
 use crate::services::remote::{expand_tilde, RemoteAuth, RemoteProfile, SshHandler};
@@ -77,8 +77,7 @@ struct SshExec {
 impl SshExec {
     /// Connect to remote server via russh and authenticate.
     fn connect(profile: &RemoteProfile) -> Result<Self, String> {
-        let runtime = Runtime::new()
-            .map_err(|e| format!("Failed to create runtime: {}", e))?;
+        let runtime = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
         let profile = profile.clone();
         let handle = runtime.block_on(async {
@@ -94,18 +93,17 @@ impl SshExec {
             let mut ssh = client::connect(
                 Arc::new(config),
                 (profile.host.as_str(), profile.port),
-                SshHandler,
+                SshHandler::new(&profile),
             )
             .await
-            .map_err(|e| format!("SSH connection failed: {}", e))?;
+            .map_err(|e| crate::services::remote::format_ssh_connect_error(&e))?;
 
             // Authenticate
             let auth_result = match &profile.auth {
-                RemoteAuth::Password { password } => {
-                    ssh.authenticate_password(&profile.user, password)
-                        .await
-                        .map_err(|e| format!("Password auth failed: {}", e))?
-                }
+                RemoteAuth::Password { password } => ssh
+                    .authenticate_password(&profile.user, password)
+                    .await
+                    .map_err(|e| format!("Password auth failed: {}", e))?,
                 RemoteAuth::KeyFile { path, passphrase } => {
                     let key_path = expand_tilde(path);
 
@@ -149,11 +147,14 @@ impl SshExec {
     ) -> Result<(bool, String), String> {
         let cmd = cmd.to_string();
         self.runtime.block_on(async {
-            let mut channel = self.handle.channel_open_session()
+            let mut channel = self
+                .handle
+                .channel_open_session()
                 .await
                 .map_err(|e| format!("Failed to open channel: {}", e))?;
 
-            channel.exec(true, cmd)
+            channel
+                .exec(true, cmd)
                 .await
                 .map_err(|e| format!("Failed to exec command: {}", e))?;
 
@@ -241,22 +242,67 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
         ssh_cmd.push_str(&format!(" -i '{}'", escaped));
     }
 
-    // Disable strict host key checking for convenience
+    // Learn first-seen host keys, but reject changed keys.
     #[cfg(unix)]
-    ssh_cmd.push_str(" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR");
+    ssh_cmd.push_str(" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR");
     #[cfg(windows)]
-    ssh_cmd.push_str(" -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR");
+    ssh_cmd.push_str(" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR");
 
     ssh_cmd
 }
 
+/// Parse a (major, minor, patch) version tuple from `rsync --version` output.
+/// Looks for the "version X.Y[.Z]" token on the first line.
+fn parse_rsync_version(output: &str) -> Option<(u32, u32, u32)> {
+    let first_line = output.lines().next()?;
+    // Only trust upstream rsync ("rsync  version X.Y.Z  protocol version N"). Apple's
+    // openrsync prints "openrsync: protocol version 29", which would otherwise parse as
+    // (29,0,0) and wrongly count as modern-arg-protection — openrsync does NOT escape
+    // remote args, so the quote-wrapping must be kept there.
+    if !first_line.starts_with("rsync") {
+        return None;
+    }
+    let after = first_line.split("version ").nth(1)?;
+    let token = after.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Whether the local rsync (>= 3.2.4) applies "modern argument protection", i.e. it
+/// backslash-escapes shell-active characters in remote args itself. On such versions our
+/// own single-quote wrapping arrives on the remote as *literal* quote characters in the
+/// path and breaks the transfer, so we must NOT add quotes. On older rsync the quoting is
+/// still the shell-interpretation defense and must be kept. Detected once and cached;
+/// parse failures fall back to the conservative (quote) behavior.
+fn rsync_uses_modern_arg_protection() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        Command::new("rsync")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|out| parse_rsync_version(&String::from_utf8_lossy(&out.stdout)))
+            .map(|ver| ver >= (3, 2, 4))
+            .unwrap_or(false)
+    })
+}
+
 /// Build remote path string for rsync: user@host:/path
-/// Wraps remote path in single quotes to prevent remote shell interpretation.
 fn build_remote_spec(profile: &RemoteProfile, path: &str) -> String {
-    // Single quotes prevent all shell interpretation.
-    // Only single quotes inside the path need escaping: ' → '\''
-    let escaped = path.replace('\'', "'\\''");
-    format!("{}@{}:'{}'", profile.user, profile.host, escaped)
+    if rsync_uses_modern_arg_protection() {
+        // Modern rsync escapes remote args itself; adding our own quotes would make them
+        // literal characters in the path. Pass the path verbatim.
+        format!("{}@{}:{}", profile.user, profile.host, path)
+    } else {
+        // Older rsync passes the arg through the remote shell: single-quote to prevent
+        // shell interpretation. Only single quotes inside the path need escaping: ' → '\''
+        let escaped = path.replace('\'', "'\\''");
+        format!("{}@{}:'{}'", profile.user, profile.host, escaped)
+    }
 }
 
 /// RAII guard for the temporary SSH_ASKPASS script: removes the file on drop
@@ -267,7 +313,9 @@ struct AskpassGuard {
 
 impl AskpassGuard {
     fn new(password: &str) -> Result<Self, String> {
-        Ok(Self { path: create_askpass_script(password)? })
+        Ok(Self {
+            path: create_askpass_script(password)?,
+        })
     }
 
     fn path(&self) -> &std::path::Path {
@@ -285,11 +333,15 @@ impl Drop for AskpassGuard {
 /// Prefer `AskpassGuard::new` over calling this directly; the guard ensures
 /// the script is removed even on panic / early return.
 fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| "Failed to get home directory".to_string())?;
+    let home = dirs::home_dir().ok_or_else(|| "Failed to get home directory".to_string())?;
     let tmp_dir = home.join(".cokacdir").join("tmp");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to set tmp dir permissions: {}", e))?;
+    }
 
     // Random suffix prevents collision when the same process spawns multiple
     // transfers concurrently (single-PID file would race).
@@ -301,43 +353,31 @@ fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
 
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
         // Escape single quotes in password: replace ' with '\''
         let escaped = password.replace('\'', "'\\''");
         let content = format!("#!/bin/sh\necho '{}'\n", escaped);
 
-        std::fs::write(&script_path, content)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&script_path)
             .map_err(|e| format!("Failed to create askpass script: {}", e))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write askpass script: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync askpass script: {}", e))?;
 
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("Failed to set script permissions: {}", e))?;
+        Ok(script_path)
     }
 
     #[cfg(windows)]
     {
-        // CMD `echo` cannot safely encode every byte: a newline splits the
-        // script into a new command (injection) and `"` closes a quoted
-        // segment. Reject passwords that contain characters we cannot
-        // safely embed instead of attempting partial escaping that
-        // CMD's parser quirks would defeat.
-        if password.contains('\n') || password.contains('\r') || password.contains('"') {
-            return Err("Password contains characters (newline or double quote) that cannot be safely embedded in a Windows askpass script.".to_string());
-        }
-        // Escape CMD special characters in password
-        let escaped = password
-            .replace('^', "^^")
-            .replace('&', "^&")
-            .replace('|', "^|")
-            .replace('<', "^<")
-            .replace('>', "^>")
-            .replace('%', "%%");
-        let content = format!("@echo off\necho {}\n", escaped);
-
-        std::fs::write(&script_path, content)
-            .map_err(|e| format!("Failed to create askpass script: {}", e))?;
+        let _ = password;
+        let _ = script_path;
+        Err("Password rsync fallback on Windows would require writing a plaintext askpass script; install sshpass or use key authentication.".to_string())
     }
-
-    Ok(script_path)
 }
 
 /// Transfer files using rsync with progress reporting.
@@ -373,16 +413,21 @@ fn transfer_rsync(
         let file_name = source_file.display().to_string();
         let _ = tx.send(ProgressMessage::FileStarted(file_name.clone()));
 
-        let source_full = format!("{}/{}", config.source_base.trim_end_matches('/'), source_file.display());
+        let source_full = format!(
+            "{}/{}",
+            config.source_base.trim_end_matches('/'),
+            source_file.display()
+        );
         let target = &config.target_path;
 
         let (src, dst) = match config.direction {
             TransferDirection::LocalToRemote => {
                 (source_full, build_remote_spec(&config.profile, target))
             }
-            TransferDirection::RemoteToLocal => {
-                (build_remote_spec(&config.profile, &source_full), target.clone())
-            }
+            TransferDirection::RemoteToLocal => (
+                build_remote_spec(&config.profile, &source_full),
+                target.clone(),
+            ),
         };
 
         // Build rsync command with --progress (compatible with all rsync versions)
@@ -400,9 +445,14 @@ fn transfer_rsync(
         let mut cmd = if use_sshpass {
             if let RemoteAuth::Password { ref password } = config.profile.auth {
                 let mut sshpass_cmd = Command::new("sshpass");
-                sshpass_cmd.arg("-p").arg(password);
+                // Pass the password via the SSHPASS env var (-e) instead of -p <pw>, so it
+                // does not appear in the process argument list (visible in `ps` / auditd).
+                sshpass_cmd.arg("-e").env("SSHPASS", password);
                 let program = cmd.get_program().to_string_lossy().to_string();
-                let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+                let args: Vec<String> = cmd
+                    .get_args()
+                    .map(|a| a.to_string_lossy().to_string())
+                    .collect();
                 sshpass_cmd.arg(program);
                 for arg in args {
                     sshpass_cmd.arg(arg);
@@ -426,7 +476,9 @@ fn transfer_rsync(
         // group-targeted SIGKILL stays scoped to rsync (and any sshpass
         // wrapper) — and never touches the cokacdir TUI process itself.
         crate::services::claude::detach_into_own_pgroup(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| format!("Failed to start rsync: {}", e))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start rsync: {}", e))?;
         let (cancel_watch_done, cancel_watch) =
             spawn_cancel_watchdog(cancel_flag.clone(), child.id());
         let mut stderr_thread = child.stderr.take().map(|stderr| {
@@ -465,7 +517,9 @@ fn transfer_rsync(
                             if !line_buf.is_empty() {
                                 let line = String::from_utf8_lossy(&line_buf).to_string();
                                 if let Some(progress) = parse_rsync_progress(&line) {
-                                    let _ = tx.send(ProgressMessage::FileProgress(progress.0, progress.1));
+                                    let _ = tx.send(ProgressMessage::FileProgress(
+                                        progress.0, progress.1,
+                                    ));
                                 }
                                 line_buf.clear();
                             }
@@ -513,11 +567,18 @@ fn transfer_rsync(
         if status.success() {
             completed_files += 1;
             let _ = tx.send(ProgressMessage::FileCompleted(file_name));
-            let _ = tx.send(ProgressMessage::TotalProgress(completed_files, total_files, 0, 0));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                completed_files,
+                total_files,
+                0,
+                0,
+            ));
         } else {
             let stderr_msg = Some(stderr_output)
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| format!("rsync exited with code {}", status.code().unwrap_or(-1)));
+                .unwrap_or_else(|| {
+                    format!("rsync exited with code {}", status.code().unwrap_or(-1))
+                });
             let _ = tx.send(ProgressMessage::Error(file_name, stderr_msg.clone()));
             return Err(stderr_msg);
         }
@@ -768,9 +829,15 @@ fn transfer_same_server(
         if success {
             completed_files += 1;
             let _ = tx.send(ProgressMessage::FileCompleted(file_name));
-            let _ = tx.send(ProgressMessage::TotalProgress(completed_files, total_files, 0, 0));
+            let _ = tx.send(ProgressMessage::TotalProgress(
+                completed_files,
+                total_files,
+                0,
+                0,
+            ));
         } else {
-            let err_msg = format!("Failed to {} '{}': {}",
+            let err_msg = format!(
+                "Failed to {} '{}': {}",
                 if is_cut { "move" } else { "copy" },
                 file_name,
                 stderr.trim()

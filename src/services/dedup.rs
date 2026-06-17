@@ -60,16 +60,11 @@ const DIR_MARKER_FILES: &[&str] = &[
 
 // Path substring: if directory path contains this string, skip it
 // (matches removeduplicated.js line 51)
-const DIR_PATH_SKIP: &[&str] = &[
-    ".fcpbundle",
-];
+const DIR_PATH_SKIP: &[&str] = &[".fcpbundle"];
 
 // Individual file names to skip during scan
 // (matches removeduplicated.js lines 60-61)
-const SKIP_FILE_NAMES: &[&str] = &[
-    ".ignoresorting",
-    ".ignoreplaceken",
-];
+const SKIP_FILE_NAMES: &[&str] = &[".ignoresorting", ".ignoreplaceken"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DedupPhase {
@@ -85,7 +80,11 @@ pub enum DedupMessage {
     Hashing(String, u8),
     Deleting(String),
     Log(String),
-    Stats { scanned: usize, duplicates: usize, freed: u64 },
+    Stats {
+        scanned: usize,
+        duplicates: usize,
+        freed: u64,
+    },
     Error(String),
     Complete,
 }
@@ -123,7 +122,11 @@ fn scan_directory(
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            let _ = tx.send(DedupMessage::Error(format!("Cannot read {}: {}", dir.display(), e)));
+            let _ = tx.send(DedupMessage::Error(format!(
+                "Cannot read {}: {}",
+                dir.display(),
+                e
+            )));
             return;
         }
     };
@@ -163,21 +166,34 @@ fn scan_directory(
             *scanned += 1;
             let _ = tx.send(DedupMessage::Scanning(path.display().to_string()));
             let _ = tx.send(DedupMessage::Log(format!("READING {}", path.display())));
-            let _ = tx.send(DedupMessage::Stats { scanned: *scanned, duplicates: 0, freed: 0 });
-
-            size_map.entry(size).or_default().push(FileEntry {
-                path,
-                size,
+            let _ = tx.send(DedupMessage::Stats {
+                scanned: *scanned,
+                duplicates: 0,
+                freed: 0,
             });
+
+            size_map
+                .entry(size)
+                .or_default()
+                .push(FileEntry { path, size });
         }
     }
 }
 
-fn compute_md5(path: &Path, file_size: u64, tx: &Sender<DedupMessage>, cancel_flag: &Arc<AtomicBool>) -> Option<String> {
+fn compute_md5(
+    path: &Path,
+    file_size: u64,
+    tx: &Sender<DedupMessage>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Option<String> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            let _ = tx.send(DedupMessage::Error(format!("Cannot open {}: {}", path.display(), e)));
+            let _ = tx.send(DedupMessage::Error(format!(
+                "Cannot open {}: {}",
+                path.display(),
+                e
+            )));
             return None;
         }
     };
@@ -196,7 +212,11 @@ fn compute_md5(path: &Path, file_size: u64, tx: &Sender<DedupMessage>, cancel_fl
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                let _ = tx.send(DedupMessage::Error(format!("Read error {}: {}", path.display(), e)));
+                let _ = tx.send(DedupMessage::Error(format!(
+                    "Read error {}: {}",
+                    path.display(),
+                    e
+                )));
                 return None;
             }
         };
@@ -206,18 +226,17 @@ fn compute_md5(path: &Path, file_size: u64, tx: &Sender<DedupMessage>, cancel_fl
 
         if file_size > 0 {
             let progress = ((bytes_read as f64 / file_size as f64) * 100.0) as u8;
-            let _ = tx.send(DedupMessage::Hashing(path.display().to_string(), progress.min(100)));
+            let _ = tx.send(DedupMessage::Hashing(
+                path.display().to_string(),
+                progress.min(100),
+            ));
         }
     }
 
     Some(format!("{:032x}", hasher.finalize()))
 }
 
-pub fn run_dedup(
-    target_path: PathBuf,
-    tx: Sender<DedupMessage>,
-    cancel_flag: Arc<AtomicBool>,
-) {
+pub fn run_dedup(target_path: PathBuf, tx: Sender<DedupMessage>, cancel_flag: Arc<AtomicBool>) {
     // Phase 1: Scan
     let _ = tx.send(DedupMessage::Phase(DedupPhase::Scanning));
     let _ = tx.send(DedupMessage::Log("Scanning files...".into()));
@@ -242,7 +261,9 @@ pub fn run_dedup(
     let candidate_count: usize = candidate_groups.iter().map(|g| g.len()).sum();
     let _ = tx.send(DedupMessage::Log(format!(
         "Scan complete: {} files scanned, {} candidates in {} groups",
-        scanned, candidate_count, candidate_groups.len()
+        scanned,
+        candidate_count,
+        candidate_groups.len()
     )));
 
     // Phase 2: Hash
@@ -251,7 +272,8 @@ pub fn run_dedup(
     let mut hash_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     // Calculate total size for percentage
-    let total_bytes: u64 = candidate_groups.iter()
+    let total_bytes: u64 = candidate_groups
+        .iter()
         .flat_map(|g| g.iter())
         .map(|e| e.size)
         .sum();
@@ -274,7 +296,11 @@ pub fn run_dedup(
 
             if let Some(hash) = compute_md5(&entry.path, entry.size, &tx, &cancel_flag) {
                 let _ = tx.send(DedupMessage::Log(format!(
-                    "{} {} % {} {}", hash, pct, entry.size, entry.path.display()
+                    "{} {} % {} {}",
+                    hash,
+                    pct,
+                    entry.size,
+                    entry.path.display()
                 )));
                 hash_map.entry(hash).or_default().push(entry.path.clone());
             }
@@ -291,7 +317,11 @@ pub fn run_dedup(
 
     if total_duplicates == 0 {
         let _ = tx.send(DedupMessage::Log("No duplicates found.".into()));
-        let _ = tx.send(DedupMessage::Stats { scanned, duplicates: 0, freed: 0 });
+        let _ = tx.send(DedupMessage::Stats {
+            scanned,
+            duplicates: 0,
+            freed: 0,
+        });
         let _ = tx.send(DedupMessage::Phase(DedupPhase::Complete));
         let _ = tx.send(DedupMessage::Complete);
         return;
@@ -311,9 +341,14 @@ pub fn run_dedup(
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(DedupMessage::Log(format!(
                     "Cancelled. Removed {} files, freed {}",
-                    deleted_count, format_size(freed_bytes)
+                    deleted_count,
+                    format_size(freed_bytes)
                 )));
-                let _ = tx.send(DedupMessage::Stats { scanned, duplicates: deleted_count, freed: freed_bytes });
+                let _ = tx.send(DedupMessage::Stats {
+                    scanned,
+                    duplicates: deleted_count,
+                    freed: freed_bytes,
+                });
                 let _ = tx.send(DedupMessage::Complete);
                 return;
             }
@@ -337,7 +372,9 @@ pub fn run_dedup(
                 Err(e) => {
                     let _ = tx.send(DedupMessage::Error(format!(
                         "Failed to verify {} vs {}: {}",
-                        keep_path.display(), dup_path.display(), e
+                        keep_path.display(),
+                        dup_path.display(),
+                        e
                     )));
                     continue;
                 }
@@ -350,12 +387,22 @@ pub fn run_dedup(
                     deleted_count += 1;
                     freed_bytes += file_size;
                     let _ = tx.send(DedupMessage::Deleting(dup_path.display().to_string()));
-                    let _ = tx.send(DedupMessage::Log(format!("REMOVE {} {}", _hash, dup_path.display())));
-                    let _ = tx.send(DedupMessage::Stats { scanned, duplicates: deleted_count, freed: freed_bytes });
+                    let _ = tx.send(DedupMessage::Log(format!(
+                        "REMOVE {} {}",
+                        _hash,
+                        dup_path.display()
+                    )));
+                    let _ = tx.send(DedupMessage::Stats {
+                        scanned,
+                        duplicates: deleted_count,
+                        freed: freed_bytes,
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(DedupMessage::Error(format!(
-                        "Failed to delete {}: {}", dup_path.display(), e
+                        "Failed to delete {}: {}",
+                        dup_path.display(),
+                        e
                     )));
                 }
             }
@@ -364,9 +411,14 @@ pub fn run_dedup(
 
     let _ = tx.send(DedupMessage::Log(format!(
         "Complete! Removed {} duplicate files, freed {}",
-        deleted_count, format_size(freed_bytes)
+        deleted_count,
+        format_size(freed_bytes)
     )));
-    let _ = tx.send(DedupMessage::Stats { scanned, duplicates: deleted_count, freed: freed_bytes });
+    let _ = tx.send(DedupMessage::Stats {
+        scanned,
+        duplicates: deleted_count,
+        freed: freed_bytes,
+    });
     let _ = tx.send(DedupMessage::Phase(DedupPhase::Complete));
     let _ = tx.send(DedupMessage::Complete);
 }

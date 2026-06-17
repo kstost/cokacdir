@@ -146,7 +146,7 @@ Examples:
   - **Claude**: `--fork-session` (native live-session fork).
   - **Codex**: independent `codex exec --ephemeral` with a transcript synthesized from the full-fidelity archive. No `resume`, no `thread_id` — the original session file is byte-identical before/after.
   - **OpenCode**: native `opencode run --session <ID> --fork --agent plan` — OpenCode forks the session natively so the original stays intact. Output is read as plain text (agent reply lands on stdout, banner decorations go to stderr). The forked session row persists in `opencode.db` — same "fork and leak" pattern as Claude's `--fork-session` which also leaves its forked .jsonl file behind.
-  Gemini sessions will be rejected with a message.
+  Agy sessions will be rejected with a message.
 - **One loop per chat at a time.** If a loop is already running, a new `/loop` is rejected. Use `/stop` to cancel the current loop first.
 
 ### What You'll See

@@ -9,6 +9,10 @@ use sha2::Sha512;
 use super::error::CokacencError;
 
 pub const MAGIC: &[u8; 8] = b"COKACENC";
+// IMPORTANT: Shift+E/Shift+D intentionally use the original cokacdir v2
+// chunk format. Do not bump this default writer version or introduce a new
+// default encrypted format here unless the file-panel UI, existing encrypted
+// archives, and cokacdircode_old compatibility are migrated together.
 pub const VERSION: u32 = 2;
 const MAX_FILENAME_LEN: usize = 4096;
 const AES_BLOCK: usize = 16;
@@ -51,6 +55,11 @@ pub fn generate_iv() -> [u8; 16] {
 }
 
 /// Write the chunk header: magic + version + salt + iv + filename.
+///
+/// The plaintext filename in this header is part of the old Shift+E contract:
+/// the file panel reads it without decrypting so encrypted chunks can still be
+/// shown under their original names. Passing an empty filename breaks that UI
+/// behavior even if decryption can technically recover the name from metadata.
 pub fn write_header(
     w: &mut dyn Write,
     salt: &[u8; 16],
@@ -101,8 +110,7 @@ pub fn read_header(r: &mut dyn Read) -> Result<([u8; 16], [u8; 16], String), Cok
     if name_len > MAX_FILENAME_LEN {
         return Err(CokacencError::Other(format!(
             "Filename length in header too long: {} bytes (max {})",
-            name_len,
-            MAX_FILENAME_LEN,
+            name_len, MAX_FILENAME_LEN,
         )));
     }
     let mut name_buf = vec![0u8; name_len];
@@ -142,8 +150,7 @@ impl ChunkEncryptor {
         let process_len = full_blocks * AES_BLOCK;
         // Encrypt in-place
         let to_encrypt = &mut self.buf[..process_len];
-        self.encryptor
-            .encrypt_blocks_mut(to_blocks_mut(to_encrypt));
+        self.encryptor.encrypt_blocks_mut(to_blocks_mut(to_encrypt));
         self.out_buf.extend_from_slice(&self.buf[..process_len]);
 
         // Keep remainder
@@ -230,9 +237,6 @@ fn to_blocks_mut(data: &mut [u8]) -> &mut [aes::Block] {
     assert!(data.len() % AES_BLOCK == 0);
     // SAFETY: aes::Block is [u8; 16] with the same alignment as u8
     unsafe {
-        std::slice::from_raw_parts_mut(
-            data.as_mut_ptr() as *mut aes::Block,
-            data.len() / AES_BLOCK,
-        )
+        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut aes::Block, data.len() / AES_BLOCK)
     }
 }

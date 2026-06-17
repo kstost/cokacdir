@@ -7,10 +7,21 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{app::{PanelState, SortBy, SortOrder}, theme::Theme};
-use crate::utils::format::{format_size, truncate_to_display_width, pad_to_display_width};
+use super::{
+    app::{PanelState, SortBy, SortOrder},
+    theme::Theme,
+};
+use crate::utils::format::{format_size, pad_to_display_width, truncate_to_display_width};
 
-pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bool, is_bookmarked: bool, diff_selected: bool, theme: &Theme) {
+pub fn draw(
+    frame: &mut Frame,
+    panel: &mut PanelState,
+    area: Rect,
+    is_active: bool,
+    is_bookmarked: bool,
+    diff_selected: bool,
+    theme: &Theme,
+) {
     let inner_width = area.width.saturating_sub(2) as usize;
 
     // Build path display (truncate if too long, using display width)
@@ -18,24 +29,25 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     let bookmark_marker = if is_bookmarked { "✻" } else { "" };
     let prefix = bookmark_marker.to_string();
     let path_display_width = path_str.width();
-    let display_path = if inner_width > 4 && path_display_width + prefix.width() > inner_width.saturating_sub(4) {
-        // Calculate how many characters to show from the end (by display width)
-        let target_width = inner_width.saturating_sub(prefix.width() + 4); // prefix + "..."
-        let mut suffix_width = 0;
-        let mut start_char_idx = path_str.chars().count();
-        for (i, c) in path_str.chars().rev().enumerate() {
-            let cw = c.width().unwrap_or(1);
-            if suffix_width + cw > target_width {
-                break;
+    let display_path =
+        if inner_width > 4 && path_display_width + prefix.width() > inner_width.saturating_sub(4) {
+            // Calculate how many characters to show from the end (by display width)
+            let target_width = inner_width.saturating_sub(prefix.width() + 4); // prefix + "..."
+            let mut suffix_width = 0;
+            let mut start_char_idx = path_str.chars().count();
+            for (i, c) in path_str.chars().rev().enumerate() {
+                let cw = c.width().unwrap_or(1);
+                if suffix_width + cw > target_width {
+                    break;
+                }
+                suffix_width += cw;
+                start_char_idx = path_str.chars().count() - i - 1;
             }
-            suffix_width += cw;
-            start_char_idx = path_str.chars().count() - i - 1;
-        }
-        let suffix: String = path_str.chars().skip(start_char_idx).collect();
-        format!("{}...{}", prefix, suffix)
-    } else {
-        format!("{}{}", prefix, path_str)
-    };
+            let suffix: String = path_str.chars().skip(start_char_idx).collect();
+            format!("{}...{}", prefix, suffix)
+        } else {
+            format!("{}{}", prefix, path_str)
+        };
 
     let block = Block::default()
         .title(format!(" {} ", display_path))
@@ -53,15 +65,13 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
             Style::default().fg(theme.panel.file_text)
         })
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(
-            if diff_selected {
-                theme.diff.panel_selected_border
-            } else if is_active {
-                theme.panel.border_active
-            } else {
-                theme.panel.border
-            }
-        ));
+        .border_style(Style::default().fg(if diff_selected {
+            theme.diff.panel_selected_border
+        } else if is_active {
+            theme.panel.border_active
+        } else {
+            theme.panel.border
+        }));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -76,7 +86,9 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     let type_col_total: usize = 10; // 2 + 6 + 2 (padding + type + padding)
 
     // Calculate max file name width (including marker and icon = 2 chars)
-    let max_name_display_width = panel.files.iter()
+    let max_name_display_width = panel
+        .files
+        .iter()
         .map(|f| {
             let name = f.display_name.as_deref().unwrap_or(&f.name);
             name.width() + 2 // +2 for marker and icon
@@ -105,7 +117,9 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     };
 
     // Header row
-    let header = create_header_line(panel, name_col, type_col, size_col, date_col, is_active, theme);
+    let header = create_header_line(
+        panel, name_col, type_col, size_col, date_col, is_active, theme,
+    );
     let header_bg = if is_active {
         theme.panel.header_bg_active
     } else {
@@ -117,7 +131,7 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     );
 
     // File list (visible area)
-    let visible_height = (inner.height - 2) as usize; // -2 for header and footer
+    let visible_height = inner.height.saturating_sub(2) as usize; // -2 for header and footer
     let total_files = panel.files.len();
 
     // 스크롤 오프셋 계산: 커서가 보이는 범위 내에 있으면 스크롤 유지
@@ -125,8 +139,9 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     let start_index = if total_files <= visible_height {
         // 파일 개수가 화면보다 적으면 스크롤 없음
         0
-    } else if panel.selected_index >= current_scroll &&
-              panel.selected_index < current_scroll + visible_height {
+    } else if panel.selected_index >= current_scroll
+        && panel.selected_index < current_scroll + visible_height
+    {
         // 커서가 현재 보이는 범위 내에 있으면 스크롤 유지
         // 단, 스크롤이 유효한 범위인지 확인
         if current_scroll + visible_height > total_files {
@@ -194,8 +209,7 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
 
-        let mut scrollbar_state = ScrollbarState::new(total_files)
-            .position(panel.selected_index);
+        let mut scrollbar_state = ScrollbarState::new(total_files).position(panel.selected_index);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,
@@ -208,13 +222,24 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     }
 
     // Footer (폴더 정보 + 디스크 용량)
-    let dir_count = panel.files.iter().filter(|f| f.name != ".." && f.is_directory).count();
+    let dir_count = panel
+        .files
+        .iter()
+        .filter(|f| f.name != ".." && f.is_directory)
+        .count();
     let file_count = panel.files.iter().filter(|f| !f.is_directory).count();
-    let total_size: u64 = panel.files.iter().filter(|f| !f.is_directory).map(|f| f.size).sum();
+    let total_size: u64 = panel
+        .files
+        .iter()
+        .filter(|f| !f.is_directory)
+        .map(|f| f.size)
+        .sum();
 
     // 선택된 파일 정보 계산
     let selected_count = panel.selected_files.len();
-    let selected_size: u64 = panel.files.iter()
+    let selected_size: u64 = panel
+        .files
+        .iter()
         .filter(|f| panel.selected_files.contains(&f.name))
         .map(|f| f.size)
         .sum();
@@ -251,10 +276,7 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
         if let Some((user, host)) = remote_info {
             let remote_style = Style::default().fg(theme.panel.remote_indicator);
             spans.push(Span::styled(" | ", label_style));
-            spans.push(Span::styled(
-                format!("{}@{}", user, host),
-                remote_style,
-            ));
+            spans.push(Span::styled(format!("{}@{}", user, host), remote_style));
         }
     } else if panel.disk_total > 0 {
         let disk_free = format_size(panel.disk_available);
@@ -271,9 +293,19 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
     );
 }
 
-fn create_header_line(panel: &PanelState, name_width: usize, type_width: usize, size_width: usize, date_width: usize, is_active: bool, theme: &Theme) -> Line<'static> {
+fn create_header_line(
+    panel: &PanelState,
+    name_width: usize,
+    type_width: usize,
+    size_width: usize,
+    date_width: usize,
+    is_active: bool,
+    theme: &Theme,
+) -> Line<'static> {
     let header_style = if is_active {
-        Style::default().fg(theme.panel.header_text_active).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.panel.header_text_active)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.panel.header_text)
     };
@@ -308,19 +340,31 @@ fn create_header_line(panel: &PanelState, name_width: usize, type_width: usize, 
     };
 
     // Use saturating_sub to prevent underflow in format width
-    let name_col = format!(" {:width$}", name_indicator, width = name_width.saturating_sub(1));
+    let name_col = format!(
+        " {:width$}",
+        name_indicator,
+        width = name_width.saturating_sub(1)
+    );
     let type_col_str = if type_width > 0 {
         format!("  {:^width$}  ", type_indicator, width = type_width)
     } else {
         String::new()
     };
     let size_col = if size_width > 2 {
-        format!("{:>width$}  ", size_indicator, width = size_width.saturating_sub(2))
+        format!(
+            "{:>width$}  ",
+            size_indicator,
+            width = size_width.saturating_sub(2)
+        )
     } else {
         String::new()
     };
     let date_col = if date_width > 2 {
-        format!("{:>width$}  ", date_indicator, width = date_width.saturating_sub(2))
+        format!(
+            "{:>width$}  ",
+            date_indicator,
+            width = date_width.saturating_sub(2)
+        )
     } else {
         String::new()
     };
@@ -332,7 +376,6 @@ fn create_header_line(panel: &PanelState, name_width: usize, type_width: usize, 
         Span::styled(date_col, header_style),
     ])
 }
-
 
 fn create_file_line(
     file: &super::app::FileItem,
@@ -411,7 +454,11 @@ fn create_file_line(
         format_size(file.size)
     };
     let size_col = if size_width > 2 {
-        format!("{:>width$}  ", size_str, width = size_width.saturating_sub(2))
+        format!(
+            "{:>width$}  ",
+            size_str,
+            width = size_width.saturating_sub(2)
+        )
     } else {
         String::new()
     };
@@ -422,7 +469,11 @@ fn create_file_line(
         file.modified.format("%m-%d %H:%M").to_string()
     };
     let date_col = if date_width > 2 {
-        format!("{:>width$}  ", date_str, width = date_width.saturating_sub(2))
+        format!(
+            "{:>width$}  ",
+            date_str,
+            width = date_width.saturating_sub(2)
+        )
     } else {
         String::new()
     };
@@ -438,9 +489,7 @@ fn create_file_line(
         } else {
             theme.panel.file_text
         };
-        Style::default()
-            .fg(theme.panel.selected_text)
-            .bg(cursor_bg)
+        Style::default().fg(theme.panel.selected_text).bg(cursor_bg)
     } else if is_marked {
         theme.marked_style()
     } else if file.is_symlink {
@@ -461,9 +510,7 @@ fn create_file_line(
         } else {
             theme.panel.file_text
         };
-        Style::default()
-            .fg(theme.panel.selected_text)
-            .bg(cursor_bg)
+        Style::default().fg(theme.panel.selected_text).bg(cursor_bg)
     } else {
         theme.dim_style()
     };

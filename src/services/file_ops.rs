@@ -48,7 +48,7 @@ pub enum FileOperationType {
 
 /// Progress message for file operations
 #[derive(Debug, Clone)]
-#[allow(dead_code)]  // Fields are used for debugging/logging, not always read
+#[allow(dead_code)] // Fields are used for debugging/logging, not always read
 pub enum ProgressMessage {
     /// Preparing operation (message)
     Preparing(String),
@@ -90,14 +90,107 @@ fn send_prepare_error_result(
     } else {
         err.to_string()
     };
-    let failure_count = if cancelled {
-        1
-    } else {
-        fallback_failure_count
-    };
+    let failure_count = if cancelled { 1 } else { fallback_failure_count };
 
     let _ = progress_tx.send(ProgressMessage::Error(String::new(), message));
     let _ = progress_tx.send(ProgressMessage::Completed(0, failure_count));
+}
+
+fn path_exists_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io::Result<()> {
+    let canonical_src = src.canonicalize()?;
+
+    if let Ok(canonical_dest) = dest.canonicalize() {
+        if canonical_src == canonical_dest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Cannot {} a file onto itself", operation),
+            ));
+        }
+    }
+
+    if fs::symlink_metadata(src)?.is_dir() {
+        let dest_anchor = if path_exists_no_follow(dest) {
+            dest.canonicalize()
+        } else {
+            dest.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()
+        };
+
+        if let Ok(canonical_anchor) = dest_anchor {
+            if canonical_anchor.starts_with(&canonical_src) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Cannot {} a directory into itself", operation),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn unique_temp_destination(target_dir: &Path, filename: &str, op: &str) -> io::Result<PathBuf> {
+    for attempt in 0..10_000 {
+        let candidate = target_dir.join(format!(
+            ".cokacdir_{}_{}_{}_{}",
+            op,
+            std::process::id(),
+            attempt,
+            filename
+        ));
+        if !path_exists_no_follow(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Unable to allocate temporary destination",
+    ))
+}
+
+fn cleanup_partial_path(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn install_completed_replacement(temp_path: &Path, dest: &Path) -> io::Result<()> {
+    match fs::rename(temp_path, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) if path_exists_no_follow(dest) => {
+            let first_error = e;
+            delete_file(dest).map_err(|delete_error| {
+                io::Error::new(
+                    delete_error.kind(),
+                    format!(
+                        "Failed to replace '{}': {} (existing target could not be removed: {})",
+                        dest.display(),
+                        first_error,
+                        delete_error
+                    ),
+                )
+            })?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    fs::rename(temp_path, dest).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to replace '{}': existing target was removed but the new copy could not be moved into place: {}",
+                dest.display(),
+                e
+            ),
+        )
+    })
 }
 
 /// Try to clone file using APFS clonefile (macOS only)
@@ -141,7 +234,10 @@ fn try_clonefile(_src: &Path, _dest: &Path) -> io::Result<bool> {
 }
 
 /// Calculate total size of files to be copied/moved
-pub fn calculate_total_size(files: &[PathBuf], cancel_flag: &Arc<AtomicBool>) -> io::Result<(u64, usize)> {
+pub fn calculate_total_size(
+    files: &[PathBuf],
+    cancel_flag: &Arc<AtomicBool>,
+) -> io::Result<(u64, usize)> {
     let mut total_size: u64 = 0;
     let mut total_files: usize = 0;
 
@@ -318,9 +414,10 @@ fn copy_dir_recursive_with_progress_inner(
 ) -> io::Result<()> {
     // Guard against pathological recursion (e.g. circular symlinks).
     if depth > MAX_COPY_DEPTH {
-        return Err(io::Error::other(
-            format!("Maximum directory depth ({}) exceeded - possible circular symlink", MAX_COPY_DEPTH),
-        ));
+        return Err(io::Error::other(format!(
+            "Maximum directory depth ({}) exceeded - possible circular symlink",
+            MAX_COPY_DEPTH
+        )));
     }
 
     // Detect symlink loops via canonicalised path. `visited` tracks only
@@ -328,11 +425,15 @@ fn copy_dir_recursive_with_progress_inner(
     // seen — otherwise two siblings whose symlinks resolve to the same
     // physical directory would be falsely reported as a cycle. We insert
     // here and remove on exit (after the body, regardless of error).
-    let canonical_src = src.canonicalize().map(strip_unc_prefix).unwrap_or_else(|_| src.to_path_buf());
+    let canonical_src = src
+        .canonicalize()
+        .map(strip_unc_prefix)
+        .unwrap_or_else(|_| src.to_path_buf());
     if visited.contains(&canonical_src) {
-        return Err(io::Error::other(
-            format!("Circular symlink detected: {}", src.display()),
-        ));
+        return Err(io::Error::other(format!(
+            "Circular symlink detected: {}",
+            src.display()
+        )));
     }
     visited.insert(canonical_src.clone());
 
@@ -413,7 +514,8 @@ fn copy_dir_recursive_with_progress_inner(
                 )?;
             } else {
                 // Regular file - copy with progress
-                let filename = src_path.file_name()
+                let filename = src_path
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
@@ -422,11 +524,8 @@ fn copy_dir_recursive_with_progress_inner(
                 let file_size = metadata.len();
                 let file_completed_bytes = *completed_bytes;
 
-                let result = copy_file_with_progress(
-                    &src_path,
-                    &dest_path,
-                    cancel_flag,
-                    |copied, total| {
+                let result =
+                    copy_file_with_progress(&src_path, &dest_path, cancel_flag, |copied, total| {
                         let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
                         let _ = progress_tx.send(ProgressMessage::TotalProgress(
                             *completed_files,
@@ -434,8 +533,7 @@ fn copy_dir_recursive_with_progress_inner(
                             file_completed_bytes + copied,
                             total_bytes,
                         ));
-                    },
-                );
+                    });
 
                 match result {
                     Ok(_) => {
@@ -449,10 +547,8 @@ fn copy_dir_recursive_with_progress_inner(
                         }
                         let error_kind = e.kind();
                         let error_message = format!("{}: {}", src_path.display(), e);
-                        let _ = progress_tx.send(ProgressMessage::Error(
-                            filename,
-                            error_message.clone(),
-                        ));
+                        let _ = progress_tx
+                            .send(ProgressMessage::Error(filename, error_message.clone()));
                         return Err(io::Error::new(error_kind, error_message));
                     }
                 }
@@ -488,13 +584,22 @@ pub fn copy_files_with_progress(
     let mut cancelled = false;
 
     // Build full paths for size calculation (excluding skipped files)
-    let full_paths: Vec<PathBuf> = files.iter()
-        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+    let full_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                source_dir.join(f)
+            }
+        })
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
     // Send preparing message before calculating sizes
-    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+    let _ = progress_tx.send(ProgressMessage::Preparing(
+        "Calculating file sizes...".to_string(),
+    ));
 
     // Calculate total size
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
@@ -523,7 +628,8 @@ pub fn copy_files_with_progress(
             source_dir.join(file_path)
         };
 
-        let filename = src.file_name()
+        let filename = src
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -534,35 +640,42 @@ pub fn copy_files_with_progress(
             continue;
         }
 
-        // Check if destination already exists
-        if dest.exists() {
-            if files_to_overwrite.contains(&src) {
-                // Delete existing file/directory before copying
-                if let Err(e) = delete_file(&dest) {
-                    failure_count += 1;
-                    let _ = progress_tx.send(ProgressMessage::Error(
-                        filename,
-                        format!("Failed to remove existing: {}", e),
-                    ));
-                    continue;
-                }
-            } else {
-                // Not in overwrite set and not in skip set - unexpected conflict
-                failure_count += 1;
-                let _ = progress_tx.send(ProgressMessage::Error(
-                    filename,
-                    "Target already exists".to_string(),
-                ));
-                continue;
-            }
+        if let Err(e) = validate_destination_not_self(&src, &dest, "copy") {
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+            continue;
+        }
+
+        let dest_exists = path_exists_no_follow(&dest);
+        let overwriting = dest_exists && files_to_overwrite.contains(&src);
+        if dest_exists && !overwriting {
+            // Not in overwrite set and not in skip set - unexpected conflict
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(
+                filename,
+                "Target already exists".to_string(),
+            ));
+            continue;
         }
 
         let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
+        let copy_dest = if overwriting {
+            match unique_temp_destination(target_dir, &filename, "copy") {
+                Ok(path) => path,
+                Err(e) => {
+                    failure_count += 1;
+                    let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                    continue;
+                }
+            }
+        } else {
+            dest.clone()
+        };
 
         if src.is_dir() {
             match copy_dir_recursive_with_progress(
                 &src,
-                &dest,
+                &copy_dest,
                 &cancel_flag,
                 &progress_tx,
                 &mut completed_bytes,
@@ -571,15 +684,30 @@ pub fn copy_files_with_progress(
                 total_files,
             ) {
                 Ok(_) => {
+                    if overwriting {
+                        if let Err(e) = install_completed_replacement(&copy_dest, &dest) {
+                            cleanup_partial_path(&copy_dest);
+                            failure_count += 1;
+                            let _ =
+                                progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                            continue;
+                        }
+                    }
                     success_count += 1;
                     let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
                         // Cancelled - clean up partial copy
-                        let _ = fs::remove_dir_all(&dest);
+                        cleanup_partial_path(&copy_dest);
                         cancelled = true;
                         break;
+                    }
+                    // AlreadyExists means a foreign entry appeared at dest after the
+                    // existence check (copy_dest == dest when not overwriting) and we
+                    // created nothing there — don't delete what we didn't create.
+                    if overwriting || e.kind() != io::ErrorKind::AlreadyExists {
+                        cleanup_partial_path(&copy_dest);
                     }
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -589,21 +717,25 @@ pub fn copy_files_with_progress(
             let file_size = fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
             let file_completed_bytes = completed_bytes;
 
-            match copy_file_with_progress(
-                &src,
-                &dest,
-                &cancel_flag,
-                |copied, total| {
-                    let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                    let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                        completed_files,
-                        total_files,
-                        file_completed_bytes + copied,
-                        total_bytes,
-                    ));
-                },
-            ) {
+            match copy_file_with_progress(&src, &copy_dest, &cancel_flag, |copied, total| {
+                let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                    completed_files,
+                    total_files,
+                    file_completed_bytes + copied,
+                    total_bytes,
+                ));
+            }) {
                 Ok(_) => {
+                    if overwriting {
+                        if let Err(e) = install_completed_replacement(&copy_dest, &dest) {
+                            cleanup_partial_path(&copy_dest);
+                            failure_count += 1;
+                            let _ =
+                                progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                            continue;
+                        }
+                    }
                     completed_bytes += file_size;
                     completed_files += 1;
                     success_count += 1;
@@ -611,8 +743,15 @@ pub fn copy_files_with_progress(
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
+                        cleanup_partial_path(&copy_dest);
                         cancelled = true;
                         break;
+                    }
+                    // AlreadyExists means a foreign entry appeared at dest after the
+                    // existence check (copy_dest == dest when not overwriting) and we
+                    // created nothing there — don't delete what we didn't create.
+                    if overwriting || e.kind() != io::ErrorKind::AlreadyExists {
+                        cleanup_partial_path(&copy_dest);
                     }
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -649,13 +788,22 @@ pub fn move_files_with_progress(
     let mut cancelled = false;
 
     // Build full paths for size calculation (excluding skipped files)
-    let full_paths: Vec<PathBuf> = files.iter()
-        .map(|f| if f.is_absolute() { f.clone() } else { source_dir.join(f) })
+    let full_paths: Vec<PathBuf> = files
+        .iter()
+        .map(|f| {
+            if f.is_absolute() {
+                f.clone()
+            } else {
+                source_dir.join(f)
+            }
+        })
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
     // Send preparing message before calculating sizes
-    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+    let _ = progress_tx.send(ProgressMessage::Preparing(
+        "Calculating file sizes...".to_string(),
+    ));
 
     // Calculate total size upfront for accurate progress
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
@@ -673,7 +821,7 @@ pub fn move_files_with_progress(
     let mut completed_files: usize = 0;
 
     // First, try simple rename for each file (fast path for same filesystem)
-    let mut needs_copy: Vec<(PathBuf, PathBuf, u64)> = Vec::new();  // (src, dest, size)
+    let mut needs_copy: Vec<(PathBuf, PathBuf, u64, bool)> = Vec::new(); // (src, dest, size, overwriting)
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -687,7 +835,8 @@ pub fn move_files_with_progress(
             source_dir.join(file_path)
         };
 
-        let filename = src.file_name()
+        let filename = src
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -695,6 +844,12 @@ pub fn move_files_with_progress(
 
         // Check if this file should be skipped
         if files_to_skip.contains(&src) {
+            continue;
+        }
+
+        if let Err(e) = validate_destination_not_self(&src, &dest, "move") {
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
             continue;
         }
 
@@ -712,27 +867,16 @@ pub fn move_files_with_progress(
             (fs::metadata(&src).map(|m| m.len()).unwrap_or(0), 1)
         };
 
-        // Check if destination already exists
-        if dest.exists() {
-            if files_to_overwrite.contains(&src) {
-                // Delete existing file/directory before moving
-                if let Err(e) = delete_file(&dest) {
-                    failure_count += 1;
-                    let _ = progress_tx.send(ProgressMessage::Error(
-                        filename,
-                        format!("Failed to remove existing: {}", e),
-                    ));
-                    continue;
-                }
-            } else {
-                // Not in overwrite set and not in skip set - unexpected conflict
-                failure_count += 1;
-                let _ = progress_tx.send(ProgressMessage::Error(
-                    filename,
-                    "Target already exists".to_string(),
-                ));
-                continue;
-            }
+        let dest_exists = path_exists_no_follow(&dest);
+        let overwriting = dest_exists && files_to_overwrite.contains(&src);
+        if dest_exists && !overwriting {
+            // Not in overwrite set and not in skip set - unexpected conflict
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(
+                filename,
+                "Target already exists".to_string(),
+            ));
+            continue;
         }
 
         let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
@@ -752,9 +896,9 @@ pub fn move_files_with_progress(
                 ));
             }
             Err(e) => {
-                // If cross-device, we need to copy+delete
-                if is_cross_device_error(&e) {
-                    needs_copy.push((src, dest, item_size));
+                // If cross-device or atomic overwrite is unavailable, copy+replace+delete.
+                if is_cross_device_error(&e) || overwriting {
+                    needs_copy.push((src, dest, item_size, overwriting));
                 } else {
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -765,22 +909,39 @@ pub fn move_files_with_progress(
 
     // Handle cross-device moves (copy + delete)
     if !needs_copy.is_empty() && !cancelled {
-        for (src, dest, _) in needs_copy {
+        for (src, dest, _, overwriting) in needs_copy {
             if cancel_flag.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
             }
 
-            let filename = src.file_name()
+            let filename = src
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
 
             let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
+            let copy_dest = if overwriting {
+                match unique_temp_destination(
+                    dest.parent().unwrap_or_else(|| Path::new(".")),
+                    &filename,
+                    "move",
+                ) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        failure_count += 1;
+                        let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                        continue;
+                    }
+                }
+            } else {
+                dest.clone()
+            };
 
             let copy_result = if src.is_dir() {
                 copy_dir_recursive_with_progress(
                     &src,
-                    &dest,
+                    &copy_dest,
                     &cancel_flag,
                     &progress_tx,
                     &mut completed_bytes,
@@ -792,20 +953,16 @@ pub fn move_files_with_progress(
                 let file_size = fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
                 let file_completed_bytes = completed_bytes;
 
-                copy_file_with_progress(
-                    &src,
-                    &dest,
-                    &cancel_flag,
-                    |copied, total| {
-                        let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                        let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                            completed_files,
-                            total_files,
-                            file_completed_bytes + copied,
-                            total_bytes,
-                        ));
-                    },
-                ).map(|_| {
+                copy_file_with_progress(&src, &copy_dest, &cancel_flag, |copied, total| {
+                    let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                    let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                        completed_files,
+                        total_files,
+                        file_completed_bytes + copied,
+                        total_bytes,
+                    ));
+                })
+                .map(|_| {
                     completed_bytes += file_size;
                     completed_files += 1;
                 })
@@ -813,6 +970,15 @@ pub fn move_files_with_progress(
 
             match copy_result {
                 Ok(_) => {
+                    if overwriting {
+                        if let Err(e) = install_completed_replacement(&copy_dest, &dest) {
+                            cleanup_partial_path(&copy_dest);
+                            failure_count += 1;
+                            let _ =
+                                progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                            continue;
+                        }
+                    }
                     // Delete source after successful copy
                     if let Err(e) = delete_file(&src) {
                         // Copy succeeded but delete failed - this is a move failure
@@ -829,13 +995,15 @@ pub fn move_files_with_progress(
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
                         // Cancelled - clean up partial copy
-                        if dest.is_dir() {
-                            let _ = fs::remove_dir_all(&dest);
-                        } else {
-                            let _ = fs::remove_file(&dest);
-                        }
+                        cleanup_partial_path(&copy_dest);
                         cancelled = true;
                         break;
+                    }
+                    // AlreadyExists means a foreign entry appeared at dest after the
+                    // existence check (copy_dest == dest when not overwriting) and we
+                    // created nothing there — don't delete what we didn't create.
+                    if overwriting || e.kind() != io::ErrorKind::AlreadyExists {
+                        cleanup_partial_path(&copy_dest);
                     }
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -926,9 +1094,10 @@ fn copy_dir_recursive_inner(
 ) -> io::Result<()> {
     // Check maximum depth to prevent stack overflow
     if depth > MAX_COPY_DEPTH {
-        return Err(io::Error::other(
-            format!("Maximum directory depth ({}) exceeded - possible circular symlink", MAX_COPY_DEPTH),
-        ));
+        return Err(io::Error::other(format!(
+            "Maximum directory depth ({}) exceeded - possible circular symlink",
+            MAX_COPY_DEPTH
+        )));
     }
 
     // Detect symlink loops via canonicalised path. `visited` tracks only
@@ -937,11 +1106,15 @@ fn copy_dir_recursive_inner(
     // same physical directory (bind mount, BTRFS subvolume, etc.) would
     // be falsely reported as a cycle. We insert here and remove on exit
     // (after the body, regardless of error).
-    let canonical_src = src.canonicalize().map(strip_unc_prefix).unwrap_or_else(|_| src.to_path_buf());
+    let canonical_src = src
+        .canonicalize()
+        .map(strip_unc_prefix)
+        .unwrap_or_else(|_| src.to_path_buf());
     if visited.contains(&canonical_src) {
-        return Err(io::Error::other(
-            format!("Circular symlink detected: {}", src.display()),
-        ));
+        return Err(io::Error::other(format!(
+            "Circular symlink detected: {}",
+            src.display()
+        )));
     }
     visited.insert(canonical_src.clone());
 
@@ -1139,13 +1312,14 @@ pub fn is_valid_filename(name: &str) -> Result<(), &'static str> {
 /// Sensitive paths that symlinks should not point to
 #[cfg(unix)]
 const SENSITIVE_PATHS: &[&str] = &[
-    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log",
-    "/home", "/dev", "/run", "/var/run",
+    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log", "/home", "/dev", "/run", "/var/run",
 ];
 
 #[cfg(windows)]
 const SENSITIVE_PATHS: &[&str] = &[
-    "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
 ];
 
 /// True iff `target` equals or is contained within one of `SENSITIVE_PATHS`.
@@ -1303,10 +1477,16 @@ fn check_symlink_recursive(
     } else if metadata.is_dir() {
         // Recursively check directory contents. Fail-secure: if the directory
         // cannot be enumerated we cannot prove its contents are safe, so error.
-        let entries = fs::read_dir(path).map_err(|e| io::Error::new(
-            e.kind(),
-            format!("Cannot read directory '{}' for symlink check: {}", path.display(), e),
-        ))?;
+        let entries = fs::read_dir(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "Cannot read directory '{}' for symlink check: {}",
+                    path.display(),
+                    e
+                ),
+            )
+        })?;
         for entry in entries {
             let entry = entry?;
             check_symlink_recursive(&entry.path(), base_canonical, visited)?;
@@ -1325,7 +1505,13 @@ pub fn filter_symlinks_for_tar(base_dir: &Path, files: &[String]) -> (Vec<String
 
     for file in files {
         let file_path = base_dir.join(file);
-        collect_unsafe_symlinks(&file_path, base_dir, file, &mut excluded_paths, &mut visited);
+        collect_unsafe_symlinks(
+            &file_path,
+            base_dir,
+            file,
+            &mut excluded_paths,
+            &mut visited,
+        );
     }
 
     (files.to_vec(), excluded_paths)
@@ -1392,7 +1578,13 @@ fn collect_unsafe_symlinks(
                 for entry in entries.filter_map(|e| e.ok()) {
                     let entry_name = entry.file_name().to_string_lossy().to_string();
                     let entry_relative = format!("{}/{}", relative_path, entry_name);
-                    collect_unsafe_symlinks(&entry.path(), base_dir, &entry_relative, excluded, visited);
+                    collect_unsafe_symlinks(
+                        &entry.path(),
+                        base_dir,
+                        &entry_relative,
+                        excluded,
+                        visited,
+                    );
                 }
             }
             Err(_) => {
@@ -1401,7 +1593,6 @@ fn collect_unsafe_symlinks(
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1435,6 +1626,16 @@ mod tests {
     #[cfg(unix)]
     fn create_socket(path: &Path) -> std::os::unix::net::UnixListener {
         std::os::unix::net::UnixListener::bind(path).unwrap()
+    }
+
+    fn completed_message(messages: &[ProgressMessage]) -> Option<(usize, usize)> {
+        messages.iter().rev().find_map(|message| {
+            if let ProgressMessage::Completed(success, failure) = message {
+                Some((*success, *failure))
+            } else {
+                None
+            }
+        })
     }
 
     // ========== is_valid_filename tests ==========
@@ -1564,7 +1765,106 @@ mod tests {
         let result = copy_file_with_progress(&src, &dest, &cancel_flag, |_, _| {});
 
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "original");
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_copy_overwrite_missing_source_preserves_destination() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let target_dir = temp_dir.join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let src = source_dir.join("missing.txt");
+        let dest = target_dir.join("missing.txt");
+        fs::write(&dest, "original").unwrap();
+
+        let mut overwrite = HashSet::new();
+        overwrite.insert(src);
+
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("missing.txt")],
+            &source_dir,
+            &target_dir,
+            overwrite,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((0, 1)));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "original");
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_copy_directory_into_itself_is_rejected_by_progress_copy() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let photos = source_dir.join("photos");
+        let target_dir = photos.join("backup");
+        fs::create_dir_all(&photos).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(photos.join("a.txt"), "a").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("photos")],
+            &source_dir,
+            &target_dir,
+            HashSet::new(),
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((0, 1)));
+        assert!(!target_dir.join("photos").exists());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_overwrite_same_file_via_symlink_preserves_destination() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let target_dir = temp_dir.join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        let dest = target_dir.join("same.txt");
+        let link = source_dir.join("same.txt");
+        fs::write(&dest, "original").unwrap();
+        std::os::unix::fs::symlink(&dest, &link).unwrap();
+
+        let mut overwrite = HashSet::new();
+        overwrite.insert(link);
+
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("same.txt")],
+            &source_dir,
+            &target_dir,
+            overwrite,
+            HashSet::new(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((0, 1)));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "original");
 
         cleanup_temp_dir(&temp_dir);
@@ -1593,9 +1893,9 @@ mod tests {
         );
 
         let messages: Vec<ProgressMessage> = rx.try_iter().collect();
-        assert!(messages.iter().any(|msg| {
-            matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled")
-        }));
+        assert!(messages
+            .iter()
+            .any(|msg| { matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled") }));
         assert!(matches!(
             messages.last(),
             Some(ProgressMessage::Completed(0, 1))
@@ -1627,9 +1927,9 @@ mod tests {
         );
 
         let messages: Vec<ProgressMessage> = rx.try_iter().collect();
-        assert!(messages.iter().any(|msg| {
-            matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled")
-        }));
+        assert!(messages
+            .iter()
+            .any(|msg| { matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled") }));
         assert!(matches!(
             messages.last(),
             Some(ProgressMessage::Completed(0, 1))

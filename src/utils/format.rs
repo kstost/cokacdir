@@ -1,6 +1,6 @@
 // === UTF-8 safe string slicing utilities ===
 use std::path::PathBuf;
-use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Windows extended-length path prefix (`\\?\`) 제거
 /// `canonicalize()`가 Windows에서 `\\?\C:\Users\...` 형태를 반환하므로 표시/비교 전에 strip

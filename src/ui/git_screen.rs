@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, Screen};
 use super::theme::Theme;
-use crate::utils::format::{truncate_to_display_width, pad_to_display_width};
+use crate::utils::format::{pad_to_display_width, truncate_to_display_width};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 데이터 구조
@@ -172,7 +172,8 @@ impl GitScreenState {
 /// Create a git Command with safe.directory configured for the given path
 fn git_cmd(path: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-c").arg(format!("safe.directory={}", path.to_string_lossy()));
+    cmd.arg("-c")
+        .arg(format!("safe.directory={}", path.to_string_lossy()));
     cmd.arg("-C").arg(path);
     cmd
 }
@@ -192,11 +193,15 @@ fn git_commit_cmd(path: &Path) -> Command {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !has_name {
-        let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "User".to_string());
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "User".to_string());
         cmd.arg("-c").arg(format!("user.name={}", user));
     }
     if !has_email {
-        let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "user".to_string());
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "user".to_string());
         cmd.arg("-c").arg(format!("user.email={}@localhost", user));
     }
     cmd
@@ -256,9 +261,7 @@ fn get_current_branch(path: &Path) -> String {
 }
 
 fn get_status(path: &Path) -> Vec<GitFileEntry> {
-    let output = git_cmd(path)
-        .args(["status", "--porcelain=v1"])
-        .output();
+    let output = git_cmd(path).args(["status", "--porcelain=v1"]).output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -300,11 +303,7 @@ fn get_status(path: &Path) -> Vec<GitFileEntry> {
 fn get_log(path: &Path, count: usize) -> Vec<GitLogEntry> {
     let count_str = count.to_string();
     let output = git_cmd(path)
-        .args([
-            "log",
-            "--format=%h|%s|%an|%ar|%D",
-            "-n", &count_str,
-        ])
+        .args(["log", "--format=%h|%s|%an|%ar|%D", "-n", &count_str])
         .output();
 
     let output = match output {
@@ -395,9 +394,7 @@ fn get_branches(path: &Path) -> Vec<GitBranchEntry> {
 }
 
 fn stage_all(path: &Path) {
-    let _ = git_cmd(path)
-        .args(["add", "-A"])
-        .output();
+    let _ = git_cmd(path).args(["add", "-A"]).output();
 }
 
 fn stage_file(path: &Path, file: &str) -> Result<(), String> {
@@ -555,12 +552,7 @@ fn get_index_matching_commit(path: &Path) -> Option<String> {
 // 그리기 함수
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn draw(
-    frame: &mut Frame,
-    state: &mut GitScreenState,
-    area: Rect,
-    theme: &Theme,
-) {
+pub fn draw(frame: &mut Frame, state: &mut GitScreenState, area: Rect, theme: &Theme) {
     let colors = &theme.git_screen;
 
     // Fill background
@@ -573,7 +565,7 @@ pub fn draw(
         .constraints([
             Constraint::Length(1), // header
             Constraint::Length(1), // tab bar
-            Constraint::Min(3),   // content
+            Constraint::Min(3),    // content
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -621,7 +613,9 @@ fn draw_header(
         Span::styled(" [", Style::default().fg(colors.header_path)),
         Span::styled(
             &state.branch_name,
-            Style::default().fg(colors.header_branch).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.header_branch)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("] ", Style::default().fg(colors.header_path)),
         Span::styled(truncated_path, Style::default().fg(colors.header_path)),
@@ -653,7 +647,9 @@ fn draw_tab_bar(
                 .bg(colors.tab_bar_bg)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
-            Style::default().fg(colors.tab_inactive).bg(colors.tab_bar_bg)
+            Style::default()
+                .fg(colors.tab_inactive)
+                .bg(colors.tab_bar_bg)
         };
         spans.push(Span::styled(format!(" {} ", label), style));
     }
@@ -747,14 +743,22 @@ fn draw_commit_tab(
         frame.render_widget(msg, file_area);
     } else {
         let mut lines = Vec::new();
-        for (i, entry) in state.status_files.iter().enumerate().skip(state.commit_scroll).take(visible_height) {
+        for (i, entry) in state
+            .status_files
+            .iter()
+            .enumerate()
+            .skip(state.commit_scroll)
+            .take(visible_height)
+        {
             let is_selected = !state.commit_input_active && i == state.commit_selected;
             let status_char = file_status_char(entry);
             let prefix = if entry.staged { "+" } else { " " };
             let text = format!(" {}[{}] {}", prefix, status_char, entry.path);
 
             let style = if is_selected {
-                Style::default().fg(colors.selected_text).bg(colors.selected_bg)
+                Style::default()
+                    .fg(colors.selected_text)
+                    .bg(colors.selected_bg)
             } else {
                 file_status_style(entry, colors)
             };
@@ -767,9 +771,14 @@ fn draw_commit_tab(
 
         // Scrollbar
         if state.status_files.len() > visible_height {
-            let mut scrollbar_state = ScrollbarState::new(state.status_files.len())
-                .position(state.commit_scroll);
-            let scrollbar_area = Rect::new(file_area.x + file_area.width.saturating_sub(1), file_area.y, 1, file_area.height);
+            let mut scrollbar_state =
+                ScrollbarState::new(state.status_files.len()).position(state.commit_scroll);
+            let scrollbar_area = Rect::new(
+                file_area.x + file_area.width.saturating_sub(1),
+                file_area.y,
+                1,
+                file_area.height,
+            );
             frame.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
                 scrollbar_area,
@@ -804,15 +813,15 @@ fn draw_commit_tab(
         Style::default().fg(colors.commit_input_text)
     };
 
-    let input_paragraph = Paragraph::new(Span::styled(display_text, text_style))
-        .block(input_block);
+    let input_paragraph = Paragraph::new(Span::styled(display_text, text_style)).block(input_block);
     frame.render_widget(input_paragraph, input_area);
 
     // Show cursor when input is active
     if state.commit_input_active {
-        let cursor_x = input_area.x + 1 + UnicodeWidthStr::width(state.commit_message.as_str()) as u16;
+        let cursor_x =
+            input_area.x + 1 + UnicodeWidthStr::width(state.commit_message.as_str()) as u16;
         let cursor_y = input_area.y + 1;
-        if cursor_x < input_area.x + input_area.width - 1 {
+        if cursor_x < input_area.x + input_area.width.saturating_sub(1) {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
@@ -837,10 +846,7 @@ fn draw_log_tab(
     if state.log_detail.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(35),
-                Constraint::Percentage(65),
-            ])
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(area);
 
         draw_log_list(frame, state, chunks[0], colors);
@@ -871,17 +877,28 @@ fn draw_log_list(
     // Detect if files have been restored to a different commit
     let restored = get_index_matching_commit(&state.repo_path);
 
-    for (i, entry) in state.log_entries.iter().enumerate().skip(state.log_scroll).take(visible_height) {
+    for (i, entry) in state
+        .log_entries
+        .iter()
+        .enumerate()
+        .skip(state.log_scroll)
+        .take(visible_height)
+    {
         let is_selected = i == state.log_selected;
         let is_restored = restored.as_deref() == Some(&entry.hash);
         let marker = if is_restored { ">" } else { " " };
 
         if is_selected {
-            let text = format!("{}{} {} ({}, {})", marker, entry.hash, entry.message, entry.author, entry.date);
+            let text = format!(
+                "{}{} {} ({}, {})",
+                marker, entry.hash, entry.message, entry.author, entry.date
+            );
             let display = pad_to_display_width(&text, max_width);
             lines.push(Line::from(Span::styled(
                 display,
-                Style::default().fg(colors.selected_text).bg(colors.selected_bg),
+                Style::default()
+                    .fg(colors.selected_text)
+                    .bg(colors.selected_bg),
             )));
         } else {
             let marker_style = if is_restored {
@@ -909,9 +926,14 @@ fn draw_log_list(
 
     // Scrollbar
     if state.log_entries.len() > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(state.log_entries.len())
-            .position(state.log_scroll);
-        let scrollbar_area = Rect::new(area.x + area.width.saturating_sub(1), area.y, 1, area.height);
+        let mut scrollbar_state =
+            ScrollbarState::new(state.log_entries.len()).position(state.log_scroll);
+        let scrollbar_area = Rect::new(
+            area.x + area.width.saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        );
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             scrollbar_area,
@@ -943,15 +965,22 @@ fn draw_diff_detail(
     let mut lines = Vec::new();
     let max_width = area.width as usize;
 
-    for line in diff_lines.iter().skip(state.log_detail_scroll).take(visible_height) {
+    for line in diff_lines
+        .iter()
+        .skip(state.log_detail_scroll)
+        .take(visible_height)
+    {
         let truncated = truncate_to_display_width(line, max_width);
 
         let style = if line.starts_with('+') && !line.starts_with("+++") {
             Style::default().fg(colors.diff_add)
         } else if line.starts_with('-') && !line.starts_with("---") {
             Style::default().fg(colors.diff_remove)
-        } else if line.starts_with("@@") || line.starts_with("diff ") || line.starts_with("index ") {
-            Style::default().fg(colors.diff_header).add_modifier(Modifier::BOLD)
+        } else if line.starts_with("@@") || line.starts_with("diff ") || line.starts_with("index ")
+        {
+            Style::default()
+                .fg(colors.diff_header)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(colors.log_message)
         };
@@ -970,9 +999,14 @@ fn draw_diff_detail(
 
     // Scrollbar
     if diff_lines.len() > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(diff_lines.len())
-            .position(state.log_detail_scroll);
-        let scrollbar_area = Rect::new(area.x + area.width.saturating_sub(1), area.y, 1, area.height);
+        let mut scrollbar_state =
+            ScrollbarState::new(diff_lines.len()).position(state.log_detail_scroll);
+        let scrollbar_area = Rect::new(
+            area.x + area.width.saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        );
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             scrollbar_area,
@@ -1008,17 +1042,29 @@ fn draw_branch_tab(
     let mut lines = Vec::new();
     let max_width = area.width as usize;
 
-    for (i, branch) in state.branches.iter().enumerate().skip(state.branch_scroll).take(visible_height) {
+    for (i, branch) in state
+        .branches
+        .iter()
+        .enumerate()
+        .skip(state.branch_scroll)
+        .take(visible_height)
+    {
         let is_selected = i == state.branch_selected;
         let prefix = if branch.is_current { "* " } else { "  " };
         let text = format!(" {}{}", prefix, branch.name);
 
         let style = if is_selected {
-            Style::default().fg(colors.selected_text).bg(colors.selected_bg)
+            Style::default()
+                .fg(colors.selected_text)
+                .bg(colors.selected_bg)
         } else if branch.is_current {
-            Style::default().fg(colors.branch_current).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(colors.branch_current)
+                .add_modifier(Modifier::BOLD)
         } else if branch.is_remote {
-            Style::default().fg(colors.footer_text).add_modifier(Modifier::DIM)
+            Style::default()
+                .fg(colors.footer_text)
+                .add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(colors.branch_normal)
         };
@@ -1032,9 +1078,14 @@ fn draw_branch_tab(
 
     // Scrollbar
     if state.branches.len() > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(state.branches.len())
-            .position(state.branch_scroll);
-        let scrollbar_area = Rect::new(area.x + area.width.saturating_sub(1), area.y, 1, area.height);
+        let mut scrollbar_state =
+            ScrollbarState::new(state.branches.len()).position(state.branch_scroll);
+        let scrollbar_area = Rect::new(
+            area.x + area.width.saturating_sub(1),
+            area.y,
+            1,
+            area.height,
+        );
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             scrollbar_area,
@@ -1055,7 +1106,9 @@ fn draw_footer(
         let display = truncate_to_display_width(&raw, area.width as usize);
         let message = Paragraph::new(Span::styled(
             display,
-            Style::default().fg(colors.footer_text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.footer_text)
+                .add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(message, area);
         return;
@@ -1064,11 +1117,7 @@ fn draw_footer(
     let shortcuts: Vec<(&str, &str)> = match state.current_tab {
         GitTab::Commit => {
             if state.commit_input_active {
-                vec![
-                    ("Enter", "commit "),
-                    ("Tab", "files "),
-                    ("Esc", "cancel"),
-                ]
+                vec![("Enter", "commit "), ("Tab", "files "), ("Esc", "cancel")]
             } else if state.log_detail.is_some() {
                 vec![
                     ("\u{2191}\u{2193}", "nav "),
@@ -1140,7 +1189,9 @@ fn draw_input_dialog(
     };
 
     let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 3u16;
+    // Clamp to the terminal area, or Clear renders out of bounds and panics on
+    // terminals shorter than 3 rows.
+    let height = 3u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
@@ -1165,7 +1216,7 @@ fn draw_input_dialog(
     // Cursor
     let cursor_x = dialog_area.x + 1 + UnicodeWidthStr::width(state.input_buffer.as_str()) as u16;
     let cursor_y = dialog_area.y + 1;
-    if cursor_x < dialog_area.x + dialog_area.width - 1 {
+    if cursor_x < dialog_area.x + dialog_area.width.saturating_sub(1) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
@@ -1177,14 +1228,20 @@ fn draw_confirm_dialog(
     theme: &super::theme::Theme,
 ) {
     let (msg, title) = match &state.confirm_action {
-        Some(ConfirmAction::BranchDelete(name)) => (format!("Delete branch '{}'?", name), " Delete "),
-        Some(ConfirmAction::RestoreToCommit(hash)) => (format!("Restore files to {}?", hash), " Restore "),
+        Some(ConfirmAction::BranchDelete(name)) => {
+            (format!("Delete branch '{}'?", name), " Delete ")
+        }
+        Some(ConfirmAction::RestoreToCommit(hash)) => {
+            (format!("Restore files to {}?", hash), " Restore ")
+        }
         None => return,
     };
     let cd = &theme.confirm_dialog;
 
     let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 6u16;
+    // Clamp height to the area too, or Clear/Paragraph render out of bounds and panic
+    // on terminals shorter than 6 rows.
+    let height = 6u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
@@ -1200,8 +1257,10 @@ fn draw_confirm_dialog(
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(block, dialog_area);
 
-    // Message
-    let message_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+    // Message — intersect with inner: on very short terminals the fixed row offsets fall
+    // outside the clamped dialog, and Paragraph indexes the buffer directly (panics OOB).
+    let message_area =
+        Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1).intersection(inner);
     frame.render_widget(
         Paragraph::new(msg)
             .style(Style::default().fg(cd.message_text))
@@ -1215,8 +1274,16 @@ fn draw_confirm_dialog(
         .bg(cd.button_selected_bg);
     let normal_style = Style::default().fg(cd.button_text);
 
-    let yes_style = if state.confirm_selected_button == 0 { selected_style } else { normal_style };
-    let no_style = if state.confirm_selected_button == 1 { selected_style } else { normal_style };
+    let yes_style = if state.confirm_selected_button == 0 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let no_style = if state.confirm_selected_button == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
 
     let buttons = Line::from(vec![
         Span::styled("  ", Style::default()),
@@ -1225,7 +1292,13 @@ fn draw_confirm_dialog(
         Span::styled(" No ", no_style),
         Span::styled("  ", Style::default()),
     ]);
-    let button_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1);
+    let button_area = Rect::new(
+        inner.x + 1,
+        inner.y + inner.height.saturating_sub(2),
+        inner.width.saturating_sub(2),
+        1,
+    )
+    .intersection(inner);
     frame.render_widget(
         Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
         button_area,

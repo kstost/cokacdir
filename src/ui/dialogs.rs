@@ -5,7 +5,6 @@ use crossterm::{
     event::{KeyCode, KeyModifiers},
     terminal,
 };
-use unicode_width::UnicodeWidthChar;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -13,13 +12,17 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::keybindings::GotoAction;
 use crate::services::file_ops::FileOperationType;
-use crate::utils::format::{safe_suffix, safe_prefix};
+use crate::utils::format::{safe_prefix, safe_suffix};
 
 use super::{
-    app::{App, ConflictResolution, ConflictState, Dialog, DialogType, GitLogDiffState, PathCompletion, RemoteConnectState, SettingsState, fuzzy_match},
+    app::{
+        fuzzy_match, App, ConflictResolution, ConflictState, Dialog, DialogType, GitLogDiffState,
+        PathCompletion, RemoteConnectState, SettingsState,
+    },
     theme::Theme,
 };
 
@@ -60,7 +63,10 @@ fn expand_path_string(input: &str) -> PathBuf {
     if input.starts_with('~') {
         if let Some(home) = dirs::home_dir() {
             let rest = input.strip_prefix('~').unwrap_or("");
-            let rest = rest.strip_prefix('/').or_else(|| rest.strip_prefix('\\')).unwrap_or(rest);
+            let rest = rest
+                .strip_prefix('/')
+                .or_else(|| rest.strip_prefix('\\'))
+                .unwrap_or(rest);
             if rest.is_empty() {
                 home
             } else {
@@ -81,7 +87,10 @@ fn parse_path_for_completion(input: &str) -> (PathBuf, String) {
     let expanded = if input.starts_with('~') {
         if let Some(home) = dirs::home_dir() {
             let rest = input.strip_prefix('~').unwrap_or("");
-            let rest = rest.strip_prefix('/').or_else(|| rest.strip_prefix('\\')).unwrap_or(rest);
+            let rest = rest
+                .strip_prefix('/')
+                .or_else(|| rest.strip_prefix('\\'))
+                .unwrap_or(rest);
             if rest.is_empty() {
                 home.display().to_string()
             } else {
@@ -103,10 +112,17 @@ fn parse_path_for_completion(input: &str) -> (PathBuf, String) {
 
     // Special handling: "/." 로 끝나면 (but not "/..") "."를 prefix로 처리
     // PathBuf::file_name()은 "."를 None으로 반환하므로 수동 처리 필요
-    if (expanded.ends_with("/.") || expanded.ends_with("\\.")) && !expanded.ends_with("/..") && !expanded.ends_with("\\..") {
+    if (expanded.ends_with("/.") || expanded.ends_with("\\."))
+        && !expanded.ends_with("/..")
+        && !expanded.ends_with("\\..")
+    {
         let parent_str = &expanded[..expanded.len() - 2]; // "/." or "\\." 제거
         let parent_path = if parent_str.is_empty() {
-            if cfg!(windows) { PathBuf::from("C:\\") } else { PathBuf::from("/") }
+            if cfg!(windows) {
+                PathBuf::from("C:\\")
+            } else {
+                PathBuf::from("/")
+            }
         } else {
             PathBuf::from(parent_str)
         };
@@ -126,7 +142,11 @@ fn parse_path_for_completion(input: &str) -> (PathBuf, String) {
         (parent.to_path_buf(), prefix)
     } else {
         // 루트 경로인 경우
-        let root = if cfg!(windows) { PathBuf::from("C:\\") } else { PathBuf::from("/") };
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
         (root, String::new())
     }
 }
@@ -179,12 +199,10 @@ fn get_path_suggestions(base_dir: &PathBuf, prefix: &str) -> Vec<String> {
     }
 
     // 디렉토리 우선, 그 다음 이름순 정렬
-    suggestions.sort_by(|a, b| {
-        match (a.1, b.1) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        }
+    suggestions.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
     });
 
     suggestions.into_iter().map(|(name, _)| name).collect()
@@ -356,24 +374,25 @@ fn current_terminal_area() -> Rect {
 
 pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, theme: &Theme) {
     // 다이얼로그 크기 상수
-    const MAX_COMPLETION_ITEMS: u16 = 8;      // 자동완성 목록 최대 표시 항목 수
-    const COMPLETION_EXTRA_HEIGHT: u16 = 1;   // 자동완성 목록 추가 여백
+    const MAX_COMPLETION_ITEMS: u16 = 8; // 자동완성 목록 최대 표시 항목 수
+    const COMPLETION_EXTRA_HEIGHT: u16 = 1; // 자동완성 목록 추가 여백
     const MAX_COMPLETION_HEIGHT: u16 = MAX_COMPLETION_ITEMS + COMPLETION_EXTRA_HEIGHT;
 
-    const DIALOG_MARGIN: u16 = 6;             // 다이얼로그 좌우 여백 (양쪽 3씩)
-    const DIALOG_MIN_WIDTH: u16 = 60;         // 다이얼로그 최소 너비
-    const SIMPLE_DIALOG_WIDTH: u16 = 50;      // 간단한 다이얼로그 너비
+    const DIALOG_MARGIN: u16 = 6; // 다이얼로그 좌우 여백 (양쪽 3씩)
+    const DIALOG_MIN_WIDTH: u16 = 60; // 다이얼로그 최소 너비
+    const SIMPLE_DIALOG_WIDTH: u16 = 50; // 간단한 다이얼로그 너비
 
-    const GOTO_BASE_HEIGHT: u16 = 6;          // Goto 다이얼로그 기본 높이
-    const SIMPLE_INPUT_HEIGHT: u16 = 5;       // 간단한 입력 다이얼로그 높이
-    const CONFIRM_DIALOG_HEIGHT: u16 = 6;     // 확인 다이얼로그 높이
-    const PROGRESS_DIALOG_HEIGHT: u16 = 8;    // 프로그레스 다이얼로그 높이
-    const CONFLICT_DIALOG_HEIGHT: u16 = 9;    // 충돌 다이얼로그 높이 (버튼 2줄)
+    const GOTO_BASE_HEIGHT: u16 = 6; // Goto 다이얼로그 기본 높이
+    const SIMPLE_INPUT_HEIGHT: u16 = 5; // 간단한 입력 다이얼로그 높이
+    const CONFIRM_DIALOG_HEIGHT: u16 = 6; // 확인 다이얼로그 높이
+    const PROGRESS_DIALOG_HEIGHT: u16 = 8; // 프로그레스 다이얼로그 높이
+    const CONFLICT_DIALOG_HEIGHT: u16 = 9; // 충돌 다이얼로그 높이 (버튼 2줄)
 
     // 자동완성 목록 현재 높이 계산
     let completion_height = if let Some(ref completion) = dialog.completion {
         if completion.visible && !completion.suggestions.is_empty() {
-            (completion.suggestions.len() as u16).min(MAX_COMPLETION_ITEMS) + COMPLETION_EXTRA_HEIGHT
+            (completion.suggestions.len() as u16).min(MAX_COMPLETION_ITEMS)
+                + COMPLETION_EXTRA_HEIGHT
         } else {
             0
         }
@@ -384,22 +403,26 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
     // 다이얼로그 타입별 크기 설정
     // Y좌표는 max_height 기준 고정, 실제 높이는 동적
     let (width, height, max_height) = match dialog.dialog_type {
-        DialogType::Delete | DialogType::LargeImageConfirm | DialogType::LargeFileConfirm | DialogType::TrueColorWarning
-        | DialogType::DecryptConfirm => {
-            (SIMPLE_DIALOG_WIDTH, CONFIRM_DIALOG_HEIGHT, CONFIRM_DIALOG_HEIGHT)
-        }
-        DialogType::DedupConfirm => {
-            (60, 10, 10)
-        }
+        DialogType::Delete
+        | DialogType::LargeImageConfirm
+        | DialogType::LargeFileConfirm
+        | DialogType::TrueColorWarning
+        | DialogType::DecryptConfirm => (
+            SIMPLE_DIALOG_WIDTH,
+            CONFIRM_DIALOG_HEIGHT,
+            CONFIRM_DIALOG_HEIGHT,
+        ),
+        DialogType::DedupConfirm => (60, 10, 10),
         DialogType::ExtensionHandlerError => {
             // Error dialog: wider to accommodate error messages, taller for multi-line
             (65, 8, 8)
         }
-        DialogType::TarError => {
-            tar_error_dialog_size(area)
-        }
+        DialogType::TarError => tar_error_dialog_size(area),
         DialogType::Goto => {
-            let w = area.width.saturating_sub(DIALOG_MARGIN).max(DIALOG_MIN_WIDTH);
+            let w = area
+                .width
+                .saturating_sub(DIALOG_MARGIN)
+                .max(DIALOG_MIN_WIDTH);
             let max_h = GOTO_BASE_HEIGHT + MAX_COMPLETION_HEIGHT;
 
             // 북마크 모드인지 확인 (입력이 경로가 아니면 북마크 모드)
@@ -416,18 +439,26 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
 
             (w, h, max_h)
         }
-        DialogType::Search | DialogType::Mkdir | DialogType::Mkfile | DialogType::Rename | DialogType::Tar => {
-            (SIMPLE_DIALOG_WIDTH, SIMPLE_INPUT_HEIGHT, SIMPLE_INPUT_HEIGHT)
-        }
-        DialogType::EncryptConfirm => {
-            (SIMPLE_DIALOG_WIDTH, 7, 7)
-        }
-        DialogType::Progress => {
-            (SIMPLE_DIALOG_WIDTH, PROGRESS_DIALOG_HEIGHT, PROGRESS_DIALOG_HEIGHT)
-        }
-        DialogType::DuplicateConflict => {
-            (SIMPLE_DIALOG_WIDTH, CONFLICT_DIALOG_HEIGHT, CONFLICT_DIALOG_HEIGHT)
-        }
+        DialogType::Search
+        | DialogType::Mkdir
+        | DialogType::Mkfile
+        | DialogType::Rename
+        | DialogType::Tar => (
+            SIMPLE_DIALOG_WIDTH,
+            SIMPLE_INPUT_HEIGHT,
+            SIMPLE_INPUT_HEIGHT,
+        ),
+        DialogType::EncryptConfirm => (SIMPLE_DIALOG_WIDTH, 7, 7),
+        DialogType::Progress => (
+            SIMPLE_DIALOG_WIDTH,
+            PROGRESS_DIALOG_HEIGHT,
+            PROGRESS_DIALOG_HEIGHT,
+        ),
+        DialogType::DuplicateConflict => (
+            SIMPLE_DIALOG_WIDTH,
+            CONFLICT_DIALOG_HEIGHT,
+            CONFLICT_DIALOG_HEIGHT,
+        ),
         DialogType::TarExcludeConfirm => {
             (60, 15, 15) // Exclude confirm dialog
         }
@@ -438,12 +469,15 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
             // Dynamic height based on input display width
             let dialog_width = 75u16;
             let input_width = (dialog_width - 4) as usize; // border + padding
-            let input_display_width: usize = dialog.input.chars()
-                .map(|c| c.width().unwrap_or(1))
-                .sum();
+            let input_display_width: usize =
+                dialog.input.chars().map(|c| c.width().unwrap_or(1)).sum();
             // +1 for cursor block at end
             let total_width = input_display_width + 1;
-            let input_lines = if total_width == 0 { 1 } else { (total_width + input_width - 1) / input_width };
+            let input_lines = if total_width == 0 {
+                1
+            } else {
+                (total_width + input_width - 1) / input_width
+            };
             let input_lines = input_lines.clamp(1, 5); // min 1, max 5 lines
             let base_height = 11u16; // height with 1 input line + 1 blank line below
             let height = base_height + (input_lines as u16 - 1);
@@ -456,28 +490,54 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
             (w, h, h)
         }
         DialogType::RemoteConnect => {
-            let w = area.width.saturating_sub(DIALOG_MARGIN).max(DIALOG_MIN_WIDTH).min(80);
+            let w = area
+                .width
+                .saturating_sub(DIALOG_MARGIN)
+                .max(DIALOG_MIN_WIDTH)
+                .min(80);
             // Password: 5 fields + 1 gap + 1 help + 2 border = 9
             // KeyFile:  6 fields + 1 gap + 1 help + 2 border = 10
             // +1 for possible error message
-            let has_error = app.remote_connect_state.as_ref().map(|s| s.error.is_some()).unwrap_or(false);
-            let is_keyfile = app.remote_connect_state.as_ref()
+            let has_error = app
+                .remote_connect_state
+                .as_ref()
+                .map(|s| s.error.is_some())
+                .unwrap_or(false);
+            let is_keyfile = app
+                .remote_connect_state
+                .as_ref()
                 .map(|s| s.auth_type == super::app::RemoteAuthType::KeyFile)
                 .unwrap_or(false);
             let h = if is_keyfile { 10_u16 } else { 9_u16 } + if has_error { 1 } else { 0 };
             (w, h, h)
         }
         DialogType::RemoteProfileSave => {
-            let w = area.width.saturating_sub(DIALOG_MARGIN).max(DIALOG_MIN_WIDTH).min(50);
+            let w = area
+                .width
+                .saturating_sub(DIALOG_MARGIN)
+                .max(DIALOG_MIN_WIDTH)
+                .min(50);
             let h = 7_u16;
             (w, h, h)
         }
     };
 
     // 다이얼로그 크기가 터미널 크기를 초과하지 않도록 제한
+    let (natural_width, natural_height) = (width, height);
     let width = width.min(area.width);
     let height = height.min(area.height);
     let max_height = max_height.min(area.height);
+    // 작은 터미널 보호 가드 — 차원별로 다르게 처리한다:
+    // · 높이: 다이얼로그 본문들이 자연 높이를 전제로 한 고정 행 오프셋(`inner.y + 5`,
+    //   `inner.height - 2` 등)을 쓰므로, 높이가 클램프되면 그 행들이 클램프된 다이얼로그
+    //   (=버퍼) 밖을 가리켜 패닉할 수 있다 → 자연 높이 미만이면 그리지 않는다.
+    // · 폭: 클램프돼도 Paragraph가 영역 폭으로 잘라내므로 정상 동작한다(좁은 tmux 분할
+    //   등에서 다이얼로그를 계속 표시해야 함). 단, 본문 산술(`inner.width - N`, 버튼
+    //   배치 등)이 언더플로하는 극소 폭(< 24)에서만 그리지 않는다.
+    const MIN_DIALOG_RENDER_WIDTH: u16 = 24;
+    if height < natural_height || width < natural_width.min(MIN_DIALOG_RENDER_WIDTH) {
+        return;
+    }
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     // Y좌표는 항상 최대 높이 기준으로 계산 (절대 고정)
     let y = area.y + (area.height.saturating_sub(max_height)) / 2;
@@ -520,7 +580,11 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         DialogType::Goto => {
             draw_goto_dialog(frame, app, dialog, dialog_area, theme);
         }
-        DialogType::Search | DialogType::Mkdir | DialogType::Mkfile | DialogType::Rename | DialogType::Tar => {
+        DialogType::Search
+        | DialogType::Mkdir
+        | DialogType::Mkfile
+        | DialogType::Rename
+        | DialogType::Tar => {
             draw_simple_input_dialog(frame, dialog, dialog_area, theme);
         }
         DialogType::Progress => {
@@ -569,11 +633,19 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
     let extension = &dialog.message; // Extension is stored in message field
     let is_edit_mode = dialog.selected_button == 1; // 0: Set, 1: Edit (fixed at dialog creation)
 
-    let title = if is_edit_mode { " Edit Handler " } else { " Set Handler " };
+    let title = if is_edit_mode {
+        " Edit Handler "
+    } else {
+        " Set Handler "
+    };
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -607,10 +679,7 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
     );
 
     // Message line 3 (extension specific)
-    let msg3 = format!(
-        "Enter the command to use for \".{}\" files:",
-        extension
-    );
+    let msg3 = format!("Enter the command to use for \".{}\" files:", extension);
     let msg3_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     frame.render_widget(
         Paragraph::new(msg3).style(Style::default().fg(theme.dialog.text)),
@@ -619,12 +688,14 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
 
     // Input field with placeholder (extension-specific examples)
     let input_width = (inner.width - 2) as usize;
-    let input_display_width: usize = dialog.input.chars()
-        .map(|c| c.width().unwrap_or(1))
-        .sum();
+    let input_display_width: usize = dialog.input.chars().map(|c| c.width().unwrap_or(1)).sum();
     // +1 for cursor block at end
     let total_width = input_display_width + 1;
-    let input_lines = if total_width == 0 { 1 } else { (total_width + input_width - 1) / input_width };
+    let input_lines = if total_width == 0 {
+        1
+    } else {
+        (total_width + input_width - 1) / input_width
+    };
     let input_height = input_lines.clamp(1, 5) as u16;
     let input_area = Rect::new(inner.x + 1, inner.y + 5, inner.width - 2, input_height);
     let placeholder = get_handler_placeholder(extension);
@@ -632,10 +703,7 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
     if dialog.input.is_empty() {
         // Show placeholder
         let input_style = Style::default().fg(theme.dialog.text_dim);
-        frame.render_widget(
-            Paragraph::new(placeholder).style(input_style),
-            input_area,
-        );
+        frame.render_widget(Paragraph::new(placeholder).style(input_style), input_area);
     } else {
         // Show input with wrap and selection/cursor support
         let input_chars: Vec<char> = dialog.input.chars().collect();
@@ -717,7 +785,11 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
             } else {
                 0
             };
-            lines.into_iter().skip(scroll_start).take(max_visible).collect()
+            lines
+                .into_iter()
+                .skip(scroll_start)
+                .take(max_visible)
+                .collect()
         } else {
             lines
         };
@@ -740,7 +812,6 @@ fn draw_binary_file_handler_dialog(frame: &mut Frame, dialog: &Dialog, area: Rec
         Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
         button_area,
     );
-
 }
 
 /// Get placeholder example command for file extension
@@ -941,7 +1012,11 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -955,12 +1030,11 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
     let cursor_pos = dialog.cursor_pos.min(input_chars.len());
 
     // Calculate display width of input
-    let input_display_width: usize = input_chars.iter()
-        .map(|c| c.width().unwrap_or(1))
-        .sum();
+    let input_display_width: usize = input_chars.iter().map(|c| c.width().unwrap_or(1)).sum();
 
     // Calculate cursor's display position
-    let cursor_display_pos: usize = input_chars.iter()
+    let cursor_display_pos: usize = input_chars
+        .iter()
         .take(cursor_pos)
         .map(|c| c.width().unwrap_or(1))
         .sum();
@@ -1068,7 +1142,9 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
         let message_area = Rect::new(inner.x + 1, message_y, inner.width - 2, 1);
         // Use warning style for error messages (ending with !)
         let message_style = if dialog.message.ends_with('!') {
-            Style::default().fg(theme.state.warning).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.state.warning)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.dialog.text)
         };
@@ -1087,9 +1163,13 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
                 "  Tab: MD5 verification [OFF]"
             };
             let md5_style = if dialog.use_md5 {
-                Style::default().fg(theme.dialog.text).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.dialog.text)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.dialog.text).add_modifier(Modifier::DIM)
+                Style::default()
+                    .fg(theme.dialog.text)
+                    .add_modifier(Modifier::DIM)
             };
             let md5_area = Rect::new(inner.x + 1, inner.y + 4, inner.width - 2, 1);
             frame.render_widget(Paragraph::new(md5_label).style(md5_style), md5_area);
@@ -1105,7 +1185,11 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
 fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme, title: &str) {
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.confirm_dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.confirm_dialog.border))
         .style(Style::default().bg(theme.confirm_dialog.bg));
@@ -1128,8 +1212,16 @@ fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &T
         .bg(theme.confirm_dialog.button_selected_bg);
     let normal_style = Style::default().fg(theme.confirm_dialog.button_text);
 
-    let yes_style = if dialog.selected_button == 0 { selected_style } else { normal_style };
-    let no_style = if dialog.selected_button == 1 { selected_style } else { normal_style };
+    let yes_style = if dialog.selected_button == 0 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let no_style = if dialog.selected_button == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
 
     // 버튼 (중앙 정렬)
     let buttons = Line::from(vec![
@@ -1149,7 +1241,11 @@ fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &T
 fn draw_dedup_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme) {
     let block = Block::default()
         .title(" Remove Duplicates ")
-        .title_style(Style::default().fg(theme.confirm_dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.confirm_dialog.border))
         .style(Style::default().bg(theme.confirm_dialog.bg));
@@ -1161,7 +1257,11 @@ fn draw_dedup_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, the
     let warn_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(
         Paragraph::new("!! WARNING !!")
-            .style(Style::default().fg(theme.state.error).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(theme.state.error)
+                    .add_modifier(Modifier::BOLD),
+            )
             .alignment(ratatui::layout::Alignment::Center),
         warn_area,
     );
@@ -1182,8 +1282,16 @@ fn draw_dedup_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, the
         .bg(theme.confirm_dialog.button_selected_bg);
     let normal_style = Style::default().fg(theme.confirm_dialog.button_text);
 
-    let yes_style = if dialog.selected_button == 0 { selected_style } else { normal_style };
-    let no_style = if dialog.selected_button == 1 { selected_style } else { normal_style };
+    let yes_style = if dialog.selected_button == 0 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let no_style = if dialog.selected_button == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
 
     let buttons = Line::from(vec![
         Span::styled("  ", Style::default()),
@@ -1203,7 +1311,11 @@ fn draw_dedup_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, the
 fn draw_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme, title: &str) {
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.confirm_dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.confirm_dialog.border))
         .style(Style::default().bg(theme.confirm_dialog.bg));
@@ -1225,9 +1337,7 @@ fn draw_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
         .fg(theme.confirm_dialog.button_selected_text)
         .bg(theme.confirm_dialog.button_selected_bg);
 
-    let buttons = Line::from(vec![
-        Span::styled(" OK ", selected_style),
-    ]);
+    let buttons = Line::from(vec![Span::styled(" OK ", selected_style)]);
     let button_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1);
     frame.render_widget(
         Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
@@ -1240,7 +1350,11 @@ fn draw_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
 fn draw_tar_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme) {
     let block = Block::default()
         .title(" Tar Error ")
-        .title_style(Style::default().fg(theme.confirm_dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.confirm_dialog.border))
         .style(Style::default().bg(theme.confirm_dialog.bg));
@@ -1289,9 +1403,7 @@ fn draw_tar_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: 
             .fg(theme.confirm_dialog.button_selected_text)
             .bg(theme.confirm_dialog.button_selected_bg);
 
-        let buttons = Line::from(vec![
-            Span::styled(" OK ", selected_style),
-        ]);
+        let buttons = Line::from(vec![Span::styled(" OK ", selected_style)]);
         let button_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, message_width, 1);
         frame.render_widget(
             Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
@@ -1313,7 +1425,11 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -1332,7 +1448,9 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
     let max_input_width = (inner.width - 4) as usize;
     let input_chars: Vec<char> = dialog.input.chars().collect();
     let display_input = if input_chars.len() > max_input_width {
-        let skip = input_chars.len().saturating_sub(max_input_width.saturating_sub(3));
+        let skip = input_chars
+            .len()
+            .saturating_sub(max_input_width.saturating_sub(3));
         let suffix: String = input_chars[skip..].iter().collect();
         format!("...{}", suffix)
     } else {
@@ -1342,13 +1460,21 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
     let input_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.dialog.input_prompt)),
         Span::styled(display_input, Style::default().fg(theme.dialog.input_text)),
-        Span::styled("_", Style::default().fg(theme.dialog.input_cursor_bg).add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled(
+            "_",
+            Style::default()
+                .fg(theme.dialog.input_cursor_bg)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
     ]);
     let input_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(input_line), input_area);
 
     // Help
-    let help = Span::styled("[Enter] Confirm  [Esc] Cancel", Style::default().fg(theme.dialog.help_label_text));
+    let help = Span::styled(
+        "[Enter] Confirm  [Esc] Cancel",
+        Style::default().fg(theme.dialog.help_label_text),
+    );
     let help_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
 }
@@ -1359,7 +1485,11 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -1368,10 +1498,10 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
     frame.render_widget(block, area);
 
     // 레이아웃 Y 좌표 계산 (상대적 위치)
-    let input_y = inner.y + 1;    // 상단 여백 1줄
-    let list_y = input_y + 1;     // 입력창 바로 아래
-    let help_y = inner.y + inner.height - 1;  // 하단
-    let list_height = help_y.saturating_sub(list_y).saturating_sub(1);  // 목록과 도움말 사이 여백
+    let input_y = inner.y + 1; // 상단 여백 1줄
+    let list_y = input_y + 1; // 입력창 바로 아래
+    let help_y = inner.y + inner.height - 1; // 하단
+    let list_height = help_y.saturating_sub(list_y).saturating_sub(1); // 목록과 도움말 사이 여백
 
     // 입력에서 완성할 이름(prefix)의 시작 위치 계산 (char 인덱스)
     let input_chars: Vec<char> = dialog.input.chars().collect();
@@ -1379,7 +1509,9 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
         input_chars.len()
     } else {
         // 마지막 경로 구분자 위치 찾기
-        find_separator_rposition(&input_chars).map(|i| i + 1).unwrap_or(0)
+        find_separator_rposition(&input_chars)
+            .map(|i| i + 1)
+            .unwrap_or(0)
     };
 
     // 현재 입력된 prefix 추출
@@ -1395,7 +1527,10 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
             if let Some(selected) = completion.suggestions.get(completion.selected_index) {
                 let selected_name = selected.trim_end_matches(['/', '\\']);
                 // 대소문자 무시하여 prefix 매칭 후 나머지 부분 추출
-                if selected_name.to_lowercase().starts_with(&current_prefix.to_lowercase()) {
+                if selected_name
+                    .to_lowercase()
+                    .starts_with(&current_prefix.to_lowercase())
+                {
                     let prefix_char_count = current_prefix.chars().count();
                     let suffix: String = selected_name.chars().skip(prefix_char_count).collect();
                     if ends_with_separator(selected) {
@@ -1423,32 +1558,42 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
     let total_len = input_chars.len() + preview_chars.len();
     let cursor_pos = dialog.cursor_pos.min(input_chars.len());
 
-    let (display_chars, display_preview, display_prefix_start, display_cursor_pos) = if total_len > max_input_width {
-        // 앞부분을 ...로 생략하고 뒷부분(미리보기 포함) 표시
-        let available = max_input_width.saturating_sub(3); // "..." 제외한 공간
+    let (display_chars, display_preview, display_prefix_start, display_cursor_pos) =
+        if total_len > max_input_width {
+            // 앞부분을 ...로 생략하고 뒷부분(미리보기 포함) 표시
+            let available = max_input_width.saturating_sub(3); // "..." 제외한 공간
 
-        if preview_chars.len() >= available {
-            // 미리보기만으로도 공간 초과 - 미리보기만 잘라서 표시
-            let preview_display: String = preview_chars[..available].iter().collect();
-            (vec!['.', '.', '.'], preview_display, 3usize, 3usize)
-        } else {
-            // 입력 일부 + 미리보기 전체 표시
-            let input_available = available - preview_chars.len();
-            let skip = input_chars.len().saturating_sub(input_available);
-            let input_display: Vec<char> = input_chars[skip..].to_vec();
-            let prefix_pos = if prefix_char_start >= skip {
-                3 + (prefix_char_start - skip)
+            if preview_chars.len() >= available {
+                // 미리보기만으로도 공간 초과 - 미리보기만 잘라서 표시
+                let preview_display: String = preview_chars[..available].iter().collect();
+                (vec!['.', '.', '.'], preview_display, 3usize, 3usize)
             } else {
-                3
-            };
-            let adj_cursor = if cursor_pos >= skip { 3 + cursor_pos - skip } else { 3 };
-            let mut display = vec!['.', '.', '.'];
-            display.extend(input_display);
-            (display, preview_suffix.clone(), prefix_pos, adj_cursor)
-        }
-    } else {
-        (input_chars.clone(), preview_suffix.clone(), prefix_char_start, cursor_pos)
-    };
+                // 입력 일부 + 미리보기 전체 표시
+                let input_available = available - preview_chars.len();
+                let skip = input_chars.len().saturating_sub(input_available);
+                let input_display: Vec<char> = input_chars[skip..].to_vec();
+                let prefix_pos = if prefix_char_start >= skip {
+                    3 + (prefix_char_start - skip)
+                } else {
+                    3
+                };
+                let adj_cursor = if cursor_pos >= skip {
+                    3 + cursor_pos - skip
+                } else {
+                    3
+                };
+                let mut display = vec!['.', '.', '.'];
+                display.extend(input_display);
+                (display, preview_suffix.clone(), prefix_pos, adj_cursor)
+            }
+        } else {
+            (
+                input_chars.clone(),
+                preview_suffix.clone(),
+                prefix_char_start,
+                cursor_pos,
+            )
+        };
 
     // 커서 위치에 따라 텍스트 분할
     let before_cursor: String = display_chars[..display_cursor_pos].iter().collect();
@@ -1468,11 +1613,12 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
         String::new()
     };
     // 미리보기 텍스트 (커서가 끝에 있으면 첫 글자 제외)
-    let display_preview_after = if display_cursor_pos >= display_chars.len() && !display_preview.is_empty() {
-        display_preview.chars().skip(1).collect()
-    } else {
-        display_preview.clone()
-    };
+    let display_preview_after =
+        if display_cursor_pos >= display_chars.len() && !display_preview.is_empty() {
+            display_preview.chars().skip(1).collect()
+        } else {
+            display_preview.clone()
+        };
 
     let cursor_style = Style::default()
         .fg(theme.dialog.input_cursor_fg)
@@ -1505,7 +1651,10 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
             Span::styled(before_cursor, Style::default().fg(theme.dialog.input_text)),
             Span::styled(cursor_char, cursor_style),
             Span::styled(after_cursor, Style::default().fg(theme.dialog.input_text)),
-            Span::styled(&display_preview_after, Style::default().fg(theme.dialog.preview_suffix_text)),  // 흐리게 미리보기
+            Span::styled(
+                &display_preview_after,
+                Style::default().fg(theme.dialog.preview_suffix_text),
+            ), // 흐리게 미리보기
         ])
     };
     let input_area = Rect::new(inner.x + 1, input_y, inner.width - 2, 1);
@@ -1515,7 +1664,9 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
     let is_path_mode = is_path_input(&dialog.input);
 
     // Help (맨 아래에 표시)
-    let help_key_style = Style::default().fg(theme.dialog.help_key_text).add_modifier(Modifier::BOLD);
+    let help_key_style = Style::default()
+        .fg(theme.dialog.help_key_text)
+        .add_modifier(Modifier::BOLD);
     let help_label_style = Style::default().fg(theme.dialog.help_label_text);
 
     if is_path_mode {
@@ -1589,11 +1740,14 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
 
         let mut local_bookmarks: Vec<String> = Vec::new();
         let mut remote_group_order: Vec<(String, String, u16)> = Vec::new();
-        let mut remote_groups: std::collections::HashMap<(String, String, u16), Vec<String>> = std::collections::HashMap::new();
+        let mut remote_groups: std::collections::HashMap<(String, String, u16), Vec<String>> =
+            std::collections::HashMap::new();
 
         for bm in &app.settings.bookmarked_path {
             if filter_lower.is_empty() || fuzzy_match(&bm.to_lowercase(), &filter_lower) {
-                if let Some((user, host, port, _path)) = crate::services::remote::parse_remote_path(bm) {
+                if let Some((user, host, port, _path)) =
+                    crate::services::remote::parse_remote_path(bm)
+                {
                     let key = (user, host, port);
                     if !remote_groups.contains_key(&key) {
                         remote_group_order.push(key.clone());
@@ -1606,7 +1760,8 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
         }
 
         for profile in &app.settings.remote_profiles {
-            let display = crate::services::remote::format_remote_display(&profile, &profile.default_path);
+            let display =
+                crate::services::remote::format_remote_display(&profile, &profile.default_path);
             if filter_lower.is_empty() || fuzzy_match(&display.to_lowercase(), &filter_lower) {
                 let key = (profile.user.clone(), profile.host.clone(), profile.port);
                 if !remote_groups.contains_key(&key) {
@@ -1638,13 +1793,15 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
         let has_bookmarks = !filtered_bookmarks.is_empty();
 
         // 목록 영역 (입력 프롬프트 "> "에 맞춤)
-        let list_x = inner.x + 1 + 2;  // 패딩 + "> " 프롬프트
+        let list_x = inner.x + 1 + 2; // 패딩 + "> " 프롬프트
         let list_width = inner.width.saturating_sub(4);
 
         if has_bookmarks {
             // 선택 인덱스를 필터링된 목록 크기에 맞게 조정
             let bookmark_count = filtered_bookmarks.len();
-            let selected_idx = dialog.completion.as_ref()
+            let selected_idx = dialog
+                .completion
+                .as_ref()
                 .map(|c| c.selected_index.min(bookmark_count.saturating_sub(1)))
                 .unwrap_or(0);
             draw_bookmark_list(
@@ -1705,7 +1862,11 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
 
     let block = Block::default()
         .title(title)
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -1720,12 +1881,20 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
         let spinner_idx = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() / 100) as usize % spinner_chars.len();
+            .as_millis()
+            / 100) as usize
+            % spinner_chars.len();
         let spinner = spinner_chars[spinner_idx];
 
         let preparing_line = Line::from(vec![
-            Span::styled(format!("{} ", spinner), Style::default().fg(theme.dialog.progress_bar_fill)),
-            Span::styled(&progress.preparing_message, Style::default().fg(theme.dialog.progress_value_text)),
+            Span::styled(
+                format!("{} ", spinner),
+                Style::default().fg(theme.dialog.progress_bar_fill),
+            ),
+            Span::styled(
+                &progress.preparing_message,
+                Style::default().fg(theme.dialog.progress_value_text),
+            ),
         ]);
         let preparing_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
         frame.render_widget(Paragraph::new(preparing_line), preparing_area);
@@ -1736,14 +1905,23 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     // Current file name (truncated if needed)
     let max_filename_len = (inner.width - 8) as usize;
     let current_file = if progress.current_file.len() > max_filename_len {
-        format!("...{}", safe_suffix(&progress.current_file, max_filename_len.saturating_sub(3)))
+        format!(
+            "...{}",
+            safe_suffix(&progress.current_file, max_filename_len.saturating_sub(3))
+        )
     } else {
         progress.current_file.clone()
     };
 
     let file_line = Line::from(vec![
-        Span::styled("File: ", Style::default().fg(theme.dialog.progress_label_text)),
-        Span::styled(current_file, Style::default().fg(theme.dialog.progress_value_text)),
+        Span::styled(
+            "File: ",
+            Style::default().fg(theme.dialog.progress_label_text),
+        ),
+        Span::styled(
+            current_file,
+            Style::default().fg(theme.dialog.progress_value_text),
+        ),
     ]);
     let file_area = Rect::new(inner.x + 1, inner.y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(file_line), file_area);
@@ -1757,18 +1935,31 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     let file_bar_empty = "░".repeat(file_empty);
 
     let file_bar_line = Line::from(vec![
-        Span::styled(file_bar_fill, Style::default().fg(theme.dialog.progress_bar_fill)),
-        Span::styled(file_bar_empty, Style::default().fg(theme.dialog.progress_bar_empty)),
-        Span::styled(format!(" {:3}%", file_progress_percent), Style::default().fg(theme.dialog.progress_percent_text)),
+        Span::styled(
+            file_bar_fill,
+            Style::default().fg(theme.dialog.progress_bar_fill),
+        ),
+        Span::styled(
+            file_bar_empty,
+            Style::default().fg(theme.dialog.progress_bar_empty),
+        ),
+        Span::styled(
+            format!(" {:3}%", file_progress_percent),
+            Style::default().fg(theme.dialog.progress_percent_text),
+        ),
     ]);
     let file_bar_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(file_bar_line), file_bar_area);
 
     // Total progress info
     let total_info = if progress.operation_type == FileOperationType::Tar
-        || progress.operation_type == FileOperationType::Untar {
+        || progress.operation_type == FileOperationType::Untar
+    {
         if progress.total_files > 0 {
-            format!("{}/{} files", progress.completed_files, progress.total_files)
+            format!(
+                "{}/{} files",
+                progress.completed_files, progress.total_files
+            )
         } else {
             format!("{} files processed", progress.completed_files)
         }
@@ -1781,7 +1972,10 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
             format_size(progress.total_bytes),
         )
     };
-    let total_line = Line::from(Span::styled(total_info, Style::default().fg(theme.dialog.progress_label_text)));
+    let total_line = Line::from(Span::styled(
+        total_info,
+        Style::default().fg(theme.dialog.progress_label_text),
+    ));
     let total_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(total_line), total_area);
 
@@ -1797,9 +1991,18 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
         let total_bar_empty = "░".repeat(total_empty);
 
         let total_bar_line = Line::from(vec![
-            Span::styled(total_bar_fill, Style::default().fg(theme.dialog.progress_bar_fill)),
-            Span::styled(total_bar_empty, Style::default().fg(theme.dialog.progress_bar_empty)),
-            Span::styled(format!(" {:3}%", total_progress_percent), Style::default().fg(theme.dialog.progress_percent_text)),
+            Span::styled(
+                total_bar_fill,
+                Style::default().fg(theme.dialog.progress_bar_fill),
+            ),
+            Span::styled(
+                total_bar_empty,
+                Style::default().fg(theme.dialog.progress_bar_empty),
+            ),
+            Span::styled(
+                format!(" {:3}%", total_progress_percent),
+                Style::default().fg(theme.dialog.progress_percent_text),
+            ),
         ]);
         let total_bar_area = Rect::new(inner.x + 1, inner.y + 4, inner.width - 2, 1);
         frame.render_widget(Paragraph::new(total_bar_line), total_bar_area);
@@ -1817,7 +2020,11 @@ fn draw_duplicate_conflict_dialog(
 ) {
     let block = Block::default()
         .title(" File Exists ")
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -1826,7 +2033,9 @@ fn draw_duplicate_conflict_dialog(
     frame.render_widget(block, area);
 
     // Get current conflict info
-    let (_, _, display_name) = state.conflicts.get(state.current_index)
+    let (_, _, display_name) = state
+        .conflicts
+        .get(state.current_index)
         .cloned()
         .unwrap_or_else(|| (PathBuf::new(), PathBuf::new(), String::new()));
 
@@ -1840,13 +2049,17 @@ fn draw_duplicate_conflict_dialog(
     // Line 2: filename (quoted, truncated if needed)
     let max_name_len = (inner.width - 6) as usize;
     let truncated_name = if display_name.len() > max_name_len {
-        format!("\"{}...\"", safe_prefix(&display_name, max_name_len.saturating_sub(4)))
+        format!(
+            "\"{}...\"",
+            safe_prefix(&display_name, max_name_len.saturating_sub(4))
+        )
     } else {
         format!("\"{}\"", display_name)
     };
     let filename_area = Rect::new(inner.x + 2, inner.y + 2, inner.width - 4, 1);
     frame.render_widget(
-        Paragraph::new(truncated_name).style(Style::default().fg(theme.dialog.conflict_filename_text)),
+        Paragraph::new(truncated_name)
+            .style(Style::default().fg(theme.dialog.conflict_filename_text)),
         filename_area,
     );
 
@@ -1875,11 +2088,22 @@ fn draw_duplicate_conflict_dialog(
     // Style helpers
     let key_fg = theme.dialog.conflict_shortcut_text;
     let get_styles = |is_selected: bool| {
-        let bg = if is_selected { theme.dialog.button_selected_bg } else { theme.dialog.bg };
-        let fg = if is_selected { theme.dialog.button_selected_text } else { theme.dialog.button_text };
+        let bg = if is_selected {
+            theme.dialog.button_selected_bg
+        } else {
+            theme.dialog.bg
+        };
+        let fg = if is_selected {
+            theme.dialog.button_selected_text
+        } else {
+            theme.dialog.button_text
+        };
         (
             Style::default().fg(fg).bg(bg),
-            Style::default().fg(key_fg).bg(bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(key_fg)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
         )
     };
 
@@ -1890,7 +2114,10 @@ fn draw_duplicate_conflict_dialog(
         Span::styled("O", key_style),
         Span::styled("verwrite ", style),
     ]);
-    frame.render_widget(Paragraph::new(btn_overwrite), Rect::new(col1_x, button_y1, 11, 1));
+    frame.render_widget(
+        Paragraph::new(btn_overwrite),
+        Rect::new(col1_x, button_y1, 11, 1),
+    );
 
     let (style, key_style) = get_styles(selected == 1);
     let btn_skip = Line::from(vec![
@@ -1907,7 +2134,10 @@ fn draw_duplicate_conflict_dialog(
         Span::styled("A", key_style),
         Span::styled("ll ", style),
     ]);
-    frame.render_widget(Paragraph::new(btn_overwrite_all), Rect::new(col1_x, button_y2, 15, 1));
+    frame.render_widget(
+        Paragraph::new(btn_overwrite_all),
+        Rect::new(col1_x, button_y2, 15, 1),
+    );
 
     let (style, key_style) = get_styles(selected == 3);
     let btn_skip_all = Line::from(vec![
@@ -1915,7 +2145,10 @@ fn draw_duplicate_conflict_dialog(
         Span::styled("l", key_style),
         Span::styled("l ", style),
     ]);
-    frame.render_widget(Paragraph::new(btn_skip_all), Rect::new(col2_x, button_y2, 10, 1));
+    frame.render_widget(
+        Paragraph::new(btn_skip_all),
+        Rect::new(col2_x, button_y2, 10, 1),
+    );
 }
 
 /// Tar exclude confirmation dialog
@@ -1928,7 +2161,11 @@ fn draw_tar_exclude_confirm_dialog(
 ) {
     let block = Block::default()
         .title(" Exclude Unsafe Symlinks ")
-        .title_style(Style::default().fg(theme.dialog.tar_exclude_title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.tar_exclude_title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.tar_exclude_border))
         .style(Style::default().bg(theme.dialog.tar_exclude_bg));
@@ -1949,7 +2186,8 @@ fn draw_tar_exclude_confirm_dialog(
 
     // List of excluded paths (scrollable)
     let list_height = (inner.height - 5) as usize; // Reserve space for message and buttons
-    let visible_paths: Vec<&String> = state.excluded_paths
+    let visible_paths: Vec<&String> = state
+        .excluded_paths
         .iter()
         .skip(state.scroll_offset)
         .take(list_height)
@@ -1964,7 +2202,8 @@ fn draw_tar_exclude_confirm_dialog(
             format!("  {}", path)
         };
         frame.render_widget(
-            Paragraph::new(display_path).style(Style::default().fg(theme.dialog.tar_exclude_path_text)),
+            Paragraph::new(display_path)
+                .style(Style::default().fg(theme.dialog.tar_exclude_path_text)),
             Rect::new(inner.x + 2, y, inner.width - 4, 1),
         );
     }
@@ -1984,7 +2223,8 @@ fn draw_tar_exclude_confirm_dialog(
             1,
         );
         frame.render_widget(
-            Paragraph::new(scroll_info).style(Style::default().fg(theme.dialog.tar_exclude_scroll_info)),
+            Paragraph::new(scroll_info)
+                .style(Style::default().fg(theme.dialog.tar_exclude_scroll_info)),
             scroll_area,
         );
     }
@@ -2001,8 +2241,16 @@ fn draw_tar_exclude_confirm_dialog(
     let btn_proceed = " Proceed ";
     let btn_cancel = " Cancel ";
 
-    let proceed_style = if selected == 0 { selected_style } else { normal_style };
-    let cancel_style = if selected == 1 { selected_style } else { normal_style };
+    let proceed_style = if selected == 0 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let cancel_style = if selected == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
 
     let btn_width = btn_proceed.len() + btn_cancel.len() + 4;
     let btn_start = inner.x + (inner.width - btn_width as u16) / 2;
@@ -2013,7 +2261,12 @@ fn draw_tar_exclude_confirm_dialog(
     );
     frame.render_widget(
         Paragraph::new(btn_cancel).style(cancel_style),
-        Rect::new(btn_start + btn_proceed.len() as u16 + 4, button_y, btn_cancel.len() as u16, 1),
+        Rect::new(
+            btn_start + btn_proceed.len() as u16 + 4,
+            button_y,
+            btn_cancel.len() as u16,
+            1,
+        ),
     );
 }
 
@@ -2112,7 +2365,8 @@ fn draw_bookmark_list(
         let info_y = area.y;
         if info_x >= area.x {
             frame.render_widget(
-                Paragraph::new(scroll_info).style(Style::default().fg(theme.dialog.autocomplete_scroll_info)),
+                Paragraph::new(scroll_info)
+                    .style(Style::default().fg(theme.dialog.autocomplete_scroll_info)),
                 Rect::new(info_x, info_y, info_len, 1),
             );
         }
@@ -2191,7 +2445,10 @@ fn draw_completion_list(
         let info_x = area.x + area.width.saturating_sub(info_len + 1);
         let info_y = area.y;
         frame.render_widget(
-            Paragraph::new(Span::styled(scroll_info, Style::default().fg(theme.dialog.autocomplete_scroll_info))),
+            Paragraph::new(Span::styled(
+                scroll_info,
+                Style::default().fg(theme.dialog.autocomplete_scroll_info),
+            )),
             Rect::new(info_x, info_y, info_len + 1, 1),
         );
     }
@@ -2208,8 +2465,12 @@ pub fn handle_paste(app: &mut App, text: &str) {
     if let Some(ref mut dialog) = app.dialog {
         match dialog.dialog_type {
             // Dialog types with text input
-            DialogType::Search | DialogType::Mkdir | DialogType::Mkfile
-            | DialogType::Rename | DialogType::Tar | DialogType::BinaryFileHandler
+            DialogType::Search
+            | DialogType::Mkdir
+            | DialogType::Mkfile
+            | DialogType::Rename
+            | DialogType::Tar
+            | DialogType::BinaryFileHandler
             | DialogType::EncryptConfirm => {
                 // Delete selection if exists
                 if let Some((sel_start, sel_end)) = dialog.selection.take() {
@@ -2309,102 +2570,94 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                     _ => {}
                 }
             }
-            DialogType::DecryptConfirm => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+            DialogType::DecryptConfirm => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.dialog = None;
+                    app.execute_decrypt();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.dialog = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    dialog.selected_button = 1 - dialog.selected_button;
+                }
+                KeyCode::Enter => {
+                    if dialog.selected_button == 0 {
                         app.dialog = None;
                         app.execute_decrypt();
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    } else {
                         app.dialog = None;
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        dialog.selected_button = 1 - dialog.selected_button;
-                    }
-                    KeyCode::Enter => {
-                        if dialog.selected_button == 0 {
-                            app.dialog = None;
-                            app.execute_decrypt();
-                        } else {
-                            app.dialog = None;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            DialogType::DedupConfirm => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                _ => {}
+            },
+            DialogType::DedupConfirm => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.dialog = None;
+                    app.execute_dedup();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.dialog = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    dialog.selected_button = 1 - dialog.selected_button;
+                }
+                KeyCode::Enter => {
+                    if dialog.selected_button == 0 {
                         app.dialog = None;
                         app.execute_dedup();
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    } else {
                         app.dialog = None;
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        dialog.selected_button = 1 - dialog.selected_button;
-                    }
-                    KeyCode::Enter => {
-                        if dialog.selected_button == 0 {
-                            app.dialog = None;
-                            app.execute_dedup();
-                        } else {
-                            app.dialog = None;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            DialogType::LargeImageConfirm | DialogType::TrueColorWarning => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                _ => {}
+            },
+            DialogType::LargeImageConfirm | DialogType::TrueColorWarning => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.dialog = None;
+                    app.execute_open_large_image();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.dialog = None;
+                    app.pending_large_image = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    dialog.selected_button = 1 - dialog.selected_button;
+                }
+                KeyCode::Enter => {
+                    if dialog.selected_button == 0 {
                         app.dialog = None;
                         app.execute_open_large_image();
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    } else {
                         app.dialog = None;
                         app.pending_large_image = None;
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        dialog.selected_button = 1 - dialog.selected_button;
-                    }
-                    KeyCode::Enter => {
-                        if dialog.selected_button == 0 {
-                            app.dialog = None;
-                            app.execute_open_large_image();
-                        } else {
-                            app.dialog = None;
-                            app.pending_large_image = None;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            DialogType::LargeFileConfirm => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                _ => {}
+            },
+            DialogType::LargeFileConfirm => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    app.dialog = None;
+                    app.execute_open_large_file();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.dialog = None;
+                    app.pending_large_file = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    dialog.selected_button = 1 - dialog.selected_button;
+                }
+                KeyCode::Enter => {
+                    if dialog.selected_button == 0 {
                         app.dialog = None;
                         app.execute_open_large_file();
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    } else {
                         app.dialog = None;
                         app.pending_large_file = None;
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        dialog.selected_button = 1 - dialog.selected_button;
-                    }
-                    KeyCode::Enter => {
-                        if dialog.selected_button == 0 {
-                            app.dialog = None;
-                            app.execute_open_large_file();
-                        } else {
-                            app.dialog = None;
-                            app.pending_large_file = None;
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                _ => {}
+            },
             DialogType::Goto => {
                 return handle_goto_dialog_input(app, code, modifiers);
             }
@@ -2434,12 +2687,14 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                     tar_error_max_scroll_for_area(&dialog.message, current_terminal_area());
                 match code {
                     KeyCode::Up => {
-                        dialog.cursor_pos =
-                            dialog.cursor_pos.min(max_scroll).saturating_sub(1);
+                        dialog.cursor_pos = dialog.cursor_pos.min(max_scroll).saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        dialog.cursor_pos =
-                            dialog.cursor_pos.min(max_scroll).saturating_add(1).min(max_scroll);
+                        dialog.cursor_pos = dialog
+                            .cursor_pos
+                            .min(max_scroll)
+                            .saturating_add(1)
+                            .min(max_scroll);
                     }
                     KeyCode::Home => {
                         dialog.cursor_pos = 0;
@@ -2677,7 +2932,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     // 새 문자 처리
                     if c == '~' {
                         if let Some(home) = dirs::home_dir() {
-                            dialog.input = format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
+                            dialog.input =
+                                format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
                             dialog.cursor_pos = dialog.input.chars().count();
                             update_path_suggestions(dialog);
                         }
@@ -2844,8 +3100,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     if path.is_file() {
                         // 파일인 경우 - 부모 디렉토리로 이동하고 파일에 커서 위치
                         if let Some(parent) = path.parent() {
-                            let filename = path.file_name()
-                                .map(|n| n.to_string_lossy().to_string());
+                            let filename =
+                                path.file_name().map(|n| n.to_string_lossy().to_string());
                             app.dialog = None;
                             app.goto_directory_with_focus(parent, filename);
                             app.show_message(&format!("Moved to file: {}", path.display()));
@@ -2894,7 +3150,9 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     let prefix_start = if ends_with_separator(&dialog.input) {
                         input_chars.len()
                     } else {
-                        find_separator_rposition(&input_chars).map(|i| i + 1).unwrap_or(0)
+                        find_separator_rposition(&input_chars)
+                            .map(|i| i + 1)
+                            .unwrap_or(0)
                     };
                     if dialog.cursor_pos > prefix_start {
                         dialog.cursor_pos -= 1;
@@ -2911,7 +3169,9 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     let prefix_start = if ends_with_separator(&dialog.input) {
                         input_chars.len()
                     } else {
-                        find_separator_rposition(&input_chars).map(|i| i + 1).unwrap_or(0)
+                        find_separator_rposition(&input_chars)
+                            .map(|i| i + 1)
+                            .unwrap_or(0)
                     };
                     dialog.cursor_pos = prefix_start;
                 }
@@ -2922,7 +3182,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     if c == '~' {
                         // '~' 입력 시 홈 폴더 경로로 설정
                         if let Some(home) = dirs::home_dir() {
-                            dialog.input = format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
+                            dialog.input =
+                                format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
                             dialog.cursor_pos = dialog.input.chars().count();
                             update_path_suggestions(dialog);
                         }
@@ -2961,16 +3222,24 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
 
             let mut local_bookmarks: Vec<String> = Vec::new();
             let mut remote_group_order: Vec<(String, String, u16)> = Vec::new();
-            let mut remote_groups: std::collections::HashMap<(String, String, u16), Vec<(String, Option<usize>)>> = std::collections::HashMap::new();
+            let mut remote_groups: std::collections::HashMap<
+                (String, String, u16),
+                Vec<(String, Option<usize>)>,
+            > = std::collections::HashMap::new();
 
             for bm in &app.settings.bookmarked_path {
                 if filter_lower.is_empty() || fuzzy_match(&bm.to_lowercase(), &filter_lower) {
-                    if let Some((user, host, port, _path)) = crate::services::remote::parse_remote_path(bm) {
+                    if let Some((user, host, port, _path)) =
+                        crate::services::remote::parse_remote_path(bm)
+                    {
                         let key = (user, host, port);
                         if !remote_groups.contains_key(&key) {
                             remote_group_order.push(key.clone());
                         }
-                        remote_groups.entry(key).or_default().push((bm.clone(), None));
+                        remote_groups
+                            .entry(key)
+                            .or_default()
+                            .push((bm.clone(), None));
                     } else {
                         local_bookmarks.push(bm.clone());
                     }
@@ -2978,7 +3247,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
             }
 
             for (idx, profile) in app.settings.remote_profiles.iter().enumerate() {
-                let display = crate::services::remote::format_remote_display(&profile, &profile.default_path);
+                let display =
+                    crate::services::remote::format_remote_display(&profile, &profile.default_path);
                 if filter_lower.is_empty() || fuzzy_match(&display.to_lowercase(), &filter_lower) {
                     let key = (profile.user.clone(), profile.host.clone(), profile.port);
                     if !remote_groups.contains_key(&key) {
@@ -3010,7 +3280,9 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
             let has_bookmarks = bookmark_count > 0;
 
             // 선택 인덱스를 필터링된 목록 크기에 맞게 조정
-            let selected_idx = dialog.completion.as_ref()
+            let selected_idx = dialog
+                .completion
+                .as_ref()
                 .map(|c| c.selected_index.min(bookmark_count.saturating_sub(1)))
                 .unwrap_or(0);
 
@@ -3020,21 +3292,30 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                         let remote_idx = remote_profile_map.get(selected_idx).copied().flatten();
                         if let Some(profile_idx) = remote_idx {
                             // Selected a remote profile - connect
-                            if let Some(profile) = app.settings.remote_profiles.get(profile_idx).cloned() {
+                            if let Some(profile) =
+                                app.settings.remote_profiles.get(profile_idx).cloned()
+                            {
                                 let path = profile.default_path.clone();
                                 app.dialog = None;
                                 app.connect_remote_panel(&profile, &path);
                                 return false;
                             }
                         } else if let Some(entry) = mixed_entries.get(selected_idx) {
-                            if let Some((user, host, port, path)) = crate::services::remote::parse_remote_path(entry) {
+                            if let Some((user, host, port, path)) =
+                                crate::services::remote::parse_remote_path(entry)
+                            {
                                 // Selected a remote bookmark — check if same server is already connected
-                                let same_server = app.active_panel().remote_ctx.as_ref().map_or(false, |ctx| {
-                                    ctx.profile.user == user && ctx.profile.host == host && ctx.profile.port == port
-                                });
+                                let same_server =
+                                    app.active_panel().remote_ctx.as_ref().map_or(false, |ctx| {
+                                        ctx.profile.user == user
+                                            && ctx.profile.host == host
+                                            && ctx.profile.port == port
+                                    });
                                 if same_server {
                                     // Already connected to same server — validate path (async with spinner)
-                                    if app.remote_spinner.is_some() { return false; }
+                                    if app.remote_spinner.is_some() {
+                                        return false;
+                                    }
                                     let panel_idx = app.active_panel_index;
                                     let mut ctx = match app.panels[panel_idx].remote_ctx.take() {
                                         Some(ctx) => ctx,
@@ -3081,7 +3362,10 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                     return false;
                                 } else {
                                     app.dialog = None;
-                                    app.show_extension_handler_error(&format!("Path not found: {}", entry));
+                                    app.show_extension_handler_error(&format!(
+                                        "Path not found: {}",
+                                        entry
+                                    ));
                                 }
                             }
                         }
@@ -3111,7 +3395,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                 KeyCode::Down => {
                     if has_bookmarks {
                         if let Some(ref mut completion) = dialog.completion {
-                            completion.selected_index = (completion.selected_index + 1) % bookmark_count;
+                            completion.selected_index =
+                                (completion.selected_index + 1) % bookmark_count;
                         }
                     }
                 }
@@ -3164,24 +3449,36 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                         GotoAction::BookmarkDelete => {
                             // Delete selected bookmark or profile
                             if has_bookmarks {
-                                if let Some(Some(profile_idx)) = remote_profile_map.get(selected_idx) {
+                                if let Some(Some(profile_idx)) =
+                                    remote_profile_map.get(selected_idx)
+                                {
                                     let profile_idx = *profile_idx;
-                                    if let Some(profile) = app.settings.remote_profiles.get(profile_idx) {
+                                    if let Some(profile) =
+                                        app.settings.remote_profiles.get(profile_idx)
+                                    {
                                         let user = profile.user.clone();
                                         let host = profile.host.clone();
                                         let port = profile.port;
 
-                                        let related_bookmark_pos = app.settings.bookmarked_path.iter().position(|bm| {
-                                            if let Some((bu, bh, bp, _)) = crate::services::remote::parse_remote_path(bm) {
-                                                bu == user && bh == host && bp == port
-                                            } else {
-                                                false
-                                            }
-                                        });
+                                        let related_bookmark_pos =
+                                            app.settings.bookmarked_path.iter().position(|bm| {
+                                                if let Some((bu, bh, bp, _)) =
+                                                    crate::services::remote::parse_remote_path(bm)
+                                                {
+                                                    bu == user && bh == host && bp == port
+                                                } else {
+                                                    false
+                                                }
+                                            });
 
                                         if let Some(pos) = related_bookmark_pos {
-                                            if let Some((_, _, _, path)) = crate::services::remote::parse_remote_path(&app.settings.bookmarked_path[pos]) {
-                                                app.settings.remote_profiles[profile_idx].default_path = path;
+                                            if let Some((_, _, _, path)) =
+                                                crate::services::remote::parse_remote_path(
+                                                    &app.settings.bookmarked_path[pos],
+                                                )
+                                            {
+                                                app.settings.remote_profiles[profile_idx]
+                                                    .default_path = path;
                                             }
                                             app.settings.bookmarked_path.remove(pos);
                                         } else {
@@ -3191,13 +3488,25 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                     }
                                 } else if let Some(entry) = mixed_entries.get(selected_idx) {
                                     let entry = entry.clone();
-                                    if let Some(pos) = app.settings.bookmarked_path.iter().position(|p| *p == entry) {
+                                    if let Some(pos) = app
+                                        .settings
+                                        .bookmarked_path
+                                        .iter()
+                                        .position(|p| *p == entry)
+                                    {
                                         app.settings.bookmarked_path.remove(pos);
                                         // 원격 북마크인 경우, 동일 경로를 가진 프로필의 default_path도 정리
-                                        if let Some((user, host, port, path)) = crate::services::remote::parse_remote_path(&entry) {
-                                            if let Some(pidx) = app.settings.remote_profiles.iter().position(|p| {
-                                                p.user == user && p.host == host && p.port == port && p.default_path == path
-                                            }) {
+                                        if let Some((user, host, port, path)) =
+                                            crate::services::remote::parse_remote_path(&entry)
+                                        {
+                                            if let Some(pidx) =
+                                                app.settings.remote_profiles.iter().position(|p| {
+                                                    p.user == user
+                                                        && p.host == host
+                                                        && p.port == port
+                                                        && p.default_path == path
+                                                })
+                                            {
                                                 // 같은 서버의 다른 북마크가 있으면 그 경로로 교체
                                                 let other_path = app.settings.bookmarked_path.iter().find_map(|bm| {
                                                     if let Some((bu, bh, bp, bp_path)) = crate::services::remote::parse_remote_path(bm) {
@@ -3208,7 +3517,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                                     None
                                                 });
                                                 if let Some(other_path) = other_path {
-                                                    app.settings.remote_profiles[pidx].default_path = other_path;
+                                                    app.settings.remote_profiles[pidx]
+                                                        .default_path = other_path;
                                                 } else {
                                                     app.settings.remote_profiles.remove(pidx);
                                                 }
@@ -3227,10 +3537,20 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                         GotoAction::BookmarkEdit => {
                             // Edit selected remote entry in RemoteConnect dialog
                             if has_bookmarks {
-                                if let Some(Some(profile_idx)) = remote_profile_map.get(selected_idx) {
-                                    if let Some(profile) = app.settings.remote_profiles.get(*profile_idx).cloned() {
-                                        let state = RemoteConnectState::from_profile(&profile, *profile_idx);
-                                        let msg = format!("Edit: {}@{}:{}", profile.user, profile.host, profile.port);
+                                if let Some(Some(profile_idx)) =
+                                    remote_profile_map.get(selected_idx)
+                                {
+                                    if let Some(profile) =
+                                        app.settings.remote_profiles.get(*profile_idx).cloned()
+                                    {
+                                        let state = RemoteConnectState::from_profile(
+                                            &profile,
+                                            *profile_idx,
+                                        );
+                                        let msg = format!(
+                                            "Edit: {}@{}:{}",
+                                            profile.user, profile.host, profile.port
+                                        );
                                         app.remote_connect_state = Some(state);
                                         app.dialog = Some(Dialog {
                                             dialog_type: DialogType::RemoteConnect,
@@ -3244,13 +3564,25 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                         });
                                     }
                                 } else if let Some(entry) = mixed_entries.get(selected_idx) {
-                                    if let Some((user, host, port, _path)) = crate::services::remote::parse_remote_path(entry) {
-                                        if let Some((idx, profile)) = app.settings.remote_profiles.iter().enumerate()
-                                            .find(|(_, p)| p.user == user && p.host == host && p.port == port)
+                                    if let Some((user, host, port, _path)) =
+                                        crate::services::remote::parse_remote_path(entry)
+                                    {
+                                        if let Some((idx, profile)) = app
+                                            .settings
+                                            .remote_profiles
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(_, p)| {
+                                                p.user == user && p.host == host && p.port == port
+                                            })
                                         {
                                             let profile = profile.clone();
-                                            let state = RemoteConnectState::from_profile(&profile, idx);
-                                            let msg = format!("Edit: {}@{}:{}", profile.user, profile.host, profile.port);
+                                            let state =
+                                                RemoteConnectState::from_profile(&profile, idx);
+                                            let msg = format!(
+                                                "Edit: {}@{}:{}",
+                                                profile.user, profile.host, profile.port
+                                            );
                                             app.remote_connect_state = Some(state);
                                             app.dialog = Some(Dialog {
                                                 dialog_type: DialogType::RemoteConnect,
@@ -3275,7 +3607,8 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                     if dialog.input.is_empty() && (c == '/' || c == '~') {
                         if c == '~' {
                             if let Some(home) = dirs::home_dir() {
-                                dialog.input = format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
+                                dialog.input =
+                                    format!("{}{}", home.display(), std::path::MAIN_SEPARATOR);
                                 dialog.cursor_pos = dialog.input.chars().count();
                                 update_path_suggestions(dialog);
                             }
@@ -3672,7 +4005,8 @@ fn handle_binary_file_handler_input(app: &mut App, code: KeyCode) -> bool {
                         // In set mode with empty input, just close without action
                     } else {
                         // Non-empty input - set handler (replaces any existing)
-                        app.settings.extension_handler
+                        app.settings
+                            .extension_handler
                             .insert(ext_lower.clone(), vec![input.clone()]);
 
                         // Save settings
@@ -3740,7 +4074,11 @@ fn handle_binary_file_handler_input(app: &mut App, code: KeyCode) -> bool {
 fn draw_settings_dialog(frame: &mut Frame, state: &SettingsState, area: Rect, theme: &Theme) {
     let block = Block::default()
         .title(" Settings ")
-        .title_style(Style::default().fg(theme.settings.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.settings.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.settings.border))
         .style(Style::default().bg(theme.settings.bg));
@@ -3752,25 +4090,37 @@ fn draw_settings_dialog(frame: &mut Frame, state: &SettingsState, area: Rect, th
 
     // Theme setting (row 0)
     let theme_value = format!("< {} >", state.current_theme());
-    let theme_prompt = if state.selected_field == 0 { "> " } else { "  " };
+    let theme_prompt = if state.selected_field == 0 {
+        "> "
+    } else {
+        "  "
+    };
     lines.push(Line::from(vec![
         Span::styled(theme_prompt, Style::default().fg(theme.settings.prompt)),
         Span::styled("Theme: ", Style::default().fg(theme.settings.label_text)),
         Span::styled(
             theme_value,
-            Style::default().fg(theme.settings.value_text).bg(theme.settings.value_bg),
+            Style::default()
+                .fg(theme.settings.value_text)
+                .bg(theme.settings.value_bg),
         ),
     ]));
 
     // Diff compare method setting (row 1)
     let diff_value = format!("< {} >", state.current_diff_method());
-    let diff_prompt = if state.selected_field == 1 { "> " } else { "  " };
+    let diff_prompt = if state.selected_field == 1 {
+        "> "
+    } else {
+        "  "
+    };
     lines.push(Line::from(vec![
         Span::styled(diff_prompt, Style::default().fg(theme.settings.prompt)),
         Span::styled("Diff:  ", Style::default().fg(theme.settings.label_text)),
         Span::styled(
             diff_value,
-            Style::default().fg(theme.settings.value_text).bg(theme.settings.value_bg),
+            Style::default()
+                .fg(theme.settings.value_text)
+                .bg(theme.settings.value_bg),
         ),
     ]));
 
@@ -3802,7 +4152,11 @@ fn draw_git_log_diff_dialog(
 ) {
     let block = Block::default()
         .title(" Git Log Diff ")
-        .title_style(Style::default().fg(theme.dialog.git_log_diff_title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.git_log_diff_title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.git_log_diff_border))
         .style(Style::default().bg(theme.dialog.git_log_diff_bg));
@@ -3827,7 +4181,8 @@ fn draw_git_log_diff_dialog(
 
     // Commit list area
     let list_height = (inner.height - 3) as usize; // header + blank + buttons
-    let visible_entries: Vec<(usize, &crate::ui::git_screen::GitLogEntry)> = state.log_entries
+    let visible_entries: Vec<(usize, &crate::ui::git_screen::GitLogEntry)> = state
+        .log_entries
         .iter()
         .enumerate()
         .skip(state.scroll_offset)
@@ -3893,7 +4248,8 @@ fn draw_git_log_diff_dialog(
         let info_len = scroll_info.len() as u16;
         let info_x = inner.x + inner.width - info_len - 1;
         frame.render_widget(
-            Paragraph::new(scroll_info).style(Style::default().fg(theme.dialog.git_log_diff_scroll_info)),
+            Paragraph::new(scroll_info)
+                .style(Style::default().fg(theme.dialog.git_log_diff_scroll_info)),
             Rect::new(info_x, inner.y, info_len, 1),
         );
     }
@@ -3932,7 +4288,12 @@ fn draw_git_log_diff_dialog(
     );
     frame.render_widget(
         Paragraph::new(btn_cancel).style(cancel_style),
-        Rect::new(btn_start + btn_compare.len() as u16 + 4, button_y, btn_cancel.len() as u16, 1),
+        Rect::new(
+            btn_start + btn_compare.len() as u16 + 4,
+            button_y,
+            btn_cancel.len() as u16,
+            1,
+        ),
     );
 }
 
@@ -3975,7 +4336,8 @@ fn handle_git_log_diff_input(app: &mut App, code: KeyCode) -> bool {
         KeyCode::PageDown => {
             if let Some(ref mut state) = app.git_log_diff_state {
                 let page = state.visible_height.max(1);
-                state.selected_index = (state.selected_index + page).min(state.log_entries.len().saturating_sub(1));
+                state.selected_index =
+                    (state.selected_index + page).min(state.log_entries.len().saturating_sub(1));
                 let vh = state.visible_height.max(1);
                 if state.selected_index >= state.scroll_offset + vh {
                     state.scroll_offset = state.selected_index - vh + 1;
@@ -4020,7 +4382,9 @@ fn handle_git_log_diff_input(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Enter => {
             if selected_button == 0 {
                 // Compare
-                let has_two = app.git_log_diff_state.as_ref()
+                let has_two = app
+                    .git_log_diff_state
+                    .as_ref()
                     .map(|s| s.selected_commits.len() == 2)
                     .unwrap_or(false);
                 if has_two {
@@ -4055,7 +4419,11 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
     let block = Block::default()
         .title(" Remote Connect ")
-        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.dialog.border))
         .style(Style::default().bg(theme.dialog.bg));
@@ -4078,7 +4446,7 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
         .add_modifier(Modifier::SLOW_BLINK);
     let error_style = Style::default().fg(theme.state.error);
 
-    use super::app::{RemoteField, RemoteAuthType};
+    use super::app::{RemoteAuthType, RemoteField};
     let label_width = 10;
     let auth_display = match state.auth_type {
         RemoteAuthType::Password => "Password",
@@ -4089,9 +4457,14 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
     let value_max_width = (inner.width as usize).saturating_sub(2 + label_width + 2);
 
     // Helper closure to build value spans with cursor and horizontal scroll
-    let build_value_spans = |value: &str, is_selected: bool, cursor_pos: usize, vs: Style, is_masked: bool| -> Vec<Span<'_>> {
+    let build_value_spans = |value: &str,
+                             is_selected: bool,
+                             cursor_pos: usize,
+                             vs: Style,
+                             is_masked: bool|
+     -> Vec<Span<'_>> {
         let display_value = if is_masked {
-            "*".repeat(value.len())
+            "*".repeat(value.chars().count())
         } else {
             value.to_string()
         };
@@ -4160,11 +4533,28 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
     for (label, value, is_masked, field) in &fields {
         let is_selected = state.selected_field == *field;
-        let ls = if is_selected { selected_style } else { label_style };
-        let vs = if is_selected { selected_style } else { value_style };
+        let ls = if is_selected {
+            selected_style
+        } else {
+            label_style
+        };
+        let vs = if is_selected {
+            selected_style
+        } else {
+            value_style
+        };
 
-        let mut spans = vec![Span::styled(format!("{:>width$}: ", label, width = label_width), ls)];
-        spans.extend(build_value_spans(value, is_selected, state.cursor_pos, vs, *is_masked));
+        let mut spans = vec![Span::styled(
+            format!("{:>width$}: ", label, width = label_width),
+            ls,
+        )];
+        spans.extend(build_value_spans(
+            value,
+            is_selected,
+            state.cursor_pos,
+            vs,
+            *is_masked,
+        ));
 
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
@@ -4176,8 +4566,16 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
     // Auth type field - toggle only, no text cursor
     {
         let is_selected = state.selected_field == RemoteField::AuthType;
-        let ls = if is_selected { selected_style } else { label_style };
-        let vs = if is_selected { selected_style } else { value_style };
+        let ls = if is_selected {
+            selected_style
+        } else {
+            label_style
+        };
+        let vs = if is_selected {
+            selected_style
+        } else {
+            value_style
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("{:>width$}: ", "Auth", width = label_width), ls),
@@ -4192,10 +4590,27 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
     if state.auth_type == RemoteAuthType::Password {
         // Password
         let is_selected = state.selected_field == RemoteField::Credential;
-        let ls = if is_selected { selected_style } else { label_style };
-        let vs = if is_selected { selected_style } else { value_style };
-        let mut spans = vec![Span::styled(format!("{:>width$}: ", "Password", width = label_width), ls)];
-        spans.extend(build_value_spans(&state.password, is_selected, state.cursor_pos, vs, true));
+        let ls = if is_selected {
+            selected_style
+        } else {
+            label_style
+        };
+        let vs = if is_selected {
+            selected_style
+        } else {
+            value_style
+        };
+        let mut spans = vec![Span::styled(
+            format!("{:>width$}: ", "Password", width = label_width),
+            ls,
+        )];
+        spans.extend(build_value_spans(
+            &state.password,
+            is_selected,
+            state.cursor_pos,
+            vs,
+            true,
+        ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect::new(inner.x + 1, y, inner.width - 2, 1),
@@ -4203,10 +4618,27 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
     } else {
         // Key file
         let is_selected = state.selected_field == RemoteField::Credential;
-        let ls = if is_selected { selected_style } else { label_style };
-        let vs = if is_selected { selected_style } else { value_style };
-        let mut spans = vec![Span::styled(format!("{:>width$}: ", "Key File", width = label_width), ls)];
-        spans.extend(build_value_spans(&state.key_path, is_selected, state.cursor_pos, vs, false));
+        let ls = if is_selected {
+            selected_style
+        } else {
+            label_style
+        };
+        let vs = if is_selected {
+            selected_style
+        } else {
+            value_style
+        };
+        let mut spans = vec![Span::styled(
+            format!("{:>width$}: ", "Key File", width = label_width),
+            ls,
+        )];
+        spans.extend(build_value_spans(
+            &state.key_path,
+            is_selected,
+            state.cursor_pos,
+            vs,
+            false,
+        ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect::new(inner.x + 1, y, inner.width - 2, 1),
@@ -4215,11 +4647,32 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
         // Passphrase
         let is_selected = state.selected_field == RemoteField::Passphrase;
-        let ls = if is_selected { selected_style } else { label_style };
-        let vs = if is_selected { selected_style } else { value_style };
-        let display = if state.passphrase.is_empty() && !is_selected { "(none)".to_string() } else { state.passphrase.clone() };
-        let mut spans = vec![Span::styled(format!("{:>width$}: ", "Passphrase", width = label_width), ls)];
-        spans.extend(build_value_spans(&display, is_selected, state.cursor_pos, vs, !state.passphrase.is_empty() || is_selected));
+        let ls = if is_selected {
+            selected_style
+        } else {
+            label_style
+        };
+        let vs = if is_selected {
+            selected_style
+        } else {
+            value_style
+        };
+        let display = if state.passphrase.is_empty() && !is_selected {
+            "(none)".to_string()
+        } else {
+            state.passphrase.clone()
+        };
+        let mut spans = vec![Span::styled(
+            format!("{:>width$}: ", "Passphrase", width = label_width),
+            ls,
+        )];
+        spans.extend(build_value_spans(
+            &display,
+            is_selected,
+            state.cursor_pos,
+            vs,
+            !state.passphrase.is_empty() || is_selected,
+        ));
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect::new(inner.x + 1, y, inner.width - 2, 1),
@@ -4256,7 +4709,7 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
 /// Handle input for the remote connect dialog
 fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
-    use super::app::{RemoteField, RemoteAuthType};
+    use super::app::{RemoteAuthType, RemoteField};
 
     if app.remote_connect_state.is_none() {
         app.dialog = None;
@@ -4275,14 +4728,14 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
                     state.cursor_pos = 0;
                 } else {
                     state.selected_field = state.next_field();
-                    state.cursor_pos = state.active_field_value().len();
+                    state.cursor_pos = state.active_field_value().chars().count();
                 }
             }
         }
         KeyCode::Down => {
             if let Some(ref mut state) = app.remote_connect_state {
                 state.selected_field = state.next_field();
-                state.cursor_pos = state.active_field_value().len();
+                state.cursor_pos = state.active_field_value().chars().count();
             }
         }
         KeyCode::BackTab => {
@@ -4291,14 +4744,14 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
                 if state.is_auth_type_field() {
                     state.toggle_auth_type();
                 } else {
-                    state.cursor_pos = state.active_field_value().len();
+                    state.cursor_pos = state.active_field_value().chars().count();
                 }
             }
         }
         KeyCode::Up => {
             if let Some(ref mut state) = app.remote_connect_state {
                 state.selected_field = state.prev_field();
-                state.cursor_pos = state.active_field_value().len();
+                state.cursor_pos = state.active_field_value().chars().count();
             }
         }
         KeyCode::Enter => {
@@ -4363,7 +4816,7 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
                 if state.is_auth_type_field() {
                     return false;
                 }
-                let len = state.active_field_value().len();
+                let len = state.active_field_value().chars().count();
                 if state.cursor_pos < len {
                     let field = state.active_field_mut();
                     let mut chars: Vec<char> = field.chars().collect();
@@ -4381,7 +4834,7 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Right => {
             if let Some(ref mut state) = app.remote_connect_state {
-                let len = state.active_field_value().len();
+                let len = state.active_field_value().chars().count();
                 if state.cursor_pos < len {
                     state.cursor_pos += 1;
                 }
@@ -4394,7 +4847,7 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::End => {
             if let Some(ref mut state) = app.remote_connect_state {
-                state.cursor_pos = state.active_field_value().len();
+                state.cursor_pos = state.active_field_value().chars().count();
             }
         }
         _ => {}
@@ -4416,8 +4869,9 @@ fn handle_remote_profile_save_input(app: &mut App, code: KeyCode) -> bool {
                     }
                 }
                 // Check for duplicate
-                let existing = app.settings.remote_profiles.iter()
-                    .position(|p| p.host == profile.host && p.user == profile.user && p.port == profile.port);
+                let existing = app.settings.remote_profiles.iter().position(|p| {
+                    p.host == profile.host && p.user == profile.user && p.port == profile.port
+                });
                 if let Some(idx) = existing {
                     app.settings.remote_profiles[idx] = profile;
                 } else {
@@ -4705,7 +5159,9 @@ mod tests {
         let suggestions = get_path_suggestions(&temp_dir, "ap");
 
         assert_eq!(suggestions.len(), 2);
-        assert!(suggestions.iter().all(|s| s.to_lowercase().starts_with("ap")));
+        assert!(suggestions
+            .iter()
+            .all(|s| s.to_lowercase().starts_with("ap")));
 
         cleanup_temp_test_dir(&temp_dir);
     }
@@ -4763,10 +5219,7 @@ mod tests {
 
     #[test]
     fn test_common_prefix_same() {
-        let suggestions = vec![
-            "test".to_string(),
-            "test".to_string(),
-        ];
+        let suggestions = vec!["test".to_string(), "test".to_string()];
         let common = find_common_prefix(&suggestions);
         assert_eq!(common, "test");
     }
@@ -4780,20 +5233,14 @@ mod tests {
 
     #[test]
     fn test_common_prefix_no_common() {
-        let suggestions = vec![
-            "apple".to_string(),
-            "banana".to_string(),
-        ];
+        let suggestions = vec!["apple".to_string(), "banana".to_string()];
         let common = find_common_prefix(&suggestions);
         assert_eq!(common, "");
     }
 
     #[test]
     fn test_common_prefix_strips_trailing_slash() {
-        let suggestions = vec![
-            "dir/".to_string(),
-            "dir2/".to_string(),
-        ];
+        let suggestions = vec!["dir/".to_string(), "dir2/".to_string()];
         let common = find_common_prefix(&suggestions);
         assert_eq!(common, "dir");
     }
@@ -4891,7 +5338,9 @@ pub fn draw_remote_spinner(frame: &mut Frame, message: &str, area: Rect, theme: 
     let spinner_idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() / 100) as usize % spinner_chars.len();
+        .as_millis()
+        / 100) as usize
+        % spinner_chars.len();
     let spinner = spinner_chars[spinner_idx];
 
     let display = format!(" {} {} ", spinner, message);
@@ -4918,10 +5367,7 @@ pub fn draw_remote_spinner(frame: &mut Frame, message: &str, area: Rect, theme: 
             format!("{} ", spinner),
             Style::default().fg(theme.dialog.progress_bar_fill),
         ),
-        Span::styled(
-            message,
-            Style::default().fg(theme.dialog.text),
-        ),
+        Span::styled(message, Style::default().fg(theme.dialog.text)),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
 }

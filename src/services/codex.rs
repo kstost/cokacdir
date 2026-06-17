@@ -1,13 +1,13 @@
-use std::process::{Command, Stdio};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
-use serde_json::Value;
-use sha2::{Sha256, Digest};
 
-use crate::services::claude::{debug_log_to, StreamMessage, CancelToken, kill_child_tree};
+use crate::services::claude::{debug_log_to, kill_child_tree, CancelToken, StreamMessage};
 
 /// Context required to auto-deliver images that Codex's built-in `image_gen`
 /// tool drops into `~/.codex/generated_images/<session_id>/` without surfacing
@@ -51,10 +51,7 @@ fn resolve_codex_path() -> Option<String> {
         }
     }
 
-    if let Ok(output) = Command::new("bash")
-        .args(["-lc", "which codex"])
-        .output()
-    {
+    if let Ok(output) = Command::new("bash").args(["-lc", "which codex"]).output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() && codex_path_is_runnable(&path) {
@@ -124,14 +121,17 @@ pub fn is_codex_available() -> bool {
 
 /// Check if a model string refers to the Codex backend
 pub fn is_codex_model(model: Option<&str>) -> bool {
-    model.map(|m| m == "codex" || m.starts_with("codex:")).unwrap_or(false)
+    model
+        .map(|m| m == "codex" || m.starts_with("codex:"))
+        .unwrap_or(false)
 }
 
 /// Strip "codex:" prefix and return the actual model name.
 /// Returns None if the input is just "codex" (use CLI default).
 /// Also strips display-name suffix (" — Description") if present.
 pub fn strip_codex_prefix(model: &str) -> Option<&str> {
-    model.strip_prefix("codex:")
+    model
+        .strip_prefix("codex:")
         .filter(|s| !s.is_empty())
         .map(|s| s.split(" \u{2014} ").next().unwrap_or(s).trim())
 }
@@ -174,13 +174,15 @@ pub fn verify_completion_codex(
     // — if they differ between consecutive iterations the input is fresh.
     codex_debug_log(&format!(
         "[loop-verify input] sid={} transcript_len={} transcript_sha={}",
-        session_id, transcript.len(), short_sha(&transcript)));
+        session_id,
+        transcript.len(),
+        short_sha(&transcript)
+    ));
 
-    let codex_bin = get_codex_path()
-        .ok_or_else(|| {
-            codex_debug_log("  ERROR: Codex CLI not found");
-            "Codex CLI not found".to_string()
-        })?;
+    let codex_bin = get_codex_path().ok_or_else(|| {
+        codex_debug_log("  ERROR: Codex CLI not found");
+        "Codex CLI not found".to_string()
+    })?;
 
     // 2. Build verification prompt. Read-only sandbox + "no tools" directive
     //    is the best Codex offers in place of Claude's `--tools ""`.
@@ -226,7 +228,9 @@ pub fn verify_completion_codex(
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos()).unwrap_or(0)));
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     // Best-effort pre-clean; ignore failure.
     let _ = std::fs::remove_file(&out_path);
 
@@ -239,8 +243,10 @@ pub fn verify_completion_codex(
         "exec".to_string(),
         "--ephemeral".to_string(),
         "--skip-git-repo-check".to_string(),
-        "--sandbox".to_string(), "read-only".to_string(),
-        "--output-last-message".to_string(), out_path_str,
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+        "--output-last-message".to_string(),
+        out_path_str,
     ];
     if let Some(effort) = reasoning_effort {
         args.push("-c".to_string());
@@ -257,7 +263,10 @@ pub fn verify_completion_codex(
     let mut child = Command::new(codex_bin)
         .args(&args)
         .current_dir(working_dir)
-        .env("PATH", crate::services::claude::enhanced_path_for_bin(codex_bin))
+        .env(
+            "PATH",
+            crate::services::claude::enhanced_path_for_bin(codex_bin),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -266,7 +275,11 @@ pub fn verify_completion_codex(
             codex_debug_log(&format!("  ERROR: Failed to spawn: {}", e));
             format!("Failed to start Codex for verify_completion: {}", e)
         })?;
-    codex_debug_log(&format!("  spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    codex_debug_log(&format!(
+        "  spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(verify_prompt.as_bytes());
@@ -274,9 +287,14 @@ pub fn verify_completion_codex(
     }
 
     let wait_start = std::time::Instant::now();
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("Failed to read verify output: {}", e))?;
-    codex_debug_log(&format!("  completed in {:?}, exit={:?}", wait_start.elapsed(), output.status.code()));
+    codex_debug_log(&format!(
+        "  completed in {:?}, exit={:?}",
+        wait_start.elapsed(),
+        output.status.code()
+    ));
 
     // Read and clean up the last-message file regardless of exit status so we
     // don't leak tempfiles even on failure paths.
@@ -287,7 +305,9 @@ pub fn verify_completion_codex(
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(format!(
             "verify_completion_codex process failed (exit {:?}). stderr: {}",
-            output.status.code(), crate::services::claude::safe_preview(&stderr, 500)));
+            output.status.code(),
+            crate::services::claude::safe_preview(&stderr, 500)
+        ));
     }
 
     // 4. Extract the model's final response. --output-last-message gives us
@@ -299,11 +319,15 @@ pub fn verify_completion_codex(
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(format!(
                 "verify_completion_codex produced no last-message output. stderr: {}",
-                crate::services::claude::safe_preview(&stderr, 500)));
+                crate::services::claude::safe_preview(&stderr, 500)
+            ));
         }
     };
-    codex_debug_log(&format!("  last_message len={}, preview: {}",
-        response_text.len(), response_text.chars().take(300).collect::<String>()));
+    codex_debug_log(&format!(
+        "  last_message len={}, preview: {}",
+        response_text.len(),
+        response_text.chars().take(300).collect::<String>()
+    ));
 
     // Same decision rule as claude::verify_completion: treat as complete only
     // when `mission_complete` is present AND `mission_pending` is absent.
@@ -316,11 +340,20 @@ pub fn verify_completion_codex(
             .replace("mission_pending", "")
             .replace("mission_complete", "");
         let cleaned = cleaned.trim();
-        if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
     };
 
-    codex_debug_log(&format!("  complete={}, feedback={:?}",
-        complete, feedback.as_ref().map(|s| crate::services::claude::safe_preview(s, 200))));
+    codex_debug_log(&format!(
+        "  complete={}, feedback={:?}",
+        complete,
+        feedback
+            .as_ref()
+            .map(|s| crate::services::claude::safe_preview(s, 200))
+    ));
     // Forensic log: the full verifier reply plus its sha. Compare consecutive
     // iterations — identical `output_sha` across iterations with a *changing*
     // `transcript_sha` proves the verifier's output is converging to the same
@@ -354,11 +387,11 @@ pub fn execute_command_streaming(
     system_prompt: Option<&str>,
     _allowed_tools: Option<&[String]>, // ignored — Codex has no tool restriction
     cancel_token: Option<std::sync::Arc<CancelToken>>,
-    model: Option<&str>,               // "codex:" prefix already stripped
-    _no_session_persistence: bool,     // ignored — Codex exec handles persistence internally
+    model: Option<&str>,                  // "codex:" prefix already stripped
+    _no_session_persistence: bool,        // ignored — Codex exec handles persistence internally
     auto_send: Option<&CodexAutoSendCtx>, // when Some, deliver image_gen outputs that the model forgot to sendfile
-    reasoning_effort: Option<&str>,    // None = use Codex CLI default (~/.codex/config.toml)
-    fast_mode: bool,                   // true = pass `-c service_tier="fast"`
+    reasoning_effort: Option<&str>,       // None = use Codex CLI default (~/.codex/config.toml)
+    fast_mode: bool,                      // true = pass `-c service_tier="fast"`
 ) -> Result<(), String> {
     codex_debug_log("========================================");
     codex_debug_log("=== codex execute_command_streaming START ===");
@@ -370,7 +403,11 @@ pub fn execute_command_streaming(
     codex_debug_log(&format!("fast_mode: {}", fast_mode));
     let is_resume = session_id.is_some();
     codex_debug_log(&format!("is_resume: {}", is_resume));
-    codex_debug_log(&format!("system_prompt: is_some={}, len={}", system_prompt.is_some(), system_prompt.map(|s| s.len()).unwrap_or(0)));
+    codex_debug_log(&format!(
+        "system_prompt: is_some={}, len={}",
+        system_prompt.is_some(),
+        system_prompt.map(|s| s.len()).unwrap_or(0)
+    ));
 
     // Write system prompt to file and use -c model_instructions_file to pass it,
     // mirroring Claude's --append-system-prompt-file pattern.
@@ -411,7 +448,10 @@ pub fn execute_command_streaming(
             sid.to_string(),
         ]
     } else {
-        codex_debug_log(&format!("Building NEW SESSION args, working_dir={}", working_dir));
+        codex_debug_log(&format!(
+            "Building NEW SESSION args, working_dir={}",
+            working_dir
+        ));
         // codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -
         vec![
             "exec".to_string(),
@@ -426,25 +466,47 @@ pub fn execute_command_streaming(
     // Write system prompt to temp file and pass via -c model_instructions_file
     if let Some(sp) = system_prompt {
         if !sp.is_empty() {
-            codex_debug_log(&format!("[SP-FILE] is_resume={}, system_prompt_len={} — writing temp file", is_resume, sp.len()));
-            let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+            codex_debug_log(&format!(
+                "[SP-FILE] is_resume={}, system_prompt_len={} — writing temp file",
+                is_resume,
+                sp.len()
+            ));
+            let sp_dir = dirs::home_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cokacdir");
             codex_debug_log(&format!("[SP-FILE] sp_dir={:?}", sp_dir));
             match std::fs::create_dir_all(&sp_dir) {
                 Ok(()) => codex_debug_log("[SP-FILE] create_dir_all OK"),
-                Err(e) => codex_debug_log(&format!("[SP-FILE] WARN: create_dir_all failed: {} (write may also fail)", e)),
+                Err(e) => codex_debug_log(&format!(
+                    "[SP-FILE] WARN: create_dir_all failed: {} (write may also fail)",
+                    e
+                )),
             }
             let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
             let sp_path = sp_dir.join(format!("codex_sp_{:x}_{}", nanos, std::process::id()));
             codex_debug_log(&format!("[SP-FILE] sp_path={:?}", sp_path));
             if let Err(e) = std::fs::write(&sp_path, sp) {
-                codex_debug_log(&format!("[SP-FILE] ERROR: Failed to write system prompt file: {}", e));
+                codex_debug_log(&format!(
+                    "[SP-FILE] ERROR: Failed to write system prompt file: {}",
+                    e
+                ));
                 return Err(format!("Failed to write system prompt file: {}", e));
             }
             // Verify the file was written correctly
             match std::fs::metadata(&sp_path) {
-                Ok(meta) => codex_debug_log(&format!("[SP-FILE] Written OK: file_size={}, sp_len={}, match={}", meta.len(), sp.len(), meta.len() as usize == sp.len())),
-                Err(e) => codex_debug_log(&format!("[SP-FILE] WARN: metadata check failed after write: {}", e)),
+                Ok(meta) => codex_debug_log(&format!(
+                    "[SP-FILE] Written OK: file_size={}, sp_len={}, match={}",
+                    meta.len(),
+                    sp.len(),
+                    meta.len() as usize == sp.len()
+                )),
+                Err(e) => codex_debug_log(&format!(
+                    "[SP-FILE] WARN: metadata check failed after write: {}",
+                    e
+                )),
             }
             let arg_value = format!("model_instructions_file={}", sp_path.to_string_lossy());
             codex_debug_log(&format!("[SP-FILE] Adding args: -c {}", arg_value));
@@ -483,11 +545,10 @@ pub fn execute_command_streaming(
     // `-` means read prompt from stdin
     args.push("-".to_string());
 
-    let codex_bin = get_codex_path()
-        .ok_or_else(|| {
-            codex_debug_log("ERROR: Codex CLI not found");
-            "Codex CLI not found. Is Codex CLI installed?".to_string()
-        })?;
+    let codex_bin = get_codex_path().ok_or_else(|| {
+        codex_debug_log("ERROR: Codex CLI not found");
+        "Codex CLI not found. Is Codex CLI installed?".to_string()
+    })?;
 
     codex_debug_log("--- Spawning codex process ---");
     codex_debug_log(&format!("Command: {} {:?}", codex_bin, args));
@@ -506,19 +567,24 @@ pub fn execute_command_streaming(
     let mut cmd = Command::new(codex_bin);
     cmd.args(&args)
         .current_dir(working_dir)
-        .env("PATH", crate::services::claude::enhanced_path_for_bin(codex_bin))
+        .env(
+            "PATH",
+            crate::services::claude::enhanced_path_for_bin(codex_bin),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::services::claude::detach_into_own_pgroup(&mut cmd);
     crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| {
-            codex_debug_log(&format!("ERROR: Failed to spawn: {}", e));
-            format!("Failed to start Codex: {}. Is Codex CLI installed?", e)
-        })?;
-    codex_debug_log(&format!("Codex process spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    let mut child = cmd.spawn().map_err(|e| {
+        codex_debug_log(&format!("ERROR: Failed to spawn: {}", e));
+        format!("Failed to start Codex: {}. Is Codex CLI installed?", e)
+    })?;
+    codex_debug_log(&format!(
+        "Codex process spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     // Store child PID in cancel token. Recover from a poisoned mutex
     // (a prior holder panicked) instead of silently dropping the PID —
@@ -537,8 +603,15 @@ pub fn execute_command_streaming(
 
     // Write prompt to stdin (system prompt is now passed via -c model_instructions_file)
     if let Some(mut stdin) = child.stdin.take() {
-        codex_debug_log(&format!("[STDIN] Writing prompt to stdin ({} bytes), is_resume={}", prompt.len(), is_resume));
-        codex_debug_log(&format!("[STDIN] prompt_first_200={:?}", prompt.chars().take(200).collect::<String>()));
+        codex_debug_log(&format!(
+            "[STDIN] Writing prompt to stdin ({} bytes), is_resume={}",
+            prompt.len(),
+            is_resume
+        ));
+        codex_debug_log(&format!(
+            "[STDIN] prompt_first_200={:?}",
+            prompt.chars().take(200).collect::<String>()
+        ));
         match stdin.write_all(prompt.as_bytes()) {
             Ok(()) => codex_debug_log("[STDIN] write_all OK"),
             Err(e) => codex_debug_log(&format!("[STDIN] ERROR: write_all failed: {}", e)),
@@ -549,17 +622,14 @@ pub fn execute_command_streaming(
     // Drain stderr in a background thread to prevent deadlock
     // (if child writes >64KB to stderr while we block reading stdout, both sides block)
     let stderr_thread = child.stderr.take().map(|stderr| {
-        std::thread::spawn(move || {
-            std::io::read_to_string(stderr).unwrap_or_default()
-        })
+        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
     });
 
     // Read stdout line by line (JSONL)
-    let stdout = child.stdout.take()
-        .ok_or_else(|| {
-            codex_debug_log("ERROR: Failed to capture stdout");
-            "Failed to capture stdout".to_string()
-        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        codex_debug_log("ERROR: Failed to capture stdout");
+        "Failed to capture stdout".to_string()
+    })?;
     let reader = BufReader::new(stdout);
 
     let mut last_session_id: Option<String> = None;
@@ -588,7 +658,9 @@ pub fn execute_command_streaming(
                 codex_debug_log(&format!("ERROR: Failed to read line: {}", e));
                 let _ = sender.send(StreamMessage::Error {
                     message: format!("Failed to read output: {}", e),
-                    stdout: String::new(), stderr: String::new(), exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
                 });
                 break;
             }
@@ -640,18 +712,32 @@ pub fn execute_command_streaming(
                     }
                     StreamMessage::Text { content } => {
                         let preview: String = content.chars().take(100).collect();
-                        codex_debug_log(&format!("  >>> Text: {} chars, preview: {:?}", content.len(), preview));
+                        codex_debug_log(&format!(
+                            "  >>> Text: {} chars, preview: {:?}",
+                            content.len(),
+                            preview
+                        ));
                     }
                     StreamMessage::ToolUse { name, input } => {
                         let input_preview: String = input.chars().take(200).collect();
-                        codex_debug_log(&format!("  >>> ToolUse: name={}, input={:?}", name, input_preview));
+                        codex_debug_log(&format!(
+                            "  >>> ToolUse: name={}, input={:?}",
+                            name, input_preview
+                        ));
                         if let Some(p) = extract_sendfile_path(name, input) {
-                            codex_debug_log(&format!("  >>> ToolUse: model --sendfile path recorded: {}", p.display()));
+                            codex_debug_log(&format!(
+                                "  >>> ToolUse: model --sendfile path recorded: {}",
+                                p.display()
+                            ));
                             model_sent_paths.push(p);
                         }
                     }
                     StreamMessage::ToolResult { content, is_error } => {
-                        codex_debug_log(&format!("  >>> ToolResult: is_error={}, len={}", is_error, content.len()));
+                        codex_debug_log(&format!(
+                            "  >>> ToolResult: is_error={}, len={}",
+                            is_error,
+                            content.len()
+                        ));
                     }
                     StreamMessage::TaskNotification { .. } => {}
                 }
@@ -666,7 +752,10 @@ pub fn execute_command_streaming(
         }
     }
 
-    codex_debug_log(&format!("--- Exited lines loop, {} lines read ---", line_count));
+    codex_debug_log(&format!(
+        "--- Exited lines loop, {} lines read ---",
+        line_count
+    ));
 
     // Check cancel after loop
     if let Some(ref token) = cancel_token {
@@ -683,7 +772,12 @@ pub fn execute_command_streaming(
         codex_debug_log(&format!("ERROR: Process wait failed: {}", e));
         format!("Process error: {}", e)
     })?;
-    codex_debug_log(&format!("Process finished, exit_code: {:?}, is_resume={}, sp_file_used={}", status.code(), is_resume, _sp_guard.0.is_some()));
+    codex_debug_log(&format!(
+        "Process finished, exit_code: {:?}, is_resume={}, sp_file_used={}",
+        status.code(),
+        is_resume,
+        _sp_guard.0.is_some()
+    ));
 
     // Handle errors
     if stdout_error.is_some() || !status.success() {
@@ -693,10 +787,21 @@ pub fn execute_command_streaming(
 
         // Log stderr for diagnosing -c flag issues (e.g., unrecognized option on resume)
         if !stderr_msg.is_empty() {
-            codex_debug_log(&format!("[STDERR] is_resume={}, exit_code={:?}, stderr_len={}", is_resume, status.code(), stderr_msg.len()));
-            codex_debug_log(&format!("[STDERR] content_first_500={:?}", stderr_msg.chars().take(500).collect::<String>()));
+            codex_debug_log(&format!(
+                "[STDERR] is_resume={}, exit_code={:?}, stderr_len={}",
+                is_resume,
+                status.code(),
+                stderr_msg.len()
+            ));
+            codex_debug_log(&format!(
+                "[STDERR] content_first_500={:?}",
+                stderr_msg.chars().take(500).collect::<String>()
+            ));
             // Check for common -c/config rejection patterns
-            if stderr_msg.contains("unknown option") || stderr_msg.contains("unrecognized") || stderr_msg.contains("model_instructions_file") {
+            if stderr_msg.contains("unknown option")
+                || stderr_msg.contains("unrecognized")
+                || stderr_msg.contains("model_instructions_file")
+            {
                 codex_debug_log(&format!("[STDERR] *** LIKELY -c FLAG REJECTION: Codex may not support -c model_instructions_file on {}",
                     if is_resume { "exec resume" } else { "exec" }));
             }
@@ -705,7 +810,10 @@ pub fn execute_command_streaming(
         let (message, stdout_raw) = if let Some((msg, raw)) = stdout_error {
             (msg, raw)
         } else {
-            (format!("Process exited with code {:?}", status.code()), String::new())
+            (
+                format!("Process exited with code {:?}", status.code()),
+                String::new(),
+            )
         };
 
         codex_debug_log(&format!("Sending error: message={}", message));
@@ -722,9 +830,20 @@ pub fn execute_command_streaming(
     if let Some(h) = stderr_thread {
         if let Ok(stderr_content) = h.join() {
             if !stderr_content.is_empty() {
-                codex_debug_log(&format!("[STDERR-SUCCESS] is_resume={}, stderr_len={}", is_resume, stderr_content.len()));
-                codex_debug_log(&format!("[STDERR-SUCCESS] content_first_500={:?}", stderr_content.chars().take(500).collect::<String>()));
-                if stderr_content.contains("model_instructions_file") || stderr_content.contains("unknown") || stderr_content.contains("warning") || stderr_content.contains("ignored") {
+                codex_debug_log(&format!(
+                    "[STDERR-SUCCESS] is_resume={}, stderr_len={}",
+                    is_resume,
+                    stderr_content.len()
+                ));
+                codex_debug_log(&format!(
+                    "[STDERR-SUCCESS] content_first_500={:?}",
+                    stderr_content.chars().take(500).collect::<String>()
+                ));
+                if stderr_content.contains("model_instructions_file")
+                    || stderr_content.contains("unknown")
+                    || stderr_content.contains("warning")
+                    || stderr_content.contains("ignored")
+                {
                     codex_debug_log("[STDERR-SUCCESS] *** WARNING: stderr mentions model_instructions_file/unknown/warning/ignored — -c flag may not be working as expected");
                 }
             } else {
@@ -756,7 +875,10 @@ pub fn execute_command_streaming(
         });
     }
 
-    codex_debug_log(&format!("[SP-FILE] About to drop SpFileGuard (path={:?}), is_resume={}", _sp_guard.0, is_resume));
+    codex_debug_log(&format!(
+        "[SP-FILE] About to drop SpFileGuard (path={:?}), is_resume={}",
+        _sp_guard.0, is_resume
+    ));
     codex_debug_log("=== codex execute_command_streaming END (success) ===");
     Ok(())
     // _sp_guard dropped here — temp file removed
@@ -764,7 +886,11 @@ pub fn execute_command_streaming(
 
 /// Resolve `~/.codex/generated_images/<session_id>/` for the given session.
 fn generated_images_dir(session_id: &str) -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".codex/generated_images").join(session_id))
+    Some(
+        dirs::home_dir()?
+            .join(".codex/generated_images")
+            .join(session_id),
+    )
 }
 
 /// Snapshot existing files in the codex generated-images directory for a
@@ -773,7 +899,9 @@ fn generated_images_dir(session_id: &str) -> Option<PathBuf> {
 fn snapshot_image_dir(session_id: Option<&str>) -> HashSet<PathBuf> {
     let mut set = HashSet::new();
     let Some(sid) = session_id else { return set };
-    let Some(dir) = generated_images_dir(sid) else { return set };
+    let Some(dir) = generated_images_dir(sid) else {
+        return set;
+    };
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for entry in rd.flatten() {
             if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
@@ -786,7 +914,9 @@ fn snapshot_image_dir(session_id: Option<&str>) -> HashSet<PathBuf> {
 
 /// Two paths point to the same file if either equality or canonicalization match.
 fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    if a == b { return true; }
+    if a == b {
+        return true;
+    }
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
@@ -797,7 +927,9 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 /// the parsed Bash command happens to contain one. Used to record paths the
 /// model already delivered so we don't double-send them.
 fn extract_sendfile_path(name: &str, input_json: &str) -> Option<PathBuf> {
-    if name != "Bash" { return None; }
+    if name != "Bash" {
+        return None;
+    }
     let v: Value = serde_json::from_str(input_json).ok()?;
     let cmd = v.get("command")?.as_str()?;
 
@@ -809,8 +941,7 @@ fn extract_sendfile_path(name: &str, input_json: &str) -> Option<PathBuf> {
     let mut search_start = 0;
     while let Some(rel) = cmd[search_start..].find(TOKEN) {
         let pos = search_start + rel;
-        let lhs_ok = pos == 0
-            || cmd[..pos].chars().last().map_or(true, char::is_whitespace);
+        let lhs_ok = pos == 0 || cmd[..pos].chars().last().map_or(true, char::is_whitespace);
         let rest = &cmd[pos + TOKEN.len()..];
         let rhs_ok = rest.chars().next().map_or(false, char::is_whitespace);
         if lhs_ok && rhs_ok {
@@ -845,13 +976,21 @@ fn auto_deliver_new_images(
     ctx: &CodexAutoSendCtx,
     sender: &Sender<StreamMessage>,
 ) {
-    let Some(dir) = generated_images_dir(session_id) else { return };
-    if !dir.exists() { return; }
+    let Some(dir) = generated_images_dir(session_id) else {
+        return;
+    };
+    if !dir.exists() {
+        return;
+    }
 
     let rd = match std::fs::read_dir(&dir) {
         Ok(r) => r,
         Err(e) => {
-            codex_debug_log(&format!("[auto-send] read_dir failed: {} ({})", dir.display(), e));
+            codex_debug_log(&format!(
+                "[auto-send] read_dir failed: {} ({})",
+                dir.display(),
+                e
+            ));
             return;
         }
     };
@@ -861,34 +1000,62 @@ fn auto_deliver_new_images(
     let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) { continue; }
-        if snapshot.contains(&path) { continue; }
-        let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
-        if !matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")) { continue; }
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if snapshot.contains(&path) {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if !matches!(
+            ext.as_deref(),
+            Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
+        ) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
-        if mtime < started_at { continue; }
+        if mtime < started_at {
+            continue;
+        }
         if model_sent.iter().any(|p| paths_equivalent(p, &path)) {
-            codex_debug_log(&format!("[auto-send] skip (already sent by model): {}", path.display()));
+            codex_debug_log(&format!(
+                "[auto-send] skip (already sent by model): {}",
+                path.display()
+            ));
             continue;
         }
         candidates.push((path, mtime));
     }
     candidates.sort_by_key(|(_, mtime)| *mtime);
 
-    if candidates.is_empty() { return; }
+    if candidates.is_empty() {
+        return;
+    }
     codex_debug_log(&format!(
-        "[auto-send] {} image(s) to deliver from {}", candidates.len(), dir.display()));
+        "[auto-send] {} image(s) to deliver from {}",
+        candidates.len(),
+        dir.display()
+    ));
 
     for (path, _) in candidates {
         let path_str = path.to_string_lossy().to_string();
-        codex_debug_log(&format!("[auto-send] invoking cokacdir --sendfile {}", path_str));
+        codex_debug_log(&format!(
+            "[auto-send] invoking cokacdir --sendfile {}",
+            path_str
+        ));
 
         let output = Command::new(&ctx.cokacdir_bin)
             .args([
-                "--sendfile", &path_str,
-                "--chat", &ctx.chat_id.to_string(),
-                "--key", &ctx.bot_key,
+                "--sendfile",
+                &path_str,
+                "--chat",
+                &ctx.chat_id.to_string(),
+                "--key",
+                &ctx.bot_key,
             ])
             .output();
 
@@ -899,17 +1066,24 @@ fn auto_deliver_new_images(
                 let is_err = !out.status.success();
                 codex_debug_log(&format!(
                     "[auto-send] result: exit={:?}, stdout_len={}, stderr_len={}",
-                    exit, stdout.len(), out.stderr.len()));
+                    exit,
+                    stdout.len(),
+                    out.stderr.len()
+                ));
                 if is_err {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     codex_debug_log(&format!(
                         "[auto-send] stderr_first_500={:?}",
-                        stderr.chars().take(500).collect::<String>()));
+                        stderr.chars().take(500).collect::<String>()
+                    ));
                 }
                 (stdout, exit, is_err)
             }
             Err(e) => {
-                codex_debug_log(&format!("[auto-send] spawn failed: {} (path={})", e, path_str));
+                codex_debug_log(&format!(
+                    "[auto-send] spawn failed: {} (path={})",
+                    e, path_str
+                ));
                 continue;
             }
         };
@@ -919,23 +1093,31 @@ fn auto_deliver_new_images(
         // the polling loop route this exactly like a model-issued sendfile.
         let cmd_str = format!(
             "{} --sendfile {} --chat {} --key <auto>",
-            ctx.cokacdir_bin, path_str, ctx.chat_id);
+            ctx.cokacdir_bin, path_str, ctx.chat_id
+        );
         let tool_input = serde_json::json!({
             "command": cmd_str,
             "exit_code": exit_code,
-        }).to_string();
+        })
+        .to_string();
 
-        if sender.send(StreamMessage::ToolUse {
-            name: "Bash".to_string(),
-            input: tool_input,
-        }).is_err() {
+        if sender
+            .send(StreamMessage::ToolUse {
+                name: "Bash".to_string(),
+                input: tool_input,
+            })
+            .is_err()
+        {
             codex_debug_log("[auto-send] channel closed, aborting remaining deliveries");
             return;
         }
-        if sender.send(StreamMessage::ToolResult {
-            content: stdout,
-            is_error,
-        }).is_err() {
+        if sender
+            .send(StreamMessage::ToolResult {
+                content: stdout,
+                is_error,
+            })
+            .is_err()
+        {
             codex_debug_log("[auto-send] channel closed after ToolUse, aborting");
             return;
         }
@@ -955,18 +1137,19 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
     match event_type {
         // Thread started — contains thread_id
         "thread.started" => {
-            let thread_id = json.get("thread_id")
+            let thread_id = json
+                .get("thread_id")
                 .or_else(|| json.get("thread").and_then(|t| t.get("id")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("codex-session")
                 .to_string();
-            vec![StreamMessage::Init { session_id: thread_id }]
+            vec![StreamMessage::Init {
+                session_id: thread_id,
+            }]
         }
 
         // Item completed — the main content carrier
-        "item.completed" => {
-            parse_item_completed(json)
-        }
+        "item.completed" => parse_item_completed(json),
 
         // Turn completed — marks end of response
         "turn.completed" => {
@@ -978,7 +1161,8 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
 
         // turn.failed has {error: {message: "..."}}
         "turn.failed" => {
-            let message = json.get("error")
+            let message = json
+                .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown Codex error")
@@ -993,7 +1177,8 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
 
         // Top-level error event has {message: "..."}
         "error" => {
-            let message = json.get("message")
+            let message = json
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown Codex error")
                 .to_string();
@@ -1040,18 +1225,19 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
         // Command execution — produces ToolUse + ToolResult
         // Codex fields: command, aggregated_output, exit_code, status
         "command_execution" => {
-            let command = item.get("command")
+            let command = item
+                .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let aggregated_output = item.get("aggregated_output")
+            let aggregated_output = item
+                .get("aggregated_output")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            let exit_code = item.get("exit_code")
-                .and_then(|v| v.as_i64());
+            let exit_code = item.get("exit_code").and_then(|v| v.as_i64());
             let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let is_error = matches!(status, "failed" | "declined")
                 || exit_code.map(|c| c != 0).unwrap_or(false);
@@ -1059,15 +1245,22 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
             vec![
                 StreamMessage::ToolUse {
                     name: "Bash".to_string(),
-                    input: serde_json::json!({"command": command, "exit_code": exit_code}).to_string(),
+                    input: serde_json::json!({"command": command, "exit_code": exit_code})
+                        .to_string(),
                 },
-                StreamMessage::ToolResult { content: aggregated_output, is_error },
+                StreamMessage::ToolResult {
+                    content: aggregated_output,
+                    is_error,
+                },
             ]
         }
 
         // File change — Codex fields: changes (array of {path, kind, ...}), status
         "file_change" => {
-            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed");
             let is_error = status == "failed";
 
             let mut msgs = vec![StreamMessage::ToolUse {
@@ -1077,14 +1270,22 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
 
             // Only generate ToolResult on error (ToolUse already shows changes via format_tool_input)
             if is_error {
-                let content = item.get("changes").and_then(|v| v.as_array())
+                let content = item
+                    .get("changes")
+                    .and_then(|v| v.as_array())
                     .filter(|arr| !arr.is_empty())
                     .map(|changes| {
-                        changes.iter().map(|c| {
-                            let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("unknown");
-                            let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("update");
-                            format!("{}: {}", kind, path)
-                        }).collect::<Vec<_>>().join("\n")
+                        changes
+                            .iter()
+                            .map(|c| {
+                                let path =
+                                    c.get("path").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                let kind =
+                                    c.get("kind").and_then(|v| v.as_str()).unwrap_or("update");
+                                format!("{}: {}", kind, path)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     })
                     .unwrap_or_else(|| "File change failed".to_string());
                 msgs.push(StreamMessage::ToolResult {
@@ -1099,39 +1300,50 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
         // MCP tool call — Codex fields: server, tool, arguments, result{content,structured_content}, error{message}, status
         "mcp_tool_call" => {
             let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("");
-            let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let tool = item
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let display_name = if server.is_empty() {
                 tool.to_string()
             } else {
                 format!("{}:{}", server, tool)
             };
 
-            let arguments = item.get("arguments")
+            let arguments = item
+                .get("arguments")
                 .map(|v| v.to_string())
                 .unwrap_or_default();
 
-            let mut msgs = vec![
-                StreamMessage::ToolUse {
-                    name: display_name,
-                    input: arguments,
-                },
-            ];
+            let mut msgs = vec![StreamMessage::ToolUse {
+                name: display_name,
+                input: arguments,
+            }];
 
             let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
             // Check for error first (skip null — serde serializes None as null)
             if let Some(err) = item.get("error").filter(|v| !v.is_null()) {
-                let message = err.get("message")
+                let message = err
+                    .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MCP tool call failed")
                     .to_string();
-                msgs.push(StreamMessage::ToolResult { content: message, is_error: true });
+                msgs.push(StreamMessage::ToolResult {
+                    content: message,
+                    is_error: true,
+                });
             } else if let Some(result) = item.get("result").filter(|v| !v.is_null()) {
                 // result has {content: [...], structured_content}
                 let content = if let Some(arr) = result.get("content").and_then(|v| v.as_array()) {
-                    arr.iter().filter_map(|c| {
-                        c.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    }).collect::<Vec<_>>().join("\n")
+                    arr.iter()
+                        .filter_map(|c| {
+                            c.get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 } else {
                     result.to_string()
                 };
@@ -1158,14 +1370,19 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
         // CollabAgentStatus values: pending_init, running, interrupted, completed,
         //   errored, shutdown, not_found.
         "collab_tool_call" => {
-            let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let tool = item
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
             // Extract prompt for tools that carry one; leave empty for others
             // (tool name is already in the Collab:{tool} name field — no need to repeat)
             let display = match tool {
-                "spawn_agent" | "send_input" | "send_message" | "followup_task" => {
-                    item.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string()
-                }
+                "spawn_agent" | "send_input" | "send_message" | "followup_task" => item
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 _ => String::new(), // wait, close_agent, list_agents, wait_agent
             };
 
@@ -1182,19 +1399,28 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
             if matches!(tool, "wait" | "close_agent" | "wait_agent" | "list_agents") {
                 if let Some(states) = item.get("agents_states").and_then(|v| v.as_object()) {
                     let mut any_problem = false;
-                    let entries: Vec<String> = states.values().filter_map(|state| {
-                        let agent_status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let message = state.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                        let problem = matches!(agent_status,
-                            "errored" | "interrupted" | "not_found" | "pending_init");
-                        if problem { any_problem = true; }
-                        match (problem, message.is_empty()) {
-                            (false, true) => None,
-                            (false, false) => Some(message.to_string()),
-                            (true, true) => Some(format!("[{}]", agent_status)),
-                            (true, false) => Some(format!("[{}] {}", agent_status, message)),
-                        }
-                    }).collect();
+                    let entries: Vec<String> = states
+                        .values()
+                        .filter_map(|state| {
+                            let agent_status =
+                                state.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            let message =
+                                state.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                            let problem = matches!(
+                                agent_status,
+                                "errored" | "interrupted" | "not_found" | "pending_init"
+                            );
+                            if problem {
+                                any_problem = true;
+                            }
+                            match (problem, message.is_empty()) {
+                                (false, true) => None,
+                                (false, false) => Some(message.to_string()),
+                                (true, true) => Some(format!("[{}]", agent_status)),
+                                (true, false) => Some(format!("[{}] {}", agent_status, message)),
+                            }
+                        })
+                        .collect();
                     if !entries.is_empty() {
                         msgs.push(StreamMessage::ToolResult {
                             content: entries.join("\n---\n"),
@@ -1246,10 +1472,12 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                         .and_then(|a| a.get("queries"))
                         .and_then(|v| v.as_array())
                         .filter(|arr| !arr.is_empty())
-                        .map(|arr| arr.iter()
-                            .filter_map(|q| q.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "));
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|q| q.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        });
                     let from_action_query = action
                         .and_then(|a| a.get("query"))
                         .and_then(|v| v.as_str())
@@ -1263,11 +1491,21 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                         .and_then(|a| a.get("url"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if url.is_empty() { top_query.to_string() } else { format!("open: {}", url) }
+                    if url.is_empty() {
+                        top_query.to_string()
+                    } else {
+                        format!("open: {}", url)
+                    }
                 }
                 "find_in_page" => {
-                    let url = action.and_then(|a| a.get("url")).and_then(|v| v.as_str()).unwrap_or("");
-                    let pattern = action.and_then(|a| a.get("pattern")).and_then(|v| v.as_str()).unwrap_or("");
+                    let url = action
+                        .and_then(|a| a.get("url"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let pattern = action
+                        .and_then(|a| a.get("pattern"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     match (url.is_empty(), pattern.is_empty()) {
                         (false, false) => format!("find: {} in {}", pattern, url),
                         (false, true) => format!("find_in_page: {}", url),
@@ -1290,12 +1528,20 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
         // Todo list — agent's running plan. Codex fields: items (Vec<{text, completed}>)
         "todo_list" => {
             if let Some(items) = item.get("items").and_then(|v| v.as_array()) {
-                let summary: Vec<String> = items.iter().map(|t| {
-                    let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let done = t.get("completed").and_then(|v| v.as_bool()).unwrap_or(false);
-                    format!("[{}] {}", if done { "x" } else { " " }, text)
-                }).collect();
-                vec![StreamMessage::Text { content: summary.join("\n") }]
+                let summary: Vec<String> = items
+                    .iter()
+                    .map(|t| {
+                        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let done = t
+                            .get("completed")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        format!("[{}] {}", if done { "x" } else { " " }, text)
+                    })
+                    .collect();
+                vec![StreamMessage::Text {
+                    content: summary.join("\n"),
+                }]
             } else {
                 vec![]
             }
@@ -1303,18 +1549,26 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
 
         // Reasoning/thinking — internal, not shown to user
         "reasoning" => {
-            codex_debug_log(&format!("reasoning (filtered): {:?}",
-                extract_text_content(item).chars().take(80).collect::<String>()));
+            codex_debug_log(&format!(
+                "reasoning (filtered): {:?}",
+                extract_text_content(item)
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            ));
             vec![]
         }
 
         // Non-fatal error surfaced as an item — ErrorItem { message }
         "error" => {
-            let message = item.get("message")
+            let message = item
+                .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Unknown error")
                 .to_string();
-            vec![StreamMessage::Text { content: format!("⚠ {}", message) }]
+            vec![StreamMessage::Text {
+                content: format!("⚠ {}", message),
+            }]
         }
 
         _ => {

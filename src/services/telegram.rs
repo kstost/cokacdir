@@ -10,9 +10,9 @@ use teloxide::prelude::*;
 use teloxide::types::{ParseMode, UpdateKind};
 use tokio::sync::Mutex;
 
+use crate::services::agy;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
-use crate::services::gemini;
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -1006,12 +1006,21 @@ fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
 }
 
 /// Get the configured model for a specific chat_id, if any.
-/// Migrates legacy bare names (e.g. "sonnet") to "claude:" prefixed format.
+/// Migrates legacy bare names (e.g. "sonnet") and deprecated Gemini settings.
 fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
     let key = chat_id.0.to_string();
     settings.models.get(&key).map(|m| match m.as_str() {
         "sonnet" | "opus" | "haiku" | "sonnet[1m]" | "opus[1m]" | "haiku[1m]" => {
             format!("claude:{}", m)
+        }
+        "gemini" => "agy".to_string(),
+        s if s.starts_with("gemini:") => {
+            let model = s.trim_start_matches("gemini:");
+            if agy::is_valid_agy_model(model) {
+                s.to_string()
+            } else {
+                "agy".to_string()
+            }
         }
         _ => m.clone(),
     })
@@ -9291,7 +9300,7 @@ async fn handle_message(
             // /loop uses a self-verification step that currently supports
             // Claude (native --fork-session), Codex (ephemeral exec over the
             // full-fidelity session archive), and OpenCode (native --fork with
-            // the `plan` agent). Other providers (currently Gemini) are rejected.
+            // the `plan` agent). Other providers (currently Agy) are rejected.
             let provider = {
                 let _m = get_model(&state.lock().await.settings, chat_id);
                 detect_provider(_m.as_deref()).to_string()
@@ -9500,7 +9509,7 @@ Ask in natural language to manage schedules.
 
 <b>Settings</b>
 <code>/model</code> — Show current AI model
-<code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini or provider:model)
+<code>/model &lt;name&gt;</code> — Set model (claude/codex/agy/opencode or provider:model)
 <code>/stt_model</code> — Show current speech recognition model
 <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
@@ -9551,7 +9560,7 @@ async fn handle_start_command(
         chat_id.0, path_str
     ));
 
-    // Determine current provider (Claude vs Codex vs Gemini)
+    // Determine current provider (Claude vs Codex vs Agy)
     let original_provider_str: &str;
     let mut provider_str;
     let mut provider = {
@@ -9670,15 +9679,15 @@ async fn handle_start_command(
         let fallback_providers: &[SessionProvider] = match provider {
             SessionProvider::Claude => &[
                 SessionProvider::Codex,
-                SessionProvider::Gemini,
+                SessionProvider::Agy,
                 SessionProvider::OpenCode,
             ],
             SessionProvider::Codex => &[
                 SessionProvider::Claude,
-                SessionProvider::Gemini,
+                SessionProvider::Agy,
                 SessionProvider::OpenCode,
             ],
-            SessionProvider::Gemini => &[
+            SessionProvider::Agy => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
                 SessionProvider::OpenCode,
@@ -9686,7 +9695,7 @@ async fn handle_start_command(
             SessionProvider::OpenCode => &[
                 SessionProvider::Claude,
                 SessionProvider::Codex,
-                SessionProvider::Gemini,
+                SessionProvider::Agy,
             ],
         };
 
@@ -9776,7 +9785,7 @@ async fn handle_start_command(
                 let available = match fp {
                     SessionProvider::Claude => claude::is_claude_available(),
                     SessionProvider::Codex => codex::is_codex_available(),
-                    SessionProvider::Gemini => gemini::is_gemini_available(),
+                    SessionProvider::Agy => agy::is_agy_available(),
                     SessionProvider::OpenCode => opencode::is_opencode_available(),
                 };
                 if !available {
@@ -10236,7 +10245,7 @@ fn is_uuid(s: &str) -> bool {
 enum SessionProvider {
     Claude,
     Codex,
-    Gemini,
+    Agy,
     OpenCode,
 }
 
@@ -10245,8 +10254,8 @@ enum SessionProvider {
 fn provider_from_model(model: Option<&str>) -> &'static str {
     if codex::is_codex_model(model) {
         "codex"
-    } else if gemini::is_gemini_model(model) {
-        "gemini"
+    } else if agy::is_agy_model(model) {
+        "agy"
     } else if opencode::is_opencode_model(model) {
         "opencode"
     } else {
@@ -10260,8 +10269,8 @@ fn detect_provider(model: Option<&str>) -> &'static str {
         provider_from_model(model)
     } else if !claude::is_claude_available() && codex::is_codex_available() {
         "codex"
-    } else if !claude::is_claude_available() && gemini::is_gemini_available() {
-        "gemini"
+    } else if !claude::is_claude_available() && agy::is_agy_available() {
+        "agy"
     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
         "opencode"
     } else {
@@ -10273,7 +10282,7 @@ fn detect_provider(model: Option<&str>) -> &'static str {
 fn provider_to_session(provider: &str) -> SessionProvider {
     match provider {
         "codex" => SessionProvider::Codex,
-        "gemini" => SessionProvider::Gemini,
+        "agy" | "gemini" => SessionProvider::Agy,
         "opencode" => SessionProvider::OpenCode,
         _ => SessionProvider::Claude,
     }
@@ -10284,7 +10293,7 @@ fn session_provider_str(provider: SessionProvider) -> &'static str {
     match provider {
         SessionProvider::Claude => "claude",
         SessionProvider::Codex => "codex",
-        SessionProvider::Gemini => "gemini",
+        SessionProvider::Agy => "agy",
         SessionProvider::OpenCode => "opencode",
     }
 }
@@ -10314,7 +10323,7 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
             }
         }
         SessionProvider::Codex => resolve_codex_by_id(query),
-        SessionProvider::Gemini => resolve_gemini_by_id(query),
+        SessionProvider::Agy => resolve_agy_by_id(query),
         SessionProvider::OpenCode => resolve_opencode_by_id(query),
     };
     msg_debug(&format!(
@@ -10475,70 +10484,71 @@ fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
     })
 }
 
-/// Gemini: scan `~/.gemini/tmp/*/chats/session-*.json` for a matching sessionId.
-fn resolve_gemini_by_id(session_id: &str) -> Option<ResolvedSession> {
-    msg_debug(&format!("[resolve_gemini_by_id] session_id={}", session_id));
-    let tmp_dir = dirs::home_dir()?.join(".gemini").join("tmp");
-    if !tmp_dir.is_dir() {
-        msg_debug("[resolve_gemini_by_id] tmp_dir not found");
-        return None;
-    }
-    // Use first 8 chars of UUID for quick filename filtering (char-boundary safe)
-    let short_id: String = session_id.chars().take(8).collect();
-    for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
-            continue;
-        }
-        let chats_dir = proj_entry.path().join("chats");
-        if !chats_dir.is_dir() {
-            continue;
-        }
-        let Ok(chat_entries) = fs::read_dir(&chats_dir) else {
-            continue;
-        };
-        for chat_entry in chat_entries.flatten() {
-            let path = chat_entry.path();
-            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !fname.starts_with("session-") || !fname.ends_with(".json") {
-                continue;
-            }
-            // Quick filter: filename contains first 8 chars of UUID
-            if !fname.contains(short_id.as_str()) {
-                continue;
-            }
-            // Parse JSON to verify full sessionId
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-                continue;
-            };
-            let sid = val.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
-            if sid != session_id {
-                continue;
-            }
-            // Read .project_root from parent directory to get cwd
-            let project_root_file = proj_entry.path().join(".project_root");
-            let cwd = fs::read_to_string(&project_root_file)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())?;
-            msg_debug(&format!(
-                "[resolve_gemini_by_id] found: cwd={:?}, file={}",
-                cwd,
-                path.display()
-            ));
-            return Some(ResolvedSession {
-                cwd,
-                jsonl_path: path,
-                session_id: session_id.to_string(),
-                provider: SessionProvider::Gemini,
-            });
+/// Agy: resolve `~/.gemini/antigravity-cli/conversations/<id>.db|.pb`.
+fn resolve_agy_by_id(session_id: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[resolve_agy_by_id] session_id={}", session_id));
+    let path = agy::conversation_path(session_id)?;
+    let cwd = find_agy_cwd_for_session(session_id)
+        .or_else(|| extract_agy_cwd_from_conversation(&path))?;
+    msg_debug(&format!(
+        "[resolve_agy_by_id] found: cwd={:?}, file={}",
+        cwd,
+        path.display()
+    ));
+    Some(ResolvedSession {
+        cwd,
+        jsonl_path: path,
+        session_id: session_id.to_string(),
+        provider: SessionProvider::Agy,
+    })
+}
+
+fn find_agy_cwd_for_session(session_id: &str) -> Option<String> {
+    let cache = dirs::home_dir()?
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("cache")
+        .join("last_conversations.json");
+    let content = fs::read_to_string(cache).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let obj = val.as_object()?;
+    for (cwd, sid) in obj {
+        if sid.as_str() == Some(session_id) && Path::new(cwd).is_dir() {
+            return Some(cwd.clone());
         }
     }
-    msg_debug("[resolve_gemini_by_id] not found");
+    None
+}
+
+fn extract_agy_cwd_from_conversation(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut current = Vec::new();
+    let mut candidates = Vec::new();
+    for b in bytes {
+        if b.is_ascii_graphic() || b == b' ' {
+            current.push(b);
+        } else if current.len() >= 4 {
+            if let Ok(s) = String::from_utf8(std::mem::take(&mut current)) {
+                candidates.push(s);
+            }
+        } else {
+            current.clear();
+        }
+    }
+    if current.len() >= 4 {
+        if let Ok(s) = String::from_utf8(current) {
+            candidates.push(s);
+        }
+    }
+    for s in candidates {
+        let raw = s
+            .strip_prefix("file://")
+            .unwrap_or(&s)
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        if raw.starts_with('/') && Path::new(raw).is_dir() {
+            return Some(raw.to_string());
+        }
+    }
     None
 }
 
@@ -10637,7 +10647,7 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     let parser = match info.provider {
         SessionProvider::Claude => parse_claude_jsonl,
         SessionProvider::Codex => parse_codex_jsonl,
-        SessionProvider::Gemini => parse_gemini_json,
+        SessionProvider::Agy => parse_agy_session,
         SessionProvider::OpenCode => parse_opencode_session,
     };
     msg_debug(&format!(
@@ -10810,7 +10820,7 @@ fn find_latest_session_by_cwd(
     let result = match provider {
         SessionProvider::Claude => find_latest_claude_by_cwd(canonical_path),
         SessionProvider::Codex => find_latest_codex_by_cwd(canonical_path),
-        SessionProvider::Gemini => find_latest_gemini_by_cwd(canonical_path),
+        SessionProvider::Agy => find_latest_agy_by_cwd(canonical_path),
         SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
     };
     msg_debug(&format!(
@@ -10972,69 +10982,24 @@ fn collect_best_codex_jsonl(
     }
 }
 
-/// Gemini: scan `~/.gemini/tmp/*/.project_root` for cwd match, find latest chat file.
-fn find_latest_gemini_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
+/// Agy: use `last_conversations.json` workspace mapping.
+fn find_latest_agy_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
     msg_debug(&format!(
-        "[find_latest_gemini_by_cwd] canonical_path={:?}",
+        "[find_latest_agy_by_cwd] canonical_path={:?}",
         canonical_path
     ));
-    let tmp_dir = dirs::home_dir()?.join(".gemini").join("tmp");
-    if !tmp_dir.is_dir() {
-        return None;
-    }
-    let mut best_path: Option<std::path::PathBuf> = None;
-    let mut best_time = std::time::UNIX_EPOCH;
-    for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
-            continue;
-        }
-        let pr_file = proj_entry.path().join(".project_root");
-        let Ok(pr_content) = fs::read_to_string(&pr_file) else {
-            continue;
-        };
-        if pr_content.trim() != canonical_path {
-            continue;
-        }
-        let chats_dir = proj_entry.path().join("chats");
-        if !chats_dir.is_dir() {
-            continue;
-        }
-        let Ok(chat_entries) = fs::read_dir(&chats_dir) else {
-            continue;
-        };
-        for chat_entry in chat_entries.flatten() {
-            let path = chat_entry.path();
-            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !fname.starts_with("session-") || !fname.ends_with(".json") {
-                continue;
-            }
-            let mtime = path
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            if mtime > best_time {
-                best_path = Some(path);
-                best_time = mtime;
-            }
-        }
-    }
-    let jsonl_path = best_path?;
-    let content = fs::read_to_string(&jsonl_path).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let session_id = val.get("sessionId").and_then(|v| v.as_str())?.to_string();
+    let session_id = agy::read_last_conversation_id(canonical_path)?;
+    let path = agy::conversation_path(&session_id)?;
     msg_debug(&format!(
-        "[find_latest_gemini_by_cwd] found: session_id={}, file={}",
+        "[find_latest_agy_by_cwd] found: session_id={}, file={}",
         session_id,
-        jsonl_path.display()
+        path.display()
     ));
     Some(ResolvedSession {
         cwd: canonical_path.to_string(),
-        jsonl_path,
+        jsonl_path: path,
         session_id,
-        provider: SessionProvider::Gemini,
+        provider: SessionProvider::Agy,
     })
 }
 
@@ -11302,63 +11267,30 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
     })
 }
 
-/// Parse a Gemini CLI chat JSON file into cokacdir SessionData.
-fn parse_gemini_json(json_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
+/// Parse an Agy conversation into a minimal cokacdir SessionData record.
+///
+/// Antigravity stores the real conversation in SQLite/protobuf blobs under
+/// `~/.gemini/antigravity-cli/conversations/`. For resume, cokacdir only needs
+/// the session id and cwd; `agy --conversation <id>` owns the full transcript.
+fn parse_agy_session(path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
     msg_debug(&format!(
-        "[parse_gemini_json] file={}, session_id={}",
-        json_path.display(),
+        "[parse_agy_session] file={}, session_id={}",
+        path.display(),
         session_id
     ));
-    let content = fs::read_to_string(json_path).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let messages = val.get("messages")?.as_array()?;
-    let mut history: Vec<HistoryItem> = Vec::new();
-    for msg in messages {
-        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match msg_type {
-            "user" => {
-                // User content is array of {text: "..."} objects
-                if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
-                    for item in arr {
-                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                history.push(HistoryItem {
-                                    item_type: HistoryType::User,
-                                    content: truncate_utf8(trimmed, 300),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            "gemini" => {
-                // Gemini content is a plain string
-                if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        history.push(HistoryItem {
-                            item_type: HistoryType::Assistant,
-                            content: truncate_utf8(text, 2000),
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if history.is_empty() {
+    if !path.is_file() {
         return None;
     }
-    msg_debug(&format!(
-        "[parse_gemini_json] parsed: history_len={}",
-        history.len()
-    ));
     Some(SessionData {
         session_id: session_id.to_string(),
-        history,
+        history: vec![HistoryItem {
+            item_type: HistoryType::System,
+            content: "Agy conversation restored. Full transcript is stored by Antigravity CLI."
+                .to_string(),
+        }],
         current_path: cwd.to_string(),
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        provider: "gemini".to_string(),
+        provider: "agy".to_string(),
     })
 }
 
@@ -11926,13 +11858,13 @@ async fn handle_session_command(
         (Some(id), Some(path)) => {
             let resume_cmd = match session_prov {
                 "codex" => format!("codex resume {}", id),
-                "gemini" => format!("gemini --resume {}", id),
+                "agy" => format!("agy --conversation {} --print \"\"", id),
                 "opencode" => format!("opencode -s {}", id),
                 _ => format!("claude --resume {}", id),
             };
             let provider = match session_prov {
                 "codex" => "Codex",
-                "gemini" => "Gemini",
+                "agy" => "Agy",
                 "opencode" => "OpenCode",
                 _ => "Claude",
             };
@@ -14195,7 +14127,7 @@ async fn handle_public_command(
 /// Returns Err(provider_name) if the provider binary is unavailable, or Err("") if the format is invalid.
 fn resolve_model_name(name: &str) -> Result<String, &'static str> {
     // Strip display-name suffix (" — Description") that users may copy-paste
-    // from the /model help text (e.g. "gemini:gemini-2.5-flash-lite — Gemini 2.5 Flash Lite").
+    // from the /model help text.
     let clean = name.split(" \u{2014} ").next().unwrap_or(name).trim();
     if claude::is_claude_model(Some(clean)) {
         if claude::is_claude_available() {
@@ -14209,11 +14141,17 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         } else {
             Err("codex")
         }
-    } else if gemini::is_gemini_model(Some(clean)) {
-        if gemini::is_gemini_available() {
-            Ok(clean.to_string())
+    } else if agy::is_agy_model(Some(clean)) {
+        if agy::is_agy_available() {
+            if let Some(model) = agy::strip_agy_prefix(clean) {
+                if !agy::is_valid_agy_model(model) {
+                    return Err("");
+                }
+                return Ok(format!("agy:{}", model));
+            }
+            Ok("agy".to_string())
         } else {
-            Err("gemini")
+            Err("agy")
         }
     } else if opencode::is_opencode_model(Some(clean)) {
         if opencode::is_opencode_available() {
@@ -14399,7 +14337,7 @@ async fn handle_fast_command(
     if provider != "codex" {
         let provider_label = match provider {
             "claude" => "Claude",
-            "gemini" => "Gemini",
+            "agy" => "Agy",
             "opencode" => "OpenCode",
             _ => provider,
         };
@@ -14589,7 +14527,7 @@ async fn handle_model_command(
         };
         let has_claude = claude::is_claude_available();
         let has_codex = codex::is_codex_available();
-        let has_gemini = gemini::is_gemini_available();
+        let has_agy = agy::is_agy_available();
         let has_opencode = opencode::is_opencode_available();
 
         let mut msg = match &current {
@@ -14599,8 +14537,8 @@ async fn handle_model_command(
                     "claude"
                 } else if has_codex {
                     "codex"
-                } else if has_gemini {
-                    "gemini"
+                } else if has_agy {
+                    "agy"
                 } else {
                     "opencode"
                 };
@@ -14633,17 +14571,16 @@ async fn handle_model_command(
             msg.push_str("<code>/model codex:gpt-5.1-codex-max</code> — Codex-optimized model for deep and fast reasoning\n");
             msg.push_str("<code>/model codex:gpt-5.1-codex-mini</code> — Optimized for codex. Cheaper, faster, but less capable\n");
         }
-        if has_gemini {
-            msg.push_str("\n<b>Gemini:</b>\n");
-            msg.push_str("<code>/model gemini</code> — default\n");
-            msg.push_str("<code>/model gemini:gemini-3.1-flash-lite-preview</code> — Gemini 3.1 Flash Lite\n");
-            msg.push_str("<code>/model gemini:gemini-3-pro-preview</code> — Gemini 3 Pro\n");
-            msg.push_str("<code>/model gemini:gemini-3-flash-preview</code> — Gemini 3 Flash\n");
-            msg.push_str("<code>/model gemini:gemini-2.5-pro</code> — Gemini 2.5 Pro\n");
-            msg.push_str("<code>/model gemini:gemini-2.5-flash</code> — Gemini 2.5 Flash\n");
-            msg.push_str(
-                "<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n",
-            );
+        if has_agy {
+            msg.push_str("\n<b>Agy (Antigravity):</b>\n");
+            msg.push_str("<code>/model agy</code> — default\n");
+            for model_id in agy::list_models() {
+                msg.push_str(&format!(
+                    "<code>/model agy:{}</code>\n",
+                    html_escape(&model_id)
+                ));
+            }
+            msg.push_str("<i>Legacy /model gemini is accepted as an agy alias.</i>\n");
         }
         if has_opencode {
             msg.push_str("\n<b>OpenCode:</b>\n");
@@ -14803,7 +14740,7 @@ async fn handle_model_command(
                     "Invalid format. Use:\n\
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
-                 <code>/model gemini</code> or <code>/model gemini:&lt;model&gt;</code>\n\
+                 <code>/model agy</code> or <code>/model agy:&lt;model&gt;</code>\n\
                  <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
                 )
                 .parse_mode(ParseMode::Html)
@@ -15679,11 +15616,11 @@ async fn handle_text_message(
                     opencode_model,
                     false,
                 )
-            } else if provider == "gemini" {
-                let gemini_model = model_clone.as_deref().and_then(gemini::strip_gemini_prefix);
-                msg_debug(&format!("[handle_text_message] → gemini::execute, gemini_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
-                    gemini_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
-                gemini::execute_command_streaming(
+            } else if provider == "agy" {
+                let agy_model = model_clone.as_deref().and_then(agy::strip_agy_prefix);
+                msg_debug(&format!("[handle_text_message] → agy::execute, agy_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    agy_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
+                agy::execute_command_streaming(
                     &context_prompt,
                     session_id_clone.as_deref(),
                     &current_path_clone,
@@ -15691,7 +15628,7 @@ async fn handle_text_message(
                     Some(&system_prompt_owned),
                     Some(&allowed_tools),
                     Some(cancel_token_clone),
-                    gemini_model,
+                    agy_model,
                     false,
                 )
             } else if provider == "codex" {
@@ -18003,7 +17940,7 @@ fn format_cokacdir_result(content: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(effective_content.trim()) {
         Ok(v) => v,
         Err(_) => {
-            // Fallback: some backends (e.g. Gemini CLI) wrap the JSON output with
+            // Fallback: some backends wrap the JSON output with
             // extra text like "Output: {...}\nProcess Group PGID: ...".
             // Try to extract the JSON object by trimming to first '{' and last '}'.
             let trimmed = effective_content.trim();
@@ -18932,13 +18869,13 @@ async fn execute_schedule(
                 opencode_model,
                 false,
             )
-        } else if provider == "gemini" {
-            let gemini_model = model_clone_for_exec
+        } else if provider == "agy" {
+            let agy_model = model_clone_for_exec
                 .as_deref()
-                .and_then(gemini::strip_gemini_prefix);
-            sched_debug(&format!("[execute_schedule] → gemini::execute, gemini_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
-                gemini_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
-            gemini::execute_command_streaming(
+                .and_then(agy::strip_agy_prefix);
+            sched_debug(&format!("[execute_schedule] → agy::execute, agy_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
+                agy_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            agy::execute_command_streaming(
                 &prompt,
                 resume_ref,
                 &workspace_path_for_claude,
@@ -18946,7 +18883,7 @@ async fn execute_schedule(
                 Some(&system_prompt_owned),
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
-                gemini_model,
+                agy_model,
                 false,
             )
         } else if provider == "codex" {
@@ -19659,7 +19596,7 @@ async fn execute_schedule(
             ));
             None
         } else if sched_provider != "claude" {
-            // Codex/Gemini/OpenCode: skip summary extraction (not supported via Claude API)
+            // Codex/Agy/OpenCode: skip summary extraction (not supported via Claude API)
             sched_debug(&format!(
                 "[execute_schedule] id={}, non-Claude backend — skipping context summary",
                 schedule_id
@@ -20310,11 +20247,11 @@ async fn process_bot_message(
                 opencode_model,
                 false,
             )
-        } else if provider == "gemini" {
-            let gemini_model = model_clone.as_deref().and_then(gemini::strip_gemini_prefix);
-            msg_debug(&format!("[process_bot_message] → gemini::execute, gemini_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
-                gemini_model, session_id_clone, current_path_clone, prompt_for_ai.len(), system_prompt_owned.len()));
-            gemini::execute_command_streaming(
+        } else if provider == "agy" {
+            let agy_model = model_clone.as_deref().and_then(agy::strip_agy_prefix);
+            msg_debug(&format!("[process_bot_message] → agy::execute, agy_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                agy_model, session_id_clone, current_path_clone, prompt_for_ai.len(), system_prompt_owned.len()));
+            agy::execute_command_streaming(
                 &prompt_for_ai,
                 session_id_clone.as_deref(),
                 &current_path_clone,
@@ -20322,7 +20259,7 @@ async fn process_bot_message(
                 Some(&system_prompt_owned),
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
-                gemini_model,
+                agy_model,
                 false,
             )
         } else if provider == "codex" {

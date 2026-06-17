@@ -1,5 +1,4 @@
 use crossterm::event::{KeyCode, KeyModifiers};
-use unicode_width::UnicodeWidthStr;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
 use crate::utils::format::pad_to_display_width;
@@ -179,9 +179,14 @@ impl SystemData {
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 // Format: LastBootUpTime=20240101120000.000000+540
-                if let Some(val) = stdout.lines().find_map(|l| l.strip_prefix("LastBootUpTime=")) {
+                if let Some(val) = stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix("LastBootUpTime="))
+                {
                     if val.len() >= 14 {
-                        if let Ok(boot) = chrono::NaiveDateTime::parse_from_str(&val[..14], "%Y%m%d%H%M%S") {
+                        if let Ok(boot) =
+                            chrono::NaiveDateTime::parse_from_str(&val[..14], "%Y%m%d%H%M%S")
+                        {
                             let now = chrono::Local::now().naive_local();
                             data.uptime_secs = (now - boot).num_seconds().max(0) as u64;
                         }
@@ -191,13 +196,19 @@ impl SystemData {
 
             // Memory via wmic
             if let Ok(output) = std::process::Command::new("wmic")
-                .args(["os", "get", "TotalVisibleMemorySize,FreePhysicalMemory", "/value"])
+                .args([
+                    "os",
+                    "get",
+                    "TotalVisibleMemorySize,FreePhysicalMemory",
+                    "/value",
+                ])
                 .output()
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
                     if let Some(val) = line.strip_prefix("TotalVisibleMemorySize=") {
-                        data.total_mem = val.trim().parse::<u64>().unwrap_or(0) * 1024; // KB to bytes
+                        data.total_mem = val.trim().parse::<u64>().unwrap_or(0) * 1024;
+                    // KB to bytes
                     } else if let Some(val) = line.strip_prefix("FreePhysicalMemory=") {
                         data.free_mem = val.trim().parse::<u64>().unwrap_or(0) * 1024;
                     }
@@ -231,10 +242,7 @@ fn load_disk_info() -> Vec<DiskInfo> {
 
     #[cfg(unix)]
     {
-        if let Ok(output) = std::process::Command::new("df")
-            .arg("-h")
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("df").arg("-h").output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines().skip(1) {
@@ -247,10 +255,7 @@ fn load_disk_info() -> Vec<DiskInfo> {
                             continue;
                         }
 
-                        let use_percent = parts[4]
-                            .trim_end_matches('%')
-                            .parse::<u8>()
-                            .unwrap_or(0);
+                        let use_percent = parts[4].trim_end_matches('%').parse::<u8>().unwrap_or(0);
 
                         disks.push(DiskInfo {
                             filesystem,
@@ -270,7 +275,12 @@ fn load_disk_info() -> Vec<DiskInfo> {
     {
         // wmic logicaldisk get DeviceID,Size,FreeSpace,FileSystem /format:csv
         if let Ok(output) = std::process::Command::new("wmic")
-            .args(["logicaldisk", "get", "DeviceID,Size,FreeSpace,FileSystem", "/format:csv"])
+            .args([
+                "logicaldisk",
+                "get",
+                "DeviceID,Size,FreeSpace,FileSystem",
+                "/format:csv",
+            ])
             .output()
         {
             if output.status.success() {
@@ -343,7 +353,13 @@ fn get_usage_color(percent: u8, theme: &Theme) -> Color {
     }
 }
 
-pub fn draw(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &SystemInfoState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -372,7 +388,10 @@ pub fn draw(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Them
         InfoTab::Disk => {
             let up_key = kb.system_info_first_key(SystemInfoAction::MoveUp);
             let down_key = kb.system_info_first_key(SystemInfoAction::MoveDown);
-            format!("{}: Switch tab | {}/{}: Select | {}: Back", switch_key, up_key, down_key, quit_key)
+            format!(
+                "{}: Switch tab | {}/{}: Select | {}: Back",
+                switch_key, up_key, down_key, quit_key
+            )
         }
     };
     let footer = Paragraph::new(Span::styled(footer_text, theme.dim_style()))
@@ -381,10 +400,7 @@ pub fn draw(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Them
 }
 
 fn draw_tab_bar(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Theme) {
-    let tabs = [
-        (" System ", InfoTab::System),
-        (" Disk ", InfoTab::Disk),
-    ];
+    let tabs = [(" System ", InfoTab::System), (" Disk ", InfoTab::Disk)];
 
     let mut spans = Vec::new();
     spans.push(Span::styled("  ", theme.normal_style()));
@@ -398,7 +414,10 @@ fn draw_tab_bar(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &
             Style::default().fg(theme.system_info.label)
         };
         spans.push(Span::styled(label, style));
-        spans.push(Span::styled("  ", Style::default().fg(theme.system_info.label)));
+        spans.push(Span::styled(
+            "  ",
+            Style::default().fg(theme.system_info.label),
+        ));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -410,9 +429,9 @@ fn draw_system_tab(frame: &mut Frame, area: Rect, theme: &Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),  // System info
-            Constraint::Length(6),  // Memory
-            Constraint::Min(4),     // CPU
+            Constraint::Length(7), // System info
+            Constraint::Length(6), // Memory
+            Constraint::Min(4),    // CPU
         ])
         .split(area);
 
@@ -440,7 +459,12 @@ fn draw_system_tab(frame: &mut Frame, area: Rect, theme: &Theme) {
     let mem_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.system_info.border))
-        .title(Span::styled(" Memory ", Style::default().fg(theme.system_info.section_title).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Memory ",
+            Style::default()
+                .fg(theme.system_info.section_title)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     let mem_inner = mem_block.inner(chunks[1]);
     frame.render_widget(mem_block, chunks[1]);
@@ -454,11 +478,7 @@ fn draw_system_tab(frame: &mut Frame, area: Rect, theme: &Theme) {
 
     let bar_width = 20;
     let filled = (mem_percent as usize * bar_width / 100).min(bar_width);
-    let bar = format!(
-        "[{}{}]",
-        "█".repeat(filled),
-        "░".repeat(bar_width - filled)
-    );
+    let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
 
     let total_str = format_bytes(data.total_mem);
     let used_str = format!("{} ({}%)", format_bytes(mem_used), mem_percent);
@@ -479,13 +499,21 @@ fn draw_system_tab(frame: &mut Frame, area: Rect, theme: &Theme) {
     let cpu_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.system_info.border))
-        .title(Span::styled(cpu_title, Style::default().fg(theme.system_info.section_title).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            cpu_title,
+            Style::default()
+                .fg(theme.system_info.section_title)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     let cpu_inner = cpu_block.inner(chunks[2]);
     frame.render_widget(cpu_block, chunks[2]);
 
     let cpu_model_display = crate::utils::format::truncate_with_ellipsis(&data.cpu_model, 50);
-    let load_str = format!("{:.2} / {:.2} / {:.2}", data.load_avg[0], data.load_avg[1], data.load_avg[2]);
+    let load_str = format!(
+        "{:.2} / {:.2} / {:.2}",
+        data.load_avg[0], data.load_avg[1], data.load_avg[2]
+    );
 
     let cpu_lines = vec![
         create_info_line("Model:", &cpu_model_display, theme),
@@ -515,12 +543,42 @@ fn draw_disk_tab(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: 
 fn draw_disk_list_wide(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Theme) {
     // Header
     let header = Line::from(vec![
-        Span::styled(pad_to_display_width("Filesystem", 20), Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>8}", "Size"), Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>8}", "Used"), Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>8}", "Avail"), Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>6}", "Use%"), Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
-        Span::styled("  Mount", Style::default().fg(theme.system_info.disk_header).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            pad_to_display_width("Filesystem", 20),
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>8}", "Size"),
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>8}", "Used"),
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>8}", "Avail"),
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>6}", "Use%"),
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Mount",
+            Style::default()
+                .fg(theme.system_info.disk_header)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
 
     let mut lines = vec![header];
@@ -546,7 +604,10 @@ fn draw_disk_list_wide(frame: &mut Frame, state: &SystemInfoState, area: Rect, t
             Span::styled(format!("{:>8}", disk.size), line_style),
             Span::styled(format!("{:>8}", disk.used), line_style),
             Span::styled(format!("{:>8}", disk.available), line_style),
-            Span::styled(format!("{:>5}%", disk.use_percent), Style::default().fg(usage_color)),
+            Span::styled(
+                format!("{:>5}%", disk.use_percent),
+                Style::default().fg(usage_color),
+            ),
             Span::styled(format!(" {}", bar), Style::default().fg(usage_color)),
             Span::styled(format!(" {}", disk.mountpoint), line_style),
         ]);
@@ -583,7 +644,10 @@ fn draw_disk_list_narrow(frame: &mut Frame, state: &SystemInfoState, area: Rect,
         lines.push(Line::from(vec![
             Span::styled("   ", theme.normal_style()),
             Span::styled(bar, Style::default().fg(usage_color)),
-            Span::styled(format!(" {}%", disk.use_percent), Style::default().fg(usage_color)),
+            Span::styled(
+                format!(" {}%", disk.use_percent),
+                Style::default().fg(usage_color),
+            ),
             Span::styled(format!("  {}/{}", disk.used, disk.size), theme.dim_style()),
         ]));
     }
@@ -593,12 +657,23 @@ fn draw_disk_list_narrow(frame: &mut Frame, state: &SystemInfoState, area: Rect,
 
 fn create_info_line<'a>(label: &'a str, value: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{:15}", label), Style::default().fg(theme.system_info.disk_header)),
-        Span::styled(value.to_string(), Style::default().fg(theme.system_info.value)),
+        Span::styled(
+            format!("{:15}", label),
+            Style::default().fg(theme.system_info.disk_header),
+        ),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(theme.system_info.value),
+        ),
     ])
 }
 
-pub fn handle_input(state: &mut SystemInfoState, code: KeyCode, modifiers: KeyModifiers, kb: &crate::keybindings::Keybindings) -> bool {
+pub fn handle_input(
+    state: &mut SystemInfoState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &crate::keybindings::Keybindings,
+) -> bool {
     use crate::keybindings::SystemInfoAction;
 
     if let Some(action) = kb.system_info_action(code, modifiers) {

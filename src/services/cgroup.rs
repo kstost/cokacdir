@@ -38,8 +38,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Discover cokacdir's own cgroup v2 directory under /sys/fs/cgroup.
 ///
@@ -69,11 +69,14 @@ pub fn self_cgroup_root() -> Option<&'static Path> {
             }
         }
         None
-    }).as_deref()
+    })
+    .as_deref()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn self_cgroup_root() -> Option<&'static Path> { None }
+pub fn self_cgroup_root() -> Option<&'static Path> {
+    None
+}
 
 /// Generate a unique cgroup directory name.
 fn unique_name() -> String {
@@ -148,12 +151,16 @@ impl KillCgroup {
                 let mut idx = buf.len();
                 let mut n = pid as i64;
                 let neg = n < 0;
-                if neg { n = -n; }
+                if neg {
+                    n = -n;
+                }
                 loop {
                     idx -= 1;
                     buf[idx] = b'0' + (n % 10) as u8;
                     n /= 10;
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                 }
                 if neg {
                     idx -= 1;
@@ -176,7 +183,9 @@ impl KillCgroup {
             Some(h) => h,
             None => return,
         };
-        unsafe { cmd.pre_exec(hook); }
+        unsafe {
+            cmd.pre_exec(hook);
+        }
     }
 
     /// Install the cgroup-attach `pre_exec` hook on a `tokio::process::Command`.
@@ -188,7 +197,9 @@ impl KillCgroup {
             Some(h) => h,
             None => return,
         };
-        unsafe { cmd.pre_exec(hook); }
+        unsafe {
+            cmd.pre_exec(hook);
+        }
     }
 
     /// Atomically SIGKILL every process currently in this cgroup. Returns
@@ -222,9 +233,15 @@ impl Drop for KillCgroup {
 // the existing pgroup-based kill via `detach_into_own_pgroup` + SIGKILL.
 #[cfg(not(target_os = "linux"))]
 impl KillCgroup {
-    pub fn new() -> Option<Self> { None }
-    pub fn path(&self) -> &Path { unreachable!("KillCgroup::new returns None on non-Linux") }
+    pub fn new() -> Option<Self> {
+        None
+    }
+    pub fn path(&self) -> &Path {
+        unreachable!("KillCgroup::new returns None on non-Linux")
+    }
     pub fn attach_command(&self, _cmd: &mut Command) {}
     pub fn attach_tokio_command(&self, _cmd: &mut tokio::process::Command) {}
-    pub fn kill_all(&self) -> bool { false }
+    pub fn kill_all(&self) -> bool {
+        false
+    }
 }

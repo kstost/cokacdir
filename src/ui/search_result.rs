@@ -1,8 +1,5 @@
-use std::fs;
-use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyModifiers};
-use unicode_width::UnicodeWidthStr;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -10,6 +7,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use std::fs;
+use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
 use crate::utils::format::safe_suffix;
@@ -17,9 +17,9 @@ use crate::utils::format::safe_suffix;
 /// 검색 결과 아이템
 #[derive(Debug, Clone)]
 pub struct SearchResultItem {
-    pub full_path: PathBuf,     // 전체 경로
-    pub relative_path: String,  // 기준 폴더로부터의 상대 경로
-    pub name: String,           // 파일/폴더 이름
+    pub full_path: PathBuf,    // 전체 경로
+    pub relative_path: String, // 기준 폴더로부터의 상대 경로
+    pub name: String,          // 파일/폴더 이름
     pub is_directory: bool,
     pub size: u64,
     pub modified: DateTime<Local>,
@@ -32,7 +32,7 @@ pub struct SearchResultState {
     pub selected_index: usize,
     pub scroll_offset: usize,
     pub search_term: String,
-    pub base_path: PathBuf,     // 검색 시작 경로
+    pub base_path: PathBuf, // 검색 시작 경로
     pub active: bool,
 }
 
@@ -171,12 +171,10 @@ pub fn execute_recursive_search(
     recursive_search(base_path, base_path, search_term, &mut results, max_results);
 
     // 결과 정렬: 디렉토리 우선, 그 다음 이름순
-    results.sort_by(|a, b| {
-        match (a.is_directory, b.is_directory) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    results.sort_by(|a, b| match (a.is_directory, b.is_directory) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     results
@@ -226,15 +224,21 @@ pub fn draw(
         ),
         Span::styled(
             format!("{:<width$} ", "Path", width = path_width),
-            Style::default().fg(theme.search_result.column_header).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.search_result.column_header)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{:>10} ", "Size"),
-            Style::default().fg(theme.search_result.column_header).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.search_result.column_header)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{:16}", "Modified"),
-            Style::default().fg(theme.search_result.column_header).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.search_result.column_header)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -278,7 +282,10 @@ pub fn draw(
 
         // 경로가 너무 길면 앞부분을 ...로 생략 (표시 너비 기준)
         let path_str = if path_display.width() > path_width {
-            let suffix = crate::utils::format::display_width_suffix(&path_display, path_width.saturating_sub(3));
+            let suffix = crate::utils::format::display_width_suffix(
+                &path_display,
+                path_width.saturating_sub(3),
+            );
             let with_ellipsis = format!("...{}", suffix);
             crate::utils::format::pad_to_display_width(&with_ellipsis, path_width)
         } else {
@@ -330,15 +337,10 @@ pub fn draw(
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
 
-        let mut scrollbar_state = ScrollbarState::new(state.results.len())
-            .position(state.selected_index);
+        let mut scrollbar_state =
+            ScrollbarState::new(state.results.len()).position(state.selected_index);
 
-        let scrollbar_area = Rect::new(
-            inner.x + inner.width - 1,
-            inner.y + 1,
-            1,
-            list_area.height,
-        );
+        let scrollbar_area = Rect::new(inner.x + inner.width - 1, inner.y + 1, 1, list_area.height);
 
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
@@ -346,11 +348,23 @@ pub fn draw(
     // 하단 도움말 (keybindings에서 동적으로)
     use crate::keybindings::SearchResultAction;
     let help_line = Line::from(vec![
-        Span::styled(kb.search_result_first_key(SearchResultAction::MoveUp).to_string(), theme.header_style()),
+        Span::styled(
+            kb.search_result_first_key(SearchResultAction::MoveUp)
+                .to_string(),
+            theme.header_style(),
+        ),
         Span::styled(":navigate ", theme.dim_style()),
-        Span::styled(kb.search_result_first_key(SearchResultAction::Open).to_string(), theme.header_style()),
+        Span::styled(
+            kb.search_result_first_key(SearchResultAction::Open)
+                .to_string(),
+            theme.header_style(),
+        ),
         Span::styled(":go to path ", theme.dim_style()),
-        Span::styled(kb.search_result_first_key(SearchResultAction::Close).to_string(), theme.header_style()),
+        Span::styled(
+            kb.search_result_first_key(SearchResultAction::Close)
+                .to_string(),
+            theme.header_style(),
+        ),
         Span::styled(":close", theme.dim_style()),
     ]);
 
@@ -359,7 +373,12 @@ pub fn draw(
 }
 
 /// 입력 처리 - true 반환 시 화면 닫기
-pub fn handle_input(state: &mut SearchResultState, code: KeyCode, modifiers: KeyModifiers, kb: &crate::keybindings::Keybindings) -> Option<crate::keybindings::SearchResultAction> {
+pub fn handle_input(
+    state: &mut SearchResultState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &crate::keybindings::Keybindings,
+) -> Option<crate::keybindings::SearchResultAction> {
     use crate::keybindings::SearchResultAction;
 
     if let Some(action) = kb.search_result_action(code, modifiers) {
@@ -368,12 +387,24 @@ pub fn handle_input(state: &mut SearchResultState, code: KeyCode, modifiers: Key
                 state.active = false;
                 return Some(SearchResultAction::Close);
             }
-            SearchResultAction::MoveUp => { state.move_cursor(-1); }
-            SearchResultAction::MoveDown => { state.move_cursor(1); }
-            SearchResultAction::PageUp => { state.move_cursor(-10); }
-            SearchResultAction::PageDown => { state.move_cursor(10); }
-            SearchResultAction::GoHome => { state.cursor_to_start(); }
-            SearchResultAction::GoEnd => { state.cursor_to_end(); }
+            SearchResultAction::MoveUp => {
+                state.move_cursor(-1);
+            }
+            SearchResultAction::MoveDown => {
+                state.move_cursor(1);
+            }
+            SearchResultAction::PageUp => {
+                state.move_cursor(-10);
+            }
+            SearchResultAction::PageDown => {
+                state.move_cursor(10);
+            }
+            SearchResultAction::GoHome => {
+                state.cursor_to_start();
+            }
+            SearchResultAction::GoEnd => {
+                state.cursor_to_end();
+            }
             SearchResultAction::Open => {
                 return Some(SearchResultAction::Open);
             }

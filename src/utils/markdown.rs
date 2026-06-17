@@ -10,9 +10,9 @@ pub fn is_line_empty(line: &Line) -> bool {
     if line.spans.is_empty() {
         return true;
     }
-    line.spans.iter().all(|span| {
-        span.content.chars().all(|c| c.is_whitespace())
-    })
+    line.spans
+        .iter()
+        .all(|span| span.content.chars().all(|c| c.is_whitespace()))
 }
 
 /// Parse Markdown text and return styled lines for ratatui
@@ -35,10 +35,7 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
                 for code_line in &code_block_lines {
                     lines.push(Line::from(vec![
                         Span::styled("  ", Style::default()),
-                        Span::styled(
-                            code_line.clone(),
-                            Style::default().fg(theme_colors.code),
-                        ),
+                        Span::styled(code_line.clone(), Style::default().fg(theme_colors.code)),
                     ]));
                 }
                 code_block_lines.clear();
@@ -136,7 +133,10 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
         }
 
         // Handle horizontal rule
-        if line.trim().chars().all(|c| c == '-' || c == '*' || c == '_')
+        if line
+            .trim()
+            .chars()
+            .all(|c| c == '-' || c == '*' || c == '_')
             && line.trim().len() >= 3
         {
             lines.push(Line::from(Span::styled(
@@ -171,7 +171,10 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
         }
 
         // Handle checkbox list (- [ ] or - [x])
-        if let Some(rest) = line.strip_prefix("- [ ] ").or_else(|| line.strip_prefix("* [ ] ")) {
+        if let Some(rest) = line
+            .strip_prefix("- [ ] ")
+            .or_else(|| line.strip_prefix("* [ ] "))
+        {
             let spans = parse_inline_markdown(rest, &theme_colors);
             let mut result = vec![
                 Span::styled("  ", Style::default()),
@@ -182,11 +185,12 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
             i += 1;
             continue;
         }
-        if let Some(rest) = line.strip_prefix("- [x] ")
-            .or_else(|| line.strip_prefix("* [x] ")
-            .or_else(|| line.strip_prefix("- [X] ")
-            .or_else(|| line.strip_prefix("* [X] "))))
-        {
+        if let Some(rest) = line.strip_prefix("- [x] ").or_else(|| {
+            line.strip_prefix("* [x] ").or_else(|| {
+                line.strip_prefix("- [X] ")
+                    .or_else(|| line.strip_prefix("* [X] "))
+            })
+        }) {
             let spans = parse_inline_markdown(rest, &theme_colors);
             let mut result = vec![
                 Span::styled("  ", Style::default()),
@@ -204,11 +208,18 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
         // Handle nested unordered list (with indentation)
         if let Some((indent_level, content)) = parse_nested_list(line, &['-', '*', '+']) {
             let indent = "  ".repeat(indent_level);
-            let bullet = if indent_level == 0 { "• " } else if indent_level == 1 { "◦ " } else { "▪ " };
+            let bullet = if indent_level == 0 {
+                "• "
+            } else if indent_level == 1 {
+                "◦ "
+            } else {
+                "▪ "
+            };
             let spans = parse_inline_markdown(content, &theme_colors);
-            let mut result = vec![
-                Span::styled(format!("{}{}", indent, bullet), Style::default().fg(theme_colors.text)),
-            ];
+            let mut result = vec![Span::styled(
+                format!("{}{}", indent, bullet),
+                Style::default().fg(theme_colors.text),
+            )];
             result.extend(spans);
             lines.push(Line::from(result));
             i += 1;
@@ -216,9 +227,9 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
         }
 
         // Handle unordered list
-        if let Some(content) = line.strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* ")
-            .or_else(|| line.strip_prefix("+ ")))
+        if let Some(content) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* ").or_else(|| line.strip_prefix("+ ")))
         {
             let spans = parse_inline_markdown(content, &theme_colors);
             let mut result = vec![Span::styled("  • ", Style::default().fg(theme_colors.text))];
@@ -263,10 +274,7 @@ pub fn render_markdown(text: &str, theme_colors: MarkdownTheme) -> Vec<Line<'sta
         for code_line in &code_block_lines {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(
-                    code_line.clone(),
-                    Style::default().fg(theme_colors.code),
-                ),
+                Span::styled(code_line.clone(), Style::default().fg(theme_colors.code)),
             ]));
         }
     }
@@ -317,8 +325,7 @@ fn render_table(table_lines: &[&str], theme: &MarkdownTheme) -> Vec<Line<'static
     // Find separator row (contains only -, :, |, space)
     let separator_idx = rows.iter().position(|row| {
         row.iter().all(|cell| {
-            cell.chars().all(|c| c == '-' || c == ':' || c == ' ')
-                && cell.contains('-')
+            cell.chars().all(|c| c == '-' || c == ':' || c == ' ') && cell.contains('-')
         })
     });
 
@@ -330,7 +337,8 @@ fn render_table(table_lines: &[&str], theme: &MarkdownTheme) -> Vec<Line<'static
             if col_idx < num_cols {
                 // Skip separator row for width calculation
                 if !cell.chars().all(|c| c == '-' || c == ':' || c == ' ') {
-                    col_widths[col_idx] = col_widths[col_idx].max(UnicodeWidthStr::width(cell.as_str()));
+                    col_widths[col_idx] =
+                        col_widths[col_idx].max(UnicodeWidthStr::width(cell.as_str()));
                 }
             }
         }
@@ -365,9 +373,7 @@ fn render_table(table_lines: &[&str], theme: &MarkdownTheme) -> Vec<Line<'static
         }
 
         // Render data row
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::styled("│", Style::default().fg(theme.dim)),
-        ];
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("│", Style::default().fg(theme.dim))];
 
         for (col_idx, width) in col_widths.iter().enumerate() {
             let cell_content = row.get(col_idx).map(|s| s.as_str()).unwrap_or("");
@@ -379,7 +385,9 @@ fn render_table(table_lines: &[&str], theme: &MarkdownTheme) -> Vec<Line<'static
             // Header row (before separator) gets bold style
             let is_header = separator_idx.map(|idx| row_idx < idx).unwrap_or(false);
             let style = if is_header {
-                Style::default().fg(theme.header).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.header)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text)
             };
@@ -438,9 +446,7 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
                 let content: String = chars[current_pos + 2..end].iter().collect();
                 spans.push(Span::styled(
                     content,
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 ));
                 current_pos = end + 2;
                 continue;
@@ -451,10 +457,7 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
         if chars[current_pos] == '`' {
             if let Some(end) = find_closing_char(&chars, current_pos + 1, '`') {
                 let content: String = chars[current_pos + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    Style::default().fg(theme.code),
-                ));
+                spans.push(Span::styled(content, Style::default().fg(theme.code)));
                 current_pos = end + 1;
                 continue;
             }
@@ -497,7 +500,9 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
             if let Some((link_text, url, end_pos)) = parse_link(&chars, current_pos) {
                 spans.push(Span::styled(
                     link_text,
-                    Style::default().fg(theme.link).add_modifier(Modifier::UNDERLINED),
+                    Style::default()
+                        .fg(theme.link)
+                        .add_modifier(Modifier::UNDERLINED),
                 ));
                 spans.push(Span::styled(
                     format!(" ({})", url),
@@ -668,13 +673,13 @@ impl MarkdownTheme {
     /// Create MarkdownTheme using only Panel/Viewer/Editor palette colors
     pub fn from_theme(theme: &crate::ui::theme::Theme) -> Self {
         Self {
-            text: theme.palette.fg,                 // 기본 텍스트
-            dim: theme.palette.fg_dim,              // 흐린 텍스트
-            header: theme.panel.directory_text,     // 디렉토리 색상
-            code: theme.editor.footer_key,          // 코드 색상
-            link: theme.panel.directory_text,       // 링크 색상
-            blockquote: theme.panel.header_text,    // 인용 색상
-            success: theme.editor.footer_key,       // 성공 색상
+            text: theme.palette.fg,              // 기본 텍스트
+            dim: theme.palette.fg_dim,           // 흐린 텍스트
+            header: theme.panel.directory_text,  // 디렉토리 색상
+            code: theme.editor.footer_key,       // 코드 색상
+            link: theme.panel.directory_text,    // 링크 색상
+            blockquote: theme.panel.header_text, // 인용 색상
+            success: theme.editor.footer_key,    // 성공 색상
         }
     }
 }
@@ -737,20 +742,14 @@ mod tests {
         assert!(is_line_empty(&Line::from("   ")));
 
         // Multiple whitespace spans
-        let multi_span = Line::from(vec![
-            Span::raw("  "),
-            Span::raw("   "),
-        ]);
+        let multi_span = Line::from(vec![Span::raw("  "), Span::raw("   ")]);
         assert!(is_line_empty(&multi_span));
 
         // Non-empty line
         assert!(!is_line_empty(&Line::from("text")));
 
         // Mix of whitespace and content
-        let mixed = Line::from(vec![
-            Span::raw("  "),
-            Span::raw("text"),
-        ]);
+        let mixed = Line::from(vec![Span::raw("  "), Span::raw("text")]);
         assert!(!is_line_empty(&mixed));
 
         // Unicode whitespace (non-breaking space, tab, etc.)
@@ -766,12 +765,14 @@ mod tests {
         let lines = render_markdown(text, theme);
 
         // Count empty lines
-        let empty_count = lines.iter()
-            .filter(|line| is_line_empty(line))
-            .count();
+        let empty_count = lines.iter().filter(|line| is_line_empty(line)).count();
 
         // Should have at most 1 empty line between content
-        assert!(empty_count <= 1, "Expected at most 1 empty line, got {}", empty_count);
+        assert!(
+            empty_count <= 1,
+            "Expected at most 1 empty line, got {}",
+            empty_count
+        );
     }
 
     #[test]
@@ -784,8 +785,8 @@ mod tests {
             "Line 1\n\nLine 2\n\n\nLine 3",
             "\n\n\nLine 1",
             "Line 1\n\n\n",
-            "Line 1\n   \n   \n   \nLine 2",  // Lines with only spaces
-            "Line 1\n\t\n\t\nLine 2",  // Lines with only tabs
+            "Line 1\n   \n   \n   \nLine 2", // Lines with only spaces
+            "Line 1\n\t\n\t\nLine 2",        // Lines with only tabs
         ];
 
         for text in test_cases {
@@ -798,7 +799,8 @@ mod tests {
                 assert!(
                     !(prev_was_empty && current_is_empty),
                     "Found consecutive empty lines at index {} in text: {:?}",
-                    i, text
+                    i,
+                    text
                 );
                 prev_was_empty = current_is_empty;
             }
@@ -864,9 +866,7 @@ mod tests {
         // Print each line for debugging
         println!("\n=== Rendered lines ===");
         for (i, line) in lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let is_empty = is_line_empty(line);
             println!("Line {}: '{}' (empty: {})", i, content, is_empty);
         }
@@ -884,7 +884,11 @@ mod tests {
         }
 
         println!("Max consecutive empty lines: {}", max_consecutive);
-        assert!(max_consecutive <= 1, "Found {} consecutive empty lines", max_consecutive);
+        assert!(
+            max_consecutive <= 1,
+            "Found {} consecutive empty lines",
+            max_consecutive
+        );
     }
 
     #[test]
@@ -928,9 +932,7 @@ mod tests {
 
         println!("\n=== Before filtering ===");
         for (i, line) in all_lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("Line {}: '{}' (empty: {})", i, content, is_line_empty(line));
         }
 
@@ -951,9 +953,7 @@ mod tests {
 
         println!("\n=== After filtering ===");
         for (i, line) in filtered.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("Line {}: '{}' (empty: {})", i, content, is_line_empty(line));
         }
 
@@ -970,7 +970,11 @@ mod tests {
         }
 
         println!("\nMax consecutive empty lines: {}", max_consecutive);
-        assert!(max_consecutive <= 1, "Found {} consecutive empty lines", max_consecutive);
+        assert!(
+            max_consecutive <= 1,
+            "Found {} consecutive empty lines",
+            max_consecutive
+        );
     }
 
     #[test]
@@ -992,9 +996,7 @@ mod tests {
 
         println!("\n=== Korean greeting response rendering ===");
         for (i, line) in lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let is_empty = is_line_empty(line);
             println!("Line {}: '{}' (empty: {})", i, content, is_empty);
         }
@@ -1011,7 +1013,11 @@ mod tests {
             }
         }
 
-        println!("\nTotal lines: {}, Max consecutive empty: {}", lines.len(), max);
+        println!(
+            "\nTotal lines: {}, Max consecutive empty: {}",
+            lines.len(),
+            max
+        );
         assert!(max <= 1, "Found {} consecutive empty lines", max);
     }
 
@@ -1037,10 +1043,7 @@ mod tests {
         let mut all_lines: Vec<Line> = Vec::new();
 
         // User message
-        all_lines.push(Line::from(vec![
-            Span::raw("> "),
-            Span::raw(user_input),
-        ]));
+        all_lines.push(Line::from(vec![Span::raw("> "), Span::raw(user_input)]));
         all_lines.push(Line::from("")); // Empty line between messages
 
         // AI response with markdown
@@ -1055,9 +1058,7 @@ mod tests {
 
         println!("\n=== Before filtering ===");
         for (i, line) in all_lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("Line {}: '{}' (empty: {})", i, content, is_line_empty(line));
         }
 
@@ -1078,9 +1079,7 @@ mod tests {
 
         println!("\n=== After filtering (final display) ===");
         for (i, line) in filtered.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("Line {}: '{}' (empty: {})", i, content, is_line_empty(line));
         }
 
@@ -1096,16 +1095,20 @@ mod tests {
             }
         }
 
-        println!("\nTotal lines: {}, Max consecutive empty: {}", filtered.len(), max);
+        println!(
+            "\nTotal lines: {}, Max consecutive empty: {}",
+            filtered.len(),
+            max
+        );
         assert!(max <= 1, "Found {} consecutive empty lines", max);
     }
 
     #[test]
     fn test_paragraph_wrap_empty_lines() {
         use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        use ratatui::widgets::{Paragraph, Wrap};
         use ratatui::layout::Rect;
+        use ratatui::widgets::{Paragraph, Wrap};
+        use ratatui::Terminal;
 
         // Test NBSP behavior
         let nbsp = "\u{00A0}";
@@ -1113,36 +1116,44 @@ mod tests {
         println!("NBSP: {:?}", nbsp);
         println!("NBSP trim: {:?}", nbsp.trim());
         println!("NBSP trim is_empty: {}", nbsp.trim().is_empty());
-        println!("NBSP is_whitespace: {}", nbsp.chars().all(|c| c.is_whitespace()));
+        println!(
+            "NBSP is_whitespace: {}",
+            nbsp.chars().all(|c| c.is_whitespace())
+        );
 
         // Test NBSP lines
         let lines: Vec<Line> = vec![
             Line::from(vec![Span::raw("< "), Span::raw("Content 1")]),
-            Line::from("\u{00A0}"),  // NBSP - should render as 1 row
+            Line::from("\u{00A0}"), // NBSP - should render as 1 row
             Line::from(vec![Span::raw("  "), Span::raw("Content 2")]),
-            Line::from("\u{00A0}"),  // NBSP - should render as 1 row
+            Line::from("\u{00A0}"), // NBSP - should render as 1 row
             Line::from(vec![Span::raw("  "), Span::raw("Content 3")]),
-            Line::from("\u{00A0}"),  // NBSP - should render as 1 row
+            Line::from("\u{00A0}"), // NBSP - should render as 1 row
         ];
 
         println!("\n=== Input Lines ===");
         for (i, line) in lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            println!("Line {}: '{}' (spans: {}, empty: {})", i, content, line.spans.len(), is_line_empty(line));
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!(
+                "Line {}: '{}' (spans: {}, empty: {})",
+                i,
+                content,
+                line.spans.len(),
+                is_line_empty(line)
+            );
         }
 
         // Render with Paragraph and Wrap
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| {
-            let area = Rect::new(0, 0, 40, 10);
-            let paragraph = Paragraph::new(lines)
-                .wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 40, 10);
+                let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, area);
+            })
+            .unwrap();
 
         println!("\n=== Rendered Output ===");
         let buffer = terminal.backend().buffer();
@@ -1213,10 +1224,13 @@ mod tests {
         let md_lines = render_markdown(&normalized, theme);
         println!("\n=== After render_markdown ===");
         for (i, line) in md_lines.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            println!("MD line {}: '{}' (empty: {})", i, content, is_line_empty(line));
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!(
+                "MD line {}: '{}' (empty: {})",
+                i,
+                content,
+                is_line_empty(line)
+            );
         }
 
         // Step 3: Add prefix (like draw_history does)
@@ -1232,10 +1246,13 @@ mod tests {
 
         println!("\n=== After adding prefix ===");
         for (i, line) in lines_with_prefix.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            println!("Prefix line {}: '{}' (empty: {})", i, content, is_line_empty(line));
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!(
+                "Prefix line {}: '{}' (empty: {})",
+                i,
+                content,
+                is_line_empty(line)
+            );
         }
 
         // Step 4: Remove consecutive empty lines
@@ -1255,10 +1272,13 @@ mod tests {
 
         println!("\n=== Final filtered lines ===");
         for (i, line) in filtered.iter().enumerate() {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
-            println!("Final line {}: '{}' (empty: {})", i, content, is_line_empty(line));
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            println!(
+                "Final line {}: '{}' (empty: {})",
+                i,
+                content,
+                is_line_empty(line)
+            );
         }
 
         // Verify no consecutive empty lines
@@ -1317,7 +1337,9 @@ mod tests {
             assert!(
                 max <= 1,
                 "Test case {} failed: found {} consecutive empty lines.\nInput: {:?}",
-                idx, max, text
+                idx,
+                max,
+                text
             );
         }
     }

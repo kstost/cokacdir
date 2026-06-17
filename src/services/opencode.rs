@@ -1,19 +1,18 @@
 //! OpenCode service — spawns `opencode run --format json` and translates its
 //! JSONL event stream into the existing `StreamMessage` / `ClaudeResponse` types.
 //!
-//! The public API mirrors `claude.rs` / `gemini.rs` so callers can swap backends
+//! The public API mirrors the other CLI providers so callers can swap backends
 //! with minimal code changes.
 
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use serde_json::{json, Value};
 
 use crate::services::claude::{
-    ClaudeResponse, StreamMessage, CancelToken,
-    debug_log_to, kill_child_tree,
+    debug_log_to, kill_child_tree, CancelToken, ClaudeResponse, StreamMessage,
 };
 
 // ============================================================
@@ -69,13 +68,15 @@ fn opencode_debug(msg: &str) {
 /// leaves a persisted .jsonl file in the user's project directory; OpenCode
 /// forks persist the same way. Keeping these symmetrical avoids a DELETE
 /// code path whose failure modes would be worse than the clutter it avoids.
-pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result<crate::services::claude::VerifyResult, String> {
+pub fn verify_completion_opencode(
+    session_id: &str,
+    working_dir: &str,
+) -> Result<crate::services::claude::VerifyResult, String> {
     opencode_debug("=== verify_completion_opencode START ===");
     opencode_debug(&format!("  session_id: {}", session_id));
     opencode_debug(&format!("  working_dir: {}", working_dir));
 
-    let opencode_bin = resolve_opencode_path()
-        .unwrap_or_else(|| "opencode".to_string());
+    let opencode_bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
     opencode_debug(&format!("  opencode_bin: {}", opencode_bin));
 
     // Verify prompt is short because the fork already carries conversation
@@ -111,52 +112,74 @@ pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result
     let child = Command::new(&opencode_bin)
         .args([
             "run",
-            "--session", session_id,
+            "--session",
+            session_id,
             "--fork",
-            "--agent", "plan",
+            "--agent",
+            "plan",
             verify_prompt,
         ])
         .current_dir(working_dir)
-        .env("PATH", crate::services::claude::enhanced_path_for_bin(&opencode_bin))
+        .env(
+            "PATH",
+            crate::services::claude::enhanced_path_for_bin(&opencode_bin),
+        )
         // Block `question` / `plan_exit` — both wait on a user reply via
         // opencode's `question.ask` Deferred and would hang the verify fork.
         // The verify prompt itself says "Do NOT call any tools", but the
         // `plan` agent's plan_exit is auto-called when planning concludes, so
         // the deny rule is a belt-and-braces safeguard. See the matching
         // comment in `build_opencode_command` / `spawn_opencode_serve`.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env(
+            "OPENCODE_PERMISSION",
+            r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn opencode for verify: {}", e))?;
-    opencode_debug(&format!("  spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    opencode_debug(&format!(
+        "  spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     let wait_start = std::time::Instant::now();
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("Failed to read opencode verify output: {}", e))?;
-    opencode_debug(&format!("  completed in {:?}, exit={:?}",
-        wait_start.elapsed(), output.status.code()));
+    opencode_debug(&format!(
+        "  completed in {:?}, exit={:?}",
+        wait_start.elapsed(),
+        output.status.code()
+    ));
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(format!(
             "verify_completion_opencode process failed (exit {:?}). stderr: {}",
-            output.status.code(), crate::services::claude::safe_preview(&stderr, 500)));
+            output.status.code(),
+            crate::services::claude::safe_preview(&stderr, 500)
+        ));
     }
 
     // OpenCode default format writes ONLY the agent's reply to stdout (the
     // "> plan · gpt-5.4" banner goes to stderr). There is no prompt echo,
     // so direct substring matching on stdout is safe.
     let reply = String::from_utf8_lossy(&output.stdout).to_string();
-    opencode_debug(&format!("  reply len={}, preview: {}",
-        reply.len(), reply.chars().take(300).collect::<String>()));
+    opencode_debug(&format!(
+        "  reply len={}, preview: {}",
+        reply.len(),
+        reply.chars().take(300).collect::<String>()
+    ));
 
     if reply.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(format!(
             "verify_completion_opencode produced empty reply. stderr: {}",
-            crate::services::claude::safe_preview(&stderr, 500)));
+            crate::services::claude::safe_preview(&stderr, 500)
+        ));
     }
 
     // Same decision rule as claude::verify_completion: complete iff
@@ -166,13 +189,22 @@ pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result
     let feedback = if complete {
         None
     } else {
-        let cleaned = reply.replace("mission_pending", "").replace("mission_complete", "");
+        let cleaned = reply
+            .replace("mission_pending", "")
+            .replace("mission_complete", "");
         let cleaned = cleaned.trim();
-        if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
     };
 
-    opencode_debug(&format!("  complete={}, feedback_len={:?}",
-        complete, feedback.as_ref().map(|s| s.len())));
+    opencode_debug(&format!(
+        "  complete={}, feedback_len={:?}",
+        complete,
+        feedback.as_ref().map(|s| s.len())
+    ));
     opencode_debug("=== verify_completion_opencode END ===");
 
     Ok(crate::services::claude::VerifyResult { complete, feedback })
@@ -180,10 +212,14 @@ pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result
 
 /// Truncate a string for log previews (char-boundary safe).
 fn log_preview(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
+    if s.len() <= max {
+        return s;
+    }
     // Find the last char boundary at or before max
     let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     &s[..end]
 }
 
@@ -213,8 +249,13 @@ pub fn is_opencode_available() -> bool {
 
 /// Check if a model string refers to the OpenCode backend
 pub fn is_opencode_model(model: Option<&str>) -> bool {
-    let result = model.map(|m| m == "opencode" || m.starts_with("opencode:")).unwrap_or(false);
-    opencode_debug(&format!("[is_opencode_model] model={:?} result={}", model, result));
+    let result = model
+        .map(|m| m == "opencode" || m.starts_with("opencode:"))
+        .unwrap_or(false);
+    opencode_debug(&format!(
+        "[is_opencode_model] model={:?} result={}",
+        model, result
+    ));
     result
 }
 
@@ -222,10 +263,14 @@ pub fn is_opencode_model(model: Option<&str>) -> bool {
 /// Returns None if the input is just "opencode" (use default).
 /// Also strips display-name suffix (" — Description") if present.
 pub fn strip_opencode_prefix(model: &str) -> Option<&str> {
-    let result = model.strip_prefix("opencode:")
+    let result = model
+        .strip_prefix("opencode:")
         .filter(|s| !s.is_empty())
         .map(|s| s.split(" \u{2014} ").next().unwrap_or(s).trim());
-    opencode_debug(&format!("[strip_opencode_prefix] model={:?} result={:?}", model, result));
+    opencode_debug(&format!(
+        "[strip_opencode_prefix] model={:?} result={:?}",
+        model, result
+    ));
     result
 }
 
@@ -249,7 +294,10 @@ pub fn list_models() -> &'static [String] {
             }
         };
         if !output.status.success() {
-            opencode_debug(&format!("[list_models] exit code {:?}", output.status.code()));
+            opencode_debug(&format!(
+                "[list_models] exit code {:?}",
+                output.status.code()
+            ));
             return Vec::new();
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -258,7 +306,11 @@ pub fn list_models() -> &'static [String] {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && !l.starts_with('{'))
             .collect();
-        opencode_debug(&format!("[list_models] found {} models: {:?}", models.len(), models));
+        opencode_debug(&format!(
+            "[list_models] found {} models: {:?}",
+            models.len(),
+            models
+        ));
         models
     })
 }
@@ -272,10 +324,16 @@ fn resolve_opencode_path() -> Option<String> {
 
     if let Ok(val) = std::env::var("COKAC_OPENCODE_PATH") {
         if !val.is_empty() && opencode_path_is_runnable(&val) {
-            opencode_debug(&format!("[resolve_opencode_path] COKAC_OPENCODE_PATH={}", val));
+            opencode_debug(&format!(
+                "[resolve_opencode_path] COKAC_OPENCODE_PATH={}",
+                val
+            ));
             #[cfg(windows)]
             if let Some(path) = opencode_native_exe_for_wrapper(&val) {
-                opencode_debug(&format!("[resolve_opencode_path] env wrapper -> native exe {}", path));
+                opencode_debug(&format!(
+                    "[resolve_opencode_path] env wrapper -> native exe {}",
+                    path
+                ));
                 return Some(path);
             }
             return Some(val);
@@ -293,7 +351,10 @@ fn resolve_opencode_path() -> Option<String> {
                 }
             }
         }
-        if let Ok(output) = Command::new("bash").args(["-lc", "which opencode"]).output() {
+        if let Ok(output) = Command::new("bash")
+            .args(["-lc", "which opencode"])
+            .output()
+        {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !p.is_empty() && opencode_path_is_runnable(&p) {
@@ -310,7 +371,10 @@ fn resolve_opencode_path() -> Option<String> {
         // .cmd/.bat files, but doing so goes through cmd.exe and adds a batch
         // argument-escaping layer for arbitrary user prompts.
         if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".exe")) {
-            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .exe -> {}", path));
+            opencode_debug(&format!(
+                "[resolve_opencode_path] SearchPathW .exe -> {}",
+                path
+            ));
             return Some(path);
         }
         // npm also installs an extensionless POSIX shell script named
@@ -319,10 +383,16 @@ fn resolve_opencode_path() -> Option<String> {
         // safer target when present.
         if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".cmd")) {
             if let Some(native) = opencode_native_exe_for_wrapper(&path) {
-                opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> native exe {}", native));
+                opencode_debug(&format!(
+                    "[resolve_opencode_path] SearchPathW .cmd -> native exe {}",
+                    native
+                ));
                 return Some(native);
             }
-            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> {}", path));
+            opencode_debug(&format!(
+                "[resolve_opencode_path] SearchPathW .cmd -> {}",
+                path
+            ));
             return Some(path);
         }
         if let Ok(output) = Command::new("where.exe").arg("opencode").output() {
@@ -331,7 +401,10 @@ fn resolve_opencode_path() -> Option<String> {
                 for p in decoded.lines().map(str::trim).filter(|p| !p.is_empty()) {
                     if opencode_path_is_runnable(p) {
                         if let Some(native) = opencode_native_exe_for_wrapper(p) {
-                            opencode_debug(&format!("[resolve_opencode_path] where -> native exe {}", native));
+                            opencode_debug(&format!(
+                                "[resolve_opencode_path] where -> native exe {}",
+                                native
+                            ));
                             return Some(native);
                         }
                         opencode_debug(&format!("[resolve_opencode_path] where -> {}", p));
@@ -351,7 +424,10 @@ fn resolve_opencode_path() -> Option<String> {
                     .join("opencode.exe");
                 if p.exists() {
                     let p = p.display().to_string();
-                    opencode_debug(&format!("[resolve_opencode_path] npm root fallback -> {}", p));
+                    opencode_debug(&format!(
+                        "[resolve_opencode_path] npm root fallback -> {}",
+                        p
+                    ));
                     return Some(p);
                 }
             }
@@ -448,7 +524,8 @@ fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         use std::process::Command;
-        Command::new("kill").args(["-0", &pid.to_string()])
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -472,7 +549,11 @@ fn try_acquire_lock(dir: &std::path::Path) -> bool {
     let my_pid = std::process::id();
 
     // Attempt 1: atomic create (O_EXCL) — fails if file already exists
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
             opencode_debug(&format!("[lock] acquired (PID={})", my_pid));
@@ -500,16 +581,26 @@ fn try_acquire_lock(dir: &std::path::Path) -> bool {
     };
 
     if holder_pid != my_pid && holder_pid != 0 && is_pid_alive(holder_pid) {
-        opencode_debug(&format!("[lock] another process (PID={}) holds the lock, skipping injection", holder_pid));
+        opencode_debug(&format!(
+            "[lock] another process (PID={}) holds the lock, skipping injection",
+            holder_pid
+        ));
         return false;
     }
 
     // Stale lock from dead process — remove and retry with O_EXCL
-    opencode_debug(&format!("[lock] stale lock from dead PID={}, taking over", holder_pid));
+    opencode_debug(&format!(
+        "[lock] stale lock from dead PID={}, taking over",
+        holder_pid
+    ));
     let _ = std::fs::remove_file(&lock_path);
 
     // Attempt 2: another process might have grabbed it between remove and create
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
         Ok(mut f) => {
             let _ = f.write_all(my_pid.to_string().as_bytes());
             opencode_debug(&format!("[lock] acquired on retry (PID={})", my_pid));
@@ -573,7 +664,9 @@ fn recover_agents_md_if_needed(dir: &std::path::Path) {
             opencode_debug("[recover] cleaned up sentinel");
         } else {
             // Cannot delete AGENTS.md — keep sentinel for next recovery attempt
-            opencode_debug("[recover] cannot delete AGENTS.md, sentinel preserved for next recovery");
+            opencode_debug(
+                "[recover] cannot delete AGENTS.md, sentinel preserved for next recovery",
+            );
         }
         // Also clean up any stale lock
         release_lock(dir);
@@ -583,7 +676,10 @@ fn recover_agents_md_if_needed(dir: &std::path::Path) {
         match std::fs::rename(&backup_path, &agents_path) {
             Ok(()) => opencode_debug("[recover] restored OK (rename)"),
             Err(e) => {
-                opencode_debug(&format!("[recover] rename failed ({}), trying read+write", e));
+                opencode_debug(&format!(
+                    "[recover] rename failed ({}), trying read+write",
+                    e
+                ));
                 match std::fs::read_to_string(&backup_path) {
                     Ok(content) => {
                         match std::fs::write(&agents_path, &content) {
@@ -628,7 +724,10 @@ impl Drop for AgentsMdGuard {
             match std::fs::rename(&backup_path, &agents_path) {
                 Ok(()) => opencode_debug("[AgentsMdGuard] restored OK (rename)"),
                 Err(e) => {
-                    opencode_debug(&format!("[AgentsMdGuard] rename failed ({}), trying read+write", e));
+                    opencode_debug(&format!(
+                        "[AgentsMdGuard] rename failed ({}), trying read+write",
+                        e
+                    ));
                     match std::fs::read_to_string(&backup_path) {
                         Ok(content) => {
                             match std::fs::write(&agents_path, &content) {
@@ -658,7 +757,9 @@ impl Drop for AgentsMdGuard {
                 let _ = std::fs::remove_file(&sentinel_path);
             } else {
                 // Cannot delete AGENTS.md — keep sentinel for crash recovery
-                opencode_debug("[AgentsMdGuard] cannot delete AGENTS.md, sentinel preserved for recovery");
+                opencode_debug(
+                    "[AgentsMdGuard] cannot delete AGENTS.md, sentinel preserved for recovery",
+                );
             }
         }
 
@@ -669,13 +770,20 @@ impl Drop for AgentsMdGuard {
 /// Inject system prompt into AGENTS.md, prepended before any existing content.
 /// Returns `Some(guard)` on success (guard restores on drop), or `None` if
 /// injection was skipped (lock held by another process, or write failures).
-fn inject_system_prompt_into_agents_md(working_dir: &str, system_prompt: &str) -> Option<AgentsMdGuard> {
+fn inject_system_prompt_into_agents_md(
+    working_dir: &str,
+    system_prompt: &str,
+) -> Option<AgentsMdGuard> {
     let dir = std::path::Path::new(working_dir);
     let agents_path = dir.join(AGENTS_MD);
     let backup_path = dir.join(BACKUP_FILE);
     let sentinel_path = dir.join(NO_ORIGINAL_SENTINEL);
 
-    opencode_debug(&format!("[inject_agents_md] dir={} system_prompt_len={}", working_dir, system_prompt.len()));
+    opencode_debug(&format!(
+        "[inject_agents_md] dir={} system_prompt_len={}",
+        working_dir,
+        system_prompt.len()
+    ));
 
     // Step 0: recover from any previous crash
     recover_agents_md_if_needed(dir);
@@ -692,16 +800,25 @@ fn inject_system_prompt_into_agents_md(working_dir: &str, system_prompt: &str) -
         let original = match std::fs::read_to_string(&agents_path) {
             Ok(c) => c,
             Err(e) => {
-                opencode_debug(&format!("[inject_agents_md] ABORT: cannot read original AGENTS.md: {}", e));
+                opencode_debug(&format!(
+                    "[inject_agents_md] ABORT: cannot read original AGENTS.md: {}",
+                    e
+                ));
                 release_lock(dir);
                 return None;
             }
         };
-        opencode_debug(&format!("[inject_agents_md] backing up original ({} bytes)", original.len()));
+        opencode_debug(&format!(
+            "[inject_agents_md] backing up original ({} bytes)",
+            original.len()
+        ));
 
         // Atomic write: tmp file → rename to backup
         if let Err(e) = atomic_write(&backup_path, &original) {
-            opencode_debug(&format!("[inject_agents_md] ABORT: backup write FAILED: {}", e));
+            opencode_debug(&format!(
+                "[inject_agents_md] ABORT: backup write FAILED: {}",
+                e
+            ));
             release_lock(dir);
             return None; // Do NOT touch AGENTS.md without a confirmed backup
         }
@@ -710,7 +827,10 @@ fn inject_system_prompt_into_agents_md(working_dir: &str, system_prompt: &str) -
         // Step 3: NOW safe to write combined content
         let combined = format!("{}\n\n{}\n", system_prompt, original.trim());
         if let Err(e) = std::fs::write(&agents_path, &combined) {
-            opencode_debug(&format!("[inject_agents_md] combined write FAILED: {}, restoring from backup", e));
+            opencode_debug(&format!(
+                "[inject_agents_md] combined write FAILED: {}, restoring from backup",
+                e
+            ));
             // Immediately restore — backup is confirmed intact (atomic_write succeeded).
             // If rename also fails, leave backup in place for crash recovery.
             match std::fs::rename(&backup_path, &agents_path) {
@@ -722,12 +842,18 @@ fn inject_system_prompt_into_agents_md(working_dir: &str, system_prompt: &str) -
             release_lock(dir);
             return None;
         }
-        opencode_debug(&format!("[inject_agents_md] injected OK ({} bytes)", combined.len()));
+        opencode_debug(&format!(
+            "[inject_agents_md] injected OK ({} bytes)",
+            combined.len()
+        ));
     } else {
         // No original → write sentinel FIRST (so crash recovery knows to delete)
         opencode_debug("[inject_agents_md] no original AGENTS.md");
         if let Err(e) = std::fs::write(&sentinel_path, "") {
-            opencode_debug(&format!("[inject_agents_md] ABORT: sentinel write FAILED: {}", e));
+            opencode_debug(&format!(
+                "[inject_agents_md] ABORT: sentinel write FAILED: {}",
+                e
+            ));
             release_lock(dir);
             return None; // Do NOT create AGENTS.md without a sentinel
         }
@@ -752,10 +878,16 @@ fn inject_system_prompt_into_agents_md(working_dir: &str, system_prompt: &str) -
             release_lock(dir);
             return None;
         }
-        opencode_debug(&format!("[inject_agents_md] created AGENTS.md ({} bytes)", content.len()));
+        opencode_debug(&format!(
+            "[inject_agents_md] created AGENTS.md ({} bytes)",
+            content.len()
+        ));
     }
 
-    Some(AgentsMdGuard { dir: dir.to_path_buf(), had_original })
+    Some(AgentsMdGuard {
+        dir: dir.to_path_buf(),
+        had_original,
+    })
 }
 
 // ============================================================
@@ -769,13 +901,12 @@ fn build_opencode_command(
     model: Option<&str>,
 ) -> (Command, Option<std::path::PathBuf>) {
     let opencode_bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
-    opencode_debug(&format!("[build_cmd] bin={} working_dir={} session_id={:?} model={:?}",
-        opencode_bin, working_dir, session_id, model));
+    opencode_debug(&format!(
+        "[build_cmd] bin={} working_dir={} session_id={:?} model={:?}",
+        opencode_bin, working_dir, session_id, model
+    ));
 
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "--format".into(), "json".into(),
-    ];
+    let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
 
     // Working directory
     args.push("--dir".into());
@@ -801,7 +932,11 @@ fn build_opencode_command(
     let sp_path: Option<std::path::PathBuf> = None;
     let _ = system_prompt_file;
 
-    opencode_debug(&format!("[build_cmd] full args: {} {}", opencode_bin, args.join(" ")));
+    opencode_debug(&format!(
+        "[build_cmd] full args: {} {}",
+        opencode_bin,
+        args.join(" ")
+    ));
 
     let mut cmd = Command::new(&opencode_bin);
     cmd.args(&args)
@@ -812,7 +947,10 @@ fn build_opencode_command(
         // to either tool would hang the session forever. Deny them explicitly
         // while keeping every other tool allowed. Permission evaluation uses
         // `findLast` so the trailing keys override the leading `*` rule.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env(
+            "OPENCODE_PERMISSION",
+            r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#,
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -881,7 +1019,8 @@ fn normalize_tool_name(name: &str) -> String {
         "exitplanmode" => "ExitPlanMode",
         "codesearch" => "Grep",
         _ => name,
-    }.to_string()
+    }
+    .to_string()
 }
 
 /// Normalize OpenCode tool input field names to Claude-compatible names.
@@ -906,7 +1045,9 @@ fn normalize_tool_name(name: &str) -> String {
 /// `plan_exit`, `invalid`, `todowrite`) already use keys the UI renderer
 /// accepts as-is, so they need no normalization.
 fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
-    let Some(obj) = input.as_object() else { return input.clone() };
+    let Some(obj) = input.as_object() else {
+        return input.clone();
+    };
     let mut out = obj.clone();
 
     // Rename a single camelCase key to its snake_case canonical form, only if
@@ -951,12 +1092,11 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
         "apply_patch" => {
             // Extract file_path from patchText for display
             if let Some(patch) = out.get("patchText").and_then(|v| v.as_str()) {
-                let file_path = patch.lines()
-                    .find_map(|l| {
-                        l.strip_prefix("*** Add File: ")
-                            .or_else(|| l.strip_prefix("*** Update File: "))
-                            .or_else(|| l.strip_prefix("*** Delete File: "))
-                    });
+                let file_path = patch.lines().find_map(|l| {
+                    l.strip_prefix("*** Add File: ")
+                        .or_else(|| l.strip_prefix("*** Update File: "))
+                        .or_else(|| l.strip_prefix("*** Delete File: "))
+                });
                 if let Some(fp) = file_path {
                     out.insert("file_path".to_string(), Value::String(fp.to_string()));
                 }
@@ -974,42 +1114,73 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
 /// Extract tool use info from an opencode `tool_use` event
 fn parse_tool_use_event(json: &Value) -> Option<(String, String, String, String, bool)> {
     let part = json.get("part")?;
-    let raw_name = part.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let raw_name = part
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let tool_name = normalize_tool_name(raw_name);
-    let call_id = part.get("callID").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let call_id = part
+        .get("callID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let state = part.get("state")?;
     let status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
-    let raw_input = state.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+    let raw_input = state
+        .get("input")
+        .cloned()
+        .unwrap_or(Value::Object(Default::default()));
     let normalized_input = normalize_opencode_params(raw_name, &raw_input);
     if raw_input != normalized_input {
-        opencode_debug(&format!("[parse_tool_use] normalized params for {}: {:?}→{:?}",
+        opencode_debug(&format!(
+            "[parse_tool_use] normalized params for {}: {:?}→{:?}",
             raw_name,
             raw_input.as_object().map(|o| o.keys().collect::<Vec<_>>()),
-            normalized_input.as_object().map(|o| o.keys().collect::<Vec<_>>())));
+            normalized_input
+                .as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+        ));
     }
     let input = serde_json::to_string_pretty(&normalized_input).unwrap_or_default();
 
     let (output, is_error) = match status {
         "completed" => {
-            let out = state.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let out = state
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             (out, false)
         }
         "error" => {
-            let err = state.get("error").and_then(|v| v.as_str()).unwrap_or("Tool error").to_string();
+            let err = state
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Tool error")
+                .to_string();
             (err, true)
         }
         _ => (String::new(), false),
     };
 
-    opencode_debug(&format!("[parse_tool_use] tool={} call_id={} status={} input_len={} output_len={} is_error={}",
-        tool_name, call_id, status, input.len(), output.len(), is_error));
+    opencode_debug(&format!(
+        "[parse_tool_use] tool={} call_id={} status={} input_len={} output_len={} is_error={}",
+        tool_name,
+        call_id,
+        status,
+        input.len(),
+        output.len(),
+        is_error
+    ));
     Some((tool_name, call_id, input, output, is_error))
 }
 
 /// Extract session ID from any event
 fn extract_session_id(json: &Value) -> Option<String> {
-    json.get("sessionID").and_then(|v| v.as_str()).map(String::from)
+    json.get("sessionID")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Extract tokens/cost from step_finish event
@@ -1033,11 +1204,27 @@ fn extract_step_finish(json: &Value) -> (Option<String>, bool) {
 
     // Extract token details
     let tokens = part.get("tokens");
-    let total_tokens = tokens.and_then(|t| t.get("total")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let input_tokens = tokens.and_then(|t| t.get("input")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let output_tokens = tokens.and_then(|t| t.get("output")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let reasoning_tokens = tokens.and_then(|t| t.get("reasoning")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let cache_read = tokens.and_then(|t| t.get("cache")).and_then(|c| c.get("read")).and_then(|v| v.as_u64()).unwrap_or(0);
+    let total_tokens = tokens
+        .and_then(|t| t.get("total"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let input_tokens = tokens
+        .and_then(|t| t.get("input"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = tokens
+        .and_then(|t| t.get("output"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let reasoning_tokens = tokens
+        .and_then(|t| t.get("reasoning"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = tokens
+        .and_then(|t| t.get("cache"))
+        .and_then(|c| c.get("read"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     opencode_debug(&format!("[extract_step_finish] reason={} is_final={} cost={:.6} tokens(total={} in={} out={} reasoning={} cache_read={})",
         reason, is_final, cost, total_tokens, input_tokens, output_tokens, reasoning_tokens, cache_read));
@@ -1056,28 +1243,39 @@ pub fn execute_command(
     _allowed_tools: Option<&[String]>,
     model: Option<&str>,
 ) -> ClaudeResponse {
-    opencode_debug(&format!("[execute_command] START prompt_len={} session_id={:?} working_dir={} model={:?}",
-        prompt.len(), session_id, working_dir, model));
-    opencode_debug(&format!("[execute_command] prompt_preview={:?}", log_preview(prompt, 200)));
+    opencode_debug(&format!(
+        "[execute_command] START prompt_len={} session_id={:?} working_dir={} model={:?}",
+        prompt.len(),
+        session_id,
+        working_dir,
+        model
+    ));
+    opencode_debug(&format!(
+        "[execute_command] prompt_preview={:?}",
+        log_preview(prompt, 200)
+    ));
 
     if let Some(sid) = session_id {
         if !crate::services::process::is_valid_session_id(sid) {
             return ClaudeResponse {
-                success: false, response: None, session_id: None,
+                success: false,
+                response: None,
+                session_id: None,
                 error: Some(format!("Invalid session_id format: {}", sid)),
             };
         }
     }
 
-    let (mut cmd, _sp_path) = build_opencode_command(
-        session_id, working_dir, None, model,
-    );
+    let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model);
 
     // When --model is specified, opencode ignores stdin → must use positional arg.
     // When no --model, stdin works and avoids shell arg size limits.
     let use_positional = model.is_some();
     if use_positional {
-        opencode_debug(&format!("[execute_command] using positional arg (--model set), prompt_len={}", prompt.len()));
+        opencode_debug(&format!(
+            "[execute_command] using positional arg (--model set), prompt_len={}",
+            prompt.len()
+        ));
         cmd.arg("--");
         cmd.arg(prompt);
     }
@@ -1091,7 +1289,9 @@ pub fn execute_command(
         Err(e) => {
             opencode_debug(&format!("[execute_command] spawn FAILED: {}", e));
             return ClaudeResponse {
-                success: false, response: None, session_id: None,
+                success: false,
+                response: None,
+                session_id: None,
                 error: Some(format!("Failed to start opencode: {}", e)),
             };
         }
@@ -1103,7 +1303,10 @@ pub fn execute_command(
         opencode_debug("[execute_command] stdin closed (positional mode)");
     } else if let Some(mut stdin) = child.stdin.take() {
         match stdin.write_all(prompt.as_bytes()) {
-            Ok(()) => opencode_debug(&format!("[execute_command] stdin: wrote {} bytes", prompt.len())),
+            Ok(()) => opencode_debug(&format!(
+                "[execute_command] stdin: wrote {} bytes",
+                prompt.len()
+            )),
             Err(e) => opencode_debug(&format!("[execute_command] stdin write FAILED: {}", e)),
         }
         drop(stdin);
@@ -1117,10 +1320,17 @@ pub fn execute_command(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            opencode_debug(&format!("[execute_command] exit={:?} stdout_len={} stderr_len={}",
-                output.status.code(), stdout.len(), stderr.len()));
+            opencode_debug(&format!(
+                "[execute_command] exit={:?} stdout_len={} stderr_len={}",
+                output.status.code(),
+                stdout.len(),
+                stderr.len()
+            ));
             if !stderr.is_empty() {
-                opencode_debug(&format!("[execute_command] STDERR: {}", log_preview(&stderr, 500)));
+                opencode_debug(&format!(
+                    "[execute_command] STDERR: {}",
+                    log_preview(&stderr, 500)
+                ));
             }
 
             let mut sid: Option<String> = None;
@@ -1134,7 +1344,11 @@ pub fn execute_command(
 
             for line in stdout.trim().lines() {
                 line_count += 1;
-                opencode_debug(&format!("[execute_command] line {}: {}", line_count, log_preview(line, 300)));
+                opencode_debug(&format!(
+                    "[execute_command] line {}: {}",
+                    line_count,
+                    log_preview(line, 300)
+                ));
 
                 if let Ok(json) = serde_json::from_str::<Value>(line) {
                     // Capture session ID from any event
@@ -1153,11 +1367,17 @@ pub fn execute_command(
                         "text" => {
                             text_event_count += 1;
                             if let Some(text) = parse_text_event(&json) {
-                                opencode_debug(&format!("[execute_command] TEXT: {} chars, preview={:?}",
-                                    text.len(), log_preview(&text, 100)));
+                                opencode_debug(&format!(
+                                    "[execute_command] TEXT: {} chars, preview={:?}",
+                                    text.len(),
+                                    log_preview(&text, 100)
+                                ));
                                 response_text.push_str(&text);
                             } else {
-                                opencode_debug(&format!("[execute_command] TEXT parse FAILED: {}", log_preview(line, 300)));
+                                opencode_debug(&format!(
+                                    "[execute_command] TEXT parse FAILED: {}",
+                                    log_preview(line, 300)
+                                ));
                             }
                         }
                         "step_start" => {
@@ -1173,10 +1393,15 @@ pub fn execute_command(
                             if is_final {
                                 got_final_step = true;
                             }
-                            opencode_debug(&format!("[execute_command] STEP_FINISH: reason={:?} is_final={}", reason, is_final));
+                            opencode_debug(&format!(
+                                "[execute_command] STEP_FINISH: reason={:?} is_final={}",
+                                reason, is_final
+                            ));
                         }
                         "tool_use" => {
-                            opencode_debug(&format!("[execute_command] TOOL_USE event (non-streaming, skipped)"));
+                            opencode_debug(&format!(
+                                "[execute_command] TOOL_USE event (non-streaming, skipped)"
+                            ));
                         }
                         "reasoning" => {
                             opencode_debug("[execute_command] REASONING event (skipped)");
@@ -1186,31 +1411,45 @@ pub fn execute_command(
                             // (e.g. ContextOverflowError → auto-compaction) alongside
                             // eventual successful output. Record the most recent error
                             // and decide at the end whether to surface it.
-                            let err_msg = json.get("error")
+                            let err_msg = json
+                                .get("error")
                                 .and_then(|v| {
-                                    v.get("message").and_then(|m| m.as_str())
-                                        .or_else(|| v.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()))
+                                    v.get("message")
+                                        .and_then(|m| m.as_str())
+                                        .or_else(|| {
+                                            v.get("data")
+                                                .and_then(|d| d.get("message"))
+                                                .and_then(|m| m.as_str())
+                                        })
                                         .or_else(|| v.get("name").and_then(|n| n.as_str()))
                                         .or_else(|| v.as_str())
                                 })
                                 .unwrap_or("Unknown error");
-                            opencode_debug(&format!("[execute_command] ERROR event captured: {}", err_msg));
+                            opencode_debug(&format!(
+                                "[execute_command] ERROR event captured: {}",
+                                err_msg
+                            ));
                             pending_error = Some(err_msg.to_string());
                         }
                         _ => {
-                            opencode_debug(&format!("[execute_command] unknown event_type={}", event_type));
+                            opencode_debug(&format!(
+                                "[execute_command] unknown event_type={}",
+                                event_type
+                            ));
                         }
                     }
                 } else {
-                    opencode_debug(&format!("[execute_command] JSON parse failed for line {}", line_count));
+                    opencode_debug(&format!(
+                        "[execute_command] JSON parse failed for line {}",
+                        line_count
+                    ));
                 }
             }
 
             // A captured error is transient if subsequent events yielded real output
             // or a final step — in that case the successful result wins.
-            let fatal_error = pending_error.filter(|_| {
-                !(got_final_step || !response_text.is_empty() || text_event_count > 0)
-            });
+            let fatal_error = pending_error
+                .filter(|_| !(got_final_step || !response_text.is_empty() || text_event_count > 0));
 
             opencode_debug(&format!(
                 "[execute_command] DONE: lines={} text_events={} response_len={} got_final={} fatal_error={:?} session_id={:?} exit={:?}",
@@ -1244,7 +1483,10 @@ pub fn execute_command(
                 } else {
                     "OpenCode produced no output".to_string()
                 };
-                opencode_debug(&format!("[execute_command] exit 0 with zero events → surfacing: {}", err));
+                opencode_debug(&format!(
+                    "[execute_command] exit 0 with zero events → surfacing: {}",
+                    err
+                ));
                 return ClaudeResponse {
                     success: false,
                     response: None,
@@ -1287,7 +1529,10 @@ pub fn execute_command(
                     last_finish_reason.as_deref().unwrap_or("-"),
                     output.status.code()
                 );
-                opencode_debug(&format!("[execute_command] empty response → {}", diagnostic));
+                opencode_debug(&format!(
+                    "[execute_command] empty response → {}",
+                    diagnostic
+                ));
                 return ClaudeResponse {
                     success: true,
                     response: Some(diagnostic),
@@ -1306,7 +1551,9 @@ pub fn execute_command(
         Err(e) => {
             opencode_debug(&format!("[execute_command] wait_with_output FAILED: {}", e));
             ClaudeResponse {
-                success: false, response: None, session_id: None,
+                success: false,
+                response: None,
+                session_id: None,
                 error: Some(format!("Failed to read output: {}", e)),
             }
         }
@@ -1349,8 +1596,15 @@ pub fn execute_command_streaming(
     if force_legacy {
         opencode_debug("[dispatch] COKACDIR_OPENCODE_LEGACY=1 → legacy path");
         return execute_command_streaming_legacy(
-            prompt, session_id, working_dir, sender, system_prompt,
-            allowed_tools, cancel_token, model, no_session_persistence,
+            prompt,
+            session_id,
+            working_dir,
+            sender,
+            system_prompt,
+            allowed_tools,
+            cancel_token,
+            model,
+            no_session_persistence,
         );
     }
     match tokio::runtime::Handle::try_current() {
@@ -1370,16 +1624,25 @@ pub fn execute_command_streaming(
                     system_prompt.as_deref(),
                     cancel_token,
                     model.as_deref(),
-                ).await
+                )
+                .await
             })
         }
         Err(e) => {
             opencode_debug(&format!(
-                "[dispatch] no tokio runtime ({}) → legacy path", e
+                "[dispatch] no tokio runtime ({}) → legacy path",
+                e
             ));
             execute_command_streaming_legacy(
-                prompt, session_id, working_dir, sender, system_prompt,
-                allowed_tools, cancel_token, model, no_session_persistence,
+                prompt,
+                session_id,
+                working_dir,
+                sender,
+                system_prompt,
+                allowed_tools,
+                cancel_token,
+                model,
+                no_session_persistence,
             )
         }
     }
@@ -1399,18 +1662,32 @@ fn execute_command_streaming_legacy(
     _no_session_persistence: bool,
 ) -> Result<(), String> {
     opencode_debug("=== opencode execute_command_streaming_legacy START ===");
-    opencode_debug(&format!("[stream] prompt_len={} session_id={:?} working_dir={} model={:?}",
-        prompt.len(), session_id, working_dir, model));
-    opencode_debug(&format!("[stream] system_prompt_len={} cancel_token={}",
-        system_prompt.map_or(0, |s| s.len()), cancel_token.is_some()));
-    opencode_debug(&format!("[stream] prompt_preview={:?}", log_preview(prompt, 200)));
+    opencode_debug(&format!(
+        "[stream] prompt_len={} session_id={:?} working_dir={} model={:?}",
+        prompt.len(),
+        session_id,
+        working_dir,
+        model
+    ));
+    opencode_debug(&format!(
+        "[stream] system_prompt_len={} cancel_token={}",
+        system_prompt.map_or(0, |s| s.len()),
+        cancel_token.is_some()
+    ));
+    opencode_debug(&format!(
+        "[stream] prompt_preview={:?}",
+        log_preview(prompt, 200)
+    ));
 
     // Inject system prompt into AGENTS.md so opencode reads it as project
     // instructions. The guard restores the original file when dropped (on
     // function return, including early returns and panics).
     let _agents_md_guard: Option<AgentsMdGuard> = match system_prompt {
         Some(sp) if !sp.is_empty() => {
-            opencode_debug(&format!("[stream] injecting system prompt into AGENTS.md ({} bytes)", sp.len()));
+            opencode_debug(&format!(
+                "[stream] injecting system prompt into AGENTS.md ({} bytes)",
+                sp.len()
+            ));
             inject_system_prompt_into_agents_md(working_dir, sp)
         }
         _ => {
@@ -1419,20 +1696,28 @@ fn execute_command_streaming_legacy(
         }
     };
 
-    let (mut cmd, _sp_path) = build_opencode_command(
-        session_id, working_dir, None, model,
-    );
+    let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model);
 
     // When --model is specified, opencode ignores stdin → must use positional arg.
     // When no --model, stdin works and avoids shell arg size limits.
     let use_positional = model.is_some();
     if use_positional {
-        opencode_debug(&format!("[stream] using positional arg (--model set), prompt_len={}", prompt.len()));
+        opencode_debug(&format!(
+            "[stream] using positional arg (--model set), prompt_len={}",
+            prompt.len()
+        ));
         cmd.arg("--");
         cmd.arg(prompt);
     }
-    opencode_debug(&format!("[stream] effective_prompt_len={} delivery={}", prompt.len(),
-        if use_positional { "positional" } else { "stdin" }));
+    opencode_debug(&format!(
+        "[stream] effective_prompt_len={} delivery={}",
+        prompt.len(),
+        if use_positional {
+            "positional"
+        } else {
+            "stdin"
+        }
+    ));
 
     crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     opencode_debug("[stream] spawning process...");
@@ -1475,7 +1760,7 @@ fn execute_command_streaming_legacy(
     // Drain stderr in a background thread to prevent deadlock: if the child
     // writes more than the OS pipe buffer (~64KB) to stderr while we're
     // blocked reading stdout, the child's stderr write blocks and the whole
-    // pipeline hangs. Mirrors the pattern in codex.rs / gemini.rs.
+    // pipeline hangs. Mirrors the pattern in codex.rs / agy.rs.
     let stderr_thread = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
     });
@@ -1520,23 +1805,34 @@ fn execute_command_streaming_legacy(
                 opencode_debug(&format!("[stream] stdout read error: {}", e));
                 let _ = sender.send(StreamMessage::Error {
                     message: format!("Failed to read output: {}", e),
-                    stdout: String::new(), stderr: String::new(), exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
                 });
                 break;
             }
         };
 
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
 
         event_count += 1;
 
         // Log raw event (truncated) for debugging
-        opencode_debug(&format!("[stream] RAW[{}]: {}", event_count, log_preview(&line, 500)));
+        opencode_debug(&format!(
+            "[stream] RAW[{}]: {}",
+            event_count,
+            log_preview(&line, 500)
+        ));
 
         let json: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                opencode_debug(&format!("[stream] JSON parse error on event {}: {}", event_count, e));
+                opencode_debug(&format!(
+                    "[stream] JSON parse error on event {}: {}",
+                    event_count, e
+                ));
                 continue;
             }
         };
@@ -1544,7 +1840,10 @@ fn execute_command_streaming_legacy(
         // Extract session ID from every event
         if let Some(sid) = extract_session_id(&json) {
             if last_session_id.as_deref() != Some(&sid) {
-                opencode_debug(&format!("[stream] session_id updated: {:?} → {}", last_session_id, sid));
+                opencode_debug(&format!(
+                    "[stream] session_id updated: {:?} → {}",
+                    last_session_id, sid
+                ));
             }
             last_session_id = Some(sid);
         }
@@ -1556,12 +1855,18 @@ fn execute_command_streaming_legacy(
 
         match event_type {
             "step_start" => {
-                opencode_debug(&format!("[stream] STEP_START (event {}), init_sent={}", event_count, init_sent));
+                opencode_debug(&format!(
+                    "[stream] STEP_START (event {}), init_sent={}",
+                    event_count, init_sent
+                ));
                 // Send Init on first step_start
                 if !init_sent {
                     let sid = last_session_id.clone().unwrap_or_default();
                     opencode_debug(&format!("[stream] sending Init with session_id={}", sid));
-                    if sender.send(StreamMessage::Init { session_id: sid }).is_err() {
+                    if sender
+                        .send(StreamMessage::Init { session_id: sid })
+                        .is_err()
+                    {
                         opencode_debug("[stream] Init send failed (receiver dropped)");
                         break;
                     }
@@ -1572,23 +1877,38 @@ fn execute_command_streaming_legacy(
             "text" => {
                 text_event_count += 1;
                 if let Some(text) = parse_text_event(&json) {
-                    opencode_debug(&format!("[stream] TEXT[{}]: {} chars, preview={:?}, cumulative_result_len={}",
-                        text_event_count, text.len(), log_preview(&text, 100), final_result.len() + text.len()));
+                    opencode_debug(&format!(
+                        "[stream] TEXT[{}]: {} chars, preview={:?}, cumulative_result_len={}",
+                        text_event_count,
+                        text.len(),
+                        log_preview(&text, 100),
+                        final_result.len() + text.len()
+                    ));
                     final_result.push_str(&text);
                     if sender.send(StreamMessage::Text { content: text }).is_err() {
                         opencode_debug("[stream] Text send failed (receiver dropped)");
                         break;
                     }
                 } else {
-                    opencode_debug(&format!("[stream] TEXT[{}] parse FAILED: {}", text_event_count, log_preview(&line, 300)));
+                    opencode_debug(&format!(
+                        "[stream] TEXT[{}] parse FAILED: {}",
+                        text_event_count,
+                        log_preview(&line, 300)
+                    ));
                 }
             }
 
             "tool_use" => {
                 tool_event_count += 1;
-                opencode_debug(&format!("[stream] TOOL_USE[{}] (event {})", tool_event_count, event_count));
-                if let Some((tool_name, call_id, input, output, is_error)) = parse_tool_use_event(&json) {
-                    let state = json.get("part")
+                opencode_debug(&format!(
+                    "[stream] TOOL_USE[{}] (event {})",
+                    tool_event_count, event_count
+                ));
+                if let Some((tool_name, call_id, input, output, is_error)) =
+                    parse_tool_use_event(&json)
+                {
+                    let state = json
+                        .get("part")
                         .and_then(|p| p.get("state"))
                         .and_then(|s| s.get("status"))
                         .and_then(|v| v.as_str())
@@ -1598,37 +1918,55 @@ fn execute_command_streaming_legacy(
                         tool_name, call_id, state, input.len(), output.len(), is_error));
 
                     // Send ToolUse
-                    if sender.send(StreamMessage::ToolUse {
-                        name: tool_name.clone(),
-                        input: input.clone(),
-                    }).is_err() {
+                    if sender
+                        .send(StreamMessage::ToolUse {
+                            name: tool_name.clone(),
+                            input: input.clone(),
+                        })
+                        .is_err()
+                    {
                         opencode_debug("[stream] ToolUse send failed (receiver dropped)");
                         break;
                     }
 
                     // Send ToolResult if completed or error
                     if state == "completed" || state == "error" {
-                        opencode_debug(&format!("[stream] sending ToolResult: tool={} is_error={} output_preview={:?}",
-                            tool_name, is_error, log_preview(&output, 200)));
-                        if sender.send(StreamMessage::ToolResult {
-                            content: output,
+                        opencode_debug(&format!(
+                            "[stream] sending ToolResult: tool={} is_error={} output_preview={:?}",
+                            tool_name,
                             is_error,
-                        }).is_err() {
+                            log_preview(&output, 200)
+                        ));
+                        if sender
+                            .send(StreamMessage::ToolResult {
+                                content: output,
+                                is_error,
+                            })
+                            .is_err()
+                        {
                             opencode_debug("[stream] ToolResult send failed (receiver dropped)");
                             break;
                         }
                     }
                 } else {
-                    opencode_debug(&format!("[stream] TOOL_USE parse FAILED: {}", log_preview(&line, 300)));
+                    opencode_debug(&format!(
+                        "[stream] TOOL_USE parse FAILED: {}",
+                        log_preview(&line, 300)
+                    ));
                 }
             }
 
             "reasoning" => {
-                let reasoning_text = json.get("part")
+                let reasoning_text = json
+                    .get("part")
                     .and_then(|p| p.get("text"))
                     .and_then(|t| t.as_str())
                     .unwrap_or("");
-                opencode_debug(&format!("[stream] REASONING (event {}): {} chars", event_count, reasoning_text.len()));
+                opencode_debug(&format!(
+                    "[stream] REASONING (event {}): {} chars",
+                    event_count,
+                    reasoning_text.len()
+                ));
             }
 
             "step_finish" => {
@@ -1640,19 +1978,28 @@ fn execute_command_streaming_legacy(
                 }
                 // Capture output tokens so the empty-response diagnostic can say
                 // whether the model actually generated anything.
-                if let Some(out) = json.get("part")
+                if let Some(out) = json
+                    .get("part")
                     .and_then(|p| p.get("tokens"))
                     .and_then(|t| t.get("output"))
                     .and_then(|v| v.as_u64())
                 {
                     last_output_tokens = Some(out);
                 }
-                opencode_debug(&format!("[stream] STEP_FINISH (event {}): reason={:?} is_final={} result_len={}",
-                    event_count, reason, is_final, final_result.len()));
+                opencode_debug(&format!(
+                    "[stream] STEP_FINISH (event {}): reason={:?} is_final={} result_len={}",
+                    event_count,
+                    reason,
+                    is_final,
+                    final_result.len()
+                ));
                 if is_final {
                     got_done = true;
-                    opencode_debug(&format!("[stream] sending Done: result_len={} session_id={:?}",
-                        final_result.len(), last_session_id));
+                    opencode_debug(&format!(
+                        "[stream] sending Done: result_len={} session_id={:?}",
+                        final_result.len(),
+                        last_session_id
+                    ));
                     let _ = sender.send(StreamMessage::Done {
                         result: final_result.clone(),
                         session_id: last_session_id.clone(),
@@ -1661,22 +2008,35 @@ fn execute_command_streaming_legacy(
             }
 
             "error" => {
-                let err_msg = json.get("error")
+                let err_msg = json
+                    .get("error")
                     .and_then(|v| {
-                        v.get("message").and_then(|m| m.as_str())
-                            .or_else(|| v.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()))
+                        v.get("message")
+                            .and_then(|m| m.as_str())
+                            .or_else(|| {
+                                v.get("data")
+                                    .and_then(|d| d.get("message"))
+                                    .and_then(|m| m.as_str())
+                            })
                             .or_else(|| v.get("name").and_then(|n| n.as_str()))
                             .or_else(|| v.as_str())
                     })
                     .unwrap_or("Unknown error")
                     .to_string();
-                opencode_debug(&format!("[stream] ERROR event (event {}): {}", event_count, err_msg));
+                opencode_debug(&format!(
+                    "[stream] ERROR event (event {}): {}",
+                    event_count, err_msg
+                ));
                 stdout_error = Some((err_msg.clone(), line.clone()));
             }
 
             _ => {
-                opencode_debug(&format!("[stream] UNKNOWN event_type={} (event {}): {}",
-                    event_type, event_count, log_preview(&line, 200)));
+                opencode_debug(&format!(
+                    "[stream] UNKNOWN event_type={} (event {}): {}",
+                    event_type,
+                    event_count,
+                    log_preview(&line, 200)
+                ));
             }
         }
     }
@@ -1705,10 +2065,19 @@ fn execute_command_streaming_legacy(
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
     if !stderr_msg.is_empty() {
-        opencode_debug(&format!("[stream] STDERR: {}", log_preview(&stderr_msg, 500)));
+        opencode_debug(&format!(
+            "[stream] STDERR: {}",
+            log_preview(&stderr_msg, 500)
+        ));
     }
-    opencode_debug(&format!("[stream] exit_code={:?} success={} got_done={} result_len={} stderr_len={}",
-        status.code(), status.success(), got_done, final_result.len(), stderr_msg.len()));
+    opencode_debug(&format!(
+        "[stream] exit_code={:?} success={} got_done={} result_len={} stderr_len={}",
+        status.code(),
+        status.success(),
+        got_done,
+        final_result.len(),
+        stderr_msg.len()
+    ));
 
     // Tentative stdout_error: opencode publishes a session.error event even for
     // recoverable conditions like ContextOverflowError, which then triggers
@@ -1748,7 +2117,10 @@ fn execute_command_streaming_legacy(
             (msg, String::new())
         };
         let _ = sender.send(StreamMessage::Error {
-            message, stdout: stdout_raw, stderr: stderr_msg, exit_code: status.code(),
+            message,
+            stdout: stdout_raw,
+            stderr: stderr_msg,
+            exit_code: status.code(),
         });
         return Ok(());
     }
@@ -1927,23 +2299,24 @@ async fn execute_command_streaming_serve(
     }
 
     // ---- 3. Spawn opencode serve and wait for readiness ----
-    let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir, cancel_token.as_ref()).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            if serve_cancel_hit(cancel_token.as_ref()) {
-                opencode_debug(&format!("[serve] spawn aborted after cancel: {}", e));
+    let (mut serve_child, base_url) =
+        match spawn_opencode_serve(working_dir, cancel_token.as_ref()).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                if serve_cancel_hit(cancel_token.as_ref()) {
+                    opencode_debug(&format!("[serve] spawn aborted after cancel: {}", e));
+                    return Ok(());
+                }
+                opencode_debug(&format!("[serve] spawn failed: {}", e));
+                let _ = sender.send(StreamMessage::Error {
+                    message: format!("Failed to start opencode serve: {}", e),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
                 return Ok(());
             }
-            opencode_debug(&format!("[serve] spawn failed: {}", e));
-            let _ = sender.send(StreamMessage::Error {
-                message: format!("Failed to start opencode serve: {}", e),
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: None,
-            });
-            return Ok(());
-        }
-    };
+        };
     opencode_debug(&format!("[serve] ready at {}", base_url));
 
     // ---- 4. Build HTTP clients ----
@@ -2064,7 +2437,11 @@ async fn execute_command_streaming_serve(
             ));
             serve_child.shutdown().await;
             let _ = sender.send(StreamMessage::Error {
-                message: format!("SSE subscribe failed ({}): {}", code, log_preview(&body, 200)),
+                message: format!(
+                    "SSE subscribe failed ({}): {}",
+                    code,
+                    log_preview(&body, 200)
+                ),
                 stdout: String::new(),
                 stderr: String::new(),
                 exit_code: None,
@@ -2251,7 +2628,10 @@ async fn spawn_opencode_serve(
         // them explicitly while keeping every other tool allowed. Permission
         // evaluation uses `findLast` (see permission/evaluate.ts), so the
         // trailing `question`/`plan_exit` rules override the leading `*`.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
+        .env(
+            "OPENCODE_PERMISSION",
+            r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#,
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2271,9 +2651,7 @@ async fn spawn_opencode_serve(
     }
     crate::services::claude::attach_cancel_cgroup_tokio(&mut cmd, cancel_token);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {}: {}", bin, e))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {}", bin, e))?;
     opencode_debug(&format!("[serve.spawn] spawned PID={:?}", child.id()));
 
     // Register PID immediately after spawn so /stop can kill the serve
@@ -2407,8 +2785,7 @@ async fn create_session(
     let body = json!({ "title": title });
     // Serialize manually because cokacdir's reqwest build does NOT enable the
     // `json` feature — `RequestBuilder::json` is therefore unavailable.
-    let body_str = serde_json::to_string(&body)
-        .map_err(|e| format!("serialize: {}", e))?;
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {}", e))?;
     let url = format!("{}/session?directory={}", base_url, urlencoded(working_dir));
     opencode_debug(&format!("[serve.create_session] POST {}", url));
     let resp = client
@@ -2419,10 +2796,7 @@ async fn create_session(
         .await
         .map_err(|e| format!("http: {}", e))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("body: {}", e))?;
+    let text = resp.text().await.map_err(|e| format!("body: {}", e))?;
     if !status.is_success() {
         return Err(format!(
             "session create returned {}: {}",
@@ -2435,7 +2809,12 @@ async fn create_session(
     v.get("id")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("session create: no id in response: {}", log_preview(&text, 200)))
+        .ok_or_else(|| {
+            format!(
+                "session create: no id in response: {}",
+                log_preview(&text, 200)
+            )
+        })
 }
 
 /// Fire the user prompt as `prompt_async` so the server returns 204 immediately
@@ -2477,8 +2856,7 @@ async fn post_prompt_async(
         }
     }
 
-    let body_str = serde_json::to_string(&body)
-        .map_err(|e| format!("serialize: {}", e))?;
+    let body_str = serde_json::to_string(&body).map_err(|e| format!("serialize: {}", e))?;
     let url = format!("{}/session/{}/prompt_async", base_url, session_id);
     opencode_debug(&format!(
         "[serve.prompt_async] POST {} prompt_len={} model={:?}",
@@ -2682,13 +3060,8 @@ async fn handle_sse_event(
 
     match event_type {
         // Heartbeats and session-level bookkeeping we have no use for.
-        "server.connected"
-        | "server.heartbeat"
-        | "session.diff"
-        | "session.updated"
-        | "session.status"
-        | "session.created"
-        | "tui.toast.show" => {}
+        "server.connected" | "server.heartbeat" | "session.diff" | "session.updated"
+        | "session.status" | "session.created" | "tui.toast.show" => {}
 
         "message.updated" => {
             if event_sid != parent_sid {
@@ -2727,10 +3100,7 @@ async fn handle_sse_event(
                 Some(p) => p,
                 None => return,
             };
-            let msg_id = part
-                .get("messageID")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let msg_id = part.get("messageID").and_then(|v| v.as_str()).unwrap_or("");
             // Drop parts belonging to known user messages.
             if message_roles.get(msg_id).map(String::as_str) == Some("user") {
                 return;
@@ -2766,9 +3136,7 @@ async fn handle_sse_event(
                         };
                         part_progress.insert(part_id.clone(), text.to_string());
                         if !delta.is_empty() {
-                            let _ = sender.send(StreamMessage::Text {
-                                content: delta,
-                            });
+                            let _ = sender.send(StreamMessage::Text { content: delta });
                         }
                     }
                     if has_end {
@@ -2840,7 +3208,10 @@ async fn handle_sse_event(
             if field != "text" {
                 return;
             }
-            let msg_id = props.get("messageID").and_then(|v| v.as_str()).unwrap_or("");
+            let msg_id = props
+                .get("messageID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             // Drop deltas for user-role messages.
             if message_roles.get(msg_id).map(String::as_str) == Some("user") {
                 return;
@@ -2892,7 +3263,11 @@ async fn handle_sse_event(
                 .and_then(|v| {
                     v.get("message")
                         .and_then(|m| m.as_str())
-                        .or_else(|| v.get("data").and_then(|d| d.get("message")).and_then(|m| m.as_str()))
+                        .or_else(|| {
+                            v.get("data")
+                                .and_then(|d| d.get("message"))
+                                .and_then(|m| m.as_str())
+                        })
                         .or_else(|| v.get("name").and_then(|n| n.as_str()))
                         .or_else(|| v.as_str())
                 })
@@ -2949,9 +3324,7 @@ async fn poll_until_complete(
                 consecutive_http_errors = consecutive_http_errors.saturating_add(1);
                 last_http_error = Some(e);
                 if consecutive_http_errors >= POLL_MAX_CONSECUTIVE_ERRORS {
-                    let detail = last_http_error
-                        .as_deref()
-                        .unwrap_or("unknown HTTP error");
+                    let detail = last_http_error.as_deref().unwrap_or("unknown HTTP error");
                     opencode_debug(&format!(
                         "[serve.poll] POLL ABORT: {} consecutive HTTP errors on /session/status endpoint (elapsed={:.1}s, iter={}). last error: {}",
                         consecutive_http_errors, start.elapsed().as_secs_f64(), iter, detail
@@ -2997,9 +3370,7 @@ async fn poll_until_complete(
                 consecutive_http_errors = consecutive_http_errors.saturating_add(1);
                 last_http_error = Some(e);
                 if consecutive_http_errors >= POLL_MAX_CONSECUTIVE_ERRORS {
-                    let detail = last_http_error
-                        .as_deref()
-                        .unwrap_or("unknown HTTP error");
+                    let detail = last_http_error.as_deref().unwrap_or("unknown HTTP error");
                     opencode_debug(&format!(
                         "[serve.poll] POLL ABORT: {} consecutive HTTP errors on /session/{{}}/children endpoint (elapsed={:.1}s, iter={}). last error: {}",
                         consecutive_http_errors, start.elapsed().as_secs_f64(), iter, detail
@@ -3029,9 +3400,7 @@ async fn poll_until_complete(
                 consecutive_http_errors = consecutive_http_errors.saturating_add(1);
                 last_http_error = Some(e);
                 if consecutive_http_errors >= POLL_MAX_CONSECUTIVE_ERRORS {
-                    let detail = last_http_error
-                        .as_deref()
-                        .unwrap_or("unknown HTTP error");
+                    let detail = last_http_error.as_deref().unwrap_or("unknown HTTP error");
                     opencode_debug(&format!(
                         "[serve.poll] POLL ABORT: {} consecutive HTTP errors on /session/{{}}/todo endpoint (elapsed={:.1}s, iter={}). last error: {}",
                         consecutive_http_errors, start.elapsed().as_secs_f64(), iter, detail

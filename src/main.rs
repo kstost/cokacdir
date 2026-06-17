@@ -1,31 +1,31 @@
-mod ui;
-mod services;
-mod utils;
 mod config;
-mod keybindings;
 mod enc;
+mod keybindings;
+mod services;
+mod ui;
+mod utils;
 
-use std::io;
-use std::env;
-use std::sync::OnceLock;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::env;
+use std::io;
+use std::sync::OnceLock;
 use std::time::Duration;
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
 
-use crate::ui::app::{App, Screen};
+use crate::keybindings::PanelAction;
+use crate::services::agy;
 use crate::services::claude;
 use crate::services::codex;
-use crate::services::gemini;
 use crate::services::opencode;
-use crate::utils::markdown::{render_markdown, MarkdownTheme, is_line_empty};
-use crate::keybindings::PanelAction;
+use crate::ui::app::{App, Screen};
+use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -67,11 +67,14 @@ fn print_help() {
     println!("    -v, --version           Print version information");
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
-    println!("    --bridge <BACKEND>     Run as AI bridge (internal use, e.g. --bridge gemini)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord/Slack)");
+    println!(
+        "    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord/Slack)"
+    );
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
-    println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
+    println!(
+        "                            Send file via Telegram bot (internal use, HASH = token hash)"
+    );
     println!("    --currenttime            Print current server time");
     println!("    --cron <PROMPT> --at <TIME> --chat <ID> --key <HASH> [--once] [--session <SID>]");
     println!("                            Register a scheduled task");
@@ -92,7 +95,7 @@ fn print_help() {
 }
 
 fn handle_base64(encoded: &str) {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     match BASE64.decode(encoded) {
         Ok(decoded) => {
             if let Ok(text) = String::from_utf8(decoded) {
@@ -108,18 +111,27 @@ fn handle_base64(encoded: &str) {
 }
 
 fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
 
     let file_path = std::path::Path::new(path);
     if !file_path.exists() {
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("file not found: {}", path)}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("file not found: {}", path)})
+        );
         std::process::exit(1);
     }
 
-    let abs_path = match file_path.canonicalize().map(crate::utils::format::strip_unc_prefix) {
+    let abs_path = match file_path
+        .canonicalize()
+        .map(crate::utils::format::strip_unc_prefix)
+    {
         Ok(p) => p.to_string_lossy().to_string(),
         Err(e) => {
-            eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to resolve path: {}", e)}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":format!("failed to resolve path: {}", e)})
+            );
             std::process::exit(1);
         }
     };
@@ -128,12 +140,18 @@ fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
     let queue_dir = match dirs::home_dir() {
         Some(h) => h.join(".cokacdir").join("upload_queue"),
         None => {
-            eprintln!("{}", serde_json::json!({"status":"error","message":"cannot determine home directory"}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":"cannot determine home directory"})
+            );
             std::process::exit(1);
         }
     };
     if let Err(e) = std::fs::create_dir_all(&queue_dir) {
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to create queue directory: {}", e)}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("failed to create queue directory: {}", e)})
+        );
         std::process::exit(1);
     }
 
@@ -154,7 +172,10 @@ fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
     match std::fs::write(&queue_path, queue_content.to_string()) {
         Ok(_) => println!("{}", serde_json::json!({"status":"ok","path":abs_path})),
         Err(e) => {
-            eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to write queue file: {}", e)}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":format!("failed to write queue file: {}", e)})
+            );
             std::process::exit(1);
         }
     }
@@ -172,12 +193,18 @@ fn handle_read_group_chat(chat_id: i64, range_str: Option<&str>, filter_bot: Opt
     use services::telegram;
 
     // Parse range: either a single number N (last N entries) or "START-END" (1-based line range)
-    enum ReadMode { LastN(usize), Range(usize, Option<usize>) }
+    enum ReadMode {
+        LastN(usize),
+        Range(usize, Option<usize>),
+    }
     let mode = match range_str {
         Some(s) if s.contains('-') => {
             let parts: Vec<&str> = s.splitn(2, '-').collect();
             let start: usize = parts[0].parse().unwrap_or(1);
-            let end: usize = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+            let end: usize = parts
+                .get(1)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
             ReadMode::Range(start, Some(end))
         }
         Some(s) => ReadMode::LastN(s.parse().unwrap_or(20)),
@@ -196,7 +223,11 @@ fn handle_read_group_chat(chat_id: i64, range_str: Option<&str>, filter_bot: Opt
         return;
     }
     for (line_num, entry) in &entries {
-        let from_info = entry.from.as_deref().map(|f| format!("({})", f)).unwrap_or_default();
+        let from_info = entry
+            .from
+            .as_deref()
+            .map(|f| format!("({})", f))
+            .unwrap_or_default();
         let bot_label = match &entry.bot_display_name {
             Some(dn) if !dn.is_empty() => format!("{}(@{})", dn, entry.bot),
             _ => format!("@{}", entry.bot),
@@ -216,13 +247,23 @@ fn handle_read_group_chat(chat_id: i64, range_str: Option<&str>, filter_bot: Opt
         } else {
             entry.text.clone()
         };
-        println!("{:>5} [{}] {}{}: {}", line_num, entry.ts, role_display, from_info, display_text);
+        println!(
+            "{:>5} [{}] {}{}: {}",
+            line_num, entry.ts, role_display, from_info, display_text
+        );
     }
 }
 
-fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &str, once: bool, session_id: Option<&str>) {
-    use services::telegram;
+fn handle_cron_register(
+    prompt: &str,
+    at_value: &str,
+    chat_id: i64,
+    hash_key: &str,
+    once: bool,
+    session_id: Option<&str>,
+) {
     use services::claude;
+    use services::telegram;
 
     cron_debug("========================================");
     cron_debug("=== handle_cron_register START ===");
@@ -239,10 +280,18 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
 
     // Determine schedule_type and schedule value
     cron_debug("  Parsing --at value...");
-    let (schedule_type, schedule_value) = if let Some(dt) = telegram::parse_relative_time_pub(at_value) {
+    let (schedule_type, schedule_value) = if let Some(dt) =
+        telegram::parse_relative_time_pub(at_value)
+    {
         // Relative time → convert to absolute
-        cron_debug(&format!("  Parsed as relative time → absolute: {}", dt.format("%Y-%m-%d %H:%M:%S")));
-        ("absolute".to_string(), dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        cron_debug(&format!(
+            "  Parsed as relative time → absolute: {}",
+            dt.format("%Y-%m-%d %H:%M:%S")
+        ));
+        (
+            "absolute".to_string(),
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        )
     } else if at_value.split_whitespace().count() == 5 {
         // Cron expression (5 fields)
         cron_debug(&format!("  Parsed as cron expression: {}", at_value));
@@ -254,11 +303,17 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
             ("absolute".to_string(), at_value.to_string())
         } else {
             cron_debug(&format!("  ERROR: invalid --at value: {}", at_value));
-            eprintln!("{}", serde_json::json!({"status":"error","message":format!("invalid --at value: {}", at_value)}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":format!("invalid --at value: {}", at_value)})
+            );
             std::process::exit(1);
         }
     };
-    cron_debug(&format!("  schedule_type={}, schedule_value={}", schedule_type, schedule_value));
+    cron_debug(&format!(
+        "  schedule_type={}, schedule_value={}",
+        schedule_type, schedule_value
+    ));
 
     // Generate 8-char uppercase hex ID (0-9, A-F), unique among existing schedule files
     cron_debug("  Generating unique ID...");
@@ -278,8 +333,8 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
 
     // Resolve current_path from bot_settings using chat_id + hash_key
     cron_debug("  Resolving current_path...");
-    let current_path = telegram::resolve_current_path_for_chat(chat_id, hash_key)
-        .unwrap_or_else(|| {
+    let current_path =
+        telegram::resolve_current_path_for_chat(chat_id, hash_key).unwrap_or_else(|| {
             let fallback = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "/".to_string());
@@ -298,13 +353,21 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
         prompt: prompt.to_string(),
         schedule: schedule_value.clone(),
         schedule_type: schedule_type.clone(),
-        once: if schedule_type == "cron" { Some(once) } else { None },
+        once: if schedule_type == "cron" {
+            Some(once)
+        } else {
+            None
+        },
         last_run: None,
         created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
         context_summary: None,
-    }).unwrap_or_else(|e| {
+    })
+    .unwrap_or_else(|e| {
         cron_debug(&format!("  ERROR: write_schedule_entry failed: {}", e));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("{}", e)}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("{}", e)})
+        );
         std::process::exit(1);
     });
     cron_debug("  Schedule entry written successfully");
@@ -317,7 +380,10 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
         "schedule_type": schedule_type,
     });
     if schedule_type == "cron" {
-        output.as_object_mut().unwrap().insert("once".to_string(), serde_json::json!(once));
+        output
+            .as_object_mut()
+            .unwrap()
+            .insert("once".to_string(), serde_json::json!(once));
     }
     // Embed a usage hint that binds this specific schedule_id to the --cron-history
     // command. This gives the AI a direct, in-output mapping ("for THIS id, run THIS
@@ -332,11 +398,17 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
         "To inspect run history of this schedule, call: \"{}\" --cron-history {} --chat {} --key {}",
         bin, id, chat_id, hash_key
     );
-    output.as_object_mut().unwrap().insert("hint".to_string(), serde_json::json!(hint));
+    output
+        .as_object_mut()
+        .unwrap()
+        .insert("hint".to_string(), serde_json::json!(hint));
     cron_debug(&format!("  Output: {}", output));
     // Write result to temp file so the bot can read it even if Bash tool misses stdout
     if let Some(home) = dirs::home_dir() {
-        let result_path = home.join(".cokacdir").join("schedule").join(format!("{}.result", id));
+        let result_path = home
+            .join(".cokacdir")
+            .join("schedule")
+            .join(format!("{}.result", id));
         let _ = std::fs::write(&result_path, output.to_string());
         cron_debug(&format!("  Result file written: {}", result_path.display()));
     }
@@ -347,7 +419,10 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
 
     // Step 2: Spawn a detached child process to extract context summary and update the schedule
     if let Some(sid) = session_id {
-        cron_debug(&format!("  Spawning background process for context summary extraction: session={}", sid));
+        cron_debug(&format!(
+            "  Spawning background process for context summary extraction: session={}",
+            sid
+        ));
         let child = std::process::Command::new(bin_path())
             .arg("--cron-context")
             .arg(&id)
@@ -366,7 +441,10 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
             .spawn();
         match child {
             Ok(c) => cron_debug(&format!("  Background process spawned: pid={:?}", c.id())),
-            Err(e) => cron_debug(&format!("  WARNING: Failed to spawn background process: {}", e)),
+            Err(e) => cron_debug(&format!(
+                "  WARNING: Failed to spawn background process: {}",
+                e
+            )),
         }
     } else {
         cron_debug("  No session_id provided, skipping context summary");
@@ -411,8 +489,8 @@ impl CronContextArgs {
 /// Background process: extract context summary and update a schedule entry.
 /// Called as: cokacdir --cron-context <id> <session_id> <prompt> <current_path> <chat_id> <hash_key> <schedule> <schedule_type> <once> <created_at>
 fn handle_cron_context(args: &[String]) {
-    use services::telegram;
     use services::claude;
+    use services::telegram;
 
     cron_debug("=== handle_cron_context START ===");
     let ctx = match CronContextArgs::from_args(args) {
@@ -431,22 +509,40 @@ fn handle_cron_context(args: &[String]) {
     // legitimate caller always supplies a freshly generated id, so this
     // never triggers in normal use.
     if !telegram::is_valid_schedule_id_pub(&ctx.id) {
-        cron_debug(&format!("  ERROR: rejected malformed schedule_id: {:?}", ctx.id));
+        cron_debug(&format!(
+            "  ERROR: rejected malformed schedule_id: {:?}",
+            ctx.id
+        ));
         return;
     }
 
-    cron_debug(&format!("  id={}, session_id={}, prompt_len={}", ctx.id, ctx.session_id, ctx.prompt.len()));
+    cron_debug(&format!(
+        "  id={}, session_id={}, prompt_len={}",
+        ctx.id,
+        ctx.session_id,
+        ctx.prompt.len()
+    ));
 
     let extract_start = std::time::Instant::now();
     match claude::extract_context_summary(&ctx.session_id, &ctx.prompt, &ctx.current_path) {
         Ok(summary) => {
-            cron_debug(&format!("  Context summary extracted in {:?}, len={}", extract_start.elapsed(), summary.len()));
+            cron_debug(&format!(
+                "  Context summary extracted in {:?}, len={}",
+                extract_start.elapsed(),
+                summary.len()
+            ));
 
             // 실행 중 삭제된 스케줄 부활 방지: 파일이 아직 존재하는지 확인
             if let Some(home) = dirs::home_dir() {
-                let path = home.join(".cokacdir").join("schedule").join(format!("{}.json", ctx.id));
+                let path = home
+                    .join(".cokacdir")
+                    .join("schedule")
+                    .join(format!("{}.json", ctx.id));
                 if !path.exists() {
-                    cron_debug(&format!("  Schedule {} already deleted, skipping context_summary write", ctx.id));
+                    cron_debug(&format!(
+                        "  Schedule {} already deleted, skipping context_summary write",
+                        ctx.id
+                    ));
                     cron_debug("=== handle_cron_context END ===");
                     return;
                 }
@@ -460,17 +556,26 @@ fn handle_cron_context(args: &[String]) {
                 prompt: ctx.prompt.clone(),
                 schedule: ctx.schedule.clone(),
                 schedule_type: ctx.schedule_type.clone(),
-                once: if ctx.schedule_type == "cron" { Some(ctx.once) } else { None },
+                once: if ctx.schedule_type == "cron" {
+                    Some(ctx.once)
+                } else {
+                    None
+                },
                 last_run: None,
                 created_at: ctx.created_at.clone(),
                 context_summary: Some(summary),
-            }).unwrap_or_else(|e| {
+            })
+            .unwrap_or_else(|e| {
                 cron_debug(&format!("  ERROR: write_schedule_entry failed: {}", e));
             });
             cron_debug("  Schedule entry updated with context_summary");
         }
         Err(e) => {
-            cron_debug(&format!("  WARNING: extract_context_summary failed in {:?}: {}", extract_start.elapsed(), e));
+            cron_debug(&format!(
+                "  WARNING: extract_context_summary failed in {:?}: {}",
+                extract_start.elapsed(),
+                e
+            ));
         }
     }
     cron_debug("=== handle_cron_context END ===");
@@ -479,34 +584,54 @@ fn handle_cron_context(args: &[String]) {
 fn handle_cron_list(chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_list] chat_id={}, key_supplied=true", chat_id));
+    cron_debug(&format!(
+        "[handle_cron_list] chat_id={}, key_supplied=true",
+        chat_id
+    ));
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
-    cron_debug(&format!("[handle_cron_list] found {} entries", entries.len()));
-    let items: Vec<serde_json::Value> = entries.iter().map(|e| {
-        let mut obj = serde_json::json!({
-            "id": e.id,
-            "prompt": e.prompt,
-            "schedule": e.schedule,
-            "schedule_type": e.schedule_type,
-            "created_at": e.created_at
-        });
-        if let Some(once_val) = e.once {
-            obj.as_object_mut().unwrap().insert("once".to_string(), serde_json::json!(once_val));
-        }
-        obj
-    }).collect();
+    cron_debug(&format!(
+        "[handle_cron_list] found {} entries",
+        entries.len()
+    ));
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let mut obj = serde_json::json!({
+                "id": e.id,
+                "prompt": e.prompt,
+                "schedule": e.schedule,
+                "schedule_type": e.schedule_type,
+                "created_at": e.created_at
+            });
+            if let Some(once_val) = e.once {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("once".to_string(), serde_json::json!(once_val));
+            }
+            obj
+        })
+        .collect();
     println!("{}", serde_json::json!({"status":"ok","schedules":items}));
 }
 
 fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_remove] id={}, chat_id={}, key_supplied=true", id, chat_id));
+    cron_debug(&format!(
+        "[handle_cron_remove] id={}, chat_id={}, key_supplied=true",
+        id, chat_id
+    ));
     // Verify ownership
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     if !entries.iter().any(|e| e.id == id) {
-        cron_debug(&format!("[handle_cron_remove] id={}, not found or access denied", id));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
+        cron_debug(&format!(
+            "[handle_cron_remove] id={}, not found or access denied",
+            id
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)})
+        );
         std::process::exit(1);
     }
 
@@ -515,11 +640,17 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
         // future schedule that happened to receive the same 8-char ID (collision-checked
         // but theoretically reusable) would inherit the prior schedule's run history.
         telegram::delete_schedule_history_pub(id);
-        cron_debug(&format!("[handle_cron_remove] id={}, deleted successfully", id));
+        cron_debug(&format!(
+            "[handle_cron_remove] id={}, deleted successfully",
+            id
+        ));
         println!("{}", serde_json::json!({"status":"ok","id":id}));
     } else {
         cron_debug(&format!("[handle_cron_remove] id={}, delete failed", id));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to remove schedule: {}", id)}));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("failed to remove schedule: {}", id)})
+        );
         std::process::exit(1);
     }
 }
@@ -534,7 +665,10 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
 fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_history] id={}, chat_id={}, key_supplied=true", id, chat_id));
+    cron_debug(&format!(
+        "[handle_cron_history] id={}, chat_id={}, key_supplied=true",
+        id, chat_id
+    ));
 
     let history_path = match telegram::schedule_history_path_pub(id) {
         Some(p) => p,
@@ -542,8 +676,14 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
             // `schedule_history_path_pub` returns None for malformed ids
             // (path-traversal guard) as well as a missing home dir. Either
             // way we can't locate a history file — refuse uniformly.
-            cron_debug(&format!("[handle_cron_history] schedule_history_path_pub returned None for id={:?}", id));
-            eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
+            cron_debug(&format!(
+                "[handle_cron_history] schedule_history_path_pub returned None for id={:?}",
+                id
+            ));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)})
+            );
             std::process::exit(1);
         }
     };
@@ -573,8 +713,14 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
     }
 
     if !entry_authorized && !authorized_via_history {
-        cron_debug(&format!("[handle_cron_history] id={}, not authorized (no entry, no matching history)", id));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
+        cron_debug(&format!(
+            "[handle_cron_history] id={}, not authorized (no entry, no matching history)",
+            id
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)})
+        );
         std::process::exit(1);
     }
 
@@ -591,7 +737,9 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
                 .filter(|l| !l.trim().is_empty())
                 .filter_map(|l| {
                     let mut record: serde_json::Value = serde_json::from_str(l).ok()?;
-                    if !telegram::schedule_history_record_authorized_pub(&record, id, chat_id, hash_key) {
+                    if !telegram::schedule_history_record_authorized_pub(
+                        &record, id, chat_id, hash_key,
+                    ) {
                         return None;
                     }
                     telegram::sanitize_schedule_history_record_pub(&mut record);
@@ -599,8 +747,14 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
                 })
                 .collect(),
             Err(e) => {
-                cron_debug(&format!("[handle_cron_history] id={}, read failed: {}", id, e));
-                eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to read history file: {}", e)}));
+                cron_debug(&format!(
+                    "[handle_cron_history] id={}, read failed: {}",
+                    id, e
+                ));
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status":"error","message":format!("failed to read history file: {}", e)})
+                );
                 std::process::exit(1);
             }
         }
@@ -614,7 +768,11 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
         "count": history.len(),
         "history": history,
     });
-    cron_debug(&format!("[handle_cron_history] id={}, returned {} record(s)", id, history.len()));
+    cron_debug(&format!(
+        "[handle_cron_history] id={}, returned {} record(s)",
+        id,
+        history.len()
+    ));
     println!("{}", output);
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -631,24 +789,51 @@ fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     let entry = entries.iter().find(|e| e.id == id);
     let Some(entry) = entry else {
-        cron_debug(&format!("[handle_cron_update] id={}, not found or access denied", id));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, not found or access denied",
+            id
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)})
+        );
         std::process::exit(1);
     };
 
     // Parse new schedule value
-    let (schedule_type, schedule_value) = if let Some(dt) = telegram::parse_relative_time_pub(at_value) {
-        cron_debug(&format!("[handle_cron_update] id={}, parsed as relative → absolute: {}", id, dt.format("%Y-%m-%d %H:%M:%S")));
-        ("absolute".to_string(), dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    let (schedule_type, schedule_value) = if let Some(dt) =
+        telegram::parse_relative_time_pub(at_value)
+    {
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, parsed as relative → absolute: {}",
+            id,
+            dt.format("%Y-%m-%d %H:%M:%S")
+        ));
+        (
+            "absolute".to_string(),
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        )
     } else if at_value.split_whitespace().count() == 5 {
-        cron_debug(&format!("[handle_cron_update] id={}, parsed as cron: {}", id, at_value));
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, parsed as cron: {}",
+            id, at_value
+        ));
         ("cron".to_string(), at_value.to_string())
     } else if chrono::NaiveDateTime::parse_from_str(at_value, "%Y-%m-%d %H:%M:%S").is_ok() {
-        cron_debug(&format!("[handle_cron_update] id={}, parsed as absolute datetime: {}", id, at_value));
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, parsed as absolute datetime: {}",
+            id, at_value
+        ));
         ("absolute".to_string(), at_value.to_string())
     } else {
-        cron_debug(&format!("[handle_cron_update] id={}, invalid --at value: {:?}", id, at_value));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("invalid --at value: {}", at_value)}));
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, invalid --at value: {:?}",
+            id, at_value
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("invalid --at value: {}", at_value)})
+        );
         std::process::exit(1);
     };
 
@@ -664,22 +849,37 @@ fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
     updated.schedule = schedule_value.clone();
     updated.schedule_type = schedule_type.clone();
     updated.last_run = None; // Reset last_run so it triggers again
-    // once is only meaningful for cron; clear it for absolute
+                             // once is only meaningful for cron; clear it for absolute
     if schedule_type == "absolute" {
         updated.once = None;
     } else if updated.once.is_none() {
         updated.once = Some(false);
     }
 
-    cron_debug(&format!("[handle_cron_update] id={}, writing: type={}, schedule={}, last_run=None", id, schedule_type, schedule_value));
+    cron_debug(&format!(
+        "[handle_cron_update] id={}, writing: type={}, schedule={}, last_run=None",
+        id, schedule_type, schedule_value
+    ));
     telegram::write_schedule_entry_pub(&updated).unwrap_or_else(|e| {
-        cron_debug(&format!("[handle_cron_update] id={}, write failed: {}", id, e));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("{}", e)}));
+        cron_debug(&format!(
+            "[handle_cron_update] id={}, write failed: {}",
+            id, e
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("{}", e)})
+        );
         std::process::exit(1);
     });
 
-    cron_debug(&format!("[handle_cron_update] id={}, updated successfully", id));
-    println!("{}", serde_json::json!({"status":"ok","id":id,"schedule":schedule_value}));
+    cron_debug(&format!(
+        "[handle_cron_update] id={}, updated successfully",
+        id
+    ));
+    println!(
+        "{}",
+        serde_json::json!({"status":"ok","id":id,"schedule":schedule_value})
+    );
 }
 
 fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
@@ -702,7 +902,10 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
         }
         None => {
             msg_debug("[handle_bot_message] sender resolution failed for supplied key");
-            eprintln!("{}", serde_json::json!({"status":"error","message":"Invalid key"}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":"Invalid key"})
+            );
             std::process::exit(1);
         }
     };
@@ -710,30 +913,54 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
     // 2. Verify receiver: check if --to bot exists
     let to_clean = to.strip_prefix('@').unwrap_or(to);
     let to_lower = to_clean.to_lowercase();
-    msg_debug(&format!("[handle_bot_message] checking receiver bot: {}", to_lower));
+    msg_debug(&format!(
+        "[handle_bot_message] checking receiver bot: {}",
+        to_lower
+    ));
     if !telegram::bot_username_exists(&to_lower) {
-        msg_debug(&format!("[handle_bot_message] receiver bot not found: {}", to_lower));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("Bot '{}' not found", to_lower)}));
+        msg_debug(&format!(
+            "[handle_bot_message] receiver bot not found: {}",
+            to_lower
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("Bot '{}' not found", to_lower)})
+        );
         std::process::exit(1);
     }
-    msg_debug(&format!("[handle_bot_message] receiver bot confirmed: {}", to_lower));
+    msg_debug(&format!(
+        "[handle_bot_message] receiver bot confirmed: {}",
+        to_lower
+    ));
 
     // 3. Create messages directory
     msg_debug("[handle_bot_message] getting messages directory");
     let msg_dir = match telegram::messages_dir() {
         Some(d) => {
-            msg_debug(&format!("[handle_bot_message] messages_dir={}", d.display()));
+            msg_debug(&format!(
+                "[handle_bot_message] messages_dir={}",
+                d.display()
+            ));
             d
         }
         None => {
             msg_debug("[handle_bot_message] messages_dir() returned None");
-            eprintln!("{}", serde_json::json!({"status":"error","message":"cannot determine home directory"}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":"cannot determine home directory"})
+            );
             std::process::exit(1);
         }
     };
     if let Err(e) = std::fs::create_dir_all(&msg_dir) {
-        msg_debug(&format!("[handle_bot_message] create_dir_all failed: {}", e));
-        eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to create messages directory: {}", e)}));
+        msg_debug(&format!(
+            "[handle_bot_message] create_dir_all failed: {}",
+            e
+        ));
+        eprintln!(
+            "{}",
+            serde_json::json!({"status":"error","message":format!("failed to create messages directory: {}", e)})
+        );
         std::process::exit(1);
     }
     msg_debug("[handle_bot_message] messages directory ready");
@@ -743,7 +970,10 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
     let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
     let random_hex = format!("{:08x}", rand::random::<u32>());
     let msg_id = format!("msg_{}_{}", timestamp, random_hex);
-    msg_debug(&format!("[handle_bot_message] generated msg_id={}, timestamp={}", msg_id, timestamp));
+    msg_debug(&format!(
+        "[handle_bot_message] generated msg_id={}, timestamp={}",
+        msg_id, timestamp
+    ));
 
     let msg_json = serde_json::json!({
         "id": msg_id,
@@ -755,15 +985,30 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
     });
 
     let file_path = msg_dir.join(format!("{}.json", msg_id));
-    msg_debug(&format!("[handle_bot_message] writing message file: {}", file_path.display()));
-    match std::fs::write(&file_path, serde_json::to_string_pretty(&msg_json).unwrap_or_default()) {
+    msg_debug(&format!(
+        "[handle_bot_message] writing message file: {}",
+        file_path.display()
+    ));
+    match std::fs::write(
+        &file_path,
+        serde_json::to_string_pretty(&msg_json).unwrap_or_default(),
+    ) {
         Ok(_) => {
-            msg_debug(&format!("[handle_bot_message] OK: from={}, to={}, id={}, path={}", from_username, to_lower, msg_id, file_path.display()));
+            msg_debug(&format!(
+                "[handle_bot_message] OK: from={}, to={}, id={}, path={}",
+                from_username,
+                to_lower,
+                msg_id,
+                file_path.display()
+            ));
             println!("{}", serde_json::json!({"status":"ok","id":msg_id}));
         }
         Err(e) => {
             msg_debug(&format!("[handle_bot_message] write failed: {}", e));
-            eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to write message file: {}", e)}));
+            eprintln!(
+                "{}",
+                serde_json::json!({"status":"error","message":format!("failed to write message file: {}", e)})
+            );
             std::process::exit(1);
         }
     }
@@ -863,9 +1108,14 @@ fn handle_ccserver(tokens: Vec<String>) {
         } else {
             "telegram (fallback)"
         };
-        // Mask token for security: show first 8 chars only
-        let masked = if token.len() > 8 { &token[..8] } else { token };
-        eprintln!("  [ccserver] token #{}: {} → {}", i + 1, kind, format!("{}...", masked));
+        // Mask token for security: show only a short prefix (char-boundary safe).
+        let masked = crate::utils::format::safe_prefix(token, 8);
+        eprintln!(
+            "  [ccserver] token #{}: {} → {}",
+            i + 1,
+            kind,
+            format!("{}...", masked)
+        );
     }
 
     let total = tg_tokens.len() + discord_tokens.len() + slack_tokens.len();
@@ -880,21 +1130,32 @@ fn handle_ccserver(tokens: Vec<String>) {
     // Check provider availability
     let has_claude = claude::is_claude_available();
     let has_codex = codex::is_codex_available();
-    let has_gemini = gemini::is_gemini_available();
+    let has_agy = agy::is_agy_available();
     let has_opencode = opencode::is_opencode_available();
     let mark = |available: bool| if available { "✓" } else { "✗" };
-    println!("  ▸ Providers    : claude {}  codex {}  gemini {}  opencode {}", mark(has_claude), mark(has_codex), mark(has_gemini), mark(has_opencode));
+    println!(
+        "  ▸ Providers    : claude {}  codex {}  agy {}  opencode {}",
+        mark(has_claude),
+        mark(has_codex),
+        mark(has_agy),
+        mark(has_opencode)
+    );
 
-    if has_gemini {
-        let skip_trust = gemini::gemini_supports_skip_trust();
-        let ver = gemini::gemini_version().map(|s| s.as_str()).unwrap_or("unknown");
-        println!("  ▸ Gemini       : v{} ({}--skip-trust)", ver, if skip_trust { "+" } else { "−" });
+    if has_agy {
+        let ver = agy::agy_version().map(|s| s.as_str()).unwrap_or("unknown");
+        let model_count = agy::list_models().len();
+        println!(
+            "  ▸ Agy          : v{} ({} model{})",
+            ver,
+            model_count,
+            if model_count == 1 { "" } else { "s" }
+        );
     }
 
-    if !has_claude && !has_codex && !has_gemini && !has_opencode {
+    if !has_claude && !has_codex && !has_agy && !has_opencode {
         eprintln!();
         eprintln!("  Error: No AI provider available.");
-        eprintln!("  Install Claude CLI, Codex CLI, Gemini CLI, or OpenCode.");
+        eprintln!("  Install Claude CLI, Codex CLI, Antigravity CLI (agy), or OpenCode.");
         return;
     }
 
@@ -1004,7 +1265,12 @@ fn handle_prompt(prompt: &str) {
     let response = claude::execute_command(prompt, None, &current_dir, None, None);
 
     if !response.success {
-        eprintln!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string()));
+        eprintln!(
+            "Error: {}",
+            response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string())
+        );
         return;
     }
 
@@ -1028,9 +1294,7 @@ fn handle_prompt(prompt: &str) {
             }
             prev_was_empty = true;
         } else {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("{}", content);
             prev_was_empty = false;
         }
@@ -1152,8 +1416,7 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
     );
 
     // Turn on opencode debug log sink so ~/.cokacdir/debug/opencode.log captures details.
-    crate::services::claude::DEBUG_ENABLED
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::services::claude::DEBUG_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1176,7 +1439,9 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
     // adapter runs to completion.
     let cancel_token_outer: Option<std::sync::Arc<crate::services::claude::CancelToken>> =
         if cancel_after_ms.is_some() {
-            Some(std::sync::Arc::new(crate::services::claude::CancelToken::new()))
+            Some(std::sync::Arc::new(
+                crate::services::claude::CancelToken::new(),
+            ))
         } else {
             None
         };
@@ -1397,27 +1662,87 @@ fn normalize_consecutive_empty_lines(text: &str) -> String {
 /// Deploy bundled documentation files to ~/.cokacdir/docs/
 fn deploy_docs() {
     const DOCS: &[(&str, &str)] = &[
-        ("how-to-install.md", include_str!("../docs/how-to-install.md")),
+        (
+            "how-to-install.md",
+            include_str!("../docs/how-to-install.md"),
+        ),
         ("how-to-update.md", include_str!("../docs/how-to-update.md")),
-        ("how-to-manage-tokens.md", include_str!("../docs/how-to-manage-tokens.md")),
-        ("how-to-setup-telegram-bot.md", include_str!("../docs/how-to-setup-telegram-bot.md")),
-        ("how-to-setup-discord-bot.md", include_str!("../docs/how-to-setup-discord-bot.md")),
-        ("how-to-start-first-chat.md", include_str!("../docs/how-to-start-first-chat.md")),
-        ("how-to-use-start-session-and-clear.md", include_str!("../docs/how-to-use-start-session-and-clear.md")),
-        ("how-to-set-instructions.md", include_str!("../docs/how-to-set-instructions.md")),
-        ("how-to-manage-requests.md", include_str!("../docs/how-to-manage-requests.md")),
-        ("how-to-use-group-chat.md", include_str!("../docs/how-to-use-group-chat.md")),
-        ("how-to-use-schedules.md", include_str!("../docs/how-to-use-schedules.md")),
-        ("how-to-simulate-multiple-chats-with-one-bot.md", include_str!("../docs/how-to-simulate-multiple-chats-with-one-bot.md")),
-        ("how-to-install-claude-code-on-windows.md", include_str!("../docs/how-to-install-claude-code-on-windows.md")),
-        ("how-to-install-codex-on-windows.md", include_str!("../docs/how-to-install-codex-on-windows.md")),
-        ("how-to-configure-environment-variables.md", include_str!("../docs/how-to-configure-environment-variables.md")),
-        ("how-to-configure-settings.md", include_str!("../docs/how-to-configure-settings.md")),
-        ("how-to-manage-tools.md", include_str!("../docs/how-to-manage-tools.md")),
-        ("how-to-setup-slack-bot.md", include_str!("../docs/how-to-setup-slack-bot.md")),
-        ("how-to-use-file-transfer.md", include_str!("../docs/how-to-use-file-transfer.md")),
-        ("how-to-use-shell-commands.md", include_str!("../docs/how-to-use-shell-commands.md")),
-        ("how-to-share-bot-with-others.md", include_str!("../docs/how-to-share-bot-with-others.md")),
+        (
+            "how-to-manage-tokens.md",
+            include_str!("../docs/how-to-manage-tokens.md"),
+        ),
+        (
+            "how-to-setup-telegram-bot.md",
+            include_str!("../docs/how-to-setup-telegram-bot.md"),
+        ),
+        (
+            "how-to-setup-discord-bot.md",
+            include_str!("../docs/how-to-setup-discord-bot.md"),
+        ),
+        (
+            "how-to-start-first-chat.md",
+            include_str!("../docs/how-to-start-first-chat.md"),
+        ),
+        (
+            "how-to-use-start-session-and-clear.md",
+            include_str!("../docs/how-to-use-start-session-and-clear.md"),
+        ),
+        (
+            "how-to-set-instructions.md",
+            include_str!("../docs/how-to-set-instructions.md"),
+        ),
+        (
+            "how-to-manage-requests.md",
+            include_str!("../docs/how-to-manage-requests.md"),
+        ),
+        (
+            "how-to-use-group-chat.md",
+            include_str!("../docs/how-to-use-group-chat.md"),
+        ),
+        (
+            "how-to-use-schedules.md",
+            include_str!("../docs/how-to-use-schedules.md"),
+        ),
+        (
+            "how-to-simulate-multiple-chats-with-one-bot.md",
+            include_str!("../docs/how-to-simulate-multiple-chats-with-one-bot.md"),
+        ),
+        (
+            "how-to-install-claude-code-on-windows.md",
+            include_str!("../docs/how-to-install-claude-code-on-windows.md"),
+        ),
+        (
+            "how-to-install-codex-on-windows.md",
+            include_str!("../docs/how-to-install-codex-on-windows.md"),
+        ),
+        (
+            "how-to-configure-environment-variables.md",
+            include_str!("../docs/how-to-configure-environment-variables.md"),
+        ),
+        (
+            "how-to-configure-settings.md",
+            include_str!("../docs/how-to-configure-settings.md"),
+        ),
+        (
+            "how-to-manage-tools.md",
+            include_str!("../docs/how-to-manage-tools.md"),
+        ),
+        (
+            "how-to-setup-slack-bot.md",
+            include_str!("../docs/how-to-setup-slack-bot.md"),
+        ),
+        (
+            "how-to-use-file-transfer.md",
+            include_str!("../docs/how-to-use-file-transfer.md"),
+        ),
+        (
+            "how-to-use-shell-commands.md",
+            include_str!("../docs/how-to-use-shell-commands.md"),
+        ),
+        (
+            "how-to-share-bot-with-others.md",
+            include_str!("../docs/how-to-share-bot-with-others.md"),
+        ),
     ];
     if let Some(home) = dirs::home_dir() {
         let docs_dir = home.join(".cokacdir").join("docs");
@@ -1453,7 +1778,10 @@ fn load_dot_env() {
         } else if val.is_number() || val.is_boolean() {
             std::env::set_var(key, val.to_string());
         } else {
-            eprintln!("Warning: ~/.cokacdir/.env.json: skipping '{}' (unsupported value type)", key);
+            eprintln!(
+                "Warning: ~/.cokacdir/.env.json: skipping '{}' (unsupported value type)",
+                key
+            );
         }
     }
 }
@@ -1493,21 +1821,6 @@ fn main() -> io::Result<()> {
                 print_version();
                 return Ok(());
             }
-            "--bridge" => {
-                if i + 1 >= args.len() {
-                    eprintln!("Error: --bridge requires a backend argument (e.g. gemini)");
-                    std::process::exit(1);
-                }
-                let backend = &args[i + 1];
-                let remaining: Vec<String> = args[i + 2..].to_vec();
-                match backend.as_str() {
-                    "gemini" => crate::services::bridge::run_gemini(&remaining),
-                    _ => {
-                        eprintln!("Error: Unknown bridge backend '{}'. Supported: gemini", backend);
-                        std::process::exit(1);
-                    }
-                }
-            }
             "--prompt" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --prompt requires a text argument");
@@ -1538,7 +1851,8 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--ccserver" => {
-                let tokens: Vec<String> = args[i + 1..].iter()
+                let tokens: Vec<String> = args[i + 1..]
+                    .iter()
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
@@ -1551,7 +1865,10 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--currenttime" => {
-                println!("{}", serde_json::json!({"status":"ok","time":chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()}));
+                println!(
+                    "{}",
+                    serde_json::json!({"status":"ok","time":chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()})
+                );
                 return Ok(());
             }
             "--cron" => {
@@ -1568,26 +1885,48 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--at" => {
-                            if j + 1 < args.len() { at_value = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                at_value = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--chat" => {
-                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--key" => {
-                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--session" => {
-                            if j + 1 < args.len() { session_id = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                session_id = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
-                        "--once" => { once = true; j += 1; }
+                        "--once" => {
+                            once = true;
+                            j += 1;
+                        }
                         _ if prompt.is_none() && !args[j].starts_with("--") => {
-                            prompt = Some(args[j].clone()); j += 1;
+                            prompt = Some(args[j].clone());
+                            j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 cron_debug(&format!(
@@ -1606,7 +1945,10 @@ fn main() -> io::Result<()> {
                     }
                     _ => {
                         cron_debug("  ERROR: Missing required arguments");
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron requires \"prompt\", --at \"time\", --chat <ID>, --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--cron requires \"prompt\", --at \"time\", --chat <ID>, --key <HASH>"})
+                        );
                     }
                 }
                 cron_debug("=== --cron argument parsing END ===");
@@ -1614,7 +1956,7 @@ fn main() -> io::Result<()> {
             }
             "--cron-context" => {
                 // Background process: extract context summary and update schedule
-                let remaining: Vec<String> = args[i+1..].to_vec();
+                let remaining: Vec<String> = args[i + 1..].to_vec();
                 handle_cron_context(&remaining);
                 return Ok(());
             }
@@ -1625,20 +1967,33 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--chat" => {
-                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--key" => {
-                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (chat_id, key) {
                     (Some(cid), Some(k)) => handle_cron_list(cid, &k),
                     _ => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-list requires --chat <ID> --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--cron-list requires --chat <ID> --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1651,23 +2006,37 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--chat" => {
-                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--key" => {
-                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
-                            sched_id = Some(args[j].clone()); j += 1;
+                            sched_id = Some(args[j].clone());
+                            j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (sched_id, chat_id, key) {
                     (Some(sid), Some(cid), Some(k)) => handle_cron_remove(&sid, cid, &k),
                     _ => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-remove requires <ID> --chat <ID> --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--cron-remove requires <ID> --chat <ID> --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1680,23 +2049,37 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--chat" => {
-                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--key" => {
-                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
-                            sched_id = Some(args[j].clone()); j += 1;
+                            sched_id = Some(args[j].clone());
+                            j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (sched_id, chat_id, key) {
                     (Some(sid), Some(cid), Some(k)) => handle_cron_history(&sid, cid, &k),
                     _ => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-history requires <ID> --chat <ID> --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--cron-history requires <ID> --chat <ID> --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1710,27 +2093,47 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--at" => {
-                            if j + 1 < args.len() { at_value = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                at_value = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--chat" => {
-                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--key" => {
-                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
-                            sched_id = Some(args[j].clone()); j += 1;
+                            sched_id = Some(args[j].clone());
+                            j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (sched_id, at_value, chat_id, key) {
-                    (Some(sid), Some(at), Some(cid), Some(k)) => handle_cron_update(&sid, &at, cid, &k),
+                    (Some(sid), Some(at), Some(cid), Some(k)) => {
+                        handle_cron_update(&sid, &at, cid, &k)
+                    }
                     _ => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-update requires <ID> --at \"time\" --chat <ID> --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--cron-update requires <ID> --at \"time\" --chat <ID> --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1763,7 +2166,9 @@ fn main() -> io::Result<()> {
                             file_path = Some(args[j].clone());
                             j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (file_path, chat_id, key) {
@@ -1771,14 +2176,21 @@ fn main() -> io::Result<()> {
                         handle_sendfile(&fp, cid, &k);
                     }
                     _ => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--sendfile requires <PATH>, --chat <ID>, and --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--sendfile requires <PATH>, --chat <ID>, and --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
             }
             "--message" => {
                 // Parse: --message <TEXT> --to <BOT> --chat <ID> --key <HASH>
-                msg_debug(&format!("[main:--message] parsing args starting at i={}, remaining_args={}", i, args.len() - i - 1));
+                msg_debug(&format!(
+                    "[main:--message] parsing args starting at i={}, remaining_args={}",
+                    i,
+                    args.len() - i - 1
+                ));
                 let mut message: Option<String> = None;
                 let mut to_bot: Option<String> = None;
                 let mut chat_id: Option<i64> = None;
@@ -1800,7 +2212,11 @@ fn main() -> io::Result<()> {
                         "--chat" => {
                             if j + 1 < args.len() {
                                 chat_id = args[j + 1].parse().ok();
-                                msg_debug(&format!("[main:--message] --chat={:?} (parsed={:?})", args[j + 1], chat_id));
+                                msg_debug(&format!(
+                                    "[main:--message] --chat={:?} (parsed={:?})",
+                                    args[j + 1],
+                                    chat_id
+                                ));
                                 j += 2;
                             } else {
                                 msg_debug("[main:--message] --chat missing value");
@@ -1819,25 +2235,42 @@ fn main() -> io::Result<()> {
                         }
                         _ if message.is_none() && !args[j].starts_with("--") => {
                             message = Some(args[j].clone());
-                            msg_debug(&format!("[main:--message] message text captured: len={}", args[j].len()));
+                            msg_debug(&format!(
+                                "[main:--message] message text captured: len={}",
+                                args[j].len()
+                            ));
                             j += 1;
                         }
                         _ => {
-                            msg_debug(&format!("[main:--message] skipping unrecognized arg: {:?}", args[j]));
+                            msg_debug(&format!(
+                                "[main:--message] skipping unrecognized arg: {:?}",
+                                args[j]
+                            ));
                             j += 1;
                         }
                     }
                 }
-                msg_debug(&format!("[main:--message] parsed: message={}, to={}, chat_id={}, key={}",
-                    message.is_some(), to_bot.is_some(), chat_id.is_some(), key.is_some()));
+                msg_debug(&format!(
+                    "[main:--message] parsed: message={}, to={}, chat_id={}, key={}",
+                    message.is_some(),
+                    to_bot.is_some(),
+                    chat_id.is_some(),
+                    key.is_some()
+                ));
                 match (message, to_bot, chat_id, key) {
                     (Some(msg), Some(to), Some(cid), Some(k)) => {
-                        msg_debug(&format!("[main:--message] calling handle_bot_message: to={}, chat_id={}", to, cid));
+                        msg_debug(&format!(
+                            "[main:--message] calling handle_bot_message: to={}, chat_id={}",
+                            to, cid
+                        ));
                         handle_bot_message(&msg, &to, cid, &k);
                     }
                     _ => {
                         msg_debug("[main:--message] incomplete arguments, showing error");
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--message requires <TEXT> --to <BOT> --chat <ID> --key <HASH>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--message requires <TEXT> --to <BOT> --chat <ID> --key <HASH>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1851,24 +2284,39 @@ fn main() -> io::Result<()> {
                 while j < args.len() {
                     match args[j].as_str() {
                         "--range" => {
-                            if j + 1 < args.len() { range_str = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                range_str = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         "--bot" => {
-                            if j + 1 < args.len() { filter_bot = Some(args[j + 1].clone()); j += 2; }
-                            else { j += 1; }
+                            if j + 1 < args.len() {
+                                filter_bot = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
                         }
                         _ if chat_id.is_none() && !args[j].starts_with("--") => {
                             chat_id = args[j].parse().ok();
                             j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match chat_id {
-                    Some(cid) => handle_read_group_chat(cid, range_str.as_deref(), filter_bot.as_deref()),
+                    Some(cid) => {
+                        handle_read_group_chat(cid, range_str.as_deref(), filter_bot.as_deref())
+                    }
                     None => {
-                        eprintln!("{}", serde_json::json!({"status":"error","message":"--read_chat_log requires <CHAT_ID>"}));
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({"status":"error","message":"--read_chat_log requires <CHAT_ID>"})
+                        );
                     }
                 }
                 return Ok(());
@@ -1887,7 +2335,15 @@ fn main() -> io::Result<()> {
                 let resolved = if p.is_absolute() {
                     p
                 } else {
-                    env::current_dir().unwrap_or_else(|_| if cfg!(windows) { std::path::PathBuf::from("C:\\") } else { std::path::PathBuf::from("/") }).join(p)
+                    env::current_dir()
+                        .unwrap_or_else(|_| {
+                            if cfg!(windows) {
+                                std::path::PathBuf::from("C:\\")
+                            } else {
+                                std::path::PathBuf::from("/")
+                            }
+                        })
+                        .join(p)
                 };
                 start_paths.push(resolved);
             }
@@ -1942,6 +2398,20 @@ fn main() -> io::Result<()> {
         Ok(s) => (s, None),
         Err(e) => (config::Settings::default(), Some(e)),
     };
+    // If the on-disk settings failed to parse, we run on in-memory defaults — but must NOT
+    // save on exit, or we would overwrite the user's intact-but-unparseable settings file
+    // (remote profiles, keybindings, theme, ...) with those defaults.
+    let settings_load_failed = settings_error.is_some();
+    // The exit-save skip alone is not enough: changing any setting during the session
+    // (bookmarks, remote profiles, ...) also calls settings.save() and would clobber the
+    // original. Preserve the unparseable file with a one-time backup copy.
+    let mut settings_backup_made = false;
+    if settings_load_failed {
+        if let Some(path) = config::Settings::config_path() {
+            let backup = path.with_extension("json.bak");
+            settings_backup_made = std::fs::copy(&path, &backup).is_ok();
+        }
+    }
     let mut app = App::with_settings(settings);
     app.image_picker = Some(picker);
     app.design_mode = design_mode;
@@ -1953,7 +2423,14 @@ fn main() -> io::Result<()> {
 
     // Show settings load error if any
     if let Some(err) = settings_error {
-        app.show_message(&format!("Settings error: {} (using defaults)", err));
+        if settings_backup_made {
+            app.show_message(&format!(
+                "Settings error: {} (using defaults; original backed up to settings.json.bak)",
+                err
+            ));
+        } else {
+            app.show_message(&format!("Settings error: {} (using defaults)", err));
+        }
     }
 
     // Show design mode message if active
@@ -1964,8 +2441,11 @@ fn main() -> io::Result<()> {
     // Run app
     let result = run_app(&mut terminal, &mut app);
 
-    // Save settings before exit
-    app.save_settings();
+    // Save settings before exit — but only if the original file parsed. Otherwise we would
+    // clobber the user's existing (unparseable) settings with defaults.
+    if !settings_load_failed {
+        app.save_settings();
+    }
 
     // Save last directory for shell cd (skip remote paths)
     if !app.active_panel().is_remote() {
@@ -2018,8 +2498,9 @@ fn check_for_updates() {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
-            "--max-time", "3",
-            "https://raw.githubusercontent.com/kstost/cokacdir/refs/heads/main/Cargo.toml"
+            "--max-time",
+            "3",
+            "https://raw.githubusercontent.com/kstost/cokacdir/refs/heads/main/Cargo.toml",
         ])
         .output();
 
@@ -2033,12 +2514,25 @@ fn check_for_updates() {
 
     if let Some(latest) = latest_version {
         if is_newer_version(&latest, current_version) {
-            println!("┌──────────────────────────────────────────────────────────────────────────┐");
-            println!("│  🚀 New version available: v{} (current: v{})                            ", latest, current_version);
-            println!("│                                                                          │");
-            println!("│  Update with:                                                            │");
-            println!("│  /bin/bash -c \"$(curl -fsSL https://cokacdir.cokac.com/install.sh)\"      │");
-            println!("└──────────────────────────────────────────────────────────────────────────┘");
+            println!(
+                "┌──────────────────────────────────────────────────────────────────────────┐"
+            );
+            println!(
+                "│  🚀 New version available: v{} (current: v{})                            ",
+                latest, current_version
+            );
+            println!(
+                "│                                                                          │"
+            );
+            println!(
+                "│  Update with:                                                            │"
+            );
+            println!(
+                "│  /bin/bash -c \"$(curl -fsSL https://cokacdir.cokac.com/install.sh)\"      │"
+            );
+            println!(
+                "└──────────────────────────────────────────────────────────────────────────┘"
+            );
             println!();
         }
     }
@@ -2062,11 +2556,7 @@ fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
 }
 
 fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let latest_parts = parse(latest);
     let current_parts = parse(current);
@@ -2109,8 +2599,7 @@ fn file_operation_completion_message(
             let archive_name = pending_tar_archive.unwrap_or("archive");
             Some(format!(
                 "Failed to create archive '{}'.\n\n{}",
-                archive_name,
-                error
+                archive_name, error
             ))
         };
         return (Some(format!("Error: {}", error)), tar_error);
@@ -2132,8 +2621,7 @@ fn file_operation_completion_message(
         } else if let Some(extract_dir) = pending_extract_dir {
             Some(format!(
                 "Failed to extract archive to '{}'.\n\n{}",
-                extract_dir,
-                error
+                extract_dir, error
             ))
         } else {
             Some(format!("Failed to extract archive.\n\n{}", error))
@@ -2170,9 +2658,7 @@ fn file_operation_completion_message(
     }
 }
 
-fn completed_file_operation_succeeded(
-    progress: &crate::ui::app::FileOperationProgress,
-) -> bool {
+fn completed_file_operation_succeeded(progress: &crate::ui::app::FileOperationProgress) -> bool {
     progress
         .result
         .as_ref()
@@ -2208,14 +2694,31 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // For AI screen, FileInfo with calculation, ImageViewer loading, diff comparing, file operation progress, or remote spinner, use fast polling
         let is_file_info_calculating = app.current_screen == Screen::FileInfo
-            && app.file_info_state.as_ref().map(|s| s.is_calculating).unwrap_or(false);
+            && app
+                .file_info_state
+                .as_ref()
+                .map(|s| s.is_calculating)
+                .unwrap_or(false);
         let is_image_loading = app.current_screen == Screen::ImageViewer
-            && app.image_viewer_state.as_ref().map(|s| s.is_loading).unwrap_or(false);
+            && app
+                .image_viewer_state
+                .as_ref()
+                .map(|s| s.is_loading)
+                .unwrap_or(false);
         let is_diff_comparing = app.current_screen == Screen::DiffScreen
-            && app.diff_state.as_ref().map(|s| s.is_comparing).unwrap_or(false);
+            && app
+                .diff_state
+                .as_ref()
+                .map(|s| s.is_comparing)
+                .unwrap_or(false);
         let is_dedup_active = app.current_screen == Screen::DedupScreen
-            && app.dedup_screen_state.as_ref().map(|s| !s.is_complete).unwrap_or(false);
-        let is_progress_active = app.file_operation_progress
+            && app
+                .dedup_screen_state
+                .as_ref()
+                .map(|s| !s.is_complete)
+                .unwrap_or(false);
+        let is_progress_active = app
+            .file_operation_progress
             .as_ref()
             .map(|p| p.is_active)
             .unwrap_or(false);
@@ -2225,7 +2728,12 @@ fn run_app<B: ratatui::backend::Backend>(
             Duration::from_millis(16) // ~60fps for smooth real-time updates
         } else if is_remote_spinner {
             Duration::from_millis(100) // Fast polling for spinner animation
-        } else if app.current_screen == Screen::AIScreen || app.is_ai_mode() || is_file_info_calculating || is_image_loading || is_diff_comparing {
+        } else if app.current_screen == Screen::AIScreen
+            || app.is_ai_mode()
+            || is_file_info_calculating
+            || is_image_loading
+            || is_diff_comparing
+        {
             Duration::from_millis(100) // Fast polling for spinner animation
         } else {
             Duration::from_millis(250)
@@ -2289,22 +2797,23 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Poll for file operation progress
         let mut tar_error_dialog: Option<String> = None;
-        let progress_message: Option<String> = if let Some(ref mut progress) = app.file_operation_progress {
-            let still_active = progress.poll();
-            if !still_active {
-                let (msg, tar_error) = file_operation_completion_message(
-                    progress,
-                    app.pending_tar_archive.as_deref(),
-                    app.pending_extract_dir.as_deref(),
-                );
-                tar_error_dialog = tar_error;
-                msg
+        let progress_message: Option<String> =
+            if let Some(ref mut progress) = app.file_operation_progress {
+                let still_active = progress.poll();
+                if !still_active {
+                    let (msg, tar_error) = file_operation_completion_message(
+                        progress,
+                        app.pending_tar_archive.as_deref(),
+                        app.pending_extract_dir.as_deref(),
+                    );
+                    tar_error_dialog = tar_error;
+                    msg
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Handle progress completion (outside of borrow)
         if progress_message.is_some() {
@@ -2322,7 +2831,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Completion result decides success; tmp existence is only a final sanity check.
                 let tmp_exists = match &pending {
                     crate::ui::app::PendingRemoteOpen::Editor { tmp_path, .. } => tmp_path.exists(),
-                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => tmp_path.exists(),
+                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => {
+                        tmp_path.exists()
+                    }
                 };
 
                 if !download_succeeded || !tmp_exists {
@@ -2333,15 +2844,20 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 } else {
                     match pending {
-                        crate::ui::app::PendingRemoteOpen::Editor { tmp_path, panel_index, remote_path } => {
+                        crate::ui::app::PendingRemoteOpen::Editor {
+                            tmp_path,
+                            panel_index,
+                            remote_path,
+                        } => {
                             let mut editor = crate::ui::file_editor::EditorState::new();
                             editor.set_syntax_colors(app.theme.syntax);
                             match editor.load_file(&tmp_path) {
                                 Ok(_) => {
-                                    editor.remote_origin = Some(crate::ui::file_editor::RemoteEditOrigin {
-                                        panel_index,
-                                        remote_path,
-                                    });
+                                    editor.remote_origin =
+                                        Some(crate::ui::file_editor::RemoteEditOrigin {
+                                            panel_index,
+                                            remote_path,
+                                        });
                                     app.editor_state = Some(editor);
                                     app.current_screen = Screen::FileEditor;
                                 }
@@ -2357,16 +2873,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                     dialog_type: crate::ui::app::DialogType::TrueColorWarning,
                                     input: String::new(),
                                     cursor_pos: 0,
-                                    message: "Terminal doesn't support true color. Open anyway?".to_string(),
+                                    message: "Terminal doesn't support true color. Open anyway?"
+                                        .to_string(),
                                     completion: None,
                                     selected_button: 1,
                                     selection: None,
                                     use_md5: false,
                                 });
                             } else {
-                                app.image_viewer_state = Some(
-                                    crate::ui::image_viewer::ImageViewerState::new(&tmp_path)
-                                );
+                                app.image_viewer_state =
+                                    Some(crate::ui::image_viewer::ImageViewerState::new(&tmp_path));
                                 app.current_screen = Screen::ImageViewer;
                             }
                         }
@@ -2382,20 +2898,35 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Focus on created tar archive if applicable
                 if let Some(archive_name) = app.pending_tar_archive.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == archive_name) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == archive_name)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on extracted directory if applicable
                 } else if let Some(extract_dir) = app.pending_extract_dir.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == extract_dir) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == extract_dir)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on first pasted file (by panel's sorted order) if applicable
                 } else if let Some(paste_names) = app.pending_paste_focus.take() {
                     app.refresh_panels();
                     // Find the first file in the panel's sorted list that matches any pasted name
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| paste_names.contains(&f.name)) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| paste_names.contains(&f.name))
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 } else {
@@ -2415,7 +2946,9 @@ fn run_app<B: ratatui::backend::Backend>(
             if app.remote_spinner.is_some() {
                 let ev = event::read()?;
                 if let Event::Key(key) = ev {
-                    if key.kind != KeyEventKind::Press { continue; }
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     if key.code == KeyCode::Esc {
                         app.remote_spinner = None;
                         app.show_message("Connection cancelled");
@@ -2433,7 +2966,10 @@ fn run_app<B: ratatui::backend::Backend>(
                 if let Event::Key(ref key) = ev {
                     if key.kind == KeyEventKind::Press {
                         if let KeyCode::Char(first_c) = key.code {
-                            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            {
                                 // 즉시 도착하는 후속 이벤트가 있는지 확인 (paste burst)
                                 let mut paste_buf = String::new();
                                 paste_buf.push(first_c);
@@ -2441,7 +2977,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                     match event::read()? {
                                         Event::Key(nk) if nk.kind == KeyEventKind::Press => {
                                             match nk.code {
-                                                KeyCode::Char(nc) if !nk.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                                                KeyCode::Char(nc)
+                                                    if !nk.modifiers.intersects(
+                                                        KeyModifiers::CONTROL | KeyModifiers::ALT,
+                                                    ) =>
+                                                {
                                                     paste_buf.push(nc);
                                                 }
                                                 KeyCode::Enter => paste_buf.push('\n'),
@@ -2490,7 +3030,12 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {
-                                if ui::ai_screen::handle_input(state, key.code, key.modifiers, &app.keybindings) {
+                                if ui::ai_screen::handle_input(
+                                    state,
+                                    key.code,
+                                    key.modifiers,
+                                    &app.keybindings,
+                                ) {
                                     // Save session to file before leaving
                                     state.save_session_to_file();
                                     app.current_screen = Screen::FilePanel;
@@ -2501,7 +3046,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Screen::SystemInfo => {
-                            if ui::system_info::handle_input(&mut app.system_info_state, key.code, key.modifiers, &app.keybindings) {
+                            if ui::system_info::handle_input(
+                                &mut app.system_info_state,
+                                key.code,
+                                key.modifiers,
+                                &app.keybindings,
+                            ) {
                                 app.current_screen = Screen::FilePanel;
                             }
                         }
@@ -2560,14 +3110,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::FilePanel => {
                             // AI mode with focus on AI panel
-                            if app.is_ai_mode() && app.ai_panel_index == Some(app.active_panel_index) {
+                            if app.is_ai_mode()
+                                && app.ai_panel_index == Some(app.active_panel_index)
+                            {
                                 if let Some(ref mut state) = app.ai_state {
                                     ui::ai_screen::handle_paste(state, &text);
                                 }
                             } else if app.dialog.is_some() {
                                 ui::dialogs::handle_paste(app, &text);
                             } else if app.advanced_search_state.active {
-                                ui::advanced_search::handle_paste(&mut app.advanced_search_state, &text);
+                                ui::advanced_search::handle_paste(
+                                    &mut app.advanced_search_state,
+                                    &text,
+                                );
                             }
                         }
                         Screen::FileEditor => {
@@ -2655,7 +3210,12 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
     // Handle advanced search dialog first
     if app.advanced_search_state.active {
-        if let Some(criteria) = ui::advanced_search::handle_input(&mut app.advanced_search_state, code, modifiers, &app.keybindings) {
+        if let Some(criteria) = ui::advanced_search::handle_input(
+            &mut app.advanced_search_state,
+            code,
+            modifiers,
+            &app.keybindings,
+        ) {
             app.execute_advanced_search(&criteria);
         }
         return false;
@@ -2665,7 +3225,6 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
     if app.dialog.is_some() {
         return ui::dialogs::handle_dialog_input(app, code, modifiers);
     }
-
 
     // Look up action from keybindings
     if let Some(action) = app.keybindings.panel_action(code, modifiers) {
@@ -2778,8 +3337,7 @@ mod cli_token_tests {
 #[cfg(test)]
 mod file_operation_completion_tests {
     use super::{
-        completed_file_operation_succeeded, file_operation_completion_message,
-        new_tar_error_dialog,
+        completed_file_operation_succeeded, file_operation_completion_message, new_tar_error_dialog,
     };
     use crate::services::file_ops::{FileOperationResult, FileOperationType};
     use crate::ui::app::{DialogType, FileOperationProgress};
@@ -2793,8 +3351,7 @@ mod file_operation_completion_tests {
             last_error: Some("line 1\nline 2".to_string()),
         });
 
-        let (status, modal) =
-            file_operation_completion_message(&progress, Some("bad.tar"), None);
+        let (status, modal) = file_operation_completion_message(&progress, Some("bad.tar"), None);
 
         assert_eq!(status, Some("Error: line 1\nline 2".to_string()));
         assert_eq!(
@@ -2812,8 +3369,7 @@ mod file_operation_completion_tests {
             last_error: Some("Cancelled".to_string()),
         });
 
-        let (status, modal) =
-            file_operation_completion_message(&progress, Some("bad.tar"), None);
+        let (status, modal) = file_operation_completion_message(&progress, Some("bad.tar"), None);
 
         assert_eq!(status, Some("Error: Cancelled".to_string()));
         assert_eq!(modal, None);

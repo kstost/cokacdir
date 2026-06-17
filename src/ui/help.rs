@@ -12,11 +12,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{
-    app::App,
-    draw::draw_panel_background,
-    theme::Theme,
-};
+use super::{app::App, draw::draw_panel_background, theme::Theme};
 use crate::keybindings::{
     AIScreenAction, DiffFileViewAction, DiffScreenAction, EditorAction, ImageViewerAction,
     Keybindings, PanelAction, ProcessManagerAction, SearchResultAction,
@@ -31,9 +27,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     let lines = build_help_content(theme, &app.keybindings);
     let total_lines = lines.len();
 
-    // Calculate dialog size (max 85% of screen, within bounds)
-    let width = ((area.width as u32 * 85 / 100) as u16).min(100).max(50);
-    let height = ((area.height as u32 * 85 / 100) as u16).min(50).max(20);
+    // Calculate dialog size (max 85% of screen, within bounds).
+    // Clamp to the terminal area LAST: the dialog must never exceed the buffer, or
+    // Clear/Paragraph render out of bounds and panic on small terminals.
+    let width = ((area.width as u32 * 85 / 100) as u16)
+        .min(100)
+        .max(50)
+        .min(area.width);
+    let height = ((area.height as u32 * 85 / 100) as u16)
+        .min(50)
+        .max(20)
+        .min(area.height);
 
     // Need minimum size to display anything useful
     if width < 30 || height < 10 {
@@ -60,7 +64,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     // Create block
     let block = Block::default()
         .title(" Help ")
-        .title_style(Style::default().fg(theme.help.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.help.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.help.border))
         .style(Style::default().bg(theme.help.bg));
@@ -86,8 +94,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             .begin_symbol(Some("^"))
             .end_symbol(Some("v"));
 
-        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1)
-            .position(app.help_state.scroll_offset);
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll + 1).position(app.help_state.scroll_offset);
 
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
@@ -219,7 +227,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::styled("  ".to_string(), desc_style),
         Span::styled("Selected files are marked with ".to_string(), hint_style),
-        Span::styled("*".to_string(), Style::default().fg(theme.panel.marked_text)),
+        Span::styled(
+            "*".to_string(),
+            Style::default().fg(theme.panel.marked_text),
+        ),
     ]));
     lines.push(Line::from(""));
 
@@ -273,7 +284,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(pk(PanelAction::Paste, "Paste from clipboard"));
     lines.push(Line::from(vec![
         Span::styled("  ".to_string(), desc_style),
-        Span::styled("Conflict resolution: Overwrite/Skip/All".to_string(), hint_style),
+        Span::styled(
+            "Conflict resolution: Overwrite/Skip/All".to_string(),
+            hint_style,
+        ),
     ]));
     lines.push(Line::from(""));
 
@@ -381,7 +395,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
         lines.push(aik(AIScreenAction::Submit, "Send message"));
         lines.push(aik(AIScreenAction::InsertNewline, "New line in input"));
         lines.push(aik(AIScreenAction::ScrollHistoryUp, "Scroll response up"));
-        lines.push(aik(AIScreenAction::ScrollHistoryDown, "Scroll response down"));
+        lines.push(aik(
+            AIScreenAction::ScrollHistoryDown,
+            "Scroll response down",
+        ));
         lines.push(aik(AIScreenAction::PageUp, "Page scroll up"));
         lines.push(aik(AIScreenAction::PageDown, "Page scroll down"));
         lines.push(aik(AIScreenAction::ClearHistory, "Clear conversation"));
@@ -426,7 +443,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(pk(PanelAction::StartDiff, "Start folder diff (2 panels)"));
     lines.push(Line::from(vec![
         Span::styled("  ".to_string(), desc_style),
-        Span::styled("3+ panels: press twice to select pair".to_string(), hint_style),
+        Span::styled(
+            "3+ panels: press twice to select pair".to_string(),
+            hint_style,
+        ),
     ]));
     lines.push(dsk(DiffScreenAction::MoveUp, "Move cursor up"));
     lines.push(dsk(DiffScreenAction::MoveDown, "Move cursor down"));
@@ -436,7 +456,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(dsk(DiffScreenAction::GoEnd, "Go to last item"));
     lines.push(dsk(DiffScreenAction::Open, "View file content diff"));
     lines.push(dsk(DiffScreenAction::ToggleSelect, "Select/deselect item"));
-    lines.push(dsk(DiffScreenAction::CycleFilter, "Cycle filter (All/Diff/L/R)"));
+    lines.push(dsk(
+        DiffScreenAction::CycleFilter,
+        "Cycle filter (All/Diff/L/R)",
+    ));
     lines.push(dsk(DiffScreenAction::SortByName, "Sort by name"));
     lines.push(dsk(DiffScreenAction::SortBySize, "Sort by size"));
     lines.push(dsk(DiffScreenAction::SortByDate, "Sort by date"));
@@ -468,7 +491,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(dfk(DiffFileViewAction::GoHome, "Go to start"));
     lines.push(dfk(DiffFileViewAction::GoEnd, "Go to end"));
     lines.push(dfk(DiffFileViewAction::NextChange, "Jump to next change"));
-    lines.push(dfk(DiffFileViewAction::PrevChange, "Jump to previous change"));
+    lines.push(dfk(
+        DiffFileViewAction::PrevChange,
+        "Jump to previous change",
+    ));
     lines.push(dfk(DiffFileViewAction::Close, "Return to diff screen"));
     lines.push(Line::from(""));
 
@@ -569,7 +595,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(vec![
         Span::styled(format!("  {:28}", "YouTube"), key_style),
-        Span::styled("https://www.youtube.com/@코드깎는노인".to_string(), desc_style),
+        Span::styled(
+            "https://www.youtube.com/@코드깎는노인".to_string(),
+            desc_style,
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::styled(format!("  {:28}", "코깎노클래스"), key_style),
@@ -577,7 +606,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(vec![
         Span::styled(format!("  {:28}", "Tutorial"), key_style),
-        Span::styled("https://cokacdir.cokac.com/#/tutorial".to_string(), desc_style),
+        Span::styled(
+            "https://cokacdir.cokac.com/#/tutorial".to_string(),
+            desc_style,
+        ),
     ]));
     lines.push(Line::from(""));
 

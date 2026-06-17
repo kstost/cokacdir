@@ -222,7 +222,14 @@ impl DiffState {
         thread::spawn(move || {
             // Phase 1: Count total items (with live progress)
             let counting_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let total = count_entries_recursive(&left_root, &right_root, "", &cancel_flag, &progress_tx, &counting_counter);
+            let total = count_entries_recursive(
+                &left_root,
+                &right_root,
+                "",
+                &cancel_flag,
+                &progress_tx,
+                &counting_counter,
+            );
             if cancel_flag.load(Ordering::Relaxed) {
                 return;
             }
@@ -309,7 +316,10 @@ impl DiffState {
         self.all_entries.iter().any(|e| {
             matches!(
                 e.status,
-                DiffStatus::Modified | DiffStatus::LeftOnly | DiffStatus::RightOnly | DiffStatus::DirModified
+                DiffStatus::Modified
+                    | DiffStatus::LeftOnly
+                    | DiffStatus::RightOnly
+                    | DiffStatus::DirModified
             )
         })
     }
@@ -462,7 +472,9 @@ impl DiffState {
                 } else {
                     // When collapsing, also collapse all descendant directories
                     let prefix = format!("{}/", path);
-                    let descendants: Vec<String> = self.all_entries.iter()
+                    let descendants: Vec<String> = self
+                        .all_entries
+                        .iter()
                         .filter(|e| e.is_directory && e.relative_path.starts_with(&prefix))
                         .map(|e| e.relative_path.clone())
                         .collect();
@@ -486,7 +498,8 @@ impl DiffState {
                     if self.selected_index < self.scroll_offset {
                         self.scroll_offset = self.selected_index;
                     } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
+                        self.scroll_offset =
+                            self.selected_index.saturating_sub(self.visible_height - 1);
                     }
                 }
             }
@@ -520,7 +533,8 @@ impl DiffState {
                     if self.selected_index < self.scroll_offset {
                         self.scroll_offset = self.selected_index;
                     } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
+                        self.scroll_offset =
+                            self.selected_index.saturating_sub(self.visible_height - 1);
                     }
                 }
             }
@@ -535,7 +549,9 @@ impl DiffState {
                 let path = entry.relative_path.clone();
                 let current_all_idx = self.filtered_indices.get(self.selected_index).copied();
                 let prefix = format!("{}/", path);
-                let descendants: Vec<String> = self.all_entries.iter()
+                let descendants: Vec<String> = self
+                    .all_entries
+                    .iter()
                     .filter(|e| e.is_directory && e.relative_path.starts_with(&prefix))
                     .map(|e| e.relative_path.clone())
                     .collect();
@@ -556,7 +572,8 @@ impl DiffState {
                     if self.selected_index < self.scroll_offset {
                         self.scroll_offset = self.selected_index;
                     } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
+                        self.scroll_offset =
+                            self.selected_index.saturating_sub(self.visible_height - 1);
                     }
                 }
             }
@@ -576,7 +593,9 @@ impl DiffState {
                 // Remove this directory and all descendants from collapsed_dirs
                 let prefix = format!("{}/", path);
                 self.collapsed_dirs.remove(&path);
-                let descendants: Vec<String> = self.collapsed_dirs.iter()
+                let descendants: Vec<String> = self
+                    .collapsed_dirs
+                    .iter()
                     .filter(|p| p.starts_with(&prefix))
                     .cloned()
                     .collect();
@@ -597,7 +616,8 @@ impl DiffState {
                     if self.selected_index < self.scroll_offset {
                         self.scroll_offset = self.selected_index;
                     } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
+                        self.scroll_offset =
+                            self.selected_index.saturating_sub(self.visible_height - 1);
                     }
                 }
             }
@@ -612,7 +632,9 @@ impl DiffState {
                 let current_all_idx = self.filtered_indices.get(self.selected_index).copied();
                 // Collapse this directory and all descendant directories
                 let prefix = format!("{}/", path);
-                let descendants: Vec<String> = self.all_entries.iter()
+                let descendants: Vec<String> = self
+                    .all_entries
+                    .iter()
                     .filter(|e| e.is_directory && e.relative_path.starts_with(&prefix))
                     .map(|e| e.relative_path.clone())
                     .collect();
@@ -634,7 +656,8 @@ impl DiffState {
                     if self.selected_index < self.scroll_offset {
                         self.scroll_offset = self.selected_index;
                     } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
+                        self.scroll_offset =
+                            self.selected_index.saturating_sub(self.visible_height - 1);
                     }
                 }
             }
@@ -677,11 +700,7 @@ impl DiffState {
                 DiffStatus::RightOnly
             };
 
-            let (left, right) = if is_left {
-                (info, None)
-            } else {
-                (None, info)
-            };
+            let (left, right) = if is_left { (info, None) } else { (None, info) };
 
             children.push(DiffEntry {
                 relative_path: child_relative,
@@ -712,7 +731,8 @@ impl DiffState {
             // Collapse newly loaded child directories by default
             for i in insert_pos..insert_pos + count {
                 if self.all_entries[i].is_directory {
-                    self.collapsed_dirs.insert(self.all_entries[i].relative_path.clone());
+                    self.collapsed_dirs
+                        .insert(self.all_entries[i].relative_path.clone());
                 }
             }
         }
@@ -747,7 +767,8 @@ impl DiffState {
         }
         let new_index = (self.selected_index as i32 + delta)
             .max(0)
-            .min(self.filtered_indices.len().saturating_sub(1) as i32) as usize;
+            .min(self.filtered_indices.len().saturating_sub(1) as i32)
+            as usize;
         self.selected_index = new_index;
     }
 
@@ -801,7 +822,14 @@ impl DiffState {
         if self.all_entries.is_empty() {
             return;
         }
-        let sorted = resort_level(&self.all_entries, 0, 0, self.all_entries.len(), self.sort_by, self.sort_order);
+        let sorted = resort_level(
+            &self.all_entries,
+            0,
+            0,
+            self.all_entries.len(),
+            self.sort_by,
+            self.sort_order,
+        );
         self.all_entries = sorted;
         self.apply_filter();
     }
@@ -984,7 +1012,6 @@ fn build_recursive(
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Threaded diff builders (async with cancel + progress)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1056,7 +1083,14 @@ fn count_entries_recursive(
             let left_is_dir = is_dir_via_info(&left_dir.join(name));
             let right_is_dir = is_dir_via_info(&right_dir.join(name));
             if left_is_dir && right_is_dir {
-                count += count_entries_recursive(left_root, right_root, &child_relative, cancel_flag, progress_tx, running_count);
+                count += count_entries_recursive(
+                    left_root,
+                    right_root,
+                    &child_relative,
+                    cancel_flag,
+                    progress_tx,
+                    running_count,
+                );
             }
         }
         // One-side-only directories: no recursion needed, just count the directory itself
@@ -1135,7 +1169,11 @@ fn build_recursive_threaded(
 
         // Send progress
         let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = progress_tx.send(DiffProgressMsg::Comparing(child_relative.clone(), count, total));
+        let _ = progress_tx.send(DiffProgressMsg::Comparing(
+            child_relative.clone(),
+            count,
+            total,
+        ));
 
         let left_path = left_dir.join(name);
         let right_path = right_dir.join(name);
@@ -1285,8 +1323,16 @@ fn make_file_info(path: &Path, name: &str) -> Option<DiffFileInfo> {
     } else {
         metadata.clone()
     };
-    let is_directory = actual_metadata.is_dir();
-    let size = if is_directory { 0 } else { actual_metadata.len() };
+    // Never treat a symlink as a directory to recurse into: following symlinked
+    // directories can loop forever on a cycle (e.g. `ln -s .. loop`), which makes the
+    // recursive tree builder and expand-all recurse without bound. Symlinks are shown
+    // as leaf entries (is_symlink distinguishes them) and are not descended into.
+    let is_directory = !is_symlink && actual_metadata.is_dir();
+    let size = if is_directory {
+        0
+    } else {
+        actual_metadata.len()
+    };
     let modified = metadata
         .modified()
         .ok()
@@ -1340,7 +1386,9 @@ fn sort_names(
             SortBy::Type => {
                 let a_ext = get_extension(a);
                 let b_ext = get_extension(b);
-                a_ext.cmp(&b_ext).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+                a_ext
+                    .cmp(&b_ext)
+                    .then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
             }
         };
 
@@ -1350,8 +1398,6 @@ fn sort_names(
         }
     });
 }
-
-
 
 fn is_name_dir(
     name: &str,
@@ -1469,7 +1515,14 @@ fn resort_level(
     for (block_start, block_end) in blocks {
         result.push(entries[block_start].clone());
         if entries[block_start].is_directory && block_end > block_start + 1 {
-            let children = resort_level(entries, target_depth + 1, block_start + 1, block_end, sort_by, sort_order);
+            let children = resort_level(
+                entries,
+                target_depth + 1,
+                block_start + 1,
+                block_end,
+                sort_by,
+                sort_order,
+            );
             result.extend(children);
         }
     }
@@ -1596,7 +1649,7 @@ fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> usize {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,    // EOF
+            Ok(0) => break, // EOF
             Ok(n) => filled += n,
             Err(_) => return 0,
         }
@@ -1620,11 +1673,11 @@ pub fn draw(
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Header
-            Constraint::Length(1),  // Column header
+            Constraint::Length(1), // Header
+            Constraint::Length(1), // Column header
             Constraint::Min(3),    // Content
-            Constraint::Length(1),  // Status bar
-            Constraint::Length(1),  // Function bar
+            Constraint::Length(1), // Status bar
+            Constraint::Length(1), // Function bar
         ])
         .split(area);
 
@@ -1661,7 +1714,11 @@ pub fn draw(
             .fg(theme.diff.status_bar_text)
             .bg(theme.diff.status_bar_bg);
         let line = Line::from(vec![Span::styled(
-            format!("{:<width$}", status_text, width = status_area.width as usize),
+            format!(
+                "{:<width$}",
+                status_text,
+                width = status_area.width as usize
+            ),
             status_style,
         )]);
         frame.render_widget(Paragraph::new(line), status_area);
@@ -1669,7 +1726,10 @@ pub fn draw(
         // Function bar shows Close key only
         let close_key = kb.diff_screen_first_key(crate::keybindings::DiffScreenAction::Close);
         let fn_line = Line::from(vec![
-            Span::styled(close_key.to_string(), Style::default().fg(theme.diff.footer_key)),
+            Span::styled(
+                close_key.to_string(),
+                Style::default().fg(theme.diff.footer_key),
+            ),
             Span::styled(":cancel", Style::default().fg(theme.diff.footer_text)),
         ]);
         frame.render_widget(Paragraph::new(fn_line), fn_bar_area);
@@ -1682,8 +1742,18 @@ pub fn draw(
     // ── Content (split 50:50, no gap) ──────────────────────────────────────
     let left_width = content_area.width / 2;
     let right_width = content_area.width - left_width;
-    let left_area = Rect::new(content_area.x, content_area.y, left_width, content_area.height);
-    let right_area = Rect::new(content_area.x + left_width, content_area.y, right_width, content_area.height);
+    let left_area = Rect::new(
+        content_area.x,
+        content_area.y,
+        left_width,
+        content_area.height,
+    );
+    let right_area = Rect::new(
+        content_area.x + left_width,
+        content_area.y,
+        right_width,
+        content_area.height,
+    );
 
     let visible_height = content_area.height as usize;
     state.adjust_scroll(visible_height);
@@ -1698,8 +1768,8 @@ pub fn draw(
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
 
-        let mut scrollbar_state = ScrollbarState::new(state.filtered_indices.len())
-            .position(state.selected_index);
+        let mut scrollbar_state =
+            ScrollbarState::new(state.filtered_indices.len()).position(state.selected_index);
 
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }
@@ -1711,7 +1781,13 @@ pub fn draw(
     draw_function_bar(frame, fn_bar_area, theme, kb);
 }
 
-fn draw_comparing_progress(frame: &mut Frame, state: &DiffState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+fn draw_comparing_progress(
+    frame: &mut Frame,
+    state: &DiffState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     let center_y = area.y + area.height / 2;
 
     // Spinner
@@ -1719,7 +1795,9 @@ fn draw_comparing_progress(frame: &mut Frame, state: &DiffState, area: Rect, the
     let spinner_idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() / 100) as usize % spinner_chars.len();
+        .as_millis()
+        / 100) as usize
+        % spinner_chars.len();
     let spinner = spinner_chars[spinner_idx];
 
     let is_counting = state.progress_count == 0;
@@ -1738,24 +1816,30 @@ fn draw_comparing_progress(frame: &mut Frame, state: &DiffState, area: Rect, the
             ),
             Span::styled(
                 count_text,
-                Style::default().fg(theme.diff.header_label).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.diff.header_label)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
 
         let title_area = Rect::new(area.x, center_y, area.width, 1);
-        frame.render_widget(Paragraph::new(title_line).alignment(Alignment::Center), title_area);
+        frame.render_widget(
+            Paragraph::new(title_line).alignment(Alignment::Center),
+            title_area,
+        );
 
         // Cancel hint
         if center_y + 2 < area.y + area.height {
             let close_key = kb.diff_screen_first_key(crate::keybindings::DiffScreenAction::Close);
-            let hint_line = Line::from(vec![
-                Span::styled(
-                    format!("Press {} to cancel", close_key),
-                    Style::default().fg(theme.diff.progress_hint_text),
-                ),
-            ]);
+            let hint_line = Line::from(vec![Span::styled(
+                format!("Press {} to cancel", close_key),
+                Style::default().fg(theme.diff.progress_hint_text),
+            )]);
             let hint_area = Rect::new(area.x, center_y + 2, area.width, 1);
-            frame.render_widget(Paragraph::new(hint_line).alignment(Alignment::Center), hint_area);
+            frame.render_widget(
+                Paragraph::new(hint_line).alignment(Alignment::Center),
+                hint_area,
+            );
         }
         return;
     }
@@ -1779,19 +1863,27 @@ fn draw_comparing_progress(frame: &mut Frame, state: &DiffState, area: Rect, the
         ),
         Span::styled(
             "Comparing directories...",
-            Style::default().fg(theme.diff.header_label).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.diff.header_label)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
     if center_y >= area.y + 1 {
         let title_area = Rect::new(area.x, center_y.saturating_sub(2), area.width, 1);
-        frame.render_widget(Paragraph::new(title_line).alignment(Alignment::Center), title_area);
+        frame.render_widget(
+            Paragraph::new(title_line).alignment(Alignment::Center),
+            title_area,
+        );
     }
 
     // Line 2: Progress bar
     let bar_line = Line::from(vec![
         Span::styled(bar_fill, Style::default().fg(theme.diff.progress_bar_fill)),
-        Span::styled(bar_empty, Style::default().fg(theme.diff.progress_bar_empty)),
+        Span::styled(
+            bar_empty,
+            Style::default().fg(theme.diff.progress_bar_empty),
+        ),
         Span::styled(
             format!(" {:3}%", percent),
             Style::default().fg(theme.diff.progress_percent_text),
@@ -1799,40 +1891,48 @@ fn draw_comparing_progress(frame: &mut Frame, state: &DiffState, area: Rect, the
     ]);
 
     let bar_area = Rect::new(area.x, center_y, area.width, 1);
-    frame.render_widget(Paragraph::new(bar_line).alignment(Alignment::Center), bar_area);
+    frame.render_widget(
+        Paragraph::new(bar_line).alignment(Alignment::Center),
+        bar_area,
+    );
 
     // Line 3: Current file being compared
     let max_path_len = (area.width as usize).saturating_sub(6);
     let current_display = if state.progress_current.width() > max_path_len {
-        let suffix = crate::utils::format::display_width_suffix(&state.progress_current, max_path_len.saturating_sub(3));
+        let suffix = crate::utils::format::display_width_suffix(
+            &state.progress_current,
+            max_path_len.saturating_sub(3),
+        );
         format!("...{}", suffix)
     } else {
         state.progress_current.clone()
     };
 
-    let file_line = Line::from(vec![
-        Span::styled(
-            current_display,
-            Style::default().fg(theme.diff.progress_value_text),
-        ),
-    ]);
+    let file_line = Line::from(vec![Span::styled(
+        current_display,
+        Style::default().fg(theme.diff.progress_value_text),
+    )]);
 
     if center_y + 1 < area.y + area.height {
         let file_area = Rect::new(area.x, center_y + 1, area.width, 1);
-        frame.render_widget(Paragraph::new(file_line).alignment(Alignment::Center), file_area);
+        frame.render_widget(
+            Paragraph::new(file_line).alignment(Alignment::Center),
+            file_area,
+        );
     }
 
     // Line 4: Cancel hint
     if center_y + 3 < area.y + area.height {
         let close_key = kb.diff_screen_first_key(crate::keybindings::DiffScreenAction::Close);
-        let hint_line = Line::from(vec![
-            Span::styled(
-                format!("Press {} to cancel", close_key),
-                Style::default().fg(theme.diff.progress_hint_text),
-            ),
-        ]);
+        let hint_line = Line::from(vec![Span::styled(
+            format!("Press {} to cancel", close_key),
+            Style::default().fg(theme.diff.progress_hint_text),
+        )]);
         let hint_area = Rect::new(area.x, center_y + 3, area.width, 1);
-        frame.render_widget(Paragraph::new(hint_line).alignment(Alignment::Center), hint_area);
+        frame.render_widget(
+            Paragraph::new(hint_line).alignment(Alignment::Center),
+            hint_area,
+        );
     }
 }
 
@@ -1842,7 +1942,8 @@ fn draw_header(frame: &mut Frame, state: &DiffState, area: Rect, theme: &Theme) 
 
     let left_str = state.left_root.display().to_string();
     let left_display = if left_str.width() > half_width {
-        let suffix = crate::utils::format::display_width_suffix(&left_str, half_width.saturating_sub(3));
+        let suffix =
+            crate::utils::format::display_width_suffix(&left_str, half_width.saturating_sub(3));
         format!("...{}", suffix)
     } else {
         left_str
@@ -1850,7 +1951,8 @@ fn draw_header(frame: &mut Frame, state: &DiffState, area: Rect, theme: &Theme) 
 
     let right_str = state.right_root.display().to_string();
     let right_display = if right_str.width() > half_width {
-        let suffix = crate::utils::format::display_width_suffix(&right_str, half_width.saturating_sub(3));
+        let suffix =
+            crate::utils::format::display_width_suffix(&right_str, half_width.saturating_sub(3));
         format!("...{}", suffix)
     } else {
         right_str
@@ -1863,20 +1965,14 @@ fn draw_header(frame: &mut Frame, state: &DiffState, area: Rect, theme: &Theme) 
                 .fg(theme.diff.header_label)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            left_display,
-            Style::default().fg(theme.diff.header_text),
-        ),
+        Span::styled(left_display, Style::default().fg(theme.diff.header_text)),
         Span::styled(
             " \u{27F7} ",
             Style::default()
                 .fg(theme.diff.header_label)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            right_display,
-            Style::default().fg(theme.diff.header_text),
-        ),
+        Span::styled(right_display, Style::default().fg(theme.diff.header_text)),
     ]);
 
     frame.render_widget(Paragraph::new(header_line), area);
@@ -1966,9 +2062,7 @@ fn draw_content_side(
                 DiffStatus::LeftOnly | DiffStatus::RightOnly => theme.diff.left_only_text,
                 _ => theme.diff.cursor_bg,
             };
-            let cursor_style = Style::default()
-                .fg(theme.diff.cursor_text)
-                .bg(cursor_bg);
+            let cursor_style = Style::default().fg(theme.diff.cursor_text).bg(cursor_bg);
             (cursor_style, cursor_style, cursor_style)
         } else if is_file_selected {
             let marked_style = Style::default()
@@ -1991,7 +2085,10 @@ fn draw_content_side(
                 } else {
                     "\u{25BC}" // ▼ (expanded)
                 };
-                format!("{}{}{} {}/", selection_marker, indent, collapse_indicator, file_info.name)
+                format!(
+                    "{}{}{} {}/",
+                    selection_marker, indent, collapse_indicator, file_info.name
+                )
             } else {
                 format!("{}{}  {}", selection_marker, indent, file_info.name)
             };
@@ -2007,14 +2104,22 @@ fn draw_content_side(
             let size_str = if file_info.is_directory {
                 format!("{:>size_w$}", "<DIR>", size_w = size_col)
             } else {
-                format!("{:>size_w$}", format_size(file_info.size), size_w = size_col)
+                format!(
+                    "{:>size_w$}",
+                    format_size(file_info.size),
+                    size_w = size_col
+                )
             };
 
             let date_str = format!("{}", file_info.modified.format("%m-%d %H:%M"));
 
             let line = Line::from(vec![
                 Span::styled(
-                    format!(" {:<name_w$}", name_str, name_w = name_col.saturating_sub(1)),
+                    format!(
+                        " {:<name_w$}",
+                        name_str,
+                        name_w = name_col.saturating_sub(1)
+                    ),
                     name_style,
                 ),
                 Span::styled(format!(" {}", size_str), size_style),
@@ -2029,7 +2134,9 @@ fn draw_content_side(
                     .fg(theme.diff.cursor_text)
                     .bg(theme.diff.cursor_bg)
             } else {
-                Style::default().fg(theme.diff.same_text).bg(theme.diff.empty_bg)
+                Style::default()
+                    .fg(theme.diff.same_text)
+                    .bg(theme.diff.empty_bg)
             };
 
             let line = Line::from(vec![Span::styled(
@@ -2079,14 +2186,22 @@ fn get_entry_styles(
             let style = Style::default()
                 .fg(dc.modified_text)
                 .add_modifier(Modifier::BOLD);
-            (style, Style::default().fg(dc.size_text), Style::default().fg(dc.date_text))
+            (
+                style,
+                Style::default().fg(dc.size_text),
+                Style::default().fg(dc.date_text),
+            )
         }
         DiffStatus::LeftOnly => {
             if is_left {
                 let style = Style::default()
                     .fg(dc.left_only_text)
                     .add_modifier(Modifier::BOLD);
-                (style, Style::default().fg(dc.size_text), Style::default().fg(dc.date_text))
+                (
+                    style,
+                    Style::default().fg(dc.size_text),
+                    Style::default().fg(dc.date_text),
+                )
             } else {
                 let style = Style::default().fg(dc.same_text).bg(dc.empty_bg);
                 (style, style, style)
@@ -2097,7 +2212,11 @@ fn get_entry_styles(
                 let style = Style::default()
                     .fg(dc.right_only_text)
                     .add_modifier(Modifier::BOLD);
-                (style, Style::default().fg(dc.size_text), Style::default().fg(dc.date_text))
+                (
+                    style,
+                    Style::default().fg(dc.size_text),
+                    Style::default().fg(dc.date_text),
+                )
             } else {
                 let style = Style::default().fg(dc.same_text).bg(dc.empty_bg);
                 (style, style, style)
@@ -2107,7 +2226,11 @@ fn get_entry_styles(
             let style = Style::default()
                 .fg(dc.dir_modified_text)
                 .add_modifier(Modifier::BOLD);
-            (style, Style::default().fg(dc.size_text), Style::default().fg(dc.date_text))
+            (
+                style,
+                Style::default().fg(dc.size_text),
+                Style::default().fg(dc.date_text),
+            )
         }
         DiffStatus::DirSame => {
             let name_style = Style::default().fg(dc.dir_same_text);
@@ -2166,22 +2289,77 @@ fn draw_status_bar(frame: &mut Frame, state: &DiffState, area: Rect, theme: &The
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_function_bar(frame: &mut Frame, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+fn draw_function_bar(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     use crate::keybindings::DiffScreenAction;
 
     let shortcuts: Vec<(String, &str)> = vec![
-        (format!("{}/{}", kb.diff_screen_first_key(DiffScreenAction::MoveUp), kb.diff_screen_first_key(DiffScreenAction::MoveDown)), "nav "),
-        (kb.diff_screen_first_key(DiffScreenAction::ExpandDir).to_string(), ":open "),
-        (kb.diff_screen_first_key(DiffScreenAction::CollapseDir).to_string(), ":close "),
-        (kb.diff_screen_first_key(DiffScreenAction::Open).to_string(), ":view "),
-        (kb.diff_screen_first_key(DiffScreenAction::ExpandAll).to_string(), ":expand "),
-        (kb.diff_screen_first_key(DiffScreenAction::CollapseAll).to_string(), ":collapse "),
-        (kb.diff_screen_first_key(DiffScreenAction::CycleFilter).to_string(), ":filter "),
-        (kb.diff_screen_first_key(DiffScreenAction::SortByName).to_string(), "ame "),
-        (kb.diff_screen_first_key(DiffScreenAction::SortBySize).to_string(), "ize "),
-        (kb.diff_screen_first_key(DiffScreenAction::SortByDate).to_string(), "ate "),
-        (kb.diff_screen_first_key(DiffScreenAction::SortByType).to_string(), ":type "),
-        (kb.diff_screen_first_key(DiffScreenAction::Close).to_string(), ":back"),
+        (
+            format!(
+                "{}/{}",
+                kb.diff_screen_first_key(DiffScreenAction::MoveUp),
+                kb.diff_screen_first_key(DiffScreenAction::MoveDown)
+            ),
+            "nav ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::ExpandDir)
+                .to_string(),
+            ":open ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::CollapseDir)
+                .to_string(),
+            ":close ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::Open).to_string(),
+            ":view ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::ExpandAll)
+                .to_string(),
+            ":expand ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::CollapseAll)
+                .to_string(),
+            ":collapse ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::CycleFilter)
+                .to_string(),
+            ":filter ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::SortByName)
+                .to_string(),
+            "ame ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::SortBySize)
+                .to_string(),
+            "ize ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::SortByDate)
+                .to_string(),
+            "ate ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::SortByType)
+                .to_string(),
+            ":type ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::Close)
+                .to_string(),
+            ":back",
+        ),
     ];
 
     let mut spans: Vec<Span> = Vec::new();
@@ -2211,7 +2389,9 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     // While comparing, only Close action is allowed
     if let Some(ref state) = app.diff_state {
         if state.is_comparing {
-            if let Some(DiffScreenAction::Close) = app.keybindings.diff_screen_action(code, modifiers) {
+            if let Some(DiffScreenAction::Close) =
+                app.keybindings.diff_screen_action(code, modifiers)
+            {
                 if let Some(ref mut state) = app.diff_state {
                     state.cancel();
                 }
@@ -2340,9 +2520,15 @@ fn handle_enter(app: &mut App) {
     }
 
     // Need both sides for file diff view
-    let left_path = entry.left.as_ref().map(|f| f.full_path.clone())
+    let left_path = entry
+        .left
+        .as_ref()
+        .map(|f| f.full_path.clone())
         .unwrap_or_default();
-    let right_path = entry.right.as_ref().map(|f| f.full_path.clone())
+    let right_path = entry
+        .right
+        .as_ref()
+        .map(|f| f.full_path.clone())
         .unwrap_or_default();
 
     // Get file name for display

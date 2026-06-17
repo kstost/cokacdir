@@ -1,9 +1,9 @@
 [package]
 name = "cokacdir"
-version = "0.6.20"
+version = "0.6.21"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
-description = "Telegram/Discord bot that runs Claude Code, Codex, Gemini, and Opencode, with a multi-panel terminal file manager"
+description = "Telegram/Discord bot that runs Claude Code, Codex, Agy, and Opencode, with a multi-panel terminal file manager"
 license = "MIT"
 repository = "https://github.com/kstost/cokacdir"
 homepage = "https://cokacdir.cokac.com"

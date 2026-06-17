@@ -63,13 +63,13 @@ Override the path to the Codex CLI binary. Same semantics as `COKAC_CLAUDE_PATH`
 - **Default:** not set (automatic resolution)
 - **Example:** `COKAC_CODEX_PATH=/opt/codex/codex`
 
-### `COKAC_GEMINI_PATH`
+### `COKAC_AGY_PATH`
 
-Override the path to the Gemini CLI binary. Same semantics as above but for Gemini.
+Override the path to the Antigravity CLI `agy` binary. Same semantics as above but for Agy.
 
 - **Type:** absolute path to an existing executable
 - **Default:** not set (automatic resolution)
-- **Example:** `COKAC_GEMINI_PATH=/usr/local/bin/gemini`
+- **Example:** `COKAC_AGY_PATH=/usr/local/bin/agy`
 
 ### `COKAC_OPENCODE_PATH`
 

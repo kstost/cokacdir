@@ -1,11 +1,11 @@
+use crate::keybindings::KeybindingsConfig;
+use crate::services::remote::RemoteProfile;
+use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
-use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
-use crate::services::remote::RemoteProfile;
-use crate::keybindings::KeybindingsConfig;
 
 use crate::utils::format::strip_unc_prefix;
 
@@ -258,14 +258,13 @@ impl Settings {
         // Ensure config directories and files exist
         Self::ensure_config_exists();
 
-        let config_path = Self::config_path()
-            .ok_or_else(|| "Could not determine config path".to_string())?;
+        let config_path =
+            Self::config_path().ok_or_else(|| "Could not determine config path".to_string())?;
 
         let content = fs::read_to_string(&config_path)
             .map_err(|e| format!("Failed to read settings file: {}", e))?;
 
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Invalid JSON in settings.json: {}", e))
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in settings.json: {}", e))
     }
 
     /// Saves settings to the config file using atomic write pattern
@@ -375,7 +374,10 @@ mod tests {
     #[test]
     fn test_parse_partial_json() {
         let test_path = std::env::temp_dir().display().to_string();
-        let json = format!(r#"{{"panels":[{{"start_path":"{}"}}]}}"#, test_path.replace('\\', "\\\\"));
+        let json = format!(
+            r#"{{"panels":[{{"start_path":"{}"}}]}}"#,
+            test_path.replace('\\', "\\\\")
+        );
         let settings: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings.panels[0].start_path, Some(test_path));
         assert_eq!(settings.panels[0].sort_by, "name");

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::hash::Hash;
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::Hash;
 
 // ─── Generic key binding infrastructure ────────────────────────────────
 
@@ -28,10 +28,7 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
     /// - Actions present in `overrides` completely replace the default bindings
     ///   for that action.
     /// - Actions **not** present in `overrides` keep the default bindings.
-    pub fn build(
-        defaults: &HashMap<A, Vec<String>>,
-        overrides: &HashMap<A, Vec<String>>,
-    ) -> Self {
+    pub fn build(defaults: &HashMap<A, Vec<String>>, overrides: &HashMap<A, Vec<String>>) -> Self {
         let mut merged = defaults.clone();
         for (action, keys) in overrides {
             merged.insert(*action, keys.clone());
@@ -50,7 +47,8 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
         // Build forward display map (action → formatted key strings, comments filtered)
         let mut display: HashMap<A, Vec<String>> = HashMap::new();
         for (action, key_strings) in &merged {
-            let keys: Vec<String> = key_strings.iter()
+            let keys: Vec<String> = key_strings
+                .iter()
                 .filter(|s| !s.trim().starts_with("//"))
                 .map(|s| format_key_display(s))
                 .collect();
@@ -62,7 +60,10 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
 
     /// Get formatted display strings for an action (e.g. `["Ctrl+C"]`).
     pub fn keys(&self, action: A) -> &[String] {
-        self.display.get(&action).map(|v| v.as_slice()).unwrap_or(&[])
+        self.display
+            .get(&action)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get the first display key for an action (e.g. `"Ctrl+C"`).
@@ -88,7 +89,10 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
         if let KeyCode::Char(_) = code {
             if modifiers.contains(KeyModifiers::SHIFT) {
                 let stripped = modifiers & !KeyModifiers::SHIFT;
-                let bind2 = KeyBind { code, modifiers: stripped };
+                let bind2 = KeyBind {
+                    code,
+                    modifiers: stripped,
+                };
                 return self.map.get(&bind2).copied();
             }
         }
@@ -174,8 +178,14 @@ pub fn parse_key(s: &str) -> Vec<KeyBind> {
             let lower = ch.to_ascii_lowercase();
             let upper = ch.to_ascii_uppercase();
             return vec![
-                KeyBind { code: KeyCode::Char(lower), modifiers },
-                KeyBind { code: KeyCode::Char(upper), modifiers },
+                KeyBind {
+                    code: KeyCode::Char(lower),
+                    modifiers,
+                },
+                KeyBind {
+                    code: KeyCode::Char(upper),
+                    modifiers,
+                },
             ];
         }
     }
@@ -201,8 +211,12 @@ pub fn format_key_display(s: &str) -> String {
                 "ctrl" | "control" => "Ctrl",
                 "shift" => "Shift",
                 "alt" => "Alt",
-                other => { result.push(other.to_string()); continue; }
-            }.to_string()
+                other => {
+                    result.push(other.to_string());
+                    continue;
+                }
+            }
+            .to_string()
         } else {
             // Key name
             match *part {
@@ -314,88 +328,249 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
 
     // General
     m.insert(PanelAction::Quit, vec!["//Quit program".into(), "q".into()]);
-    m.insert(PanelAction::Help, vec!["//Show help screen".into(), "?".into()]);
-    m.insert(PanelAction::Settings, vec!["//Open settings dialog".into(), "`".into()]);
-    m.insert(PanelAction::Refresh, vec!["//Refresh panels".into(), "2".into()]);
+    m.insert(
+        PanelAction::Help,
+        vec!["//Show help screen".into(), "?".into()],
+    );
+    m.insert(
+        PanelAction::Settings,
+        vec!["//Open settings dialog".into(), "`".into()],
+    );
+    m.insert(
+        PanelAction::Refresh,
+        vec!["//Refresh panels".into(), "2".into()],
+    );
 
     // Navigation
-    m.insert(PanelAction::MoveUp, vec!["//Move cursor up".into(), "up".into(), "k".into()]);
-    m.insert(PanelAction::MoveDown, vec!["//Move cursor down".into(), "down".into(), "j".into()]);
-    m.insert(PanelAction::PageUp, vec!["//Page up (10 lines)".into(), "pageup".into()]);
-    m.insert(PanelAction::PageDown, vec!["//Page down (10 lines)".into(), "pagedown".into()]);
-    m.insert(PanelAction::GoHome, vec!["//Go to first item".into(), "home".into()]);
-    m.insert(PanelAction::GoEnd, vec!["//Go to last item".into(), "end".into()]);
-    m.insert(PanelAction::Open, vec!["//Open file or enter directory".into(), "enter".into()]);
-    m.insert(PanelAction::ParentDir, vec!["//Go to parent directory (or cancel diff)".into(), "esc".into()]);
-    m.insert(PanelAction::GoToPath, vec!["//Go to path".into(), "/".into()]);
-    m.insert(PanelAction::GoHomeDir, vec!["//Go to home directory".into(), "1".into()]);
+    m.insert(
+        PanelAction::MoveUp,
+        vec!["//Move cursor up".into(), "up".into(), "k".into()],
+    );
+    m.insert(
+        PanelAction::MoveDown,
+        vec!["//Move cursor down".into(), "down".into(), "j".into()],
+    );
+    m.insert(
+        PanelAction::PageUp,
+        vec!["//Page up (10 lines)".into(), "pageup".into()],
+    );
+    m.insert(
+        PanelAction::PageDown,
+        vec!["//Page down (10 lines)".into(), "pagedown".into()],
+    );
+    m.insert(
+        PanelAction::GoHome,
+        vec!["//Go to first item".into(), "home".into()],
+    );
+    m.insert(
+        PanelAction::GoEnd,
+        vec!["//Go to last item".into(), "end".into()],
+    );
+    m.insert(
+        PanelAction::Open,
+        vec!["//Open file or enter directory".into(), "enter".into()],
+    );
+    m.insert(
+        PanelAction::ParentDir,
+        vec![
+            "//Go to parent directory (or cancel diff)".into(),
+            "esc".into(),
+        ],
+    );
+    m.insert(
+        PanelAction::GoToPath,
+        vec!["//Go to path".into(), "/".into()],
+    );
+    m.insert(
+        PanelAction::GoHomeDir,
+        vec!["//Go to home directory".into(), "1".into()],
+    );
 
     // Panel
-    m.insert(PanelAction::SwitchPanel, vec!["//Switch to next panel".into(), "tab".into()]);
-    m.insert(PanelAction::SwitchPanelLeft, vec!["//Switch to left panel".into(), "left".into(), "h".into()]);
-    m.insert(PanelAction::SwitchPanelRight, vec!["//Switch to right panel".into(), "right".into(), "l".into()]);
-    m.insert(PanelAction::AddPanel, vec!["//Add new panel".into(), "0".into()]);
-    m.insert(PanelAction::ClosePanel, vec!["//Close current panel".into(), "9".into()]);
+    m.insert(
+        PanelAction::SwitchPanel,
+        vec!["//Switch to next panel".into(), "tab".into()],
+    );
+    m.insert(
+        PanelAction::SwitchPanelLeft,
+        vec!["//Switch to left panel".into(), "left".into(), "h".into()],
+    );
+    m.insert(
+        PanelAction::SwitchPanelRight,
+        vec!["//Switch to right panel".into(), "right".into(), "l".into()],
+    );
+    m.insert(
+        PanelAction::AddPanel,
+        vec!["//Add new panel".into(), "0".into()],
+    );
+    m.insert(
+        PanelAction::ClosePanel,
+        vec!["//Close current panel".into(), "9".into()],
+    );
 
     // Selection
-    m.insert(PanelAction::ToggleSelect, vec!["//Toggle file selection".into(), "space".into()]);
-    m.insert(PanelAction::SelectAll, vec!["//Select/deselect all".into(), "*".into(), "ctrl+a".into()]);
-    m.insert(PanelAction::SelectByExtension, vec!["//Select by extension".into(), ";".into()]);
-    m.insert(PanelAction::SelectUp, vec!["//Select and move up".into(), "shift+up".into()]);
-    m.insert(PanelAction::SelectDown, vec!["//Select and move down".into(), "shift+down".into()]);
+    m.insert(
+        PanelAction::ToggleSelect,
+        vec!["//Toggle file selection".into(), "space".into()],
+    );
+    m.insert(
+        PanelAction::SelectAll,
+        vec!["//Select/deselect all".into(), "*".into(), "ctrl+a".into()],
+    );
+    m.insert(
+        PanelAction::SelectByExtension,
+        vec!["//Select by extension".into(), ";".into()],
+    );
+    m.insert(
+        PanelAction::SelectUp,
+        vec!["//Select and move up".into(), "shift+up".into()],
+    );
+    m.insert(
+        PanelAction::SelectDown,
+        vec!["//Select and move down".into(), "shift+down".into()],
+    );
 
     // Clipboard
-    m.insert(PanelAction::Copy, vec!["//Copy selected files".into(), "ctrl+c".into()]);
-    m.insert(PanelAction::Cut, vec!["//Cut selected files".into(), "ctrl+x".into()]);
+    m.insert(
+        PanelAction::Copy,
+        vec!["//Copy selected files".into(), "ctrl+c".into()],
+    );
+    m.insert(
+        PanelAction::Cut,
+        vec!["//Cut selected files".into(), "ctrl+x".into()],
+    );
     #[cfg(not(windows))]
-    m.insert(PanelAction::Paste, vec!["//Paste files".into(), "ctrl+v".into(), "shift+v".into()]);
+    m.insert(
+        PanelAction::Paste,
+        vec!["//Paste files".into(), "ctrl+v".into(), "shift+v".into()],
+    );
     #[cfg(windows)]
-    m.insert(PanelAction::Paste, vec!["//Paste files".into(), "shift+v".into()]);
+    m.insert(
+        PanelAction::Paste,
+        vec!["//Paste files".into(), "shift+v".into()],
+    );
 
     // Sort
-    m.insert(PanelAction::SortByName, vec!["//Sort by name".into(), "n".into()]);
-    m.insert(PanelAction::SortByType, vec!["//Sort by type".into(), "y".into()]);
-    m.insert(PanelAction::SortBySize, vec!["//Sort by size".into(), "s".into()]);
-    m.insert(PanelAction::SortByDate, vec!["//Sort by date".into(), "d".into()]);
+    m.insert(
+        PanelAction::SortByName,
+        vec!["//Sort by name".into(), "n".into()],
+    );
+    m.insert(
+        PanelAction::SortByType,
+        vec!["//Sort by type".into(), "y".into()],
+    );
+    m.insert(
+        PanelAction::SortBySize,
+        vec!["//Sort by size".into(), "s".into()],
+    );
+    m.insert(
+        PanelAction::SortByDate,
+        vec!["//Sort by date".into(), "d".into()],
+    );
 
     // File operations
-    m.insert(PanelAction::FileInfo, vec!["//Show file info".into(), "i".into()]);
+    m.insert(
+        PanelAction::FileInfo,
+        vec!["//Show file info".into(), "i".into()],
+    );
     m.insert(PanelAction::Edit, vec!["//Edit file".into(), "e".into()]);
-    m.insert(PanelAction::Mkdir, vec!["//Create directory".into(), ",".into()]);
-    m.insert(PanelAction::Mkfile, vec!["//Create file".into(), "m".into()]);
-    m.insert(PanelAction::Delete, vec!["//Delete file".into(), "x".into(), "delete".into(), "backspace".into()]);
-    m.insert(PanelAction::Rename, vec!["//Rename file".into(), "r".into()]);
+    m.insert(
+        PanelAction::Mkdir,
+        vec!["//Create directory".into(), ",".into()],
+    );
+    m.insert(
+        PanelAction::Mkfile,
+        vec!["//Create file".into(), "m".into()],
+    );
+    m.insert(
+        PanelAction::Delete,
+        vec![
+            "//Delete file".into(),
+            "x".into(),
+            "delete".into(),
+            "backspace".into(),
+        ],
+    );
+    m.insert(
+        PanelAction::Rename,
+        vec!["//Rename file".into(), "r".into()],
+    );
     m.insert(PanelAction::Tar, vec!["//Archive (tar)".into(), "t".into()]);
-    m.insert(PanelAction::Search, vec!["//Search files".into(), "f".into()]);
-    m.insert(PanelAction::SetHandler, vec!["//Set extension handler".into(), "u".into()]);
+    m.insert(
+        PanelAction::Search,
+        vec!["//Search files".into(), "f".into()],
+    );
+    m.insert(
+        PanelAction::SetHandler,
+        vec!["//Set extension handler".into(), "u".into()],
+    );
 
     // Tools
-    m.insert(PanelAction::ProcessManager, vec!["//Process manager".into(), "p".into()]);
-    m.insert(PanelAction::AIScreen, vec!["//AI assistant shortcut disabled".into()]);
-    m.insert(PanelAction::ToggleBookmark, vec!["//Toggle bookmark".into(), "'".into()]);
+    m.insert(
+        PanelAction::ProcessManager,
+        vec!["//Process manager".into(), "p".into()],
+    );
+    m.insert(
+        PanelAction::AIScreen,
+        vec!["//AI assistant shortcut disabled".into()],
+    );
+    m.insert(
+        PanelAction::ToggleBookmark,
+        vec!["//Toggle bookmark".into(), "'".into()],
+    );
 
     // Git / Diff
-    m.insert(PanelAction::GitScreen, vec!["//Git screen".into(), "g".into()]);
-    m.insert(PanelAction::GitLogDiff, vec!["//Git log diff".into(), "7".into()]);
-    m.insert(PanelAction::StartDiff, vec!["//Start diff".into(), "8".into()]);
+    m.insert(
+        PanelAction::GitScreen,
+        vec!["//Git screen".into(), "g".into()],
+    );
+    m.insert(
+        PanelAction::GitLogDiff,
+        vec!["//Git log diff".into(), "7".into()],
+    );
+    m.insert(
+        PanelAction::StartDiff,
+        vec!["//Start diff".into(), "8".into()],
+    );
 
     // Encryption
-    m.insert(PanelAction::EncryptAll, vec!["//Encrypt all files in directory".into(), "shift+e".into()]);
-    m.insert(PanelAction::DecryptAll, vec!["//Decrypt all .cokacenc files".into(), "shift+d".into()]);
-    m.insert(PanelAction::RemoveDuplicates, vec!["//Remove duplicate files".into(), "shift+x".into()]);
+    m.insert(
+        PanelAction::EncryptAll,
+        vec!["//Encrypt all files in directory".into(), "shift+e".into()],
+    );
+    m.insert(
+        PanelAction::DecryptAll,
+        vec!["//Decrypt all .cokacenc files".into(), "shift+d".into()],
+    );
+    m.insert(
+        PanelAction::RemoveDuplicates,
+        vec!["//Remove duplicate files".into(), "shift+x".into()],
+    );
 
     // macOS only
     #[cfg(target_os = "macos")]
     {
-        m.insert(PanelAction::OpenInFinder, vec!["//Open in Finder".into(), "o".into()]);
-        m.insert(PanelAction::OpenInVSCode, vec!["//Open in VS Code".into(), "c".into()]);
+        m.insert(
+            PanelAction::OpenInFinder,
+            vec!["//Open in Finder".into(), "o".into()],
+        );
+        m.insert(
+            PanelAction::OpenInVSCode,
+            vec!["//Open in VS Code".into(), "c".into()],
+        );
     }
 
     // Windows only
     #[cfg(target_os = "windows")]
     {
-        m.insert(PanelAction::OpenInExplorer, vec!["//Open in Explorer".into(), "o".into()]);
-        m.insert(PanelAction::OpenInVSCode, vec!["//Open in VS Code".into(), "c".into()]);
+        m.insert(
+            PanelAction::OpenInExplorer,
+            vec!["//Open in Explorer".into(), "o".into()],
+        );
+        m.insert(
+            PanelAction::OpenInVSCode,
+            vec!["//Open in VS Code".into(), "c".into()],
+        );
     }
 
     m
@@ -446,48 +621,141 @@ pub fn default_editor_keybindings() -> HashMap<EditorAction, Vec<String>> {
     let mut m = HashMap::new();
 
     // File
-    m.insert(EditorAction::Save, vec!["//Save file".into(), "ctrl+s".into()]);
+    m.insert(
+        EditorAction::Save,
+        vec!["//Save file".into(), "ctrl+s".into()],
+    );
 
     // Clipboard & selection
-    m.insert(EditorAction::Cut, vec!["//Cut (line if no selection)".into(), "ctrl+x".into()]);
-    m.insert(EditorAction::Copy, vec!["//Copy (line if no selection)".into(), "ctrl+c".into()]);
+    m.insert(
+        EditorAction::Cut,
+        vec!["//Cut (line if no selection)".into(), "ctrl+x".into()],
+    );
+    m.insert(
+        EditorAction::Copy,
+        vec!["//Copy (line if no selection)".into(), "ctrl+c".into()],
+    );
     m.insert(EditorAction::Paste, vec!["//Paste".into(), "ctrl+v".into()]);
-    m.insert(EditorAction::SelectAll, vec!["//Select all".into(), "ctrl+a".into()]);
-    m.insert(EditorAction::SelectNextOccurrence, vec!["//Select next occurrence".into(), "ctrl+d".into()]);
-    m.insert(EditorAction::SelectLine, vec!["//Select line".into(), "ctrl+l".into()]);
+    m.insert(
+        EditorAction::SelectAll,
+        vec!["//Select all".into(), "ctrl+a".into()],
+    );
+    m.insert(
+        EditorAction::SelectNextOccurrence,
+        vec!["//Select next occurrence".into(), "ctrl+d".into()],
+    );
+    m.insert(
+        EditorAction::SelectLine,
+        vec!["//Select line".into(), "ctrl+l".into()],
+    );
 
     // Editing
     m.insert(EditorAction::Undo, vec!["//Undo".into(), "ctrl+z".into()]);
     m.insert(EditorAction::Redo, vec!["//Redo".into(), "ctrl+y".into()]);
-    m.insert(EditorAction::DeleteLine, vec!["//Delete line".into(), "ctrl+k".into()]);
-    m.insert(EditorAction::DuplicateLine, vec!["//Duplicate line".into(), "ctrl+j".into()]);
-    m.insert(EditorAction::ToggleComment, vec!["//Toggle comment".into(), "ctrl+/".into(), "ctrl+_".into(), "ctrl+7".into()]);
-    m.insert(EditorAction::Indent, vec!["//Indent".into(), "ctrl+]".into()]);
-    m.insert(EditorAction::InsertLineBelow, vec!["//Insert line below".into(), "ctrl+enter".into()]);
-    m.insert(EditorAction::InsertLineAbove, vec!["//Insert line above".into(), "ctrl+shift+enter".into()]);
+    m.insert(
+        EditorAction::DeleteLine,
+        vec!["//Delete line".into(), "ctrl+k".into()],
+    );
+    m.insert(
+        EditorAction::DuplicateLine,
+        vec!["//Duplicate line".into(), "ctrl+j".into()],
+    );
+    m.insert(
+        EditorAction::ToggleComment,
+        vec![
+            "//Toggle comment".into(),
+            "ctrl+/".into(),
+            "ctrl+_".into(),
+            "ctrl+7".into(),
+        ],
+    );
+    m.insert(
+        EditorAction::Indent,
+        vec!["//Indent".into(), "ctrl+]".into()],
+    );
+    m.insert(
+        EditorAction::InsertLineBelow,
+        vec!["//Insert line below".into(), "ctrl+enter".into()],
+    );
+    m.insert(
+        EditorAction::InsertLineAbove,
+        vec!["//Insert line above".into(), "ctrl+shift+enter".into()],
+    );
 
     // Word navigation / deletion
-    m.insert(EditorAction::MoveWordLeft, vec!["//Move word left".into(), "ctrl+left".into(), "ctrl+shift+left".into()]);
-    m.insert(EditorAction::MoveWordRight, vec!["//Move word right".into(), "ctrl+right".into(), "ctrl+shift+right".into()]);
-    m.insert(EditorAction::DeleteWordBackward, vec!["//Delete word backward".into(), "ctrl+backspace".into()]);
-    m.insert(EditorAction::DeleteWordForward, vec!["//Delete word forward".into(), "ctrl+delete".into()]);
+    m.insert(
+        EditorAction::MoveWordLeft,
+        vec![
+            "//Move word left".into(),
+            "ctrl+left".into(),
+            "ctrl+shift+left".into(),
+        ],
+    );
+    m.insert(
+        EditorAction::MoveWordRight,
+        vec![
+            "//Move word right".into(),
+            "ctrl+right".into(),
+            "ctrl+shift+right".into(),
+        ],
+    );
+    m.insert(
+        EditorAction::DeleteWordBackward,
+        vec!["//Delete word backward".into(), "ctrl+backspace".into()],
+    );
+    m.insert(
+        EditorAction::DeleteWordForward,
+        vec!["//Delete word forward".into(), "ctrl+delete".into()],
+    );
 
     // View
-    m.insert(EditorAction::ToggleWordWrap, vec!["//Toggle word wrap".into(), "ctrl+w".into()]);
+    m.insert(
+        EditorAction::ToggleWordWrap,
+        vec!["//Toggle word wrap".into(), "ctrl+w".into()],
+    );
 
     // Search / navigation
     m.insert(EditorAction::Find, vec!["//Find".into(), "ctrl+f".into()]);
-    m.insert(EditorAction::Replace, vec!["//Find and replace".into(), "ctrl+h".into()]);
-    m.insert(EditorAction::GotoLine, vec!["//Go to line".into(), "ctrl+g".into()]);
-    m.insert(EditorAction::GoToFileStart, vec!["//Go to file start".into(), "ctrl+home".into(), "ctrl+shift+home".into()]);
-    m.insert(EditorAction::GoToFileEnd, vec!["//Go to file end".into(), "ctrl+end".into(), "ctrl+shift+end".into()]);
+    m.insert(
+        EditorAction::Replace,
+        vec!["//Find and replace".into(), "ctrl+h".into()],
+    );
+    m.insert(
+        EditorAction::GotoLine,
+        vec!["//Go to line".into(), "ctrl+g".into()],
+    );
+    m.insert(
+        EditorAction::GoToFileStart,
+        vec![
+            "//Go to file start".into(),
+            "ctrl+home".into(),
+            "ctrl+shift+home".into(),
+        ],
+    );
+    m.insert(
+        EditorAction::GoToFileEnd,
+        vec![
+            "//Go to file end".into(),
+            "ctrl+end".into(),
+            "ctrl+shift+end".into(),
+        ],
+    );
 
     // Line move
-    m.insert(EditorAction::MoveLineUp, vec!["//Move line up".into(), "alt+up".into()]);
-    m.insert(EditorAction::MoveLineDown, vec!["//Move line down".into(), "alt+down".into()]);
+    m.insert(
+        EditorAction::MoveLineUp,
+        vec!["//Move line up".into(), "alt+up".into()],
+    );
+    m.insert(
+        EditorAction::MoveLineDown,
+        vec!["//Move line down".into(), "alt+down".into()],
+    );
 
     // Exit
-    m.insert(EditorAction::Exit, vec!["//Close editor".into(), "esc".into()]);
+    m.insert(
+        EditorAction::Exit,
+        vec!["//Close editor".into(), "esc".into()],
+    );
 
     m
 }
@@ -502,7 +770,10 @@ pub enum FileInfoAction {
 
 pub fn default_file_info_keybindings() -> HashMap<FileInfoAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(FileInfoAction::Close, vec!["//Close file info".into(), "esc".into()]);
+    m.insert(
+        FileInfoAction::Close,
+        vec!["//Close file info".into(), "esc".into()],
+    );
     m
 }
 
@@ -519,10 +790,27 @@ pub enum SystemInfoAction {
 
 pub fn default_system_info_keybindings() -> HashMap<SystemInfoAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(SystemInfoAction::Quit, vec!["//Close system info".into(), "esc".into(), "q".into()]);
-    m.insert(SystemInfoAction::SwitchTab, vec!["//Switch tab".into(), "tab".into(), "left".into(), "right".into()]);
-    m.insert(SystemInfoAction::MoveUp, vec!["//Move up (disk tab)".into(), "up".into()]);
-    m.insert(SystemInfoAction::MoveDown, vec!["//Move down (disk tab)".into(), "down".into()]);
+    m.insert(
+        SystemInfoAction::Quit,
+        vec!["//Close system info".into(), "esc".into(), "q".into()],
+    );
+    m.insert(
+        SystemInfoAction::SwitchTab,
+        vec![
+            "//Switch tab".into(),
+            "tab".into(),
+            "left".into(),
+            "right".into(),
+        ],
+    );
+    m.insert(
+        SystemInfoAction::MoveUp,
+        vec!["//Move up (disk tab)".into(), "up".into()],
+    );
+    m.insert(
+        SystemInfoAction::MoveDown,
+        vec!["//Move down (disk tab)".into(), "down".into()],
+    );
     m
 }
 
@@ -543,14 +831,38 @@ pub enum SearchResultAction {
 
 pub fn default_search_result_keybindings() -> HashMap<SearchResultAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(SearchResultAction::Close, vec!["//Close search results".into(), "esc".into()]);
-    m.insert(SearchResultAction::MoveUp, vec!["//Move up".into(), "up".into(), "k".into()]);
-    m.insert(SearchResultAction::MoveDown, vec!["//Move down".into(), "down".into(), "j".into()]);
-    m.insert(SearchResultAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(SearchResultAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(SearchResultAction::GoHome, vec!["//Go to first".into(), "home".into(), "g".into()]);
-    m.insert(SearchResultAction::GoEnd, vec!["//Go to last".into(), "end".into(), "shift+g".into()]);
-    m.insert(SearchResultAction::Open, vec!["//Open selected result".into(), "enter".into()]);
+    m.insert(
+        SearchResultAction::Close,
+        vec!["//Close search results".into(), "esc".into()],
+    );
+    m.insert(
+        SearchResultAction::MoveUp,
+        vec!["//Move up".into(), "up".into(), "k".into()],
+    );
+    m.insert(
+        SearchResultAction::MoveDown,
+        vec!["//Move down".into(), "down".into(), "j".into()],
+    );
+    m.insert(
+        SearchResultAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        SearchResultAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        SearchResultAction::GoHome,
+        vec!["//Go to first".into(), "home".into(), "g".into()],
+    );
+    m.insert(
+        SearchResultAction::GoEnd,
+        vec!["//Go to last".into(), "end".into(), "shift+g".into()],
+    );
+    m.insert(
+        SearchResultAction::Open,
+        vec!["//Open selected result".into(), "enter".into()],
+    );
     m
 }
 
@@ -567,10 +879,22 @@ pub enum AdvancedSearchAction {
 
 pub fn default_advanced_search_keybindings() -> HashMap<AdvancedSearchAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(AdvancedSearchAction::Cancel, vec!["//Cancel search".into(), "esc".into()]);
-    m.insert(AdvancedSearchAction::Submit, vec!["//Submit search".into(), "enter".into()]);
-    m.insert(AdvancedSearchAction::MoveUp, vec!["//Previous field".into(), "up".into()]);
-    m.insert(AdvancedSearchAction::MoveDown, vec!["//Next field".into(), "down".into(), "tab".into()]);
+    m.insert(
+        AdvancedSearchAction::Cancel,
+        vec!["//Cancel search".into(), "esc".into()],
+    );
+    m.insert(
+        AdvancedSearchAction::Submit,
+        vec!["//Submit search".into(), "enter".into()],
+    );
+    m.insert(
+        AdvancedSearchAction::MoveUp,
+        vec!["//Previous field".into(), "up".into()],
+    );
+    m.insert(
+        AdvancedSearchAction::MoveDown,
+        vec!["//Next field".into(), "down".into(), "tab".into()],
+    );
     m
 }
 
@@ -592,15 +916,42 @@ pub enum DiffFileViewAction {
 
 pub fn default_diff_file_view_keybindings() -> HashMap<DiffFileViewAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(DiffFileViewAction::Close, vec!["//Return to diff screen".into(), "esc".into()]);
-    m.insert(DiffFileViewAction::MoveUp, vec!["//Scroll up".into(), "up".into()]);
-    m.insert(DiffFileViewAction::MoveDown, vec!["//Scroll down".into(), "down".into()]);
-    m.insert(DiffFileViewAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(DiffFileViewAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(DiffFileViewAction::GoHome, vec!["//Go to start".into(), "home".into()]);
-    m.insert(DiffFileViewAction::GoEnd, vec!["//Go to end".into(), "end".into()]);
-    m.insert(DiffFileViewAction::NextChange, vec!["//Next change".into(), "n".into()]);
-    m.insert(DiffFileViewAction::PrevChange, vec!["//Previous change".into(), "shift+n".into(), "p".into()]);
+    m.insert(
+        DiffFileViewAction::Close,
+        vec!["//Return to diff screen".into(), "esc".into()],
+    );
+    m.insert(
+        DiffFileViewAction::MoveUp,
+        vec!["//Scroll up".into(), "up".into()],
+    );
+    m.insert(
+        DiffFileViewAction::MoveDown,
+        vec!["//Scroll down".into(), "down".into()],
+    );
+    m.insert(
+        DiffFileViewAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        DiffFileViewAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        DiffFileViewAction::GoHome,
+        vec!["//Go to start".into(), "home".into()],
+    );
+    m.insert(
+        DiffFileViewAction::GoEnd,
+        vec!["//Go to end".into(), "end".into()],
+    );
+    m.insert(
+        DiffFileViewAction::NextChange,
+        vec!["//Next change".into(), "n".into()],
+    );
+    m.insert(
+        DiffFileViewAction::PrevChange,
+        vec!["//Previous change".into(), "shift+n".into(), "p".into()],
+    );
     m
 }
 
@@ -633,32 +984,86 @@ pub fn default_diff_screen_keybindings() -> HashMap<DiffScreenAction, Vec<String
     let mut m = HashMap::new();
 
     // Navigation
-    m.insert(DiffScreenAction::MoveUp, vec!["//Move cursor up".into(), "up".into(), "k".into()]);
-    m.insert(DiffScreenAction::MoveDown, vec!["//Move cursor down".into(), "down".into(), "j".into()]);
-    m.insert(DiffScreenAction::ExpandDir, vec!["//Expand directory".into(), "right".into(), "l".into()]);
-    m.insert(DiffScreenAction::CollapseDir, vec!["//Collapse directory".into(), "left".into(), "h".into()]);
-    m.insert(DiffScreenAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(DiffScreenAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(DiffScreenAction::GoHome, vec!["//Go to first item".into(), "home".into()]);
-    m.insert(DiffScreenAction::GoEnd, vec!["//Go to last item".into(), "end".into()]);
+    m.insert(
+        DiffScreenAction::MoveUp,
+        vec!["//Move cursor up".into(), "up".into(), "k".into()],
+    );
+    m.insert(
+        DiffScreenAction::MoveDown,
+        vec!["//Move cursor down".into(), "down".into(), "j".into()],
+    );
+    m.insert(
+        DiffScreenAction::ExpandDir,
+        vec!["//Expand directory".into(), "right".into(), "l".into()],
+    );
+    m.insert(
+        DiffScreenAction::CollapseDir,
+        vec!["//Collapse directory".into(), "left".into(), "h".into()],
+    );
+    m.insert(
+        DiffScreenAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        DiffScreenAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        DiffScreenAction::GoHome,
+        vec!["//Go to first item".into(), "home".into()],
+    );
+    m.insert(
+        DiffScreenAction::GoEnd,
+        vec!["//Go to last item".into(), "end".into()],
+    );
 
     // Selection & filter
-    m.insert(DiffScreenAction::ToggleSelect, vec!["//Toggle selection".into(), "space".into()]);
-    m.insert(DiffScreenAction::CycleFilter, vec!["//Cycle filter".into(), "f".into()]);
+    m.insert(
+        DiffScreenAction::ToggleSelect,
+        vec!["//Toggle selection".into(), "space".into()],
+    );
+    m.insert(
+        DiffScreenAction::CycleFilter,
+        vec!["//Cycle filter".into(), "f".into()],
+    );
 
     // Sort
-    m.insert(DiffScreenAction::SortByName, vec!["//Sort by name".into(), "n".into()]);
-    m.insert(DiffScreenAction::SortBySize, vec!["//Sort by size".into(), "s".into()]);
-    m.insert(DiffScreenAction::SortByDate, vec!["//Sort by date".into(), "d".into()]);
-    m.insert(DiffScreenAction::SortByType, vec!["//Sort by type".into(), "y".into()]);
+    m.insert(
+        DiffScreenAction::SortByName,
+        vec!["//Sort by name".into(), "n".into()],
+    );
+    m.insert(
+        DiffScreenAction::SortBySize,
+        vec!["//Sort by size".into(), "s".into()],
+    );
+    m.insert(
+        DiffScreenAction::SortByDate,
+        vec!["//Sort by date".into(), "d".into()],
+    );
+    m.insert(
+        DiffScreenAction::SortByType,
+        vec!["//Sort by type".into(), "y".into()],
+    );
 
     // Expand/Collapse all
-    m.insert(DiffScreenAction::ExpandAll, vec!["//Expand all".into(), "e".into()]);
-    m.insert(DiffScreenAction::CollapseAll, vec!["//Collapse all".into(), "c".into()]);
+    m.insert(
+        DiffScreenAction::ExpandAll,
+        vec!["//Expand all".into(), "e".into()],
+    );
+    m.insert(
+        DiffScreenAction::CollapseAll,
+        vec!["//Collapse all".into(), "c".into()],
+    );
 
     // Actions
-    m.insert(DiffScreenAction::Open, vec!["//View file diff / toggle dir".into(), "enter".into()]);
-    m.insert(DiffScreenAction::Close, vec!["//Return to file panel".into(), "esc".into()]);
+    m.insert(
+        DiffScreenAction::Open,
+        vec!["//View file diff / toggle dir".into(), "enter".into()],
+    );
+    m.insert(
+        DiffScreenAction::Close,
+        vec!["//Return to file panel".into(), "esc".into()],
+    );
 
     m
 }
@@ -689,23 +1094,74 @@ pub enum ViewerAction {
 
 pub fn default_viewer_keybindings() -> HashMap<ViewerAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(ViewerAction::Quit, vec!["//Close viewer".into(), "esc".into(), "ctrl+q".into()]);
-    m.insert(ViewerAction::Edit, vec!["//Open in editor".into(), "e".into()]);
-    m.insert(ViewerAction::ScrollUp, vec!["//Scroll up".into(), "up".into(), "k".into()]);
-    m.insert(ViewerAction::ScrollDown, vec!["//Scroll down".into(), "down".into(), "j".into()]);
-    m.insert(ViewerAction::ScrollLeft, vec!["//Scroll left".into(), "left".into()]);
-    m.insert(ViewerAction::ScrollRight, vec!["//Scroll right".into(), "right".into()]);
-    m.insert(ViewerAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(ViewerAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(ViewerAction::GoTop, vec!["//Go to top".into(), "home".into()]);
-    m.insert(ViewerAction::GoBottom, vec!["//Go to bottom".into(), "end".into(), "shift+g".into()]);
-    m.insert(ViewerAction::Find, vec!["//Find text".into(), "ctrl+f".into()]);
-    m.insert(ViewerAction::ToggleBookmark, vec!["//Toggle bookmark".into(), "b".into()]);
-    m.insert(ViewerAction::NextBookmark, vec!["//Next bookmark".into(), "shift+b".into(), "]".into()]);
-    m.insert(ViewerAction::PrevBookmark, vec!["//Previous bookmark".into(), "[".into()]);
-    m.insert(ViewerAction::ToggleWrap, vec!["//Toggle word wrap".into(), "w".into()]);
-    m.insert(ViewerAction::ToggleHex, vec!["//Toggle hex mode".into(), "h".into(), "shift+h".into()]);
-    m.insert(ViewerAction::GotoLine, vec!["//Go to line".into(), "ctrl+g".into(), ":".into()]);
+    m.insert(
+        ViewerAction::Quit,
+        vec!["//Close viewer".into(), "esc".into(), "ctrl+q".into()],
+    );
+    m.insert(
+        ViewerAction::Edit,
+        vec!["//Open in editor".into(), "e".into()],
+    );
+    m.insert(
+        ViewerAction::ScrollUp,
+        vec!["//Scroll up".into(), "up".into(), "k".into()],
+    );
+    m.insert(
+        ViewerAction::ScrollDown,
+        vec!["//Scroll down".into(), "down".into(), "j".into()],
+    );
+    m.insert(
+        ViewerAction::ScrollLeft,
+        vec!["//Scroll left".into(), "left".into()],
+    );
+    m.insert(
+        ViewerAction::ScrollRight,
+        vec!["//Scroll right".into(), "right".into()],
+    );
+    m.insert(
+        ViewerAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        ViewerAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        ViewerAction::GoTop,
+        vec!["//Go to top".into(), "home".into()],
+    );
+    m.insert(
+        ViewerAction::GoBottom,
+        vec!["//Go to bottom".into(), "end".into(), "shift+g".into()],
+    );
+    m.insert(
+        ViewerAction::Find,
+        vec!["//Find text".into(), "ctrl+f".into()],
+    );
+    m.insert(
+        ViewerAction::ToggleBookmark,
+        vec!["//Toggle bookmark".into(), "b".into()],
+    );
+    m.insert(
+        ViewerAction::NextBookmark,
+        vec!["//Next bookmark".into(), "shift+b".into(), "]".into()],
+    );
+    m.insert(
+        ViewerAction::PrevBookmark,
+        vec!["//Previous bookmark".into(), "[".into()],
+    );
+    m.insert(
+        ViewerAction::ToggleWrap,
+        vec!["//Toggle word wrap".into(), "w".into()],
+    );
+    m.insert(
+        ViewerAction::ToggleHex,
+        vec!["//Toggle hex mode".into(), "h".into(), "shift+h".into()],
+    );
+    m.insert(
+        ViewerAction::GotoLine,
+        vec!["//Go to line".into(), "ctrl+g".into(), ":".into()],
+    );
     m
 }
 
@@ -730,18 +1186,62 @@ pub enum ImageViewerAction {
 
 pub fn default_image_viewer_keybindings() -> HashMap<ImageViewerAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(ImageViewerAction::Close, vec!["//Close viewer".into(), "esc".into(), "q".into()]);
-    m.insert(ImageViewerAction::ZoomIn, vec!["//Zoom in".into(), "+".into(), "=".into()]);
-    m.insert(ImageViewerAction::ZoomOut, vec!["//Zoom out".into(), "-".into(), "_".into()]);
-    m.insert(ImageViewerAction::ResetView, vec!["//Reset zoom".into(), "r".into()]);
-    m.insert(ImageViewerAction::PanUp, vec!["//Pan up".into(), "up".into()]);
-    m.insert(ImageViewerAction::PanDown, vec!["//Pan down".into(), "down".into()]);
-    m.insert(ImageViewerAction::PanLeft, vec!["//Pan left".into(), "left".into()]);
-    m.insert(ImageViewerAction::PanRight, vec!["//Pan right".into(), "right".into()]);
-    m.insert(ImageViewerAction::PrevImage, vec!["//Previous image".into(), "pageup".into(), "shift+up".into()]);
-    m.insert(ImageViewerAction::NextImage, vec!["//Next image".into(), "pagedown".into(), "shift+down".into()]);
-    m.insert(ImageViewerAction::ToggleSelect, vec!["//Select image".into(), "space".into()]);
-    m.insert(ImageViewerAction::Delete, vec!["//Delete image".into(), "delete".into(), "backspace".into()]);
+    m.insert(
+        ImageViewerAction::Close,
+        vec!["//Close viewer".into(), "esc".into(), "q".into()],
+    );
+    m.insert(
+        ImageViewerAction::ZoomIn,
+        vec!["//Zoom in".into(), "+".into(), "=".into()],
+    );
+    m.insert(
+        ImageViewerAction::ZoomOut,
+        vec!["//Zoom out".into(), "-".into(), "_".into()],
+    );
+    m.insert(
+        ImageViewerAction::ResetView,
+        vec!["//Reset zoom".into(), "r".into()],
+    );
+    m.insert(
+        ImageViewerAction::PanUp,
+        vec!["//Pan up".into(), "up".into()],
+    );
+    m.insert(
+        ImageViewerAction::PanDown,
+        vec!["//Pan down".into(), "down".into()],
+    );
+    m.insert(
+        ImageViewerAction::PanLeft,
+        vec!["//Pan left".into(), "left".into()],
+    );
+    m.insert(
+        ImageViewerAction::PanRight,
+        vec!["//Pan right".into(), "right".into()],
+    );
+    m.insert(
+        ImageViewerAction::PrevImage,
+        vec![
+            "//Previous image".into(),
+            "pageup".into(),
+            "shift+up".into(),
+        ],
+    );
+    m.insert(
+        ImageViewerAction::NextImage,
+        vec![
+            "//Next image".into(),
+            "pagedown".into(),
+            "shift+down".into(),
+        ],
+    );
+    m.insert(
+        ImageViewerAction::ToggleSelect,
+        vec!["//Select image".into(), "space".into()],
+    );
+    m.insert(
+        ImageViewerAction::Delete,
+        vec!["//Delete image".into(), "delete".into(), "backspace".into()],
+    );
     m
 }
 
@@ -768,20 +1268,62 @@ pub enum ProcessManagerAction {
 
 pub fn default_process_manager_keybindings() -> HashMap<ProcessManagerAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(ProcessManagerAction::Quit, vec!["//Close manager".into(), "esc".into(), "q".into()]);
-    m.insert(ProcessManagerAction::MoveUp, vec!["//Move up".into(), "up".into()]);
-    m.insert(ProcessManagerAction::MoveDown, vec!["//Move down".into(), "down".into()]);
-    m.insert(ProcessManagerAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(ProcessManagerAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(ProcessManagerAction::GoHome, vec!["//Go to first".into(), "home".into()]);
-    m.insert(ProcessManagerAction::GoEnd, vec!["//Go to last".into(), "end".into()]);
-    m.insert(ProcessManagerAction::SortByPid, vec!["//Sort by PID".into(), "p".into()]);
-    m.insert(ProcessManagerAction::SortByCpu, vec!["//Sort by CPU".into(), "c".into()]);
-    m.insert(ProcessManagerAction::SortByMem, vec!["//Sort by memory".into(), "m".into()]);
-    m.insert(ProcessManagerAction::SortByName, vec!["//Sort by name".into(), "n".into()]);
-    m.insert(ProcessManagerAction::Kill, vec!["//Kill process (SIGTERM)".into(), "k".into()]);
-    m.insert(ProcessManagerAction::ForceKill, vec!["//Force kill (SIGKILL)".into(), "shift+k".into()]);
-    m.insert(ProcessManagerAction::Refresh, vec!["//Refresh list".into(), "r".into()]);
+    m.insert(
+        ProcessManagerAction::Quit,
+        vec!["//Close manager".into(), "esc".into(), "q".into()],
+    );
+    m.insert(
+        ProcessManagerAction::MoveUp,
+        vec!["//Move up".into(), "up".into()],
+    );
+    m.insert(
+        ProcessManagerAction::MoveDown,
+        vec!["//Move down".into(), "down".into()],
+    );
+    m.insert(
+        ProcessManagerAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        ProcessManagerAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        ProcessManagerAction::GoHome,
+        vec!["//Go to first".into(), "home".into()],
+    );
+    m.insert(
+        ProcessManagerAction::GoEnd,
+        vec!["//Go to last".into(), "end".into()],
+    );
+    m.insert(
+        ProcessManagerAction::SortByPid,
+        vec!["//Sort by PID".into(), "p".into()],
+    );
+    m.insert(
+        ProcessManagerAction::SortByCpu,
+        vec!["//Sort by CPU".into(), "c".into()],
+    );
+    m.insert(
+        ProcessManagerAction::SortByMem,
+        vec!["//Sort by memory".into(), "m".into()],
+    );
+    m.insert(
+        ProcessManagerAction::SortByName,
+        vec!["//Sort by name".into(), "n".into()],
+    );
+    m.insert(
+        ProcessManagerAction::Kill,
+        vec!["//Kill process (SIGTERM)".into(), "k".into()],
+    );
+    m.insert(
+        ProcessManagerAction::ForceKill,
+        vec!["//Force kill (SIGKILL)".into(), "shift+k".into()],
+    );
+    m.insert(
+        ProcessManagerAction::Refresh,
+        vec!["//Refresh list".into(), "r".into()],
+    );
     m
 }
 
@@ -817,28 +1359,104 @@ pub enum AIScreenAction {
 pub fn default_ai_screen_keybindings() -> HashMap<AIScreenAction, Vec<String>> {
     let mut m = HashMap::new();
 
-    m.insert(AIScreenAction::Escape, vec!["//Cancel/clear/exit".into(), "esc".into()]);
-    m.insert(AIScreenAction::Submit, vec!["//Submit prompt".into(), "enter".into()]);
-    m.insert(AIScreenAction::InsertNewline, vec!["//Insert newline".into(), "shift+enter".into(), "ctrl+enter".into(), "alt+enter".into(), "ctrl+j".into()]);
-    m.insert(AIScreenAction::Backspace, vec!["//Backspace".into(), "backspace".into()]);
-    m.insert(AIScreenAction::DeleteChar, vec!["//Delete character".into(), "delete".into()]);
-    m.insert(AIScreenAction::MoveLeft, vec!["//Move cursor left".into(), "left".into()]);
-    m.insert(AIScreenAction::MoveRight, vec!["//Move cursor right".into(), "right".into()]);
-    m.insert(AIScreenAction::MoveUp, vec!["//Move up / history".into(), "up".into()]);
-    m.insert(AIScreenAction::MoveDown, vec!["//Move down / history".into(), "down".into()]);
-    m.insert(AIScreenAction::ScrollHistoryUp, vec!["//Scroll history up".into(), "ctrl+up".into()]);
-    m.insert(AIScreenAction::ScrollHistoryDown, vec!["//Scroll history down".into(), "ctrl+down".into()]);
-    m.insert(AIScreenAction::PageUp, vec!["//Page up".into(), "pageup".into()]);
-    m.insert(AIScreenAction::PageDown, vec!["//Page down".into(), "pagedown".into()]);
-    m.insert(AIScreenAction::MoveToLineStart, vec!["//Move to line start".into(), "home".into(), "ctrl+a".into()]);
-    m.insert(AIScreenAction::MoveToLineEnd, vec!["//Move to line end".into(), "end".into(), "ctrl+e".into()]);
-    m.insert(AIScreenAction::ScrollToTop, vec!["//Scroll to top".into(), "ctrl+home".into()]);
-    m.insert(AIScreenAction::ScrollToBottom, vec!["//Scroll to bottom".into(), "ctrl+end".into()]);
-    m.insert(AIScreenAction::KillLineLeft, vec!["//Kill line left".into(), "ctrl+u".into()]);
-    m.insert(AIScreenAction::KillLineRight, vec!["//Kill line right".into(), "ctrl+k".into()]);
-    m.insert(AIScreenAction::DeleteWordLeft, vec!["//Delete word left".into(), "ctrl+w".into()]);
-    m.insert(AIScreenAction::ClearHistory, vec!["//Clear conversation".into(), "ctrl+l".into()]);
-    m.insert(AIScreenAction::ToggleFullscreen, vec!["//Toggle fullscreen".into(), "ctrl+f".into()]);
+    m.insert(
+        AIScreenAction::Escape,
+        vec!["//Cancel/clear/exit".into(), "esc".into()],
+    );
+    m.insert(
+        AIScreenAction::Submit,
+        vec!["//Submit prompt".into(), "enter".into()],
+    );
+    m.insert(
+        AIScreenAction::InsertNewline,
+        vec![
+            "//Insert newline".into(),
+            "shift+enter".into(),
+            "ctrl+enter".into(),
+            "alt+enter".into(),
+            "ctrl+j".into(),
+        ],
+    );
+    m.insert(
+        AIScreenAction::Backspace,
+        vec!["//Backspace".into(), "backspace".into()],
+    );
+    m.insert(
+        AIScreenAction::DeleteChar,
+        vec!["//Delete character".into(), "delete".into()],
+    );
+    m.insert(
+        AIScreenAction::MoveLeft,
+        vec!["//Move cursor left".into(), "left".into()],
+    );
+    m.insert(
+        AIScreenAction::MoveRight,
+        vec!["//Move cursor right".into(), "right".into()],
+    );
+    m.insert(
+        AIScreenAction::MoveUp,
+        vec!["//Move up / history".into(), "up".into()],
+    );
+    m.insert(
+        AIScreenAction::MoveDown,
+        vec!["//Move down / history".into(), "down".into()],
+    );
+    m.insert(
+        AIScreenAction::ScrollHistoryUp,
+        vec!["//Scroll history up".into(), "ctrl+up".into()],
+    );
+    m.insert(
+        AIScreenAction::ScrollHistoryDown,
+        vec!["//Scroll history down".into(), "ctrl+down".into()],
+    );
+    m.insert(
+        AIScreenAction::PageUp,
+        vec!["//Page up".into(), "pageup".into()],
+    );
+    m.insert(
+        AIScreenAction::PageDown,
+        vec!["//Page down".into(), "pagedown".into()],
+    );
+    m.insert(
+        AIScreenAction::MoveToLineStart,
+        vec![
+            "//Move to line start".into(),
+            "home".into(),
+            "ctrl+a".into(),
+        ],
+    );
+    m.insert(
+        AIScreenAction::MoveToLineEnd,
+        vec!["//Move to line end".into(), "end".into(), "ctrl+e".into()],
+    );
+    m.insert(
+        AIScreenAction::ScrollToTop,
+        vec!["//Scroll to top".into(), "ctrl+home".into()],
+    );
+    m.insert(
+        AIScreenAction::ScrollToBottom,
+        vec!["//Scroll to bottom".into(), "ctrl+end".into()],
+    );
+    m.insert(
+        AIScreenAction::KillLineLeft,
+        vec!["//Kill line left".into(), "ctrl+u".into()],
+    );
+    m.insert(
+        AIScreenAction::KillLineRight,
+        vec!["//Kill line right".into(), "ctrl+k".into()],
+    );
+    m.insert(
+        AIScreenAction::DeleteWordLeft,
+        vec!["//Delete word left".into(), "ctrl+w".into()],
+    );
+    m.insert(
+        AIScreenAction::ClearHistory,
+        vec!["//Clear conversation".into(), "ctrl+l".into()],
+    );
+    m.insert(
+        AIScreenAction::ToggleFullscreen,
+        vec!["//Toggle fullscreen".into(), "ctrl+f".into()],
+    );
 
     m
 }
@@ -854,8 +1472,14 @@ pub enum GotoAction {
 
 pub fn default_goto_keybindings() -> HashMap<GotoAction, Vec<String>> {
     let mut m = HashMap::new();
-    m.insert(GotoAction::BookmarkDelete, vec!["//Delete bookmark or profile".into(), "ctrl+d".into()]);
-    m.insert(GotoAction::BookmarkEdit, vec!["//Edit remote profile".into(), "ctrl+e".into()]);
+    m.insert(
+        GotoAction::BookmarkDelete,
+        vec!["//Delete bookmark or profile".into(), "ctrl+d".into()],
+    );
+    m.insert(
+        GotoAction::BookmarkEdit,
+        vec!["//Edit remote profile".into(), "ctrl+e".into()],
+    );
     m
 }
 
@@ -956,13 +1580,28 @@ impl Keybindings {
             editor: ActionMap::build(&default_editor_keybindings(), &config.file_editor),
             file_info: ActionMap::build(&default_file_info_keybindings(), &config.file_info),
             system_info: ActionMap::build(&default_system_info_keybindings(), &config.system_info),
-            search_result: ActionMap::build(&default_search_result_keybindings(), &config.search_result),
-            advanced_search: ActionMap::build(&default_advanced_search_keybindings(), &config.advanced_search),
-            diff_file_view: ActionMap::build(&default_diff_file_view_keybindings(), &config.diff_file_view),
+            search_result: ActionMap::build(
+                &default_search_result_keybindings(),
+                &config.search_result,
+            ),
+            advanced_search: ActionMap::build(
+                &default_advanced_search_keybindings(),
+                &config.advanced_search,
+            ),
+            diff_file_view: ActionMap::build(
+                &default_diff_file_view_keybindings(),
+                &config.diff_file_view,
+            ),
             diff_screen: ActionMap::build(&default_diff_screen_keybindings(), &config.diff_screen),
             file_viewer: ActionMap::build(&default_viewer_keybindings(), &config.file_viewer),
-            image_viewer: ActionMap::build(&default_image_viewer_keybindings(), &config.image_viewer),
-            process_manager: ActionMap::build(&default_process_manager_keybindings(), &config.process_manager),
+            image_viewer: ActionMap::build(
+                &default_image_viewer_keybindings(),
+                &config.image_viewer,
+            ),
+            process_manager: ActionMap::build(
+                &default_process_manager_keybindings(),
+                &config.process_manager,
+            ),
             ai_screen: ActionMap::build(&default_ai_screen_keybindings(), &config.ai_screen),
             goto: ActionMap::build(&default_goto_keybindings(), &config.goto),
         }
@@ -972,94 +1611,186 @@ impl Keybindings {
     pub fn panel_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<PanelAction> {
         self.panel.lookup(code, modifiers)
     }
-    pub fn panel_keys(&self, action: PanelAction) -> &[String] { self.panel.keys(action) }
-    pub fn panel_first_key(&self, action: PanelAction) -> &str { self.panel.first_key(action) }
-    pub fn panel_keys_joined(&self, action: PanelAction, sep: &str) -> String { self.panel.keys_joined(action, sep) }
+    pub fn panel_keys(&self, action: PanelAction) -> &[String] {
+        self.panel.keys(action)
+    }
+    pub fn panel_first_key(&self, action: PanelAction) -> &str {
+        self.panel.first_key(action)
+    }
+    pub fn panel_keys_joined(&self, action: PanelAction, sep: &str) -> String {
+        self.panel.keys_joined(action, sep)
+    }
 
     // ── FileEditor ──
     pub fn editor_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<EditorAction> {
         self.editor.lookup(code, modifiers)
     }
-    pub fn editor_keys(&self, action: EditorAction) -> &[String] { self.editor.keys(action) }
-    pub fn editor_first_key(&self, action: EditorAction) -> &str { self.editor.first_key(action) }
-    pub fn editor_keys_joined(&self, action: EditorAction, sep: &str) -> String { self.editor.keys_joined(action, sep) }
+    pub fn editor_keys(&self, action: EditorAction) -> &[String] {
+        self.editor.keys(action)
+    }
+    pub fn editor_first_key(&self, action: EditorAction) -> &str {
+        self.editor.first_key(action)
+    }
+    pub fn editor_keys_joined(&self, action: EditorAction, sep: &str) -> String {
+        self.editor.keys_joined(action, sep)
+    }
 
     // ── FileInfo ──
-    pub fn file_info_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<FileInfoAction> {
+    pub fn file_info_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<FileInfoAction> {
         self.file_info.lookup(code, modifiers)
     }
-    pub fn file_info_first_key(&self, action: FileInfoAction) -> &str { self.file_info.first_key(action) }
-    pub fn file_info_keys_joined(&self, action: FileInfoAction, sep: &str) -> String { self.file_info.keys_joined(action, sep) }
+    pub fn file_info_first_key(&self, action: FileInfoAction) -> &str {
+        self.file_info.first_key(action)
+    }
+    pub fn file_info_keys_joined(&self, action: FileInfoAction, sep: &str) -> String {
+        self.file_info.keys_joined(action, sep)
+    }
 
     // ── SystemInfo ──
-    pub fn system_info_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<SystemInfoAction> {
+    pub fn system_info_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<SystemInfoAction> {
         self.system_info.lookup(code, modifiers)
     }
-    pub fn system_info_first_key(&self, action: SystemInfoAction) -> &str { self.system_info.first_key(action) }
-    pub fn system_info_keys_joined(&self, action: SystemInfoAction, sep: &str) -> String { self.system_info.keys_joined(action, sep) }
+    pub fn system_info_first_key(&self, action: SystemInfoAction) -> &str {
+        self.system_info.first_key(action)
+    }
+    pub fn system_info_keys_joined(&self, action: SystemInfoAction, sep: &str) -> String {
+        self.system_info.keys_joined(action, sep)
+    }
 
     // ── SearchResult ──
-    pub fn search_result_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<SearchResultAction> {
+    pub fn search_result_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<SearchResultAction> {
         self.search_result.lookup(code, modifiers)
     }
-    pub fn search_result_first_key(&self, action: SearchResultAction) -> &str { self.search_result.first_key(action) }
-    pub fn search_result_keys_joined(&self, action: SearchResultAction, sep: &str) -> String { self.search_result.keys_joined(action, sep) }
+    pub fn search_result_first_key(&self, action: SearchResultAction) -> &str {
+        self.search_result.first_key(action)
+    }
+    pub fn search_result_keys_joined(&self, action: SearchResultAction, sep: &str) -> String {
+        self.search_result.keys_joined(action, sep)
+    }
 
     // ── AdvancedSearch ──
-    pub fn advanced_search_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<AdvancedSearchAction> {
+    pub fn advanced_search_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<AdvancedSearchAction> {
         self.advanced_search.lookup(code, modifiers)
     }
-    pub fn advanced_search_first_key(&self, action: AdvancedSearchAction) -> &str { self.advanced_search.first_key(action) }
-    pub fn advanced_search_keys_joined(&self, action: AdvancedSearchAction, sep: &str) -> String { self.advanced_search.keys_joined(action, sep) }
+    pub fn advanced_search_first_key(&self, action: AdvancedSearchAction) -> &str {
+        self.advanced_search.first_key(action)
+    }
+    pub fn advanced_search_keys_joined(&self, action: AdvancedSearchAction, sep: &str) -> String {
+        self.advanced_search.keys_joined(action, sep)
+    }
 
     // ── DiffFileView ──
-    pub fn diff_file_view_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<DiffFileViewAction> {
+    pub fn diff_file_view_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<DiffFileViewAction> {
         self.diff_file_view.lookup(code, modifiers)
     }
-    pub fn diff_file_view_first_key(&self, action: DiffFileViewAction) -> &str { self.diff_file_view.first_key(action) }
-    pub fn diff_file_view_keys_joined(&self, action: DiffFileViewAction, sep: &str) -> String { self.diff_file_view.keys_joined(action, sep) }
+    pub fn diff_file_view_first_key(&self, action: DiffFileViewAction) -> &str {
+        self.diff_file_view.first_key(action)
+    }
+    pub fn diff_file_view_keys_joined(&self, action: DiffFileViewAction, sep: &str) -> String {
+        self.diff_file_view.keys_joined(action, sep)
+    }
 
     // ── DiffScreen ──
-    pub fn diff_screen_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<DiffScreenAction> {
+    pub fn diff_screen_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<DiffScreenAction> {
         self.diff_screen.lookup(code, modifiers)
     }
-    pub fn diff_screen_first_key(&self, action: DiffScreenAction) -> &str { self.diff_screen.first_key(action) }
-    pub fn diff_screen_keys_joined(&self, action: DiffScreenAction, sep: &str) -> String { self.diff_screen.keys_joined(action, sep) }
+    pub fn diff_screen_first_key(&self, action: DiffScreenAction) -> &str {
+        self.diff_screen.first_key(action)
+    }
+    pub fn diff_screen_keys_joined(&self, action: DiffScreenAction, sep: &str) -> String {
+        self.diff_screen.keys_joined(action, sep)
+    }
 
     // ── FileViewer ──
     pub fn viewer_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<ViewerAction> {
         self.file_viewer.lookup(code, modifiers)
     }
-    pub fn viewer_first_key(&self, action: ViewerAction) -> &str { self.file_viewer.first_key(action) }
-    pub fn viewer_keys_joined(&self, action: ViewerAction, sep: &str) -> String { self.file_viewer.keys_joined(action, sep) }
+    pub fn viewer_first_key(&self, action: ViewerAction) -> &str {
+        self.file_viewer.first_key(action)
+    }
+    pub fn viewer_keys_joined(&self, action: ViewerAction, sep: &str) -> String {
+        self.file_viewer.keys_joined(action, sep)
+    }
 
     // ── ImageViewer ──
-    pub fn image_viewer_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<ImageViewerAction> {
+    pub fn image_viewer_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<ImageViewerAction> {
         self.image_viewer.lookup(code, modifiers)
     }
-    pub fn image_viewer_first_key(&self, action: ImageViewerAction) -> &str { self.image_viewer.first_key(action) }
-    pub fn image_viewer_keys_joined(&self, action: ImageViewerAction, sep: &str) -> String { self.image_viewer.keys_joined(action, sep) }
+    pub fn image_viewer_first_key(&self, action: ImageViewerAction) -> &str {
+        self.image_viewer.first_key(action)
+    }
+    pub fn image_viewer_keys_joined(&self, action: ImageViewerAction, sep: &str) -> String {
+        self.image_viewer.keys_joined(action, sep)
+    }
 
     // ── ProcessManager ──
-    pub fn process_manager_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<ProcessManagerAction> {
+    pub fn process_manager_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<ProcessManagerAction> {
         self.process_manager.lookup(code, modifiers)
     }
-    pub fn process_manager_first_key(&self, action: ProcessManagerAction) -> &str { self.process_manager.first_key(action) }
-    pub fn process_manager_keys_joined(&self, action: ProcessManagerAction, sep: &str) -> String { self.process_manager.keys_joined(action, sep) }
+    pub fn process_manager_first_key(&self, action: ProcessManagerAction) -> &str {
+        self.process_manager.first_key(action)
+    }
+    pub fn process_manager_keys_joined(&self, action: ProcessManagerAction, sep: &str) -> String {
+        self.process_manager.keys_joined(action, sep)
+    }
 
     // ── AIScreen ──
-    pub fn ai_screen_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<AIScreenAction> {
+    pub fn ai_screen_action(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<AIScreenAction> {
         self.ai_screen.lookup(code, modifiers)
     }
-    pub fn ai_screen_first_key(&self, action: AIScreenAction) -> &str { self.ai_screen.first_key(action) }
-    pub fn ai_screen_keys_joined(&self, action: AIScreenAction, sep: &str) -> String { self.ai_screen.keys_joined(action, sep) }
+    pub fn ai_screen_first_key(&self, action: AIScreenAction) -> &str {
+        self.ai_screen.first_key(action)
+    }
+    pub fn ai_screen_keys_joined(&self, action: AIScreenAction, sep: &str) -> String {
+        self.ai_screen.keys_joined(action, sep)
+    }
 
     // ── Goto dialog ──
     pub fn goto_action(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<GotoAction> {
         self.goto.lookup(code, modifiers)
     }
-    pub fn goto_first_key(&self, action: GotoAction) -> &str { self.goto.first_key(action) }
-    pub fn goto_keys_joined(&self, action: GotoAction, sep: &str) -> String { self.goto.keys_joined(action, sep) }
+    pub fn goto_first_key(&self, action: GotoAction) -> &str {
+        self.goto.first_key(action)
+    }
+    pub fn goto_keys_joined(&self, action: GotoAction, sep: &str) -> String {
+        self.goto.keys_joined(action, sep)
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -1074,8 +1805,14 @@ mod tests {
     fn test_parse_simple_key() {
         let binds = parse_key("q");
         assert_eq!(binds.len(), 2);
-        assert!(binds.contains(&KeyBind { code: KeyCode::Char('q'), modifiers: KeyModifiers::NONE }));
-        assert!(binds.contains(&KeyBind { code: KeyCode::Char('Q'), modifiers: KeyModifiers::NONE }));
+        assert!(binds.contains(&KeyBind {
+            code: KeyCode::Char('q'),
+            modifiers: KeyModifiers::NONE
+        }));
+        assert!(binds.contains(&KeyBind {
+            code: KeyCode::Char('Q'),
+            modifiers: KeyModifiers::NONE
+        }));
     }
 
     #[test]
@@ -1089,15 +1826,27 @@ mod tests {
     fn test_parse_ctrl_key() {
         let binds = parse_key("ctrl+c");
         assert_eq!(binds.len(), 2);
-        assert!(binds.contains(&KeyBind { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL }));
-        assert!(binds.contains(&KeyBind { code: KeyCode::Char('C'), modifiers: KeyModifiers::CONTROL }));
+        assert!(binds.contains(&KeyBind {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL
+        }));
+        assert!(binds.contains(&KeyBind {
+            code: KeyCode::Char('C'),
+            modifiers: KeyModifiers::CONTROL
+        }));
     }
 
     #[test]
     fn test_parse_shift_arrow() {
         let binds = parse_key("shift+up");
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], KeyBind { code: KeyCode::Up, modifiers: KeyModifiers::SHIFT });
+        assert_eq!(
+            binds[0],
+            KeyBind {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::SHIFT
+            }
+        );
     }
 
     #[test]
@@ -1116,7 +1865,13 @@ mod tests {
     fn test_parse_symbol_key() {
         let binds = parse_key("*");
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], KeyBind { code: KeyCode::Char('*'), modifiers: KeyModifiers::NONE });
+        assert_eq!(
+            binds[0],
+            KeyBind {
+                code: KeyCode::Char('*'),
+                modifiers: KeyModifiers::NONE
+            }
+        );
     }
 
     #[test]
@@ -1137,10 +1892,13 @@ mod tests {
     fn test_ctrl_shift_number() {
         let binds = parse_key("ctrl+shift+1");
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0], KeyBind {
-            code: KeyCode::Char('1'),
-            modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        });
+        assert_eq!(
+            binds[0],
+            KeyBind {
+                code: KeyCode::Char('1'),
+                modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            }
+        );
     }
 
     #[test]
@@ -1217,13 +1975,34 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('q'), KeyModifiers::NONE), Some(PanelAction::Quit));
-        assert_eq!(kb.panel_action(KeyCode::Char('Q'), KeyModifiers::NONE), Some(PanelAction::Quit));
-        assert_eq!(kb.panel_action(KeyCode::Up, KeyModifiers::NONE), Some(PanelAction::MoveUp));
-        assert_eq!(kb.panel_action(KeyCode::Char('c'), KeyModifiers::CONTROL), Some(PanelAction::Copy));
-        assert_eq!(kb.panel_action(KeyCode::Up, KeyModifiers::SHIFT), Some(PanelAction::SelectUp));
-        assert_eq!(kb.panel_action(KeyCode::Enter, KeyModifiers::NONE), Some(PanelAction::Open));
-        assert_eq!(kb.panel_action(KeyCode::Char(' '), KeyModifiers::NONE), Some(PanelAction::ToggleSelect));
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('q'), KeyModifiers::NONE),
+            Some(PanelAction::Quit)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('Q'), KeyModifiers::NONE),
+            Some(PanelAction::Quit)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Up, KeyModifiers::NONE),
+            Some(PanelAction::MoveUp)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(PanelAction::Copy)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Up, KeyModifiers::SHIFT),
+            Some(PanelAction::SelectUp)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Enter, KeyModifiers::NONE),
+            Some(PanelAction::Open)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char(' '), KeyModifiers::NONE),
+            Some(PanelAction::ToggleSelect)
+        );
     }
 
     #[test]
@@ -1231,8 +2010,14 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('Q'), KeyModifiers::SHIFT), Some(PanelAction::Quit));
-        assert_eq!(kb.panel_action(KeyCode::Char('*'), KeyModifiers::SHIFT), Some(PanelAction::SelectAll));
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+            Some(PanelAction::Quit)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('*'), KeyModifiers::SHIFT),
+            Some(PanelAction::SelectAll)
+        );
     }
 
     #[test]
@@ -1240,7 +2025,10 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('V'), KeyModifiers::SHIFT), Some(PanelAction::Paste));
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('V'), KeyModifiers::SHIFT),
+            Some(PanelAction::Paste)
+        );
     }
 
     #[test]
@@ -1255,7 +2043,10 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE), None);
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE),
+            None
+        );
         assert!(kb.panel_first_key(PanelAction::AIScreen).is_empty());
     }
 
@@ -1265,7 +2056,10 @@ mod tests {
         let config: KeybindingsConfig = serde_json::from_str(json).unwrap();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE), None);
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE),
+            None
+        );
         assert!(kb.panel_first_key(PanelAction::AIScreen).is_empty());
     }
 
@@ -1283,11 +2077,26 @@ mod tests {
         let config: KeybindingsConfig = serde_json::from_str(json).unwrap();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.panel_action(KeyCode::Char('q'), KeyModifiers::CONTROL), Some(PanelAction::Quit));
-        assert_eq!(kb.panel_action(KeyCode::Char('q'), KeyModifiers::NONE), None);
-        assert_eq!(kb.panel_action(KeyCode::Up, KeyModifiers::NONE), Some(PanelAction::MoveUp));
-        assert_eq!(kb.panel_action(KeyCode::Enter, KeyModifiers::NONE), Some(PanelAction::Open));
-        assert_eq!(kb.panel_action(KeyCode::Char('c'), KeyModifiers::CONTROL), Some(PanelAction::Copy));
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            Some(PanelAction::Quit)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('q'), KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Up, KeyModifiers::NONE),
+            Some(PanelAction::MoveUp)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Enter, KeyModifiers::NONE),
+            Some(PanelAction::Open)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(PanelAction::Copy)
+        );
     }
 
     #[test]
@@ -1297,15 +2106,24 @@ mod tests {
         let kb = Keybindings::from_config(&config);
 
         assert_eq!(
-            kb.panel_action(KeyCode::Char('d'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            kb.panel_action(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
             Some(PanelAction::Quit)
         );
         assert_eq!(
-            kb.panel_action(KeyCode::Char('D'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            kb.panel_action(
+                KeyCode::Char('D'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
             Some(PanelAction::Quit)
         );
         // Plain 'd' must NOT match ctrl+shift+d binding (default SortByDate for 'd' is expected)
-        assert_ne!(kb.panel_action(KeyCode::Char('d'), KeyModifiers::NONE), Some(PanelAction::Quit));
+        assert_ne!(
+            kb.panel_action(KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(PanelAction::Quit)
+        );
     }
 
     // -- ActionMap generic reusability test --
@@ -1313,7 +2131,10 @@ mod tests {
     #[test]
     fn test_action_map_with_custom_enum() {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        enum TestAction { Save, Close }
+        enum TestAction {
+            Save,
+            Close,
+        }
 
         let mut defaults: HashMap<TestAction, Vec<String>> = HashMap::new();
         defaults.insert(TestAction::Save, vec!["ctrl+s".into()]);
@@ -1322,8 +2143,14 @@ mod tests {
         let overrides = HashMap::new(); // no overrides
         let map = ActionMap::build(&defaults, &overrides);
 
-        assert_eq!(map.lookup(KeyCode::Char('s'), KeyModifiers::CONTROL), Some(TestAction::Save));
-        assert_eq!(map.lookup(KeyCode::Char('w'), KeyModifiers::CONTROL), Some(TestAction::Close));
+        assert_eq!(
+            map.lookup(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Some(TestAction::Save)
+        );
+        assert_eq!(
+            map.lookup(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Some(TestAction::Close)
+        );
         assert_eq!(map.lookup(KeyCode::Char('z'), KeyModifiers::CONTROL), None);
     }
 
@@ -1334,23 +2161,74 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
 
-        assert_eq!(kb.editor_action(KeyCode::Char('s'), KeyModifiers::CONTROL), Some(EditorAction::Save));
-        assert_eq!(kb.editor_action(KeyCode::Char('z'), KeyModifiers::CONTROL), Some(EditorAction::Undo));
-        assert_eq!(kb.editor_action(KeyCode::Char('y'), KeyModifiers::CONTROL), Some(EditorAction::Redo));
-        assert_eq!(kb.editor_action(KeyCode::Char('c'), KeyModifiers::CONTROL), Some(EditorAction::Copy));
-        assert_eq!(kb.editor_action(KeyCode::Char('v'), KeyModifiers::CONTROL), Some(EditorAction::Paste));
-        assert_eq!(kb.editor_action(KeyCode::Char('x'), KeyModifiers::CONTROL), Some(EditorAction::Cut));
-        assert_eq!(kb.editor_action(KeyCode::Char('f'), KeyModifiers::CONTROL), Some(EditorAction::Find));
-        assert_eq!(kb.editor_action(KeyCode::Char('h'), KeyModifiers::CONTROL), Some(EditorAction::Replace));
-        assert_eq!(kb.editor_action(KeyCode::Char('g'), KeyModifiers::CONTROL), Some(EditorAction::GotoLine));
-        assert_eq!(kb.editor_action(KeyCode::Esc, KeyModifiers::NONE), Some(EditorAction::Exit));
-        assert_eq!(kb.editor_action(KeyCode::Up, KeyModifiers::ALT), Some(EditorAction::MoveLineUp));
-        assert_eq!(kb.editor_action(KeyCode::Down, KeyModifiers::ALT), Some(EditorAction::MoveLineDown));
-        assert_eq!(kb.editor_action(KeyCode::Left, KeyModifiers::CONTROL), Some(EditorAction::MoveWordLeft));
-        assert_eq!(kb.editor_action(KeyCode::Right, KeyModifiers::CONTROL), Some(EditorAction::MoveWordRight));
-        assert_eq!(kb.editor_action(KeyCode::Home, KeyModifiers::CONTROL), Some(EditorAction::GoToFileStart));
-        assert_eq!(kb.editor_action(KeyCode::End, KeyModifiers::CONTROL), Some(EditorAction::GoToFileEnd));
-        assert_eq!(kb.editor_action(KeyCode::Enter, KeyModifiers::CONTROL), Some(EditorAction::InsertLineBelow));
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Some(EditorAction::Save)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            Some(EditorAction::Undo)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            Some(EditorAction::Redo)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(EditorAction::Copy)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            Some(EditorAction::Paste)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            Some(EditorAction::Cut)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            Some(EditorAction::Find)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            Some(EditorAction::Replace)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            Some(EditorAction::GotoLine)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Esc, KeyModifiers::NONE),
+            Some(EditorAction::Exit)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Up, KeyModifiers::ALT),
+            Some(EditorAction::MoveLineUp)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Down, KeyModifiers::ALT),
+            Some(EditorAction::MoveLineDown)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Left, KeyModifiers::CONTROL),
+            Some(EditorAction::MoveWordLeft)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Right, KeyModifiers::CONTROL),
+            Some(EditorAction::MoveWordRight)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Home, KeyModifiers::CONTROL),
+            Some(EditorAction::GoToFileStart)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::End, KeyModifiers::CONTROL),
+            Some(EditorAction::GoToFileEnd)
+        );
+        assert_eq!(
+            kb.editor_action(KeyCode::Enter, KeyModifiers::CONTROL),
+            Some(EditorAction::InsertLineBelow)
+        );
         assert_eq!(
             kb.editor_action(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
             Some(EditorAction::InsertLineAbove)
@@ -1403,13 +2281,22 @@ mod tests {
 
         // Overridden: Ctrl+Shift+S → Save
         assert_eq!(
-            kb.editor_action(KeyCode::Char('s'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            kb.editor_action(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
             Some(EditorAction::Save)
         );
         // Original Ctrl+S should no longer map to Save
-        assert_eq!(kb.editor_action(KeyCode::Char('s'), KeyModifiers::CONTROL), None);
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            None
+        );
         // Other defaults still work
-        assert_eq!(kb.editor_action(KeyCode::Char('z'), KeyModifiers::CONTROL), Some(EditorAction::Undo));
+        assert_eq!(
+            kb.editor_action(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            Some(EditorAction::Undo)
+        );
     }
 
     #[test]
@@ -1431,6 +2318,9 @@ mod tests {
         assert_eq!(kb.editor_action(KeyCode::Left, KeyModifiers::NONE), None);
         assert_eq!(kb.editor_action(KeyCode::Right, KeyModifiers::NONE), None);
         assert_eq!(kb.editor_action(KeyCode::Enter, KeyModifiers::NONE), None);
-        assert_eq!(kb.editor_action(KeyCode::Backspace, KeyModifiers::NONE), None);
+        assert_eq!(
+            kb.editor_action(KeyCode::Backspace, KeyModifiers::NONE),
+            None
+        );
     }
 }

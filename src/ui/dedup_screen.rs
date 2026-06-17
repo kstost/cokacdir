@@ -99,7 +99,11 @@ impl DedupScreenState {
                 DedupMessage::Log(msg) => {
                     self.push_log(msg);
                 }
-                DedupMessage::Stats { scanned, duplicates, freed } => {
+                DedupMessage::Stats {
+                    scanned,
+                    duplicates,
+                    freed,
+                } => {
                     self.scanned = scanned;
                     self.duplicates = duplicates;
                     self.freed = freed;
@@ -126,7 +130,7 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // unified info box (header + stats)
+            Constraint::Length(4), // unified info box (header + stats)
             Constraint::Min(3),    // log area
             Constraint::Length(1), // footer
         ])
@@ -145,7 +149,9 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
         .border_style(Style::default().fg(colors.border))
         .title(Span::styled(
             " Remove Duplicates ",
-            Style::default().fg(colors.title).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.title)
+                .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(colors.bg));
 
@@ -159,7 +165,9 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
         Span::raw("  "),
         Span::styled(
             format!("[{}]", phase_text),
-            Style::default().fg(colors.phase_text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.phase_text)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -168,17 +176,26 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
         Span::styled("Scanned: ", Style::default().fg(colors.stats_text)),
         Span::styled(
             format!("{}", state.scanned),
-            Style::default().fg(colors.phase_text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.phase_text)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  |  Duplicates removed: ", Style::default().fg(colors.stats_text)),
+        Span::styled(
+            "  |  Duplicates removed: ",
+            Style::default().fg(colors.stats_text),
+        ),
         Span::styled(
             format!("{}", state.duplicates),
-            Style::default().fg(colors.log_deleted).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.log_deleted)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  |  Freed: ", Style::default().fg(colors.stats_text)),
         Span::styled(
             dedup::format_size(state.freed),
-            Style::default().fg(colors.phase_text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.phase_text)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
 
@@ -189,15 +206,14 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
     let log_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors.border))
-        .title(Span::styled(
-            " Log ",
-            Style::default().fg(colors.title),
-        ))
+        .title(Span::styled(" Log ", Style::default().fg(colors.title)))
         .style(Style::default().bg(colors.bg));
 
     let inner_height = chunks[1].height.saturating_sub(2) as usize; // borders
 
-    let skip_count = state.log_scroll.saturating_sub(inner_height.saturating_sub(1));
+    let skip_count = state
+        .log_scroll
+        .saturating_sub(inner_height.saturating_sub(1));
     let ca = Style::default().fg(colors.log_text);
     let cb = Style::default().fg(colors.log_text_alt);
     let log_lines: Vec<Line> = state
@@ -207,7 +223,10 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
         .take(inner_height)
         .map(|line| {
             if line.starts_with("[ERROR]") {
-                Line::from(Span::styled(line.as_str(), Style::default().fg(colors.log_error)))
+                Line::from(Span::styled(
+                    line.as_str(),
+                    Style::default().fg(colors.log_error),
+                ))
             } else if line.starts_with("REMOVE ") {
                 // REMOVE {hash} {path}
                 let rest = &line[7..];
@@ -218,7 +237,10 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
                         Span::styled(&rest[sp..], cb),
                     ])
                 } else {
-                    Line::from(Span::styled(line.as_str(), Style::default().fg(colors.log_deleted)))
+                    Line::from(Span::styled(
+                        line.as_str(),
+                        Style::default().fg(colors.log_deleted),
+                    ))
                 }
             } else if line.starts_with("READING ") {
                 // READING {path}
@@ -259,26 +281,55 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
     // ── Footer ──
     let footer_items = if state.is_complete {
         vec![
-            Span::styled(" Esc", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Esc",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Close  ", Style::default().fg(colors.footer_text)),
-            Span::styled("Up/Down", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Up/Down",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Scroll  ", Style::default().fg(colors.footer_text)),
-            Span::styled("PgUp/PgDn", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "PgUp/PgDn",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Page scroll", Style::default().fg(colors.footer_text)),
         ]
     } else {
         vec![
-            Span::styled(" Esc", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Esc",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Cancel  ", Style::default().fg(colors.footer_text)),
-            Span::styled("Up/Down", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Up/Down",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Scroll  ", Style::default().fg(colors.footer_text)),
-            Span::styled("PgUp/PgDn", Style::default().fg(colors.footer_key).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "PgUp/PgDn",
+                Style::default()
+                    .fg(colors.footer_key)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Page scroll", Style::default().fg(colors.footer_text)),
         ]
     };
 
-    let footer = Paragraph::new(Line::from(footer_items))
-        .style(Style::default().bg(colors.bg));
+    let footer = Paragraph::new(Line::from(footer_items)).style(Style::default().bg(colors.bg));
     frame.render_widget(footer, chunks[2]);
 }
 

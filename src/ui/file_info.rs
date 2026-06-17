@@ -1,9 +1,3 @@
-use std::fs;
-use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -12,9 +6,18 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
 
-use super::{app::{App, Screen}, theme::Theme};
-use crate::utils::format::{format_size, format_permissions};
+use super::{
+    app::{App, Screen},
+    theme::Theme,
+};
+use crate::utils::format::{format_permissions, format_size};
 
 /// Result of recursive directory calculation
 #[derive(Debug, Clone)]
@@ -153,7 +156,9 @@ fn get_spinner_frame() -> char {
     let frame_idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() / 100) as usize % SPINNER_FRAMES.len();
+        .as_millis()
+        / 100) as usize
+        % SPINNER_FRAMES.len();
     SPINNER_FRAMES[frame_idx]
 }
 
@@ -180,7 +185,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     let spinner_style = Style::default().fg(theme.file_info.calculating_spinner);
 
     if let Ok(meta) = metadata {
-        let name = path.file_name()
+        let name = path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -319,14 +325,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     lines.push(Line::from(Span::raw("")));
 
     // Show different hint based on calculation state
-    let is_calculating = app.file_info_state
+    let is_calculating = app
+        .file_info_state
         .as_ref()
         .map(|s| s.is_calculating)
         .unwrap_or(false);
 
     let hint_style = Style::default().fg(theme.file_info.hint_text);
     if is_calculating {
-        let close_key = app.keybindings.file_info_first_key(crate::keybindings::FileInfoAction::Close);
+        let close_key = app
+            .keybindings
+            .file_info_first_key(crate::keybindings::FileInfoAction::Close);
         lines.push(Line::from(Span::styled(
             format!("Press {} to cancel, any other key to close", close_key),
             hint_style,
@@ -357,7 +366,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
     let block = Block::default()
         .title(" File Information ")
-        .title_style(Style::default().fg(theme.file_info.title).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(theme.file_info.title)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.file_info.border))
         .style(Style::default().bg(theme.file_info.bg));
@@ -381,7 +394,8 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     use crate::keybindings::FileInfoAction;
 
     // Check if we're calculating
-    let is_calculating = app.file_info_state
+    let is_calculating = app
+        .file_info_state
         .as_ref()
         .map(|s| s.is_calculating)
         .unwrap_or(false);

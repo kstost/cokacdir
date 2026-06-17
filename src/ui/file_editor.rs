@@ -759,8 +759,7 @@ impl EditorState {
                 let rollback_result = if actual_path.exists() {
                     Err("target path already exists after failed replacement".to_string())
                 } else {
-                    fs::rename(&backup_path, actual_path)
-                        .map_err(|rollback| rollback.to_string())
+                    fs::rename(&backup_path, actual_path).map_err(|rollback| rollback.to_string())
                 };
                 if let Err(rollback_error) = rollback_result {
                     return Err(format!(
@@ -2257,8 +2256,8 @@ impl EditorState {
             self.clipboard = self.get_selected_text();
         } else {
             // 줄 전체 복사
-            self.clipboard =
-                self.lines[self.cursor_line].clone() + &self.line_ending_for_clipboard(self.cursor_line);
+            self.clipboard = self.lines[self.cursor_line].clone()
+                + &self.line_ending_for_clipboard(self.cursor_line);
         }
     }
 
@@ -3021,6 +3020,8 @@ impl EditorState {
                 }
 
                 self.selection = None;
+                // Replacements may have shortened the cursor's line; clamp before any later edit.
+                self.clamp_cursor();
                 self.perform_find();
             }
             Err(e) => {
@@ -3582,7 +3583,7 @@ impl EditorState {
         self.set_line_ending_at(current_line, inserted_ending.clone());
         self.insert_line_with_ending(current_line + 1, indent.clone(), old_line_ending.clone());
         self.cursor_line += 1;
-        self.cursor_col = indent.len();
+        self.cursor_col = indent.chars().count();
 
         self.push_undo(EditAction::Batch {
             actions: vec![
@@ -3615,7 +3616,7 @@ impl EditorState {
 
         let inserted_ending = self.default_line_ending();
         self.insert_line_with_ending(self.cursor_line, indent.clone(), inserted_ending.clone());
-        self.cursor_col = indent.len();
+        self.cursor_col = indent.chars().count();
 
         self.push_undo(EditAction::InsertLine {
             line: self.cursor_line,
@@ -3838,6 +3839,8 @@ impl EditorState {
             if !actions.is_empty() {
                 self.push_undo(EditAction::Batch { actions });
             }
+            // Lines may have shrunk; keep cursor_col within the (possibly shorter) current line.
+            self.clamp_cursor();
         } else {
             self.selection = None;
             let old_content = self.lines[self.cursor_line].clone();
@@ -3979,6 +3982,8 @@ impl EditorState {
                 new_content,
             });
         }
+        // Uncommenting shortens the line; keep cursor_col within the current line.
+        self.clamp_cursor();
     }
 }
 
@@ -4534,11 +4539,7 @@ fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, 
         .borders(Borders::ALL)
         .border_style(Style::default().fg(cd.border))
         .title(" Unsaved Changes ")
-        .title_style(
-            Style::default()
-                .fg(cd.title)
-                .add_modifier(Modifier::BOLD),
-        )
+        .title_style(Style::default().fg(cd.title).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(cd.bg));
     let inner = block.inner(dialog_area);
 
@@ -4570,8 +4571,13 @@ fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, 
         .fg(cd.button_selected_text)
         .bg(cd.button_selected_bg);
     let normal_style = Style::default().fg(cd.button_text);
-    let button_style =
-        |idx| if state.exit_confirm_selected == idx { selected_style } else { normal_style };
+    let button_style = |idx| {
+        if state.exit_confirm_selected == idx {
+            selected_style
+        } else {
+            normal_style
+        }
+    };
 
     let buttons = Line::from(vec![
         Span::styled(" Save ", button_style(0)),
@@ -4858,7 +4864,11 @@ pub fn handle_paste(app: &mut App, text: &str) {
 }
 
 fn close_file_editor(app: &mut App, reload_viewer: bool) {
-    let scroll = app.editor_state.as_ref().map(|state| state.scroll).unwrap_or(0);
+    let scroll = app
+        .editor_state
+        .as_ref()
+        .map(|state| state.scroll)
+        .unwrap_or(0);
 
     if let Some(Screen::FileViewer) = app.previous_screen {
         if let Some(ref mut viewer) = app.viewer_state {
@@ -6409,6 +6419,28 @@ mod tests {
     }
 
     #[test]
+    fn insert_line_below_uses_char_column_for_unicode_indent() {
+        let mut editor = editor_with_lines(&["　abc"]);
+
+        editor.insert_line_below();
+        assert_eq!(editor.cursor_col, 1);
+        editor.insert_char('x');
+
+        assert_eq!(editor.lines[1], "　x");
+    }
+
+    #[test]
+    fn insert_line_above_uses_char_column_for_unicode_indent() {
+        let mut editor = editor_with_lines(&["　abc"]);
+
+        editor.insert_line_above();
+        assert_eq!(editor.cursor_col, 1);
+        editor.insert_char('x');
+
+        assert_eq!(editor.lines[0], "　x");
+    }
+
+    #[test]
     fn outdent_without_indent_is_noop_not_modified() {
         let mut editor = editor_with_lines(&["plain", "text"]);
         editor.outdent();
@@ -6686,21 +6718,11 @@ mod tests {
         let second_generation = editor.begin_remote_save();
 
         assert!(editor.remote_dirty);
-        assert!(!editor.apply_remote_save_result(
-            2,
-            "/remote/file.txt",
-            first_generation,
-            false
-        ));
+        assert!(!editor.apply_remote_save_result(2, "/remote/file.txt", first_generation, false));
         assert!(editor.remote_dirty);
         assert!(editor.modified);
 
-        assert!(editor.apply_remote_save_result(
-            2,
-            "/remote/file.txt",
-            second_generation,
-            false
-        ));
+        assert!(editor.apply_remote_save_result(2, "/remote/file.txt", second_generation, false));
         assert!(!editor.remote_dirty);
     }
 
@@ -6713,20 +6735,10 @@ mod tests {
         });
         let generation = editor.begin_remote_save();
 
-        assert!(!editor.apply_remote_save_result(
-            1,
-            "/remote/previous.txt",
-            generation,
-            false
-        ));
+        assert!(!editor.apply_remote_save_result(1, "/remote/previous.txt", generation, false));
         assert!(editor.remote_dirty);
 
-        assert!(editor.apply_remote_save_result(
-            1,
-            "/remote/current.txt",
-            generation,
-            false
-        ));
+        assert!(editor.apply_remote_save_result(1, "/remote/current.txt", generation, false));
         assert!(!editor.remote_dirty);
     }
 }

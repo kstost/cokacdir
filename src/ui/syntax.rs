@@ -207,21 +207,18 @@ impl SyntaxHighlighter {
     // Rust 토큰화
     fn tokenize_rust(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "as", "async", "await", "break", "const", "continue", "crate", "dyn",
-            "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
-            "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-            "self", "Self", "static", "struct", "super", "trait", "true", "type",
-            "unsafe", "use", "where", "while", "abstract", "become", "box", "do",
-            "final", "macro", "override", "priv", "typeof", "unsized", "virtual",
+            "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+            "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+            "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+            "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become",
+            "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual",
             "yield",
         ];
         let types = [
-            "i8", "i16", "i32", "i64", "i128", "isize",
-            "u8", "u16", "u32", "u64", "u128", "usize",
-            "f32", "f64", "bool", "char", "str", "String",
-            "Vec", "Option", "Result", "Box", "Rc", "Arc",
-            "HashMap", "HashSet", "BTreeMap", "BTreeSet",
-            "Path", "PathBuf", "OsStr", "OsString",
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64", "bool", "char", "str", "String", "Vec", "Option", "Result", "Box", "Rc",
+            "Arc", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Path", "PathBuf", "OsStr",
+            "OsString",
         ];
 
         self.tokenize_c_like(line, &keywords, &types, "//", ("/*", "*/"), true)
@@ -230,15 +227,26 @@ impl SyntaxHighlighter {
     // Python 토큰화
     fn tokenize_python(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "and", "as", "assert", "async", "await", "break", "class", "continue",
-            "def", "del", "elif", "else", "except", "False", "finally", "for",
-            "from", "global", "if", "import", "in", "is", "lambda", "None",
-            "nonlocal", "not", "or", "pass", "raise", "return", "True", "try",
-            "while", "with", "yield",
+            "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
+            "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return",
+            "True", "try", "while", "with", "yield",
         ];
         let types = [
-            "int", "float", "str", "bool", "list", "dict", "tuple", "set",
-            "frozenset", "bytes", "bytearray", "object", "type", "None",
+            "int",
+            "float",
+            "str",
+            "bool",
+            "list",
+            "dict",
+            "tuple",
+            "set",
+            "frozenset",
+            "bytes",
+            "bytearray",
+            "object",
+            "type",
+            "None",
         ];
 
         let mut tokens = Vec::new();
@@ -257,14 +265,14 @@ impl SyntaxHighlighter {
 
             // 문자열 (triple quotes)
             if i + 2 < chars.len()
-                && ((chars[i] == '"' && chars[i+1] == '"' && chars[i+2] == '"')
-                    || (chars[i] == '\'' && chars[i+1] == '\'' && chars[i+2] == '\''))
+                && ((chars[i] == '"' && chars[i + 1] == '"' && chars[i + 2] == '"')
+                    || (chars[i] == '\'' && chars[i + 1] == '\'' && chars[i + 2] == '\''))
             {
                 let quote = chars[i];
                 let start = i;
                 i += 3;
                 while i + 2 < chars.len() {
-                    if chars[i] == quote && chars[i+1] == quote && chars[i+2] == quote {
+                    if chars[i] == quote && chars[i + 1] == quote && chars[i + 2] == quote {
                         i += 3;
                         break;
                     }
@@ -320,16 +328,24 @@ impl SyntaxHighlighter {
                     i += 1;
                 }
                 tokens.push(Token {
-                    text: format!("{}{}", prefix, chars[start+1..i].iter().collect::<String>()),
+                    text: format!(
+                        "{}{}",
+                        prefix,
+                        chars[start + 1..i].iter().collect::<String>()
+                    ),
                     token_type: TokenType::String,
                 });
                 continue;
             }
 
             // 숫자
-            if chars[i].is_ascii_digit() || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            if chars[i].is_ascii_digit()
+                || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+            {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -368,7 +384,9 @@ impl SyntaxHighlighter {
             if chars[i] == '@' {
                 let start = i;
                 i += 1;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -412,20 +430,87 @@ impl SyntaxHighlighter {
     // JavaScript/TypeScript 토큰화
     fn tokenize_javascript(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "break", "case", "catch", "class", "const", "continue", "debugger",
-            "default", "delete", "do", "else", "export", "extends", "false",
-            "finally", "for", "function", "if", "import", "in", "instanceof",
-            "let", "new", "null", "return", "super", "switch", "this", "throw",
-            "true", "try", "typeof", "var", "void", "while", "with", "yield",
-            "async", "await", "of", "static", "get", "set", "from", "as",
+            "break",
+            "case",
+            "catch",
+            "class",
+            "const",
+            "continue",
+            "debugger",
+            "default",
+            "delete",
+            "do",
+            "else",
+            "export",
+            "extends",
+            "false",
+            "finally",
+            "for",
+            "function",
+            "if",
+            "import",
+            "in",
+            "instanceof",
+            "let",
+            "new",
+            "null",
+            "return",
+            "super",
+            "switch",
+            "this",
+            "throw",
+            "true",
+            "try",
+            "typeof",
+            "var",
+            "void",
+            "while",
+            "with",
+            "yield",
+            "async",
+            "await",
+            "of",
+            "static",
+            "get",
+            "set",
+            "from",
+            "as",
             // TypeScript
-            "interface", "type", "enum", "implements", "private", "protected",
-            "public", "readonly", "abstract", "declare", "namespace", "module",
+            "interface",
+            "type",
+            "enum",
+            "implements",
+            "private",
+            "protected",
+            "public",
+            "readonly",
+            "abstract",
+            "declare",
+            "namespace",
+            "module",
         ];
         let types = [
-            "string", "number", "boolean", "object", "any", "void", "never",
-            "unknown", "undefined", "null", "Array", "Map", "Set", "Promise",
-            "Date", "RegExp", "Error", "Function", "Object", "Symbol", "BigInt",
+            "string",
+            "number",
+            "boolean",
+            "object",
+            "any",
+            "void",
+            "never",
+            "unknown",
+            "undefined",
+            "null",
+            "Array",
+            "Map",
+            "Set",
+            "Promise",
+            "Date",
+            "RegExp",
+            "Error",
+            "Function",
+            "Object",
+            "Symbol",
+            "BigInt",
         ];
 
         self.tokenize_c_like(line, &keywords, &types, "//", ("/*", "*/"), true)
@@ -434,35 +519,148 @@ impl SyntaxHighlighter {
     // C/C++ 토큰화
     fn tokenize_c(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "auto", "break", "case", "char", "const", "continue", "default",
-            "do", "double", "else", "enum", "extern", "float", "for", "goto",
-            "if", "inline", "int", "long", "register", "restrict", "return",
-            "short", "signed", "sizeof", "static", "struct", "switch", "typedef",
-            "union", "unsigned", "void", "volatile", "while", "_Bool", "_Complex",
+            "auto",
+            "break",
+            "case",
+            "char",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "float",
+            "for",
+            "goto",
+            "if",
+            "inline",
+            "int",
+            "long",
+            "register",
+            "restrict",
+            "return",
+            "short",
+            "signed",
+            "sizeof",
+            "static",
+            "struct",
+            "switch",
+            "typedef",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "while",
+            "_Bool",
+            "_Complex",
             "_Imaginary",
             // C++
-            "alignas", "alignof", "and", "and_eq", "asm", "atomic_cancel",
-            "atomic_commit", "atomic_noexcept", "bitand", "bitor", "bool",
-            "catch", "char8_t", "char16_t", "char32_t", "class", "compl",
-            "concept", "consteval", "constexpr", "constinit", "const_cast",
-            "co_await", "co_return", "co_yield", "decltype", "delete",
-            "dynamic_cast", "explicit", "export", "false", "friend", "mutable",
-            "namespace", "new", "noexcept", "not", "not_eq", "nullptr",
-            "operator", "or", "or_eq", "private", "protected", "public",
-            "reflexpr", "reinterpret_cast", "requires", "static_assert",
-            "static_cast", "synchronized", "template", "this", "thread_local",
-            "throw", "true", "try", "typeid", "typename", "using", "virtual",
-            "wchar_t", "xor", "xor_eq",
+            "alignas",
+            "alignof",
+            "and",
+            "and_eq",
+            "asm",
+            "atomic_cancel",
+            "atomic_commit",
+            "atomic_noexcept",
+            "bitand",
+            "bitor",
+            "bool",
+            "catch",
+            "char8_t",
+            "char16_t",
+            "char32_t",
+            "class",
+            "compl",
+            "concept",
+            "consteval",
+            "constexpr",
+            "constinit",
+            "const_cast",
+            "co_await",
+            "co_return",
+            "co_yield",
+            "decltype",
+            "delete",
+            "dynamic_cast",
+            "explicit",
+            "export",
+            "false",
+            "friend",
+            "mutable",
+            "namespace",
+            "new",
+            "noexcept",
+            "not",
+            "not_eq",
+            "nullptr",
+            "operator",
+            "or",
+            "or_eq",
+            "private",
+            "protected",
+            "public",
+            "reflexpr",
+            "reinterpret_cast",
+            "requires",
+            "static_assert",
+            "static_cast",
+            "synchronized",
+            "template",
+            "this",
+            "thread_local",
+            "throw",
+            "true",
+            "try",
+            "typeid",
+            "typename",
+            "using",
+            "virtual",
+            "wchar_t",
+            "xor",
+            "xor_eq",
         ];
         let types = [
-            "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
-            "uint32_t", "uint64_t", "size_t", "ssize_t", "ptrdiff_t", "intptr_t",
-            "uintptr_t", "FILE", "time_t", "clock_t", "wint_t", "errno_t",
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+            "size_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "intptr_t",
+            "uintptr_t",
+            "FILE",
+            "time_t",
+            "clock_t",
+            "wint_t",
+            "errno_t",
             "nullptr_t",
             // C++ STL
-            "string", "vector", "map", "set", "list", "deque", "array",
-            "unordered_map", "unordered_set", "pair", "tuple", "optional",
-            "variant", "any", "span", "string_view", "unique_ptr", "shared_ptr",
+            "string",
+            "vector",
+            "map",
+            "set",
+            "list",
+            "deque",
+            "array",
+            "unordered_map",
+            "unordered_set",
+            "pair",
+            "tuple",
+            "optional",
+            "variant",
+            "any",
+            "span",
+            "string_view",
+            "unique_ptr",
+            "shared_ptr",
             "weak_ptr",
         ];
 
@@ -472,30 +670,133 @@ impl SyntaxHighlighter {
     // Java/Kotlin 토큰화
     fn tokenize_java(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "abstract", "assert", "boolean", "break", "byte", "case", "catch",
-            "char", "class", "const", "continue", "default", "do", "double",
-            "else", "enum", "extends", "final", "finally", "float", "for",
-            "goto", "if", "implements", "import", "instanceof", "int",
-            "interface", "long", "native", "new", "package", "private",
-            "protected", "public", "return", "short", "static", "strictfp",
-            "super", "switch", "synchronized", "this", "throw", "throws",
-            "transient", "try", "void", "volatile", "while", "true", "false",
+            "abstract",
+            "assert",
+            "boolean",
+            "break",
+            "byte",
+            "case",
+            "catch",
+            "char",
+            "class",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extends",
+            "final",
+            "finally",
+            "float",
+            "for",
+            "goto",
+            "if",
+            "implements",
+            "import",
+            "instanceof",
+            "int",
+            "interface",
+            "long",
+            "native",
+            "new",
+            "package",
+            "private",
+            "protected",
+            "public",
+            "return",
+            "short",
+            "static",
+            "strictfp",
+            "super",
+            "switch",
+            "synchronized",
+            "this",
+            "throw",
+            "throws",
+            "transient",
+            "try",
+            "void",
+            "volatile",
+            "while",
+            "true",
+            "false",
             "null",
             // Kotlin
-            "fun", "val", "var", "when", "object", "companion", "data", "sealed",
-            "inline", "crossinline", "noinline", "reified", "suspend", "typealias",
-            "by", "init", "constructor", "where", "out", "in", "is", "as",
-            "internal", "open", "lateinit", "annotation", "actual", "expect",
+            "fun",
+            "val",
+            "var",
+            "when",
+            "object",
+            "companion",
+            "data",
+            "sealed",
+            "inline",
+            "crossinline",
+            "noinline",
+            "reified",
+            "suspend",
+            "typealias",
+            "by",
+            "init",
+            "constructor",
+            "where",
+            "out",
+            "in",
+            "is",
+            "as",
+            "internal",
+            "open",
+            "lateinit",
+            "annotation",
+            "actual",
+            "expect",
         ];
         let types = [
-            "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte",
-            "Short", "Character", "Object", "Class", "List", "Map", "Set",
-            "ArrayList", "HashMap", "HashSet", "LinkedList", "TreeMap", "TreeSet",
-            "Optional", "Stream", "Comparable", "Runnable", "Callable", "Future",
-            "Thread", "Exception", "RuntimeException", "Error", "Throwable",
+            "String",
+            "Integer",
+            "Long",
+            "Double",
+            "Float",
+            "Boolean",
+            "Byte",
+            "Short",
+            "Character",
+            "Object",
+            "Class",
+            "List",
+            "Map",
+            "Set",
+            "ArrayList",
+            "HashMap",
+            "HashSet",
+            "LinkedList",
+            "TreeMap",
+            "TreeSet",
+            "Optional",
+            "Stream",
+            "Comparable",
+            "Runnable",
+            "Callable",
+            "Future",
+            "Thread",
+            "Exception",
+            "RuntimeException",
+            "Error",
+            "Throwable",
             // Kotlin
-            "Int", "Any", "Unit", "Nothing", "Array", "Pair", "Triple",
-            "Sequence", "MutableList", "MutableMap", "MutableSet",
+            "Int",
+            "Any",
+            "Unit",
+            "Nothing",
+            "Array",
+            "Pair",
+            "Triple",
+            "Sequence",
+            "MutableList",
+            "MutableMap",
+            "MutableSet",
         ];
 
         self.tokenize_c_like(line, &keywords, &types, "//", ("/*", "*/"), true)
@@ -504,15 +805,57 @@ impl SyntaxHighlighter {
     // Go 토큰화
     fn tokenize_go(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "break", "case", "chan", "const", "continue", "default", "defer",
-            "else", "fallthrough", "for", "func", "go", "goto", "if", "import",
-            "interface", "map", "package", "range", "return", "select", "struct",
-            "switch", "type", "var", "true", "false", "nil", "iota",
+            "break",
+            "case",
+            "chan",
+            "const",
+            "continue",
+            "default",
+            "defer",
+            "else",
+            "fallthrough",
+            "for",
+            "func",
+            "go",
+            "goto",
+            "if",
+            "import",
+            "interface",
+            "map",
+            "package",
+            "range",
+            "return",
+            "select",
+            "struct",
+            "switch",
+            "type",
+            "var",
+            "true",
+            "false",
+            "nil",
+            "iota",
         ];
         let types = [
-            "bool", "byte", "complex64", "complex128", "error", "float32",
-            "float64", "int", "int8", "int16", "int32", "int64", "rune",
-            "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+            "bool",
+            "byte",
+            "complex64",
+            "complex128",
+            "error",
+            "float32",
+            "float64",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "rune",
+            "string",
+            "uint",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "uintptr",
         ];
 
         self.tokenize_c_like(line, &keywords, &types, "//", ("/*", "*/"), false)
@@ -527,12 +870,15 @@ impl SyntaxHighlighter {
         while i < chars.len() {
             // 주석
             if i + 3 < chars.len()
-                && chars[i] == '<' && chars[i+1] == '!' && chars[i+2] == '-' && chars[i+3] == '-'
+                && chars[i] == '<'
+                && chars[i + 1] == '!'
+                && chars[i + 2] == '-'
+                && chars[i + 3] == '-'
             {
                 let start = i;
                 i += 4;
                 while i + 2 < chars.len() {
-                    if chars[i] == '-' && chars[i+1] == '-' && chars[i+2] == '>' {
+                    if chars[i] == '-' && chars[i + 1] == '-' && chars[i + 2] == '>' {
                         i += 3;
                         break;
                     }
@@ -560,7 +906,12 @@ impl SyntaxHighlighter {
 
                 // 태그 이름
                 let tag_start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_' || chars[i] == ':') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '-'
+                        || chars[i] == '_'
+                        || chars[i] == ':')
+                {
                     i += 1;
                 }
                 let tag_name: String = chars[tag_start..i].iter().collect();
@@ -594,7 +945,12 @@ impl SyntaxHighlighter {
                     // 속성 이름
                     if chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == ':' {
                         let attr_start = i;
-                        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_' || chars[i] == ':') {
+                        while i < chars.len()
+                            && (chars[i].is_alphanumeric()
+                                || chars[i] == '-'
+                                || chars[i] == '_'
+                                || chars[i] == ':')
+                        {
                             i += 1;
                         }
                         tokens.push(Token {
@@ -701,7 +1057,9 @@ impl SyntaxHighlighter {
             if chars[i] == '.' || chars[i] == '#' {
                 let start = i;
                 i += 1;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -760,9 +1118,16 @@ impl SyntaxHighlighter {
             }
 
             // 숫자
-            if chars[i].is_ascii_digit() || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            if chars[i].is_ascii_digit()
+                || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+            {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '%' || chars[i] == '-') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric()
+                        || chars[i] == '.'
+                        || chars[i] == '%'
+                        || chars[i] == '-')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -849,7 +1214,11 @@ impl SyntaxHighlighter {
 
                 tokens.push(Token {
                     text: chars[start..i].iter().collect(),
-                    token_type: if is_key { TokenType::Attribute } else { TokenType::String },
+                    token_type: if is_key {
+                        TokenType::Attribute
+                    } else {
+                        TokenType::String
+                    },
                 });
                 continue;
             }
@@ -860,7 +1229,14 @@ impl SyntaxHighlighter {
                 if chars[i] == '-' || chars[i] == '+' {
                     i += 1;
                 }
-                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == 'e' || chars[i] == 'E' || chars[i] == '-' || chars[i] == '+') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit()
+                        || chars[i] == '.'
+                        || chars[i] == 'e'
+                        || chars[i] == 'E'
+                        || chars[i] == '-'
+                        || chars[i] == '+')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -959,7 +1335,12 @@ impl SyntaxHighlighter {
             // 키: 값 형태
             if chars[i].is_alphabetic() || chars[i] == '_' || chars[i] == '-' {
                 let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-' || chars[i] == '.') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '-'
+                        || chars[i] == '.')
+                {
                     i += 1;
                 }
 
@@ -971,7 +1352,11 @@ impl SyntaxHighlighter {
 
                 tokens.push(Token {
                     text: chars[start..i].iter().collect(),
-                    token_type: if is_key { TokenType::Attribute } else { TokenType::Variable },
+                    token_type: if is_key {
+                        TokenType::Attribute
+                    } else {
+                        TokenType::Variable
+                    },
                 });
                 continue;
             }
@@ -998,12 +1383,18 @@ impl SyntaxHighlighter {
             }
 
             // 숫자
-            if chars[i].is_ascii_digit() || ((chars[i] == '-' || chars[i] == '+') && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            if chars[i].is_ascii_digit()
+                || ((chars[i] == '-' || chars[i] == '+')
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit())
+            {
                 let start = i;
                 if chars[i] == '-' || chars[i] == '+' {
                     i += 1;
                 }
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -1015,8 +1406,23 @@ impl SyntaxHighlighter {
 
             // 불린
             let remaining: String = chars[i..].iter().collect();
-            if remaining.starts_with("true") || remaining.starts_with("false") || remaining.starts_with("yes") || remaining.starts_with("no") || remaining.starts_with("null") {
-                let word_len = if remaining.starts_with("false") { 5 } else if remaining.starts_with("true") { 4 } else if remaining.starts_with("null") { 4 } else if remaining.starts_with("yes") { 3 } else { 2 };
+            if remaining.starts_with("true")
+                || remaining.starts_with("false")
+                || remaining.starts_with("yes")
+                || remaining.starts_with("no")
+                || remaining.starts_with("null")
+            {
+                let word_len = if remaining.starts_with("false") {
+                    5
+                } else if remaining.starts_with("true") {
+                    4
+                } else if remaining.starts_with("null") {
+                    4
+                } else if remaining.starts_with("yes") {
+                    3
+                } else {
+                    2
+                };
                 tokens.push(Token {
                     text: chars[i..i + word_len].iter().collect(),
                     token_type: TokenType::Keyword,
@@ -1069,19 +1475,52 @@ impl SyntaxHighlighter {
     // Shell 토큰화
     fn tokenize_shell(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "if", "then", "else", "elif", "fi", "case", "esac", "for", "while",
-            "until", "do", "done", "in", "function", "select", "time", "coproc",
-            "return", "exit", "break", "continue", "local", "declare", "typeset",
-            "export", "readonly", "unset", "shift", "source", "alias", "unalias",
-            "set", "shopt", "trap", "exec", "eval", "true", "false",
+            "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do",
+            "done", "in", "function", "select", "time", "coproc", "return", "exit", "break",
+            "continue", "local", "declare", "typeset", "export", "readonly", "unset", "shift",
+            "source", "alias", "unalias", "set", "shopt", "trap", "exec", "eval", "true", "false",
         ];
         let builtins = [
-            "echo", "printf", "read", "cd", "pwd", "pushd", "popd", "dirs",
-            "let", "test", "[", "[[", "]]", "]", "getopts", "hash", "type",
-            "umask", "ulimit", "wait", "jobs", "fg", "bg", "kill", "disown",
-            "suspend", "logout", "history", "fc", "bind", "help", "enable",
-            "builtin", "command", "compgen", "complete", "compopt", "mapfile",
-            "readarray", "coproc",
+            "echo",
+            "printf",
+            "read",
+            "cd",
+            "pwd",
+            "pushd",
+            "popd",
+            "dirs",
+            "let",
+            "test",
+            "[",
+            "[[",
+            "]]",
+            "]",
+            "getopts",
+            "hash",
+            "type",
+            "umask",
+            "ulimit",
+            "wait",
+            "jobs",
+            "fg",
+            "bg",
+            "kill",
+            "disown",
+            "suspend",
+            "logout",
+            "history",
+            "fc",
+            "bind",
+            "help",
+            "enable",
+            "builtin",
+            "command",
+            "compgen",
+            "complete",
+            "compopt",
+            "mapfile",
+            "readarray",
+            "coproc",
         ];
 
         let mut tokens = Vec::new();
@@ -1170,7 +1609,9 @@ impl SyntaxHighlighter {
             // 식별자/키워드
             if chars[i].is_alphabetic() || chars[i] == '_' {
                 let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '-')
+                {
                     i += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
@@ -1222,49 +1663,271 @@ impl SyntaxHighlighter {
     // SQL 토큰화
     fn tokenize_sql(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "BETWEEN",
-            "LIKE", "IS", "NULL", "TRUE", "FALSE", "AS", "ON", "JOIN", "LEFT",
-            "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "NATURAL", "USING",
-            "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
-            "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",
-            "TABLE", "INDEX", "VIEW", "DROP", "ALTER", "ADD", "COLUMN",
-            "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "CHECK",
-            "DEFAULT", "CONSTRAINT", "CASCADE", "RESTRICT", "UNION", "ALL",
-            "EXCEPT", "INTERSECT", "EXISTS", "CASE", "WHEN", "THEN", "ELSE",
-            "END", "IF", "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION",
-            "DECLARE", "CURSOR", "FETCH", "CLOSE", "OPEN", "FOR", "WHILE",
-            "LOOP", "RETURN", "FUNCTION", "PROCEDURE", "TRIGGER", "DATABASE",
-            "SCHEMA", "GRANT", "REVOKE", "WITH", "RECURSIVE", "DISTINCT",
-            "select", "from", "where", "and", "or", "not", "in", "between",
-            "like", "is", "null", "true", "false", "as", "on", "join", "left",
-            "right", "inner", "outer", "full", "cross", "natural", "using",
-            "group", "by", "having", "order", "asc", "desc", "limit", "offset",
-            "insert", "into", "values", "update", "set", "delete", "create",
-            "table", "index", "view", "drop", "alter", "add", "column",
-            "primary", "key", "foreign", "references", "unique", "check",
-            "default", "constraint", "cascade", "restrict", "union", "all",
-            "except", "intersect", "exists", "case", "when", "then", "else",
-            "end", "if", "begin", "commit", "rollback", "transaction",
+            "SELECT",
+            "FROM",
+            "WHERE",
+            "AND",
+            "OR",
+            "NOT",
+            "IN",
+            "BETWEEN",
+            "LIKE",
+            "IS",
+            "NULL",
+            "TRUE",
+            "FALSE",
+            "AS",
+            "ON",
+            "JOIN",
+            "LEFT",
+            "RIGHT",
+            "INNER",
+            "OUTER",
+            "FULL",
+            "CROSS",
+            "NATURAL",
+            "USING",
+            "GROUP",
+            "BY",
+            "HAVING",
+            "ORDER",
+            "ASC",
+            "DESC",
+            "LIMIT",
+            "OFFSET",
+            "INSERT",
+            "INTO",
+            "VALUES",
+            "UPDATE",
+            "SET",
+            "DELETE",
+            "CREATE",
+            "TABLE",
+            "INDEX",
+            "VIEW",
+            "DROP",
+            "ALTER",
+            "ADD",
+            "COLUMN",
+            "PRIMARY",
+            "KEY",
+            "FOREIGN",
+            "REFERENCES",
+            "UNIQUE",
+            "CHECK",
+            "DEFAULT",
+            "CONSTRAINT",
+            "CASCADE",
+            "RESTRICT",
+            "UNION",
+            "ALL",
+            "EXCEPT",
+            "INTERSECT",
+            "EXISTS",
+            "CASE",
+            "WHEN",
+            "THEN",
+            "ELSE",
+            "END",
+            "IF",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "TRANSACTION",
+            "DECLARE",
+            "CURSOR",
+            "FETCH",
+            "CLOSE",
+            "OPEN",
+            "FOR",
+            "WHILE",
+            "LOOP",
+            "RETURN",
+            "FUNCTION",
+            "PROCEDURE",
+            "TRIGGER",
+            "DATABASE",
+            "SCHEMA",
+            "GRANT",
+            "REVOKE",
+            "WITH",
+            "RECURSIVE",
+            "DISTINCT",
+            "select",
+            "from",
+            "where",
+            "and",
+            "or",
+            "not",
+            "in",
+            "between",
+            "like",
+            "is",
+            "null",
+            "true",
+            "false",
+            "as",
+            "on",
+            "join",
+            "left",
+            "right",
+            "inner",
+            "outer",
+            "full",
+            "cross",
+            "natural",
+            "using",
+            "group",
+            "by",
+            "having",
+            "order",
+            "asc",
+            "desc",
+            "limit",
+            "offset",
+            "insert",
+            "into",
+            "values",
+            "update",
+            "set",
+            "delete",
+            "create",
+            "table",
+            "index",
+            "view",
+            "drop",
+            "alter",
+            "add",
+            "column",
+            "primary",
+            "key",
+            "foreign",
+            "references",
+            "unique",
+            "check",
+            "default",
+            "constraint",
+            "cascade",
+            "restrict",
+            "union",
+            "all",
+            "except",
+            "intersect",
+            "exists",
+            "case",
+            "when",
+            "then",
+            "else",
+            "end",
+            "if",
+            "begin",
+            "commit",
+            "rollback",
+            "transaction",
         ];
         let types = [
-            "INT", "INTEGER", "SMALLINT", "BIGINT", "DECIMAL", "NUMERIC",
-            "FLOAT", "REAL", "DOUBLE", "PRECISION", "CHAR", "VARCHAR", "TEXT",
-            "DATE", "TIME", "TIMESTAMP", "DATETIME", "BOOLEAN", "BOOL", "BLOB",
-            "CLOB", "BINARY", "VARBINARY", "UUID", "JSON", "JSONB", "ARRAY",
-            "SERIAL", "BIGSERIAL", "MONEY", "INTERVAL",
-            "int", "integer", "smallint", "bigint", "decimal", "numeric",
-            "float", "real", "double", "precision", "char", "varchar", "text",
-            "date", "time", "timestamp", "datetime", "boolean", "bool",
+            "INT",
+            "INTEGER",
+            "SMALLINT",
+            "BIGINT",
+            "DECIMAL",
+            "NUMERIC",
+            "FLOAT",
+            "REAL",
+            "DOUBLE",
+            "PRECISION",
+            "CHAR",
+            "VARCHAR",
+            "TEXT",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "DATETIME",
+            "BOOLEAN",
+            "BOOL",
+            "BLOB",
+            "CLOB",
+            "BINARY",
+            "VARBINARY",
+            "UUID",
+            "JSON",
+            "JSONB",
+            "ARRAY",
+            "SERIAL",
+            "BIGSERIAL",
+            "MONEY",
+            "INTERVAL",
+            "int",
+            "integer",
+            "smallint",
+            "bigint",
+            "decimal",
+            "numeric",
+            "float",
+            "real",
+            "double",
+            "precision",
+            "char",
+            "varchar",
+            "text",
+            "date",
+            "time",
+            "timestamp",
+            "datetime",
+            "boolean",
+            "bool",
         ];
         let functions = [
-            "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "NULLIF",
-            "CAST", "CONVERT", "CONCAT", "SUBSTRING", "TRIM", "UPPER", "LOWER",
-            "LENGTH", "REPLACE", "ROUND", "FLOOR", "CEIL", "ABS", "NOW",
-            "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "EXTRACT",
-            "DATE_PART", "DATE_TRUNC", "ROW_NUMBER", "RANK", "DENSE_RANK",
-            "FIRST_VALUE", "LAST_VALUE", "LAG", "LEAD", "OVER", "PARTITION",
-            "count", "sum", "avg", "min", "max", "coalesce", "nullif",
-            "cast", "convert", "concat", "substring", "trim", "upper", "lower",
+            "COUNT",
+            "SUM",
+            "AVG",
+            "MIN",
+            "MAX",
+            "COALESCE",
+            "NULLIF",
+            "CAST",
+            "CONVERT",
+            "CONCAT",
+            "SUBSTRING",
+            "TRIM",
+            "UPPER",
+            "LOWER",
+            "LENGTH",
+            "REPLACE",
+            "ROUND",
+            "FLOOR",
+            "CEIL",
+            "ABS",
+            "NOW",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "EXTRACT",
+            "DATE_PART",
+            "DATE_TRUNC",
+            "ROW_NUMBER",
+            "RANK",
+            "DENSE_RANK",
+            "FIRST_VALUE",
+            "LAST_VALUE",
+            "LAG",
+            "LEAD",
+            "OVER",
+            "PARTITION",
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "coalesce",
+            "nullif",
+            "cast",
+            "convert",
+            "concat",
+            "substring",
+            "trim",
+            "upper",
+            "lower",
         ];
 
         let mut tokens = Vec::new();
@@ -1304,7 +1967,9 @@ impl SyntaxHighlighter {
             }
 
             // 숫자
-            if chars[i].is_ascii_digit() || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+            if chars[i].is_ascii_digit()
+                || (chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+            {
                 let start = i;
                 while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                     i += 1;
@@ -1382,15 +2047,65 @@ impl SyntaxHighlighter {
     // Ruby 토큰화
     fn tokenize_ruby(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "BEGIN", "END", "alias", "and", "begin", "break", "case", "class",
-            "def", "defined?", "do", "else", "elsif", "end", "ensure", "false",
-            "for", "if", "in", "module", "next", "nil", "not", "or", "redo",
-            "rescue", "retry", "return", "self", "super", "then", "true",
-            "undef", "unless", "until", "when", "while", "yield", "__FILE__",
-            "__LINE__", "__ENCODING__", "attr_reader", "attr_writer",
-            "attr_accessor", "private", "protected", "public", "require",
-            "require_relative", "include", "extend", "prepend", "raise", "fail",
-            "catch", "throw", "lambda", "proc", "loop",
+            "BEGIN",
+            "END",
+            "alias",
+            "and",
+            "begin",
+            "break",
+            "case",
+            "class",
+            "def",
+            "defined?",
+            "do",
+            "else",
+            "elsif",
+            "end",
+            "ensure",
+            "false",
+            "for",
+            "if",
+            "in",
+            "module",
+            "next",
+            "nil",
+            "not",
+            "or",
+            "redo",
+            "rescue",
+            "retry",
+            "return",
+            "self",
+            "super",
+            "then",
+            "true",
+            "undef",
+            "unless",
+            "until",
+            "when",
+            "while",
+            "yield",
+            "__FILE__",
+            "__LINE__",
+            "__ENCODING__",
+            "attr_reader",
+            "attr_writer",
+            "attr_accessor",
+            "private",
+            "protected",
+            "public",
+            "require",
+            "require_relative",
+            "include",
+            "extend",
+            "prepend",
+            "raise",
+            "fail",
+            "catch",
+            "throw",
+            "lambda",
+            "proc",
+            "loop",
         ];
 
         let mut tokens = Vec::new();
@@ -1429,10 +2144,18 @@ impl SyntaxHighlighter {
             }
 
             // 심볼
-            if chars[i] == ':' && i + 1 < chars.len() && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_') {
+            if chars[i] == ':'
+                && i + 1 < chars.len()
+                && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_')
+            {
                 let start = i;
                 i += 1;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '?' || chars[i] == '!') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '?'
+                        || chars[i] == '!')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -1476,7 +2199,9 @@ impl SyntaxHighlighter {
             // 숫자
             if chars[i].is_ascii_digit() {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -1489,13 +2214,23 @@ impl SyntaxHighlighter {
             // 식별자/키워드
             if chars[i].is_alphabetic() || chars[i] == '_' {
                 let start = i;
-                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '?' || chars[i] == '!') {
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '?'
+                        || chars[i] == '!')
+                {
                     i += 1;
                 }
                 let word: String = chars[start..i].iter().collect();
                 let token_type = if keywords.contains(&word.as_str()) {
                     TokenType::Keyword
-                } else if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                } else if word
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
                     TokenType::Type
                 } else if i < chars.len() && chars[i] == '(' {
                     TokenType::Function
@@ -1543,24 +2278,94 @@ impl SyntaxHighlighter {
     // PHP 토큰화
     fn tokenize_php(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "abstract", "and", "array", "as", "break", "callable", "case",
-            "catch", "class", "clone", "const", "continue", "declare", "default",
-            "die", "do", "echo", "else", "elseif", "empty", "enddeclare",
-            "endfor", "endforeach", "endif", "endswitch", "endwhile", "eval",
-            "exit", "extends", "final", "finally", "fn", "for", "foreach",
-            "function", "global", "goto", "if", "implements", "include",
-            "include_once", "instanceof", "insteadof", "interface", "isset",
-            "list", "match", "namespace", "new", "or", "print", "private",
-            "protected", "public", "readonly", "require", "require_once",
-            "return", "static", "switch", "throw", "trait", "try", "unset",
-            "use", "var", "while", "xor", "yield", "yield from",
-            "true", "false", "null", "TRUE", "FALSE", "NULL",
-            "__CLASS__", "__DIR__", "__FILE__", "__FUNCTION__", "__LINE__",
-            "__METHOD__", "__NAMESPACE__", "__TRAIT__",
+            "abstract",
+            "and",
+            "array",
+            "as",
+            "break",
+            "callable",
+            "case",
+            "catch",
+            "class",
+            "clone",
+            "const",
+            "continue",
+            "declare",
+            "default",
+            "die",
+            "do",
+            "echo",
+            "else",
+            "elseif",
+            "empty",
+            "enddeclare",
+            "endfor",
+            "endforeach",
+            "endif",
+            "endswitch",
+            "endwhile",
+            "eval",
+            "exit",
+            "extends",
+            "final",
+            "finally",
+            "fn",
+            "for",
+            "foreach",
+            "function",
+            "global",
+            "goto",
+            "if",
+            "implements",
+            "include",
+            "include_once",
+            "instanceof",
+            "insteadof",
+            "interface",
+            "isset",
+            "list",
+            "match",
+            "namespace",
+            "new",
+            "or",
+            "print",
+            "private",
+            "protected",
+            "public",
+            "readonly",
+            "require",
+            "require_once",
+            "return",
+            "static",
+            "switch",
+            "throw",
+            "trait",
+            "try",
+            "unset",
+            "use",
+            "var",
+            "while",
+            "xor",
+            "yield",
+            "yield from",
+            "true",
+            "false",
+            "null",
+            "TRUE",
+            "FALSE",
+            "NULL",
+            "__CLASS__",
+            "__DIR__",
+            "__FILE__",
+            "__FUNCTION__",
+            "__LINE__",
+            "__METHOD__",
+            "__NAMESPACE__",
+            "__TRAIT__",
         ];
         let types = [
-            "int", "float", "bool", "string", "array", "object", "callable",
-            "iterable", "void", "mixed", "never", "null", "self", "parent",
+            "int", "float", "bool", "string", "array", "object", "callable", "iterable", "void",
+            "mixed", "never", "null", "self", "parent",
         ];
 
         let mut tokens = Vec::new();
@@ -1570,7 +2375,7 @@ impl SyntaxHighlighter {
         while i < chars.len() {
             // PHP 태그
             if i + 4 < chars.len() {
-                let slice: String = chars[i..i+5].iter().collect();
+                let slice: String = chars[i..i + 5].iter().collect();
                 if slice == "<?php" {
                     tokens.push(Token {
                         text: "<?php".to_string(),
@@ -1643,7 +2448,9 @@ impl SyntaxHighlighter {
             // 숫자
             if chars[i].is_ascii_digit() {
                 let start = i;
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
                     i += 1;
                 }
                 tokens.push(Token {
@@ -1710,21 +2517,96 @@ impl SyntaxHighlighter {
     // Swift 토큰화
     fn tokenize_swift(&mut self, line: &str) -> Vec<Token> {
         let keywords = [
-            "associatedtype", "class", "deinit", "enum", "extension", "fileprivate",
-            "func", "import", "init", "inout", "internal", "let", "open",
-            "operator", "private", "protocol", "public", "rethrows", "static",
-            "struct", "subscript", "typealias", "var", "break", "case",
-            "continue", "default", "defer", "do", "else", "fallthrough", "for",
-            "guard", "if", "in", "repeat", "return", "switch", "where", "while",
-            "as", "Any", "catch", "false", "is", "nil", "super", "self", "Self",
-            "throw", "throws", "true", "try", "async", "await", "actor",
+            "associatedtype",
+            "class",
+            "deinit",
+            "enum",
+            "extension",
+            "fileprivate",
+            "func",
+            "import",
+            "init",
+            "inout",
+            "internal",
+            "let",
+            "open",
+            "operator",
+            "private",
+            "protocol",
+            "public",
+            "rethrows",
+            "static",
+            "struct",
+            "subscript",
+            "typealias",
+            "var",
+            "break",
+            "case",
+            "continue",
+            "default",
+            "defer",
+            "do",
+            "else",
+            "fallthrough",
+            "for",
+            "guard",
+            "if",
+            "in",
+            "repeat",
+            "return",
+            "switch",
+            "where",
+            "while",
+            "as",
+            "Any",
+            "catch",
+            "false",
+            "is",
+            "nil",
+            "super",
+            "self",
+            "Self",
+            "throw",
+            "throws",
+            "true",
+            "try",
+            "async",
+            "await",
+            "actor",
         ];
         let types = [
-            "Int", "Int8", "Int16", "Int32", "Int64", "UInt", "UInt8", "UInt16",
-            "UInt32", "UInt64", "Float", "Double", "Bool", "String", "Character",
-            "Array", "Dictionary", "Set", "Optional", "Result", "Void", "Never",
-            "AnyObject", "AnyClass", "Error", "Codable", "Hashable", "Equatable",
-            "Comparable", "Identifiable", "View", "ObservableObject",
+            "Int",
+            "Int8",
+            "Int16",
+            "Int32",
+            "Int64",
+            "UInt",
+            "UInt8",
+            "UInt16",
+            "UInt32",
+            "UInt64",
+            "Float",
+            "Double",
+            "Bool",
+            "String",
+            "Character",
+            "Array",
+            "Dictionary",
+            "Set",
+            "Optional",
+            "Result",
+            "Void",
+            "Never",
+            "AnyObject",
+            "AnyClass",
+            "Error",
+            "Codable",
+            "Hashable",
+            "Equatable",
+            "Comparable",
+            "Identifiable",
+            "View",
+            "ObservableObject",
         ];
 
         self.tokenize_c_like(line, &keywords, &types, "//", ("/*", "*/"), true)
@@ -1979,7 +2861,8 @@ impl SyntaxHighlighter {
                     i += block_comment.0.len();
                     let mut found_end = false;
                     while i + block_comment.1.len() <= chars.len() {
-                        let end_slice: String = chars[i..i + block_comment.1.len()].iter().collect();
+                        let end_slice: String =
+                            chars[i..i + block_comment.1.len()].iter().collect();
                         if end_slice == block_comment.1 {
                             i += block_comment.1.len();
                             found_end = true;
@@ -2021,7 +2904,10 @@ impl SyntaxHighlighter {
             }
 
             // Raw 문자열 (Rust의 r#"..."#)
-            if chars[i] == 'r' && i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#') {
+            if chars[i] == 'r'
+                && i + 1 < chars.len()
+                && (chars[i + 1] == '"' || chars[i + 1] == '#')
+            {
                 let start = i;
                 i += 1;
                 let mut hash_count = 0;
@@ -2196,12 +3082,27 @@ mod tests {
 
     #[test]
     fn test_language_detection() {
-        assert_eq!(Language::from_extension(Path::new("test.rs")), Language::Rust);
-        assert_eq!(Language::from_extension(Path::new("test.py")), Language::Python);
-        assert_eq!(Language::from_extension(Path::new("test.js")), Language::JavaScript);
-        assert_eq!(Language::from_extension(Path::new("test.ts")), Language::TypeScript);
+        assert_eq!(
+            Language::from_extension(Path::new("test.rs")),
+            Language::Rust
+        );
+        assert_eq!(
+            Language::from_extension(Path::new("test.py")),
+            Language::Python
+        );
+        assert_eq!(
+            Language::from_extension(Path::new("test.js")),
+            Language::JavaScript
+        );
+        assert_eq!(
+            Language::from_extension(Path::new("test.ts")),
+            Language::TypeScript
+        );
         assert_eq!(Language::from_extension(Path::new("test.go")), Language::Go);
-        assert_eq!(Language::from_extension(Path::new("test.unknown")), Language::Plain);
+        assert_eq!(
+            Language::from_extension(Path::new("test.unknown")),
+            Language::Plain
+        );
     }
 
     #[test]
@@ -2209,8 +3110,12 @@ mod tests {
         let colors = crate::ui::theme::Theme::default().syntax;
         let mut highlighter = SyntaxHighlighter::new(Language::Rust, colors);
         let tokens = highlighter.tokenize_line("fn main() {");
-        assert!(tokens.iter().any(|t| t.text == "fn" && t.token_type == TokenType::Keyword));
-        assert!(tokens.iter().any(|t| t.text == "main" && t.token_type == TokenType::Function));
+        assert!(tokens
+            .iter()
+            .any(|t| t.text == "fn" && t.token_type == TokenType::Keyword));
+        assert!(tokens
+            .iter()
+            .any(|t| t.text == "main" && t.token_type == TokenType::Function));
     }
 
     #[test]
@@ -2218,7 +3123,11 @@ mod tests {
         let colors = crate::ui::theme::Theme::default().syntax;
         let mut highlighter = SyntaxHighlighter::new(Language::Python, colors);
         let tokens = highlighter.tokenize_line("def hello():");
-        assert!(tokens.iter().any(|t| t.text == "def" && t.token_type == TokenType::Keyword));
-        assert!(tokens.iter().any(|t| t.text == "hello" && t.token_type == TokenType::Function));
+        assert!(tokens
+            .iter()
+            .any(|t| t.text == "def" && t.token_type == TokenType::Keyword));
+        assert!(tokens
+            .iter()
+            .any(|t| t.text == "hello" && t.token_type == TokenType::Function));
     }
 }

@@ -84,8 +84,8 @@ cokacctl`} />
               String(t('auto-resolved', '자동 탐색')),
             ],
             [
-              <IC key="3">COKAC_GEMINI_PATH</IC>,
-              String(t('Override path to Gemini CLI binary', 'Gemini CLI 바이너리 경로 재지정')),
+              <IC key="3">COKAC_AGY_PATH</IC>,
+              String(t('Override path to Antigravity CLI agy binary', 'Antigravity CLI agy 바이너리 경로 재지정')),
               String(t('auto-resolved', '자동 탐색')),
             ],
             [
@@ -128,12 +128,12 @@ cokacctl`} />
         )}</P>
         <CodeBlock code="COKAC_CODEX_PATH=/opt/codex/codex" />
 
-        <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_GEMINI_PATH</IC></h3>
+        <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_AGY_PATH</IC></h3>
         <P>{t(
-          <>Override the path to the Gemini CLI binary. Same semantics as above but for Gemini.</>,
-          <>Gemini CLI 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 Gemini용입니다.</>
+          <>Override the path to the Antigravity CLI <IC>agy</IC> binary. Same semantics as above but for Agy.</>,
+          <>Antigravity CLI <IC>agy</IC> 바이너리 경로를 재지정합니다. 위와 동일한 의미이지만 Agy용입니다.</>
         )}</P>
-        <CodeBlock code="COKAC_GEMINI_PATH=/usr/local/bin/gemini" />
+        <CodeBlock code="COKAC_AGY_PATH=/usr/local/bin/agy" />
 
         <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_OPENCODE_PATH</IC></h3>
         <P>{t(

@@ -12,7 +12,10 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use super::{app::{App, Dialog, DialogType, Screen}, theme::Theme};
+use super::{
+    app::{App, Dialog, DialogType, Screen},
+    theme::Theme,
+};
 
 /// Result of async image loading
 struct ImageLoadResult {
@@ -182,9 +185,15 @@ impl ImageViewerState {
                 });
 
                 // Find current image index
-                if let Ok(canonical_path) = path.canonicalize().map(crate::utils::format::strip_unc_prefix) {
+                if let Ok(canonical_path) = path
+                    .canonicalize()
+                    .map(crate::utils::format::strip_unc_prefix)
+                {
                     for (i, img_path) in images.iter().enumerate() {
-                        if let Ok(canonical_img) = img_path.canonicalize().map(crate::utils::format::strip_unc_prefix) {
+                        if let Ok(canonical_img) = img_path
+                            .canonicalize()
+                            .map(crate::utils::format::strip_unc_prefix)
+                        {
                             if canonical_img == canonical_path {
                                 current_index = i;
                                 break;
@@ -217,7 +226,7 @@ impl ImageViewerState {
         }
 
         let new_index = if self.current_index == 0 {
-            self.image_list.len() - 1  // Wrap to last
+            self.image_list.len() - 1 // Wrap to last
         } else {
             self.current_index - 1
         };
@@ -232,7 +241,7 @@ impl ImageViewerState {
         }
 
         let new_index = if self.current_index >= self.image_list.len() - 1 {
-            0  // Wrap to first
+            0 // Wrap to first
         } else {
             self.current_index + 1
         };
@@ -291,7 +300,10 @@ impl ImageViewerState {
 pub fn is_image_file(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
         let ext = ext.to_string_lossy().to_lowercase();
-        matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif")
+        matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif"
+        )
     } else {
         false
     }
@@ -303,7 +315,9 @@ fn get_spinner_frame() -> char {
     let frame_idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() / 100) as usize % SPINNER_FRAMES.len();
+        .as_millis()
+        / 100) as usize
+        % SPINNER_FRAMES.len();
     SPINNER_FRAMES[frame_idx]
 }
 
@@ -336,7 +350,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             .constraints(constraints)
             .split(chunks[0]);
         // active_panel_index에 해당하는 패널 영역 사용
-        panel_chunks[app.active_panel_index.min(panel_chunks.len().saturating_sub(1))]
+        panel_chunks[app
+            .active_panel_index
+            .min(panel_chunks.len().saturating_sub(1))]
     } else {
         area
     };
@@ -357,7 +373,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     // Clear area
     frame.render_widget(ratatui::widgets::Clear, viewer_area);
 
-    let filename = state.path.file_name()
+    let filename = state
+        .path
+        .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Image".to_string());
 
@@ -371,12 +389,31 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             if position_info.is_empty() {
                 format!(" {} ({}x{}) ", filename, img.width(), img.height())
             } else {
-                format!(" {} [{}] ({}x{}) ", filename, position_info, img.width(), img.height())
+                format!(
+                    " {} [{}] ({}x{}) ",
+                    filename,
+                    position_info,
+                    img.width(),
+                    img.height()
+                )
             }
         } else if position_info.is_empty() {
-            format!(" {} ({}x{}) - {:.0}% ", filename, img.width(), img.height(), state.zoom * 100.0)
+            format!(
+                " {} ({}x{}) - {:.0}% ",
+                filename,
+                img.width(),
+                img.height(),
+                state.zoom * 100.0
+            )
         } else {
-            format!(" {} [{}] ({}x{}) - {:.0}% ", filename, position_info, img.width(), img.height(), state.zoom * 100.0)
+            format!(
+                " {} [{}] ({}x{}) - {:.0}% ",
+                filename,
+                position_info,
+                img.width(),
+                img.height(),
+                state.zoom * 100.0
+            )
         }
     } else if position_info.is_empty() {
         format!(" {} ", filename)
@@ -402,28 +439,41 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             Line::from(""),
             Line::from(""),
             Line::from(vec![
-                Span::styled(format!(" {} ", spinner), Style::default().fg(theme.image_viewer.loading_spinner)),
-                Span::styled("Loading image...", Style::default().fg(theme.image_viewer.loading_text)),
+                Span::styled(
+                    format!(" {} ", spinner),
+                    Style::default().fg(theme.image_viewer.loading_spinner),
+                ),
+                Span::styled(
+                    "Loading image...",
+                    Style::default().fg(theme.image_viewer.loading_text),
+                ),
             ]),
         ];
 
         // Center the loading message
         let center_y = inner.y + inner.height / 2 - 2;
         let loading_area = Rect::new(inner.x, center_y, inner.width, 4);
-        let paragraph = Paragraph::new(loading_lines)
-            .alignment(ratatui::layout::Alignment::Center);
+        let paragraph = Paragraph::new(loading_lines).alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(paragraph, loading_area);
         return;
     }
 
     if let Some(ref error) = state.error {
         use crate::keybindings::ImageViewerAction;
-        let close_key = app.keybindings.image_viewer_first_key(ImageViewerAction::Close);
+        let close_key = app
+            .keybindings
+            .image_viewer_first_key(ImageViewerAction::Close);
         let error_lines = vec![
             Line::from(""),
-            Line::from(Span::styled(error.clone(), Style::default().fg(theme.image_viewer.error_text))),
+            Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(theme.image_viewer.error_text),
+            )),
             Line::from(""),
-            Line::from(Span::styled(format!("Press {} to close", close_key), Style::default().fg(theme.image_viewer.hint_text))),
+            Line::from(Span::styled(
+                format!("Press {} to close", close_key),
+                Style::default().fg(theme.image_viewer.hint_text),
+            )),
         ];
         frame.render_widget(Paragraph::new(error_lines), inner);
         return;
@@ -435,53 +485,102 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     if let Some(ref mut state) = app.image_viewer_state {
         if let Some(ref mut protocol) = state.inline_protocol {
             // Inline protocol rendering (Kitty/iTerm2/Sixel) — centered
-            let render_area = if let (Some((img_w, img_h)), Some((fw, fh))) = (img_dimensions, font_size) {
-                // Natural cell size (image at 1:1 pixel mapping)
-                let natural_cols = img_w as f64 / fw as f64;
-                let natural_rows = img_h as f64 / fh as f64;
-                // Scale to fit area, but Resize::Fit won't upscale, so cap at 1.0
-                let scale = (inner.width as f64 / natural_cols)
-                    .min(inner.height as f64 / natural_rows)
-                    .min(1.0);
-                let fit_cols = (natural_cols * scale).floor().max(1.0) as u16;
-                let fit_rows = (natural_rows * scale).floor().max(1.0) as u16;
-                let fit_cols = fit_cols.min(inner.width);
-                let fit_rows = fit_rows.min(inner.height);
-                let off_x = (inner.width.saturating_sub(fit_cols)) / 2;
-                let off_y = (inner.height.saturating_sub(fit_rows)) / 2;
-                Rect::new(inner.x + off_x, inner.y + off_y, fit_cols, fit_rows)
-            } else {
-                inner
-            };
+            let render_area =
+                if let (Some((img_w, img_h)), Some((fw, fh))) = (img_dimensions, font_size) {
+                    // Natural cell size (image at 1:1 pixel mapping)
+                    let natural_cols = img_w as f64 / fw as f64;
+                    let natural_rows = img_h as f64 / fh as f64;
+                    // Scale to fit area, but Resize::Fit won't upscale, so cap at 1.0
+                    let scale = (inner.width as f64 / natural_cols)
+                        .min(inner.height as f64 / natural_rows)
+                        .min(1.0);
+                    let fit_cols = (natural_cols * scale).floor().max(1.0) as u16;
+                    let fit_rows = (natural_rows * scale).floor().max(1.0) as u16;
+                    let fit_cols = fit_cols.min(inner.width);
+                    let fit_rows = fit_rows.min(inner.height);
+                    let off_x = (inner.width.saturating_sub(fit_cols)) / 2;
+                    let off_y = (inner.height.saturating_sub(fit_rows)) / 2;
+                    Rect::new(inner.x + off_x, inner.y + off_y, fit_cols, fit_rows)
+                } else {
+                    inner
+                };
             let image_widget = ratatui_image::StatefulImage::new(None);
             frame.render_stateful_widget(image_widget, render_area, protocol);
         } else if let Some(ref img) = state.image {
             // Halfblock fallback rendering (existing code)
-            render_image(frame, img, inner, state.zoom, state.offset_x, state.offset_y);
+            render_image(
+                frame,
+                img,
+                inner,
+                state.zoom,
+                state.offset_x,
+                state.offset_y,
+            );
         }
     }
 
     // Help line at bottom (keybindings에서 동적으로)
     use crate::keybindings::ImageViewerAction;
     let kb = &app.keybindings;
-    let help_area = Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1);
+    let help_area = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
     let fk = Style::default().fg(theme.image_viewer.footer_key);
     let ft = Style::default().fg(theme.image_viewer.footer_text);
     let shortcuts: Vec<(String, &str)> = if use_inline {
         // Inline mode: no zoom/pan shortcuts
         vec![
-            (kb.image_viewer_first_key(ImageViewerAction::PrevImage).to_string(), "prev "),
-            (kb.image_viewer_first_key(ImageViewerAction::NextImage).to_string(), "next "),
-            (kb.image_viewer_first_key(ImageViewerAction::Close).to_string(), "close"),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::PrevImage)
+                    .to_string(),
+                "prev ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::NextImage)
+                    .to_string(),
+                "next ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::Close)
+                    .to_string(),
+                "close",
+            ),
         ]
     } else {
         vec![
-            (kb.image_viewer_first_key(ImageViewerAction::PrevImage).to_string(), "prev "),
-            (kb.image_viewer_first_key(ImageViewerAction::NextImage).to_string(), "next "),
-            (kb.image_viewer_first_key(ImageViewerAction::ZoomIn).to_string(), "zoom+ "),
-            (kb.image_viewer_first_key(ImageViewerAction::ZoomOut).to_string(), "zoom- "),
-            (kb.image_viewer_first_key(ImageViewerAction::ResetView).to_string(), "reset "),
-            (kb.image_viewer_first_key(ImageViewerAction::Close).to_string(), "close"),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::PrevImage)
+                    .to_string(),
+                "prev ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::NextImage)
+                    .to_string(),
+                "next ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::ZoomIn)
+                    .to_string(),
+                "zoom+ ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::ZoomOut)
+                    .to_string(),
+                "zoom- ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::ResetView)
+                    .to_string(),
+                "reset ",
+            ),
+            (
+                kb.image_viewer_first_key(ImageViewerAction::Close)
+                    .to_string(),
+                "close",
+            ),
         ]
     };
     let mut help_spans = Vec::new();
@@ -494,7 +593,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     frame.render_widget(Paragraph::new(help), help_area);
 }
 
-fn render_image(frame: &mut Frame, img: &DynamicImage, area: Rect, zoom: f32, offset_x: i32, offset_y: i32) {
+fn render_image(
+    frame: &mut Frame,
+    img: &DynamicImage,
+    area: Rect,
+    zoom: f32,
+    offset_x: i32,
+    offset_y: i32,
+) {
     let term_width = area.width as u32;
     let term_height = area.height.saturating_sub(1) as u32;
     let pixel_height = term_height * 2;
@@ -512,11 +618,13 @@ fn render_image(frame: &mut Frame, img: &DynamicImage, area: Rect, zoom: f32, of
     let scaled_height = ((img_height as f32 * scale) as u32).max(1);
 
     // Resize image and convert to RGB8
-    let resized = img.resize_exact(
-        scaled_width,
-        scaled_height,
-        image::imageops::FilterType::Triangle,
-    ).to_rgb8();
+    let resized = img
+        .resize_exact(
+            scaled_width,
+            scaled_height,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgb8();
 
     // Calculate offset for centering (in pixels)
     let center_offset_x = (term_width as i32 - scaled_width as i32) / 2;
@@ -539,8 +647,10 @@ fn render_image(frame: &mut Frame, img: &DynamicImage, area: Rect, zoom: f32, of
             let img_y_top = pixel_row_top - view_offset_y;
             let img_y_bottom = pixel_row_bottom - view_offset_y;
 
-            let top_color = if img_x >= 0 && img_x < scaled_width as i32
-                && img_y_top >= 0 && img_y_top < scaled_height as i32
+            let top_color = if img_x >= 0
+                && img_x < scaled_width as i32
+                && img_y_top >= 0
+                && img_y_top < scaled_height as i32
             {
                 let rgb = resized.get_pixel(img_x as u32, img_y_top as u32);
                 Some(Color::Rgb(rgb[0], rgb[1], rgb[2]))
@@ -548,8 +658,10 @@ fn render_image(frame: &mut Frame, img: &DynamicImage, area: Rect, zoom: f32, of
                 None
             };
 
-            let bottom_color = if img_x >= 0 && img_x < scaled_width as i32
-                && img_y_bottom >= 0 && img_y_bottom < scaled_height as i32
+            let bottom_color = if img_x >= 0
+                && img_x < scaled_width as i32
+                && img_y_bottom >= 0
+                && img_y_bottom < scaled_height as i32
             {
                 let rgb = resized.get_pixel(img_x as u32, img_y_bottom as u32);
                 Some(Color::Rgb(rgb[0], rgb[1], rgb[2]))
@@ -590,7 +702,9 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     if let Some(action) = app.keybindings.image_viewer_action(code, modifiers) {
         match action {
             ImageViewerAction::Close => {
-                let last_image_name = state.path.file_name()
+                let last_image_name = state
+                    .path
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string());
 
                 if let Some(filename) = last_image_name {
@@ -643,7 +757,10 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.navigate_next();
             }
             ImageViewerAction::ToggleSelect => {
-                let filename = state.path.file_name().map(|n| n.to_string_lossy().to_string());
+                let filename = state
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string());
                 state.navigate_next();
                 if let Some(name) = filename {
                     let panel = app.active_panel_mut();
@@ -655,7 +772,9 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 }
             }
             ImageViewerAction::Delete => {
-                let filename = state.path.file_name()
+                let filename = state
+                    .path
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
                 app.dialog = Some(Dialog {

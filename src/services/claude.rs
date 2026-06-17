@@ -1,16 +1,19 @@
-use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader, Write};
-use std::sync::mpsc::Sender;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::fs::OpenOptions;
 use regex::Regex;
 use serde_json::Value;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::OnceLock;
 
 /// Generate a unique ID from timestamp nanoseconds + PID
 fn simple_uuid() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     format!("{:x}_{}", nanos, std::process::id())
 }
 
@@ -24,7 +27,10 @@ pub fn safe_preview(s: &str, max_chars: usize) -> String {
 
 /// Initialize debug flag from environment variable or bot_settings.json (call once at startup)
 pub fn init_debug_from_env() {
-    if std::env::var("COKACDIR_DEBUG").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("COKACDIR_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         DEBUG_ENABLED.store(true, Ordering::Relaxed);
         return;
     }
@@ -35,7 +41,11 @@ pub fn init_debug_from_env() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(obj) = json.as_object() {
                     for (_key, entry) in obj {
-                        if entry.get("debug").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        if entry
+                            .get("debug")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
                             DEBUG_ENABLED.store(true, Ordering::Relaxed);
                             return;
                         }
@@ -56,7 +66,9 @@ static CLAUDE_PATH: OnceLock<Option<String>> = OnceLock::new();
 #[cfg(unix)]
 fn resolve_claude_path() -> Option<String> {
     if let Ok(val) = std::env::var("COKAC_CLAUDE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() { return Some(val); }
+        if !val.is_empty() && std::path::Path::new(&val).exists() {
+            return Some(val);
+        }
     }
 
     // Try direct `which claude` first
@@ -70,10 +82,7 @@ fn resolve_claude_path() -> Option<String> {
     }
 
     // Fallback: use login shell to resolve PATH
-    if let Ok(output) = Command::new("bash")
-        .args(["-lc", "which claude"])
-        .output()
-    {
+    if let Ok(output) = Command::new("bash").args(["-lc", "which claude"]).output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() && std::path::Path::new(&path).exists() {
@@ -100,25 +109,38 @@ pub fn decode_windows_output(bytes: &[u8]) -> String {
 
     extern "system" {
         fn MultiByteToWideChar(
-            code_page: u32, flags: u32,
-            src: *const u8, src_len: i32,
-            dst: *mut u16, dst_len: i32,
+            code_page: u32,
+            flags: u32,
+            src: *const u8,
+            src_len: i32,
+            dst: *mut u16,
+            dst_len: i32,
         ) -> i32;
     }
     const CP_OEMCP: u32 = 1; // System OEM code page (e.g., CP949 for Korean)
-    const CP_ACP: u32 = 0;   // System ANSI code page (e.g., CP1252 for Western European)
+    const CP_ACP: u32 = 0; // System ANSI code page (e.g., CP1252 for Western European)
 
     let decode_with_cp = |cp: u32| -> Option<String> {
         unsafe {
             let len = MultiByteToWideChar(
-                cp, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0,
+                cp,
+                0,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                std::ptr::null_mut(),
+                0,
             );
             if len <= 0 {
                 return None;
             }
             let mut wide = vec![0u16; len as usize];
             MultiByteToWideChar(
-                cp, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), len,
+                cp,
+                0,
+                bytes.as_ptr(),
+                bytes.len() as i32,
+                wide.as_mut_ptr(),
+                len,
             );
             Some(String::from_utf16_lossy(&wide))
         }
@@ -171,16 +193,24 @@ pub fn search_path_wide(name: &str, ext: Option<&str>) -> Option<String> {
 
     unsafe {
         let needed = SearchPathW(
-            std::ptr::null(), name_w.as_ptr(), ext_ptr,
-            0, std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null(),
+            name_w.as_ptr(),
+            ext_ptr,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         if needed == 0 {
             return None;
         }
         let mut buf = vec![0u16; needed as usize];
         let written = SearchPathW(
-            std::ptr::null(), name_w.as_ptr(), ext_ptr,
-            needed, buf.as_mut_ptr(), std::ptr::null_mut(),
+            std::ptr::null(),
+            name_w.as_ptr(),
+            ext_ptr,
+            needed,
+            buf.as_mut_ptr(),
+            std::ptr::null_mut(),
         );
         if written == 0 || written >= needed {
             return None;
@@ -192,7 +222,9 @@ pub fn search_path_wide(name: &str, ext: Option<&str>) -> Option<String> {
 #[cfg(windows)]
 fn resolve_claude_path() -> Option<String> {
     if let Ok(val) = std::env::var("COKAC_CLAUDE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() { return Some(val); }
+        if !val.is_empty() && std::path::Path::new(&val).exists() {
+            return Some(val);
+        }
     }
 
     // Use SearchPathW (UTF-16 native) — no code page issues with non-ASCII paths
@@ -204,10 +236,7 @@ fn resolve_claude_path() -> Option<String> {
     }
 
     // Fallback: check npm global install paths
-    if let Ok(output) = Command::new("cmd")
-        .args(["/c", "npm root -g"])
-        .output()
-    {
+    if let Ok(output) = Command::new("cmd").args(["/c", "npm root -g"]).output() {
         if output.status.success() {
             let npm_root = decode_windows_output(&output.stdout).trim().to_string();
             let claude_path = std::path::Path::new(&npm_root)
@@ -234,7 +263,10 @@ fn get_claude_path() -> Option<&'static str> {
 /// (e.g., launchd services, cron, non-interactive SSH sessions).
 pub fn enhanced_path_for_bin(bin_path: &str) -> String {
     let current = std::env::var("PATH").unwrap_or_default();
-    if let Some(parent) = std::path::Path::new(bin_path).parent().and_then(|p| p.to_str()) {
+    if let Some(parent) = std::path::Path::new(bin_path)
+        .parent()
+        .and_then(|p| p.to_str())
+    {
         if !parent.is_empty() {
             let sep = if cfg!(windows) { ';' } else { ':' };
             if !current.split(sep).any(|p| p == parent) {
@@ -251,7 +283,9 @@ pub fn debug_log(msg: &str) {
 }
 
 pub fn debug_log_to(filename: &str, msg: &str) {
-    if !DEBUG_ENABLED.load(Ordering::Relaxed) { return; }
+    if !DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(home) = dirs::home_dir() {
         let debug_dir = home.join(".cokacdir").join("debug");
         let _ = std::fs::create_dir_all(&debug_dir);
@@ -288,11 +322,23 @@ pub enum StreamMessage {
     /// Tool execution result
     ToolResult { content: String, is_error: bool },
     /// Background task notification
-    TaskNotification { task_id: String, status: String, summary: String },
+    TaskNotification {
+        task_id: String,
+        status: String,
+        summary: String,
+    },
     /// Completion
-    Done { result: String, session_id: Option<String> },
+    Done {
+        result: String,
+        session_id: Option<String>,
+    },
     /// Error
-    Error { message: String, stdout: String, stderr: String, exit_code: Option<i32> },
+    Error {
+        message: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// Token for cooperative cancellation of streaming requests.
@@ -370,7 +416,9 @@ impl CancelToken {
         let guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pid) = *guard {
             #[cfg(unix)]
-            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
             #[cfg(windows)]
             {
                 let _ = std::process::Command::new("taskkill")
@@ -458,7 +506,9 @@ pub fn kill_child_tree(child: &mut std::process::Child) {
     }
     #[cfg(not(windows))]
     {
-        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
     }
 }
 
@@ -481,9 +531,23 @@ fn is_valid_session_id(session_id: &str) -> bool {
 
 /// Default allowed tools for Claude CLI
 pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
-    "Bash", "Read", "Edit", "Write", "Glob", "Grep", "Task", "TaskOutput",
-    "TaskStop", "WebFetch", "WebSearch", "NotebookEdit", "Skill",
-    "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "Task",
+    "TaskOutput",
+    "TaskStop",
+    "WebFetch",
+    "WebSearch",
+    "NotebookEdit",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskUpdate",
+    "TaskList",
 ];
 
 /// Execute a command using Claude CLI
@@ -539,10 +603,14 @@ IMPORTANT: Format your responses using Markdown for better readability:
     struct SpFileGuard(Option<std::path::PathBuf>);
     impl Drop for SpFileGuard {
         fn drop(&mut self) {
-            if let Some(ref p) = self.0 { let _ = std::fs::remove_file(p); }
+            if let Some(ref p) = self.0 {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
-    let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+    let sp_dir = dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cokacdir");
     let _ = std::fs::create_dir_all(&sp_dir);
     let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
     if let Err(e) = std::fs::write(&sp_path, default_system_prompt) {
@@ -594,9 +662,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .current_dir(working_dir)
         .env("PATH", enhanced_path_for_bin(claude_bin))
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000")  // 24 hours (no practical timeout)
-        .env("BASH_MAX_TIMEOUT_MS", "86400000")      // 24 hours (no practical timeout)
-        .env_remove("CLAUDECODE")  // Allow running from within Claude Code sessions
+        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env("BASH_MAX_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -608,7 +676,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 success: false,
                 response: None,
                 session_id: None,
-                error: Some(format!("Failed to start Claude: {}. Is Claude CLI installed?", e)),
+                error: Some(format!(
+                    "Failed to start Claude: {}. Is Claude CLI installed?",
+                    e
+                )),
             };
         }
     };
@@ -689,7 +760,11 @@ fn parse_claude_output(output: &str) -> ClaudeResponse {
 /// Extract a context summary from an existing session for scheduled task isolation.
 /// Forks the session, asks Claude to summarize the context relevant to the schedule prompt,
 /// and returns the summary text (not a session_id).
-pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_dir: &str) -> Result<String, String> {
+pub fn extract_context_summary(
+    session_id: &str,
+    schedule_prompt: &str,
+    working_dir: &str,
+) -> Result<String, String> {
     debug_log("=== extract_context_summary START ===");
     debug_log(&format!("  session_id: {}", session_id));
     debug_log(&format!("  schedule_prompt: {}", schedule_prompt));
@@ -701,20 +776,22 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
     }
     debug_log("  session_id validation: OK");
 
-    let claude_bin = get_claude_path()
-        .ok_or_else(|| {
-            debug_log("  ERROR: Claude CLI not found");
-            "Claude CLI not found".to_string()
-        })?;
+    let claude_bin = get_claude_path().ok_or_else(|| {
+        debug_log("  ERROR: Claude CLI not found");
+        "Claude CLI not found".to_string()
+    })?;
     debug_log(&format!("  claude_bin: {}", claude_bin));
 
     let args = vec![
         "-p",
-        "--output-format", "json",
-        "--max-turns", "1",
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
         "--dangerously-skip-permissions",
         "--no-session-persistence",
-        "--resume", session_id,
+        "--resume",
+        session_id,
         "--fork-session",
     ];
     debug_log(&format!("  args: {:?}", args));
@@ -729,7 +806,10 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
          Keep it concise.",
         schedule_prompt
     );
-    debug_log(&format!("  summary_prompt len: {} chars", summary_prompt.len()));
+    debug_log(&format!(
+        "  summary_prompt len: {} chars",
+        summary_prompt.len()
+    ));
 
     debug_log("  Spawning Claude process...");
     let spawn_start = std::time::Instant::now();
@@ -746,7 +826,11 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
             debug_log(&format!("  ERROR: Failed to spawn: {}", e));
             format!("Failed to start Claude for context summary: {}", e)
         })?;
-    debug_log(&format!("  Process spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    debug_log(&format!(
+        "  Process spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     if let Some(mut stdin) = child.stdin.take() {
         debug_log("  Writing summary_prompt to stdin...");
@@ -760,12 +844,18 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
 
     debug_log("  Waiting for process to complete (wait_with_output)...");
     let wait_start = std::time::Instant::now();
-    let output = child.wait_with_output()
-        .map_err(|e| {
-            debug_log(&format!("  ERROR: wait_with_output failed after {:?}: {}", wait_start.elapsed(), e));
-            format!("Failed to read context summary output: {}", e)
-        })?;
-    debug_log(&format!("  Process completed in {:?}", wait_start.elapsed()));
+    let output = child.wait_with_output().map_err(|e| {
+        debug_log(&format!(
+            "  ERROR: wait_with_output failed after {:?}: {}",
+            wait_start.elapsed(),
+            e
+        ));
+        format!("Failed to read context summary output: {}", e)
+    })?;
+    debug_log(&format!(
+        "  Process completed in {:?}",
+        wait_start.elapsed()
+    ));
     debug_log(&format!("  exit status: {:?}", output.status));
     debug_log(&format!("  stdout len: {} bytes", output.stdout.len()));
     debug_log(&format!("  stderr len: {} bytes", output.stderr.len()));
@@ -773,11 +863,17 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        debug_log(&format!("  ERROR: Process failed. exit_code={:?}", output.status.code()));
+        debug_log(&format!(
+            "  ERROR: Process failed. exit_code={:?}",
+            output.status.code()
+        ));
         debug_log(&format!("  stderr: {}", safe_preview(&stderr, 500)));
         debug_log(&format!("  stdout: {}", safe_preview(&stdout, 500)));
-        return Err(format!("Context summary process failed (exit {:?}). stderr: {}",
-            output.status.code(), safe_preview(&stderr, 500)));
+        return Err(format!(
+            "Context summary process failed (exit {:?}). stderr: {}",
+            output.status.code(),
+            safe_preview(&stderr, 500)
+        ));
     }
     debug_log("  Process exit status: success");
 
@@ -786,16 +882,23 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
     debug_log(&format!("  stdout preview: {}", stdout_preview));
 
     let resp = parse_claude_output(&stdout);
-    debug_log(&format!("  parse_claude_output: success={}, response_len={:?}",
-        resp.success, resp.response.as_ref().map(|s| s.len())));
+    debug_log(&format!(
+        "  parse_claude_output: success={}, response_len={:?}",
+        resp.success,
+        resp.response.as_ref().map(|s| s.len())
+    ));
 
-    let result = resp.response
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            debug_log(&format!("  ERROR: Empty response. stderr: {}", safe_preview(&stderr, 500)));
-            format!("Context summary extraction returned empty. stderr: {}", safe_preview(&stderr, 500))
-        });
+    let result = resp.response.filter(|s| !s.is_empty()).ok_or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        debug_log(&format!(
+            "  ERROR: Empty response. stderr: {}",
+            safe_preview(&stderr, 500)
+        ));
+        format!(
+            "Context summary extraction returned empty. stderr: {}",
+            safe_preview(&stderr, 500)
+        )
+    });
 
     match &result {
         Ok(summary) => {
@@ -812,7 +915,11 @@ pub fn extract_context_summary(session_id: &str, schedule_prompt: &str, working_
 
 /// Resume an existing session to extract a result summary (no tools, max 1 turn).
 /// Used after cron execution to summarize results for the next run's context.
-pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option<&str>) -> Result<String, String> {
+pub fn extract_result_summary(
+    session_id: &str,
+    working_dir: &str,
+    model: Option<&str>,
+) -> Result<String, String> {
     debug_log("=== extract_result_summary START ===");
     debug_log(&format!("  session_id: {}", session_id));
     debug_log(&format!("  working_dir: {}", working_dir));
@@ -822,20 +929,22 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
         debug_log("  ERROR: Invalid session ID format");
         return Err("Invalid session ID format".to_string());
     }
-    let claude_bin = get_claude_path()
-        .ok_or_else(|| {
-            debug_log("  ERROR: Claude CLI not found");
-            "Claude CLI not found".to_string()
-        })?;
+    let claude_bin = get_claude_path().ok_or_else(|| {
+        debug_log("  ERROR: Claude CLI not found");
+        "Claude CLI not found".to_string()
+    })?;
     debug_log(&format!("  claude_bin: {}", claude_bin));
 
     let mut args = vec![
         "-p",
-        "--output-format", "json",
-        "--max-turns", "1",
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
         "--dangerously-skip-permissions",
         "--no-session-persistence",
-        "--resume", session_id,
+        "--resume",
+        session_id,
     ];
 
     let model_str;
@@ -864,7 +973,11 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
             debug_log(&format!("  ERROR: Failed to spawn: {}", e));
             format!("Failed to start Claude for result summary: {}", e)
         })?;
-    debug_log(&format!("  Process spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    debug_log(&format!(
+        "  Process spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     if let Some(mut stdin) = child.stdin.take() {
         debug_log("  Writing summary_prompt to stdin...");
@@ -878,12 +991,18 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
 
     debug_log("  Waiting for process to complete...");
     let wait_start = std::time::Instant::now();
-    let output = child.wait_with_output()
-        .map_err(|e| {
-            debug_log(&format!("  ERROR: wait_with_output failed after {:?}: {}", wait_start.elapsed(), e));
-            format!("Failed to read result summary output: {}", e)
-        })?;
-    debug_log(&format!("  Process completed in {:?}", wait_start.elapsed()));
+    let output = child.wait_with_output().map_err(|e| {
+        debug_log(&format!(
+            "  ERROR: wait_with_output failed after {:?}: {}",
+            wait_start.elapsed(),
+            e
+        ));
+        format!("Failed to read result summary output: {}", e)
+    })?;
+    debug_log(&format!(
+        "  Process completed in {:?}",
+        wait_start.elapsed()
+    ));
     debug_log(&format!("  exit status: {:?}", output.status));
     debug_log(&format!("  stdout len: {} bytes", output.stdout.len()));
     debug_log(&format!("  stderr len: {} bytes", output.stderr.len()));
@@ -891,11 +1010,17 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        debug_log(&format!("  ERROR: Process failed. exit_code={:?}", output.status.code()));
+        debug_log(&format!(
+            "  ERROR: Process failed. exit_code={:?}",
+            output.status.code()
+        ));
         debug_log(&format!("  stderr: {}", safe_preview(&stderr, 500)));
         debug_log(&format!("  stdout: {}", safe_preview(&stdout, 500)));
-        return Err(format!("Result summary process failed (exit {:?}). stderr: {}",
-            output.status.code(), safe_preview(&stderr, 500)));
+        return Err(format!(
+            "Result summary process failed (exit {:?}). stderr: {}",
+            output.status.code(),
+            safe_preview(&stderr, 500)
+        ));
     }
     debug_log("  Process exit status: success");
 
@@ -904,16 +1029,23 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
     debug_log(&format!("  stdout preview: {}", stdout_preview));
 
     let resp = parse_claude_output(&stdout);
-    debug_log(&format!("  parse_claude_output: success={}, response_len={:?}",
-        resp.success, resp.response.as_ref().map(|s| s.len())));
+    debug_log(&format!(
+        "  parse_claude_output: success={}, response_len={:?}",
+        resp.success,
+        resp.response.as_ref().map(|s| s.len())
+    ));
 
-    let result = resp.response
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            debug_log(&format!("  ERROR: Empty response. stderr: {}", safe_preview(&stderr, 500)));
-            format!("Result summary extraction returned empty. stderr: {}", safe_preview(&stderr, 500))
-        });
+    let result = resp.response.filter(|s| !s.is_empty()).ok_or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        debug_log(&format!(
+            "  ERROR: Empty response. stderr: {}",
+            safe_preview(&stderr, 500)
+        ));
+        format!(
+            "Result summary extraction returned empty. stderr: {}",
+            safe_preview(&stderr, 500)
+        )
+    });
 
     match &result {
         Ok(summary) => {
@@ -930,7 +1062,11 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
 
 /// Verify whether a session's task has been fully completed.
 /// Forks the session, asks Claude to judge completeness, and returns the result.
-pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&str>) -> Result<VerifyResult, String> {
+pub fn verify_completion(
+    session_id: &str,
+    working_dir: &str,
+    effort: Option<&str>,
+) -> Result<VerifyResult, String> {
     debug_log("=== verify_completion START ===");
     debug_log(&format!("  session_id: {}", session_id));
     debug_log(&format!("  working_dir: {}", working_dir));
@@ -940,19 +1076,20 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
         return Err("Invalid session ID format".to_string());
     }
 
-    let claude_bin = get_claude_path()
-        .ok_or_else(|| {
-            debug_log("  ERROR: Claude CLI not found");
-            "Claude CLI not found".to_string()
-        })?;
+    let claude_bin = get_claude_path().ok_or_else(|| {
+        debug_log("  ERROR: Claude CLI not found");
+        "Claude CLI not found".to_string()
+    })?;
     debug_log(&format!("  claude_bin: {}", claude_bin));
 
     let mut args = vec![
         "-p".to_string(),
         "--dangerously-skip-permissions".to_string(),
         "--no-session-persistence".to_string(),
-        "--max-turns".to_string(), "1".to_string(),
-        "--tools".to_string(), "".to_string(),
+        "--max-turns".to_string(),
+        "1".to_string(),
+        "--tools".to_string(),
+        "".to_string(),
     ];
     if let Some(effort) = effort {
         args.push("--effort".to_string());
@@ -1005,7 +1142,11 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
             debug_log(&format!("  ERROR: Failed to spawn: {}", e));
             format!("Failed to start Claude for verify_completion: {}", e)
         })?;
-    debug_log(&format!("  Process spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    debug_log(&format!(
+        "  Process spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     if let Some(mut stdin) = child.stdin.take() {
         debug_log("  Writing verify_prompt to stdin...");
@@ -1019,12 +1160,18 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
 
     debug_log("  Waiting for process to complete...");
     let wait_start = std::time::Instant::now();
-    let output = child.wait_with_output()
-        .map_err(|e| {
-            debug_log(&format!("  ERROR: wait_with_output failed after {:?}: {}", wait_start.elapsed(), e));
-            format!("Failed to read verify_completion output: {}", e)
-        })?;
-    debug_log(&format!("  Process completed in {:?}", wait_start.elapsed()));
+    let output = child.wait_with_output().map_err(|e| {
+        debug_log(&format!(
+            "  ERROR: wait_with_output failed after {:?}: {}",
+            wait_start.elapsed(),
+            e
+        ));
+        format!("Failed to read verify_completion output: {}", e)
+    })?;
+    debug_log(&format!(
+        "  Process completed in {:?}",
+        wait_start.elapsed()
+    ));
     debug_log(&format!("  exit status: {:?}", output.status));
     debug_log(&format!("  stdout len: {} bytes", output.stdout.len()));
     debug_log(&format!("  stderr len: {} bytes", output.stderr.len()));
@@ -1032,11 +1179,17 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        debug_log(&format!("  ERROR: Process failed. exit_code={:?}", output.status.code()));
+        debug_log(&format!(
+            "  ERROR: Process failed. exit_code={:?}",
+            output.status.code()
+        ));
         debug_log(&format!("  stderr: {}", safe_preview(&stderr, 500)));
         debug_log(&format!("  stdout: {}", safe_preview(&stdout, 500)));
-        return Err(format!("verify_completion process failed (exit {:?}). stderr: {}",
-            output.status.code(), safe_preview(&stderr, 500)));
+        return Err(format!(
+            "verify_completion process failed (exit {:?}). stderr: {}",
+            output.status.code(),
+            safe_preview(&stderr, 500)
+        ));
     }
     debug_log("  Process exit status: success");
 
@@ -1046,8 +1199,16 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
 
     if response_text.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        debug_log(&format!("  ERROR: Empty response. exit={:?}, stderr: {}", output.status.code(), safe_preview(&stderr, 500)));
-        return Err(format!("verify_completion returned empty (exit {:?}). stderr: {}", output.status.code(), safe_preview(&stderr, 500)));
+        debug_log(&format!(
+            "  ERROR: Empty response. exit={:?}, stderr: {}",
+            output.status.code(),
+            safe_preview(&stderr, 500)
+        ));
+        return Err(format!(
+            "verify_completion returned empty (exit {:?}). stderr: {}",
+            output.status.code(),
+            safe_preview(&stderr, 500)
+        ));
     }
 
     // Treat as complete only when "mission_complete" is present AND
@@ -1065,11 +1226,18 @@ pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&st
             .replace("mission_pending", "")
             .replace("mission_complete", "");
         let cleaned = cleaned.trim();
-        if cleaned.is_empty() { None } else { Some(cleaned.to_string()) }
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
     };
 
-    debug_log(&format!("  complete={}, feedback={:?}",
-        complete, feedback.as_ref().map(|s| safe_preview(s, 200))));
+    debug_log(&format!(
+        "  complete={}, feedback={:?}",
+        complete,
+        feedback.as_ref().map(|s| safe_preview(s, 200))
+    ));
     debug_log("=== verify_completion END ===");
 
     Ok(VerifyResult { complete, feedback })
@@ -1089,14 +1257,17 @@ pub fn is_claude_available() -> bool {
 
 /// Check if a model string refers to the Claude backend
 pub fn is_claude_model(model: Option<&str>) -> bool {
-    model.map(|m| m == "claude" || m.starts_with("claude:")).unwrap_or(false)
+    model
+        .map(|m| m == "claude" || m.starts_with("claude:"))
+        .unwrap_or(false)
 }
 
 /// Strip "claude:" prefix and return the actual model name.
 /// Returns None if the input is just "claude" (use CLI default).
 /// Also strips display-name suffix (" — Description") if present.
 pub fn strip_claude_prefix(model: &str) -> Option<&str> {
-    model.strip_prefix("claude:")
+    model
+        .strip_prefix("claude:")
         .filter(|s| !s.is_empty())
         .map(|s| s.split(" \u{2014} ").next().unwrap_or(s).trim())
 }
@@ -1184,19 +1355,27 @@ IMPORTANT: Format your responses using Markdown for better readability:
     struct SpFileGuard(Option<std::path::PathBuf>);
     impl Drop for SpFileGuard {
         fn drop(&mut self) {
-            if let Some(ref p) = self.0 { let _ = std::fs::remove_file(p); }
+            if let Some(ref p) = self.0 {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
     let mut _sp_guard = SpFileGuard(None);
     if let Some(sp) = effective_prompt {
-        let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+        let sp_dir = dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".cokacdir");
         let _ = std::fs::create_dir_all(&sp_dir);
         let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
         std::fs::write(&sp_path, sp).map_err(|e| {
             debug_log(&format!("ERROR: Failed to write system prompt file: {}", e));
             format!("Failed to write system prompt file: {}", e)
         })?;
-        debug_log(&format!("System prompt written to {:?} ({} bytes)", sp_path, sp.len()));
+        debug_log(&format!(
+            "System prompt written to {:?} ({} bytes)",
+            sp_path,
+            sp.len()
+        ));
         args.push("--append-system-prompt-file".to_string());
         args.push(sp_path.to_string_lossy().to_string());
         _sp_guard = SpFileGuard(Some(sp_path));
@@ -1233,11 +1412,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
         args.push(sid.to_string());
     }
 
-    let claude_bin = get_claude_path()
-        .ok_or_else(|| {
-            debug_log("ERROR: Claude CLI not found");
-            "Claude CLI not found. Is Claude CLI installed?".to_string()
-        })?;
+    let claude_bin = get_claude_path().ok_or_else(|| {
+        debug_log("ERROR: Claude CLI not found");
+        "Claude CLI not found. Is Claude CLI installed?".to_string()
+    })?;
 
     debug_log("--- Spawning claude process ---");
     debug_log(&format!("Command: {}", claude_bin));
@@ -1245,7 +1423,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
     for (i, arg) in args.iter().enumerate() {
         if arg.len() > 100 {
             let truncated: String = arg.chars().take(100).collect();
-            debug_log(&format!("  arg[{}]: {}... (truncated, {} chars total)", i, truncated, arg.len()));
+            debug_log(&format!(
+                "  arg[{}]: {}... (truncated, {} chars total)",
+                i,
+                truncated,
+                arg.len()
+            ));
         } else {
             debug_log(&format!("  arg[{}]: {}", i, arg));
         }
@@ -1260,21 +1443,27 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .current_dir(working_dir)
         .env("PATH", enhanced_path_for_bin(claude_bin))
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000")  // 24 hours (no practical timeout)
-        .env("BASH_MAX_TIMEOUT_MS", "86400000")      // 24 hours (no practical timeout)
-        .env_remove("CLAUDECODE")  // Allow running from within Claude Code sessions
+        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env("BASH_MAX_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
+        .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     detach_into_own_pgroup(&mut cmd);
     attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| {
-            debug_log(&format!("ERROR: Failed to spawn after {:?}: {}", spawn_start.elapsed(), e));
-            format!("Failed to start Claude: {}. Is Claude CLI installed?", e)
-        })?;
-    debug_log(&format!("Claude process spawned successfully in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
+    let mut child = cmd.spawn().map_err(|e| {
+        debug_log(&format!(
+            "ERROR: Failed to spawn after {:?}: {}",
+            spawn_start.elapsed(),
+            e
+        ));
+        format!("Failed to start Claude: {}. Is Claude CLI installed?", e)
+    })?;
+    debug_log(&format!(
+        "Claude process spawned successfully in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
 
     // Store child PID in cancel token so the caller can kill it externally.
     // Recover from a poisoned mutex (a prior holder panicked) instead of
@@ -1294,10 +1483,17 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
-        debug_log(&format!("Writing prompt to stdin ({} bytes)...", prompt.len()));
+        debug_log(&format!(
+            "Writing prompt to stdin ({} bytes)...",
+            prompt.len()
+        ));
         let write_start = std::time::Instant::now();
         let write_result = stdin.write_all(prompt.as_bytes());
-        debug_log(&format!("stdin.write_all completed in {:?}, result={:?}", write_start.elapsed(), write_result.is_ok()));
+        debug_log(&format!(
+            "stdin.write_all completed in {:?}, result={:?}",
+            write_start.elapsed(),
+            write_result.is_ok()
+        ));
         // stdin is dropped here, which closes it - this signals end of input to claude
         debug_log("stdin handle dropped (closed)");
     } else {
@@ -1307,18 +1503,17 @@ IMPORTANT: Format your responses using Markdown for better readability:
     // Drain stderr in a background thread to prevent deadlock: if the child
     // writes more than the OS pipe buffer (~64KB) to stderr while we're
     // blocked reading stdout, the child's stderr write blocks and the whole
-    // pipeline hangs. Mirrors the pattern in codex.rs / gemini.rs.
+    // pipeline hangs. Mirrors the pattern in codex.rs / agy.rs.
     let stderr_thread = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
     });
 
     // Read stdout line by line for streaming
     debug_log("Taking stdout handle...");
-    let stdout = child.stdout.take()
-        .ok_or_else(|| {
-            debug_log("ERROR: Failed to capture stdout");
-            "Failed to capture stdout".to_string()
-        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        debug_log("ERROR: Failed to capture stdout");
+        "Failed to capture stdout".to_string()
+    })?;
     let reader = BufReader::new(stdout);
     debug_log("BufReader created, ready to read lines...");
 
@@ -1342,14 +1537,20 @@ IMPORTANT: Format your responses using Markdown for better readability:
         debug_log(&format!("Line {} - read started", line_count + 1));
         let line = match line {
             Ok(l) => {
-                debug_log(&format!("Line {} - read completed: {} chars", line_count + 1, l.len()));
+                debug_log(&format!(
+                    "Line {} - read completed: {} chars",
+                    line_count + 1,
+                    l.len()
+                ));
                 l
-            },
+            }
             Err(e) => {
                 debug_log(&format!("ERROR: Failed to read line: {}", e));
                 let _ = sender.send(StreamMessage::Error {
                     message: format!("Failed to read output: {}", e),
-                    stdout: String::new(), stderr: String::new(), exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
                 });
                 break;
             }
@@ -1367,9 +1568,15 @@ IMPORTANT: Format your responses using Markdown for better readability:
         debug_log(&format!("  Raw line preview: {}", line_preview));
 
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let msg_type = json
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let msg_subtype = json.get("subtype").and_then(|v| v.as_str()).unwrap_or("-");
-            debug_log(&format!("  JSON parsed: type={}, subtype={}", msg_type, msg_subtype));
+            debug_log(&format!(
+                "  JSON parsed: type={}, subtype={}",
+                msg_type, msg_subtype
+            ));
 
             // Log more details for specific message types
             if msg_type == "assistant" {
@@ -1380,7 +1587,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
             debug_log("  Calling parse_stream_message...");
             if let Some(msg) = parse_stream_message(&json) {
-                debug_log(&format!("  Parsed message variant: {:?}", std::mem::discriminant(&msg)));
+                debug_log(&format!(
+                    "  Parsed message variant: {:?}",
+                    std::mem::discriminant(&msg)
+                ));
 
                 // Track session_id and final result for Done message
                 match &msg {
@@ -1390,21 +1600,36 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     }
                     StreamMessage::Text { content } => {
                         let preview: String = content.chars().take(100).collect();
-                        debug_log(&format!("  >>> Text: {} chars, preview: {:?}", content.len(), preview));
+                        debug_log(&format!(
+                            "  >>> Text: {} chars, preview: {:?}",
+                            content.len(),
+                            preview
+                        ));
                     }
                     StreamMessage::ToolUse { name, input } => {
                         let input_preview: String = input.chars().take(200).collect();
-                        debug_log(&format!("  >>> ToolUse: name={}, input_preview={:?}", name, input_preview));
+                        debug_log(&format!(
+                            "  >>> ToolUse: name={}, input_preview={:?}",
+                            name, input_preview
+                        ));
                     }
                     StreamMessage::ToolResult { content, is_error } => {
                         let content_preview: String = content.chars().take(200).collect();
-                        debug_log(&format!("  >>> ToolResult: is_error={}, content_len={}, preview={:?}",
-                            is_error, content.len(), content_preview));
+                        debug_log(&format!(
+                            "  >>> ToolResult: is_error={}, content_len={}, preview={:?}",
+                            is_error,
+                            content.len(),
+                            content_preview
+                        ));
                     }
                     StreamMessage::Done { result, session_id } => {
                         let result_preview: String = result.chars().take(100).collect();
-                        debug_log(&format!("  >>> Done: result_len={}, session_id={:?}, preview={:?}",
-                            result.len(), session_id, result_preview));
+                        debug_log(&format!(
+                            "  >>> Done: result_len={}, session_id={:?}, preview={:?}",
+                            result.len(),
+                            session_id,
+                            result_preview
+                        ));
                         final_result = Some(result.clone());
                         if session_id.is_some() {
                             last_session_id = session_id.clone();
@@ -1415,8 +1640,15 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         stdout_error = Some((message.clone(), line.clone()));
                         continue; // don't send yet; will combine with stderr after process exits
                     }
-                    StreamMessage::TaskNotification { task_id, status, summary } => {
-                        debug_log(&format!("  >>> TaskNotification: task_id={}, status={}, summary={}", task_id, status, summary));
+                    StreamMessage::TaskNotification {
+                        task_id,
+                        status,
+                        summary,
+                    } => {
+                        debug_log(&format!(
+                            "  >>> TaskNotification: task_id={}, status={}, summary={}",
+                            task_id, status, summary
+                        ));
                     }
                 }
 
@@ -1429,7 +1661,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 }
                 debug_log("  Message sent to channel successfully");
             } else {
-                debug_log(&format!("  parse_stream_message returned None for type={}", msg_type));
+                debug_log(&format!(
+                    "  parse_stream_message returned None for type={}",
+                    msg_type
+                ));
             }
         } else {
             let invalid_preview: String = line.chars().take(200).collect();
@@ -1456,11 +1691,19 @@ IMPORTANT: Format your responses using Markdown for better readability:
     debug_log("Waiting for child process to finish (child.wait())...");
     let wait_start = std::time::Instant::now();
     let status = child.wait().map_err(|e| {
-        debug_log(&format!("ERROR: Process wait failed after {:?}: {}", wait_start.elapsed(), e));
+        debug_log(&format!(
+            "ERROR: Process wait failed after {:?}: {}",
+            wait_start.elapsed(),
+            e
+        ));
         format!("Process error: {}", e)
     })?;
-    debug_log(&format!("Process finished in {:?}, status: {:?}, exit_code: {:?}",
-        wait_start.elapsed(), status, status.code()));
+    debug_log(&format!(
+        "Process finished in {:?}, status: {:?}, exit_code: {:?}",
+        wait_start.elapsed(),
+        status,
+        status.code()
+    ));
 
     // Handle stdout error or non-zero exit code
     if stdout_error.is_some() || !status.success() {
@@ -1472,10 +1715,17 @@ IMPORTANT: Format your responses using Markdown for better readability:
         let (message, stdout_raw) = if let Some((msg, raw)) = stdout_error {
             (msg, raw)
         } else {
-            (format!("Process exited with code {:?}", status.code()), String::new())
+            (
+                format!("Process exited with code {:?}", status.code()),
+                String::new(),
+            )
         };
 
-        debug_log(&format!("Sending error: message={}, exit_code={:?}", message, status.code()));
+        debug_log(&format!(
+            "Sending error: message={}, exit_code={:?}",
+            message,
+            status.code()
+        ));
         let _ = sender.send(StreamMessage::Error {
             message,
             stdout: stdout_raw,
@@ -1492,7 +1742,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
             result: String::new(),
             session_id: last_session_id.clone(),
         });
-        debug_log(&format!("Synthetic Done message sent, result={:?}", send_result.is_ok()));
+        debug_log(&format!(
+            "Synthetic Done message sent, result={:?}",
+            send_result.is_ok()
+        ));
     } else {
         debug_log("Done message was already received, not sending synthetic one");
     }
@@ -1518,21 +1771,28 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     Some(StreamMessage::Init { session_id })
                 }
                 "task_notification" => {
-                    let task_id = json.get("task_id")
+                    let task_id = json
+                        .get("task_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let status = json.get("status")
+                    let status = json
+                        .get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let summary = json.get("summary")
+                    let summary = json
+                        .get("summary")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    Some(StreamMessage::TaskNotification { task_id, status, summary })
+                    Some(StreamMessage::TaskNotification {
+                        task_id,
+                        status,
+                        summary,
+                    })
                 }
-                _ => None
+                _ => None,
             }
         }
         "assistant" => {
@@ -1549,7 +1809,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     }
                     "tool_use" => {
                         let name = item.get("name")?.as_str()?.to_string();
-                        let input = item.get("input")
+                        let input = item
+                            .get("input")
                             .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
                             .unwrap_or_default();
                         return Some(StreamMessage::ToolUse { name, input });
@@ -1567,7 +1828,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                 let item_type = item.get("type")?.as_str()?;
                 if item_type == "tool_result" {
                     // content can be a string or an array of text items
-                    let content_text = if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
+                    let content_text = if let Some(s) = item.get("content").and_then(|v| v.as_str())
+                    {
                         s.to_string()
                     } else if let Some(arr) = item.get("content").and_then(|v| v.as_array()) {
                         // Extract text from array: [{"type":"text","text":"..."},...]
@@ -1578,10 +1840,14 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     } else {
                         String::new()
                     };
-                    let is_error = item.get("is_error")
+                    let is_error = item
+                        .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    return Some(StreamMessage::ToolResult { content: content_text, is_error });
+                    return Some(StreamMessage::ToolResult {
+                        content: content_text,
+                        is_error,
+                    });
                 }
             }
             None
@@ -1589,7 +1855,8 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
         "result" => {
             // {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["..."]}
             // {"type":"result","subtype":"success","result":"...","session_id":"..."}
-            let is_error = json.get("is_error")
+            let is_error = json
+                .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if is_error {
@@ -1606,18 +1873,25 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
                     })
                     .or_else(|| result_raw.map(|s| s.to_string()))
                     .unwrap_or_else(|| "Unknown error".to_string());
-                return Some(StreamMessage::Error { message: error_msg, stdout: String::new(), stderr: String::new(), exit_code: None });
+                return Some(StreamMessage::Error {
+                    message: error_msg,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
             }
-            let result = json.get("result")
+            let result = json
+                .get("result")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let session_id = json.get("session_id")
+            let session_id = json
+                .get("session_id")
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(StreamMessage::Done { result, session_id })
         }
-        _ => None
+        _ => None,
     }
 }
 
@@ -1743,7 +2017,10 @@ mod tests {
         let response = parse_claude_output(output);
 
         assert!(response.success);
-        assert_eq!(response.response, Some("Just plain text response".to_string()));
+        assert_eq!(
+            response.response,
+            Some("Just plain text response".to_string())
+        );
     }
 
     #[test]
@@ -1790,9 +2067,9 @@ mod tests {
 
     #[test]
     fn test_parse_stream_message_init() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"system","subtype":"init","session_id":"test-123"}"#
-        ).unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"system","subtype":"init","session_id":"test-123"}"#)
+                .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Init { session_id }) => {
@@ -1805,8 +2082,9 @@ mod tests {
     #[test]
     fn test_parse_stream_message_text() {
         let json: Value = serde_json::from_str(
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#
-        ).unwrap();
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello world"}]}}"#,
+        )
+        .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Text { content }) => {
@@ -1864,8 +2142,9 @@ mod tests {
     #[test]
     fn test_parse_stream_message_result() {
         let json: Value = serde_json::from_str(
-            r#"{"type":"result","subtype":"success","result":"Done!","session_id":"sess-456"}"#
-        ).unwrap();
+            r#"{"type":"result","subtype":"success","result":"Done!","session_id":"sess-456"}"#,
+        )
+        .unwrap();
 
         match parse_stream_message(&json) {
             Some(StreamMessage::Done { result, session_id }) => {
@@ -1878,9 +2157,7 @@ mod tests {
 
     #[test]
     fn test_parse_stream_message_unknown_type() {
-        let json: Value = serde_json::from_str(
-            r#"{"type":"unknown","data":"something"}"#
-        ).unwrap();
+        let json: Value = serde_json::from_str(r#"{"type":"unknown","data":"something"}"#).unwrap();
 
         let msg = parse_stream_message(&json);
         assert!(msg.is_none());

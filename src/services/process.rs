@@ -32,7 +32,8 @@ pub fn is_valid_session_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('-')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Protected PIDs that should never be killed
@@ -65,7 +66,10 @@ fn is_protected_pid(pid: i32, command: Option<&str>) -> Result<(), String> {
 
     // Warn about low PIDs (likely kernel threads)
     if pid < MIN_SAFE_PID {
-        return Err(format!("Cannot kill low PID ({}) - likely a kernel thread", pid));
+        return Err(format!(
+            "Cannot kill low PID ({}) - likely a kernel thread",
+            pid
+        ));
     }
 
     // Check if command indicates kernel thread
@@ -108,7 +112,9 @@ pub fn get_process_list_result() -> ProcessListResult {
 
     // Sort by CPU usage descending by default
     processes.sort_by(|a, b| {
-        b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)
+        b.cpu
+            .partial_cmp(&a.cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     Ok(processes)
@@ -179,20 +185,23 @@ fn parse_tasklist_csv_line(line: &str) -> Option<ProcessInfo> {
     }
 
     let pid = fields[1].parse::<i32>().ok()?;
-    let mem_str = fields[4].replace(" K", "").replace(",", "").replace("\"", "");
+    let mem_str = fields[4]
+        .replace(" K", "")
+        .replace(",", "")
+        .replace("\"", "");
     let rss = mem_str.trim().parse::<u64>().unwrap_or(0);
 
     Some(ProcessInfo {
         pid,
         user: fields[6].to_string(),
-        cpu: 0.0,  // tasklist doesn't provide CPU%
+        cpu: 0.0, // tasklist doesn't provide CPU%
         mem: 0.0,
         vsz: 0,
         rss,
         tty: fields[2].to_string(),  // Session Name
         stat: fields[5].to_string(), // Status
         start: String::new(),
-        time: fields[7].to_string(), // CPU Time
+        time: fields[7].to_string(),    // CPU Time
         command: fields[0].to_string(), // Image Name
     })
 }
@@ -323,7 +332,10 @@ pub fn force_kill_process(pid: i32) -> Result<(), String> {
 
 /// Force kill a process by PID (SIGKILL) with optional starttime verification
 #[cfg(unix)]
-pub fn force_kill_process_with_verification(pid: i32, starttime: Option<u64>) -> Result<(), String> {
+pub fn force_kill_process_with_verification(
+    pid: i32,
+    starttime: Option<u64>,
+) -> Result<(), String> {
     if !is_valid_pid(pid) {
         return Err("Invalid PID".to_string());
     }
@@ -351,7 +363,10 @@ pub fn force_kill_process_with_verification(pid: i32, starttime: Option<u64>) ->
 }
 
 #[cfg(windows)]
-pub fn force_kill_process_with_verification(pid: i32, _starttime: Option<u64>) -> Result<(), String> {
+pub fn force_kill_process_with_verification(
+    pid: i32,
+    _starttime: Option<u64>,
+) -> Result<(), String> {
     if !is_valid_pid(pid) {
         return Err("Invalid PID".to_string());
     }
@@ -403,7 +418,8 @@ fn get_process_command(pid: i32) -> Option<String> {
         None
     } else {
         // First field is the image name
-        line.split(',').next()
+        line.split(',')
+            .next()
             .map(|s| s.trim_matches('"').to_string())
     }
 }

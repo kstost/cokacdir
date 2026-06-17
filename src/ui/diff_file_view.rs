@@ -40,14 +40,14 @@ pub struct DiffFileViewState {
     pub left_path: PathBuf,
     pub right_path: PathBuf,
     pub diff_lines: Vec<DiffLine>,
-    pub scroll: usize,            // visual row offset (0-based)
+    pub scroll: usize, // visual row offset (0-based)
     pub visible_height: usize,
     pub left_total_lines: usize,
     pub right_total_lines: usize,
     pub change_positions: Vec<usize>,
     pub current_change: usize,
     pub file_name: String,
-    pub max_scroll: usize,        // max visual row offset
+    pub max_scroll: usize,                 // max visual row offset
     pub change_visual_offsets: Vec<usize>, // visual row offset for each change_positions entry
 }
 
@@ -265,6 +265,38 @@ fn emit_gap(
 
 impl DiffFileViewState {
     pub fn new(left_path: PathBuf, right_path: PathBuf, file_name: String) -> Self {
+        // Guard against reading multi-GB files fully into memory (the text path below
+        // also duplicates the contents several times). Mirror the file viewer's cap.
+        const MAX_DIFF_FILE_BYTES: u64 = 100 * 1024 * 1024;
+        let file_too_large = |p: &PathBuf| {
+            fs::metadata(p)
+                .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
+                .unwrap_or(false)
+        };
+        if file_too_large(&left_path) || file_too_large(&right_path) {
+            let diff_lines = vec![DiffLine {
+                left_line_no: None,
+                left_content: Some("File too large to diff".to_string()),
+                right_line_no: None,
+                right_content: Some("File too large to diff".to_string()),
+                line_status: DiffLineStatus::Same,
+            }];
+            return Self {
+                left_path,
+                right_path,
+                diff_lines,
+                scroll: 0,
+                visible_height: 0,
+                left_total_lines: 0,
+                right_total_lines: 0,
+                change_positions: Vec::new(),
+                current_change: 0,
+                file_name,
+                max_scroll: 0,
+                change_visual_offsets: Vec::new(),
+            };
+        }
+
         let left_data = fs::read(&left_path).ok();
         let right_data = fs::read(&right_path).ok();
 
@@ -379,7 +411,13 @@ impl DiffFileViewState {
 // Drawing
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
+pub fn draw(
+    frame: &mut Frame,
+    state: &mut DiffFileViewState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     if area.height < 4 {
         return;
     }
@@ -388,7 +426,7 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Header
+            Constraint::Length(1), // Header
             Constraint::Min(3),    // Content
             Constraint::Length(1), // StatusBar
             Constraint::Length(1), // FunctionBar
@@ -411,17 +449,14 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
             .fg(theme.diff_file_view.header_text)
             .bg(theme.diff_file_view.bg),
     ));
-    let header_paragraph = Paragraph::new(header_line)
-        .style(Style::default().bg(theme.diff_file_view.bg));
+    let header_paragraph =
+        Paragraph::new(header_line).style(Style::default().bg(theme.diff_file_view.bg));
     frame.render_widget(header_paragraph, header_area);
 
     // ─── Content: split 50:50 horizontal ────────────────────────────────────
     let content_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(content_area);
 
     let left_area = content_layout[0];
@@ -480,13 +515,17 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
     state.max_scroll = total_visual_rows.saturating_sub(visible_lines);
 
     // Compute change_visual_offsets for n/p navigation
-    state.change_visual_offsets = state.change_positions.iter().map(|&pos| {
-        if pos < visual_row_offsets.len() {
-            visual_row_offsets[pos]
-        } else {
-            0
-        }
-    }).collect();
+    state.change_visual_offsets = state
+        .change_positions
+        .iter()
+        .map(|&pos| {
+            if pos < visual_row_offsets.len() {
+                visual_row_offsets[pos]
+            } else {
+                0
+            }
+        })
+        .collect();
 
     // Clamp scroll
     if state.scroll > state.max_scroll {
@@ -511,7 +550,9 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
         }
         lo
     };
-    let skip_rows = state.scroll.saturating_sub(visual_row_offsets[start_logical]);
+    let skip_rows = state
+        .scroll
+        .saturating_sub(visual_row_offsets[start_logical]);
 
     // Build left and right display lines
     let mut left_lines_display: Vec<Line> = Vec::with_capacity(visible_lines);
@@ -531,8 +572,13 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
         let diff_line = &state.diff_lines[logical_idx];
         let is_current_change = current_change_pos == Some(logical_idx);
         let rows = render_diff_line(
-            diff_line, line_no_width, left_inner_width,
-            right_area.width as usize, wrap_width, theme, is_current_change,
+            diff_line,
+            line_no_width,
+            left_inner_width,
+            right_area.width as usize,
+            wrap_width,
+            theme,
+            is_current_change,
         );
         let rows_to_skip = if first_line { skip_rows } else { 0 };
         first_line = false;
@@ -579,8 +625,9 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
     // Scrollbar
     if total_visual_rows > visible_lines {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let mut scrollbar_state = ScrollbarState::new(total_visual_rows.saturating_sub(visible_lines))
-            .position(state.scroll);
+        let mut scrollbar_state =
+            ScrollbarState::new(total_visual_rows.saturating_sub(visible_lines))
+                .position(state.scroll);
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }
 
@@ -605,8 +652,8 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
             .fg(theme.diff_file_view.status_bar_text)
             .bg(theme.diff_file_view.status_bar_bg),
     ));
-    let status_paragraph = Paragraph::new(status_line)
-        .style(Style::default().bg(theme.diff_file_view.status_bar_bg));
+    let status_paragraph =
+        Paragraph::new(status_line).style(Style::default().bg(theme.diff_file_view.status_bar_bg));
     frame.render_widget(status_paragraph, status_area);
 
     // ─── FunctionBar (keybindings에서 동적으로) ────────────────────────────
@@ -618,11 +665,31 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
         .fg(theme.diff_file_view.footer_text)
         .bg(theme.diff_file_view.bg);
     let shortcuts: Vec<(String, &str)> = vec![
-        (kb.diff_file_view_first_key(DiffFileViewAction::MoveUp).to_string(), "scroll "),
-        (kb.diff_file_view_first_key(DiffFileViewAction::PageUp).to_string(), "page "),
-        (kb.diff_file_view_first_key(DiffFileViewAction::NextChange).to_string(), "next "),
-        (kb.diff_file_view_first_key(DiffFileViewAction::PrevChange).to_string(), "prev "),
-        (kb.diff_file_view_first_key(DiffFileViewAction::Close).to_string(), "back"),
+        (
+            kb.diff_file_view_first_key(DiffFileViewAction::MoveUp)
+                .to_string(),
+            "scroll ",
+        ),
+        (
+            kb.diff_file_view_first_key(DiffFileViewAction::PageUp)
+                .to_string(),
+            "page ",
+        ),
+        (
+            kb.diff_file_view_first_key(DiffFileViewAction::NextChange)
+                .to_string(),
+            "next ",
+        ),
+        (
+            kb.diff_file_view_first_key(DiffFileViewAction::PrevChange)
+                .to_string(),
+            "prev ",
+        ),
+        (
+            kb.diff_file_view_first_key(DiffFileViewAction::Close)
+                .to_string(),
+            "back",
+        ),
     ];
     let mut fn_spans = Vec::new();
     for (key, label) in &shortcuts {
@@ -631,8 +698,7 @@ pub fn draw(frame: &mut Frame, state: &mut DiffFileViewState, area: Rect, theme:
         fn_spans.push(Span::styled(*label, text_style));
     }
     let fn_line = Line::from(fn_spans);
-    let fn_paragraph = Paragraph::new(fn_line)
-        .style(Style::default().bg(theme.diff_file_view.bg));
+    let fn_paragraph = Paragraph::new(fn_line).style(Style::default().bg(theme.diff_file_view.bg));
     frame.render_widget(fn_paragraph, function_area);
 }
 
@@ -656,38 +722,45 @@ fn render_diff_line<'a>(
             (s, s, false, false)
         }
         DiffLineStatus::Modified => {
-            let s = Style::default().fg(colors.modified_text).bg(colors.modified_bg);
+            let s = Style::default()
+                .fg(colors.modified_text)
+                .bg(colors.modified_bg);
             (s, s, false, false)
         }
         DiffLineStatus::LeftOnly => {
-            let ls = Style::default().fg(colors.left_only_text).bg(colors.left_only_bg);
+            let ls = Style::default()
+                .fg(colors.left_only_text)
+                .bg(colors.left_only_bg);
             let rs = Style::default().bg(colors.empty_bg);
             (ls, rs, false, true)
         }
         DiffLineStatus::RightOnly => {
             let ls = Style::default().bg(colors.empty_bg);
-            let rs = Style::default().fg(colors.right_only_text).bg(colors.right_only_bg);
+            let rs = Style::default()
+                .fg(colors.right_only_text)
+                .bg(colors.right_only_bg);
             (ls, rs, true, false)
         }
     };
 
-    let line_no_style = Style::default().fg(colors.line_number).bg(
-        match diff_line.line_status {
+    let line_no_style = Style::default()
+        .fg(colors.line_number)
+        .bg(match diff_line.line_status {
             DiffLineStatus::Same => colors.bg,
             DiffLineStatus::Modified => colors.modified_bg,
             DiffLineStatus::LeftOnly => colors.left_only_bg,
             DiffLineStatus::RightOnly => colors.empty_bg,
-        },
-    );
+        });
 
-    let line_no_style_right = Style::default().fg(colors.line_number).bg(
-        match diff_line.line_status {
-            DiffLineStatus::Same => colors.bg,
-            DiffLineStatus::Modified => colors.modified_bg,
-            DiffLineStatus::LeftOnly => colors.empty_bg,
-            DiffLineStatus::RightOnly => colors.right_only_bg,
-        },
-    );
+    let line_no_style_right =
+        Style::default()
+            .fg(colors.line_number)
+            .bg(match diff_line.line_status {
+                DiffLineStatus::Same => colors.bg,
+                DiffLineStatus::Modified => colors.modified_bg,
+                DiffLineStatus::LeftOnly => colors.empty_bg,
+                DiffLineStatus::RightOnly => colors.right_only_bg,
+            });
 
     // Current change marker
     let marker = if is_current_change { "\u{25B6}" } else { " " };
@@ -711,8 +784,10 @@ fn render_diff_line<'a>(
     if diff_line.line_status == DiffLineStatus::Modified {
         let lc = diff_line.left_content.as_deref().unwrap_or("");
         let rc = diff_line.right_content.as_deref().unwrap_or("");
-        left_content_rows = build_inline_wrapped_lines(lc, rc, wrap_width, left_style, inline_style);
-        right_content_rows = build_inline_wrapped_lines(rc, lc, wrap_width, right_style, inline_style);
+        left_content_rows =
+            build_inline_wrapped_lines(lc, rc, wrap_width, left_style, inline_style);
+        right_content_rows =
+            build_inline_wrapped_lines(rc, lc, wrap_width, right_style, inline_style);
     } else {
         // Non-modified lines: wrap_content at wrap_width
         if left_empty {
@@ -723,7 +798,10 @@ fn render_diff_line<'a>(
         } else {
             let lc = diff_line.left_content.as_deref().unwrap_or("");
             let segments = wrap_content(lc, wrap_width);
-            left_content_rows = segments.into_iter().map(|s| vec![Span::styled(s, left_style)]).collect();
+            left_content_rows = segments
+                .into_iter()
+                .map(|s| vec![Span::styled(s, left_style)])
+                .collect();
         }
 
         if right_empty {
@@ -734,7 +812,10 @@ fn render_diff_line<'a>(
         } else {
             let rc = diff_line.right_content.as_deref().unwrap_or("");
             let segments = wrap_content(rc, wrap_width);
-            right_content_rows = segments.into_iter().map(|s| vec![Span::styled(s, right_style)]).collect();
+            right_content_rows = segments
+                .into_iter()
+                .map(|s| vec![Span::styled(s, right_style)])
+                .collect();
         }
     }
 
@@ -746,7 +827,10 @@ fn render_diff_line<'a>(
         let left_prefix = if row_idx == 0 {
             if left_empty {
                 let no_str = format!("{}{:>width$}\u{2502}", marker, "", width = num_width);
-                Span::styled(no_str, Style::default().fg(colors.line_number).bg(colors.empty_bg))
+                Span::styled(
+                    no_str,
+                    Style::default().fg(colors.line_number).bg(colors.empty_bg),
+                )
             } else {
                 let no_str = match diff_line.left_line_no {
                     Some(n) => format!("{}{:>width$}\u{2502}", marker, n, width = num_width),
@@ -757,7 +841,10 @@ fn render_diff_line<'a>(
         } else {
             if left_empty {
                 let no_str = format!("{:>width$}\u{2502}", "", width = line_no_width);
-                Span::styled(no_str, Style::default().fg(colors.line_number).bg(colors.empty_bg))
+                Span::styled(
+                    no_str,
+                    Style::default().fg(colors.line_number).bg(colors.empty_bg),
+                )
             } else {
                 let no_str = format!("{:>width$}\u{2502}", "", width = line_no_width);
                 Span::styled(no_str, line_no_style)
@@ -768,7 +855,10 @@ fn render_diff_line<'a>(
         let right_prefix = if row_idx == 0 {
             if right_empty {
                 let no_str = format!("{}{:>width$}\u{2502}", marker, "", width = num_width);
-                Span::styled(no_str, Style::default().fg(colors.line_number).bg(colors.empty_bg))
+                Span::styled(
+                    no_str,
+                    Style::default().fg(colors.line_number).bg(colors.empty_bg),
+                )
             } else {
                 let no_str = match diff_line.right_line_no {
                     Some(n) => format!("{}{:>width$}\u{2502}", marker, n, width = num_width),
@@ -779,7 +869,10 @@ fn render_diff_line<'a>(
         } else {
             if right_empty {
                 let no_str = format!("{:>width$}\u{2502}", "", width = line_no_width);
-                Span::styled(no_str, Style::default().fg(colors.line_number).bg(colors.empty_bg))
+                Span::styled(
+                    no_str,
+                    Style::default().fg(colors.line_number).bg(colors.empty_bg),
+                )
             } else {
                 let no_str = format!("{:>width$}\u{2502}", "", width = line_no_width);
                 Span::styled(no_str, line_no_style_right)
@@ -999,15 +1092,16 @@ fn build_inline_wrapped_lines<'a>(
             if !buf.is_empty() {
                 row_spans.push(Span::styled(
                     std::mem::take(&mut buf),
-                    if buf_is_diff { inline_style } else { base_style },
+                    if buf_is_diff {
+                        inline_style
+                    } else {
+                        base_style
+                    },
                 ));
             }
             // Pad remainder (for CJK: col might be width-1 when a 2-col char doesn't fit)
             if col < width {
-                row_spans.push(Span::styled(
-                    " ".repeat(width - col),
-                    base_style,
-                ));
+                row_spans.push(Span::styled(" ".repeat(width - col), base_style));
             }
             all_rows.push(std::mem::take(&mut row_spans));
             col = 0;
@@ -1018,7 +1112,11 @@ fn build_inline_wrapped_lines<'a>(
         if is_diff != buf_is_diff && !buf.is_empty() {
             row_spans.push(Span::styled(
                 std::mem::take(&mut buf),
-                if buf_is_diff { inline_style } else { base_style },
+                if buf_is_diff {
+                    inline_style
+                } else {
+                    base_style
+                },
             ));
         }
         buf_is_diff = is_diff;
@@ -1030,14 +1128,15 @@ fn build_inline_wrapped_lines<'a>(
     if !buf.is_empty() {
         row_spans.push(Span::styled(
             buf,
-            if buf_is_diff { inline_style } else { base_style },
+            if buf_is_diff {
+                inline_style
+            } else {
+                base_style
+            },
         ));
     }
     if col < width {
-        row_spans.push(Span::styled(
-            " ".repeat(width - col),
-            base_style,
-        ));
+        row_spans.push(Span::styled(" ".repeat(width - col), base_style));
     }
     // Always push the final row (contains at least padding for empty content)
     all_rows.push(row_spans);
@@ -1176,7 +1275,10 @@ mod tests {
         // Exact fit
         assert_eq!(wrap_content("hello", 5), vec!["hello"]);
         // Wraps into two segments
-        assert_eq!(wrap_content("hello world!", 5), vec!["hello", " worl", "d!   "]);
+        assert_eq!(
+            wrap_content("hello world!", 5),
+            vec!["hello", " worl", "d!   "]
+        );
         // Empty string: padded
         assert_eq!(wrap_content("", 3), vec!["   "]);
     }

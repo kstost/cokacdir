@@ -23,7 +23,10 @@ pub fn seq_label(index: usize) -> Result<String, CokacencError> {
     let b = b'a' + ((index / (26 * 26)) % 26) as u8;
     let c = b'a' + ((index / 26) % 26) as u8;
     let d = b'a' + (index % 26) as u8;
-    Ok(format!("{}{}{}{}", a as char, b as char, c as char, d as char))
+    Ok(format!(
+        "{}{}{}{}",
+        a as char, b as char, c as char, d as char
+    ))
 }
 
 /// Parse a four-letter sequence label back to index.
@@ -43,6 +46,12 @@ fn parse_seq_label(s: &str) -> Option<usize> {
 }
 
 /// Extract key prefix from password: take first 6 bytes, filter ASCII alphanumeric.
+///
+/// This is not cosmetic. It preserves the cokacdircode_old Shift+E filename
+/// contract: encrypted chunks are named
+/// `[key_prefix_]<group_id>_<seq>.cokacenc`. Removing the prefix changes the
+/// visible archive naming scheme and breaks user expectations around existing
+/// encrypted directories.
 pub fn key_prefix(password: &[u8]) -> String {
     let len = password.len().min(6);
     password[..len]
@@ -53,7 +62,12 @@ pub fn key_prefix(password: &[u8]) -> String {
 }
 
 /// Generate chunk filename: [<key_prefix>_]<group_id_16hex>_<seq_4letter>.cokacenc
-pub fn chunk_filename(dir: &Path, key_prefix: &str, group_id: &str, seq: usize) -> Result<PathBuf, CokacencError> {
+pub fn chunk_filename(
+    dir: &Path,
+    key_prefix: &str,
+    group_id: &str,
+    seq: usize,
+) -> Result<PathBuf, CokacencError> {
     let label = seq_label(seq)?;
     if key_prefix.is_empty() {
         Ok(dir.join(format!("{}_{}{}", group_id, label, EXT)))
@@ -149,10 +163,7 @@ pub fn group_enc_files(dir: &Path) -> Result<BTreeMap<String, Vec<EncFileInfo>>,
             continue;
         }
         if let Some(info) = parse_enc_filename(&path) {
-            groups
-                .entry(info.group_id.clone())
-                .or_default()
-                .push(info);
+            groups.entry(info.group_id.clone()).or_default().push(info);
         }
     }
 

@@ -2,7 +2,7 @@
 
 **Your coding agent, already in use — on Telegram, Discord, and Slack**
 
-cokacdir is not an AI agent — it does not include an LLM or reasoning engine. Instead, it delegates tasks to the coding agent you are already using (Claude Code, Codex CLI, Gemini CLI, OpenCode) and lets you control it from chat apps such as Telegram, Discord, and Slack. Just send a message to the bot, and the agent will handle code execution, file editing, shell commands, and real-time streaming of results from your phone or desktop.
+cokacdir is not an AI agent — it does not include an LLM or reasoning engine. Instead, it delegates tasks to the coding agent you are already using (Claude Code, Codex CLI, Antigravity CLI `agy`, OpenCode) and lets you control it from chat apps such as Telegram, Discord, and Slack. Just send a message to the bot, and the agent will handle code execution, file editing, shell commands, and real-time streaming of results from your phone or desktop.
 
 It runs within each agent’s existing subscription (or free tier), so there are **no additional API costs**.
 
@@ -31,7 +31,7 @@ That’s it — open your chat app and start chatting with your bot.
 ## Key Features
 
 * **Blazing-fast performance**: Written in Rust for maximum performance. A single binary (15–20MB depending on platform), optimized with LTO and strip.
-* **AI-powered commands**: Natural-language coding and file management powered by Claude, Codex, Gemini, and OpenCode. Press `.` and describe what you want done.
+* **AI-powered commands**: Natural-language coding and file management powered by Claude, Codex, Agy, and OpenCode. Press `.` and describe what you want done.
 * **Multi-panel navigation**: A dynamic multi-panel interface for efficient file management
 * **Keyboard-first**: Full keyboard navigation for power users
 * **Built-in editor**: File editing with syntax highlighting for more than 20 languages
@@ -56,11 +56,13 @@ Telegram group for tips, updates, and support:
 For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 **[https://cokacdir.cokac.com](https://cokacdir.cokac.com)**
 
+For the measured Antigravity CLI integration contract, see [How cokacdir Uses Antigravity CLI (`agy`)](docs/how-to-use-agy-antigravity.md).
+
 ## Chat Bots
 
 **Features:**
 
-* Multi-provider support (Claude, Codex, Gemini, OpenCode) with real-time streaming
+* Multi-provider support (Claude, Codex, Agy, OpenCode) with real-time streaming
 * Session persistence and cross-provider session interpretation
 * Scheduled tasks using cron expressions or absolute time
 * Group chat support where multiple bots share context
@@ -71,7 +73,7 @@ For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 
 ## Configuration
 
-cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_GEMINI_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
+cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
 
 ## Supported Platforms
 

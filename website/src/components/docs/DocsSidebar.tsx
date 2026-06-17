@@ -53,6 +53,7 @@ const categories: SidebarCategory[] = [
       { id: 'group-chat', en: 'Group Chat', ko: '그룹 채팅' },
       { id: 'multiple-chats', en: 'Multiple Chats with One Bot', ko: '하나의 봇으로 여러 채팅' },
       { id: 'tool-management', en: 'Tool Management', ko: '도구 관리' },
+      { id: 'agy-provider', en: 'Agy Provider', ko: 'Agy 프로바이더' },
       { id: 'instructions', en: 'Custom Instructions', ko: '커스텀 지시사항' },
       { id: 'settings', en: 'Settings', ko: '설정' },
       { id: 'env-vars', en: 'Environment Variables', ko: '환경변수' },

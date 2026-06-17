@@ -1248,14 +1248,14 @@ impl DiscordState {
         let id = self.file_counter.fetch_add(1, Ordering::Relaxed);
         let file_id = format!("df_{}", id);
         self.files.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                file_id.clone(),
-                StoredFile {
-                    url,
-                    filename,
-                    mime_type,
-                    size,
-                },
-            );
+            file_id.clone(),
+            StoredFile {
+                url,
+                filename,
+                mime_type,
+                size,
+            },
+        );
         file_id
     }
 
@@ -1336,8 +1336,8 @@ impl serenity::all::EventHandler for DiscordHandler {
             let mut content = msg.content.clone();
             for mention in &msg.mentions {
                 let patterns = [
-                    format!("<@!{}>", mention.id),  // nickname mention
-                    format!("<@{}>", mention.id),    // regular mention
+                    format!("<@!{}>", mention.id), // nickname mention
+                    format!("<@{}>", mention.id),  // regular mention
                 ];
                 for pat in &patterns {
                     if content.contains(pat.as_str()) {
@@ -1705,10 +1705,7 @@ fn tokens_eq_constant_time(a: &str, b: &str) -> bool {
 fn is_allowed_discord_file_url(url: &str) -> bool {
     // Accept only HTTPS Discord-controlled CDN hosts. Matching the host on a
     // segment boundary prevents tricks like `https://cdn.discordapp.com.evil/`.
-    const ALLOWED_HOSTS: &[&str] = &[
-        "cdn.discordapp.com",
-        "media.discordapp.net",
-    ];
+    const ALLOWED_HOSTS: &[&str] = &["cdn.discordapp.com", "media.discordapp.net"];
     let rest = match url.strip_prefix("https://") {
         Some(r) => r,
         None => return false,
@@ -1716,7 +1713,9 @@ fn is_allowed_discord_file_url(url: &str) -> bool {
     // The host portion ends at the first '/', '?', or '#' — without including
     // '?' and '#' a query-only or fragment-only URL would smuggle them into
     // the host slice and the eq comparison would fail open or false-negative.
-    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+    let host_end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
     let host = &rest[..host_end];
     ALLOWED_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
 }
@@ -1851,10 +1850,7 @@ impl SlackState {
         const MAX_SEEN_INCOMING: usize = 4096;
 
         let key = (chat_id, slack_ts.to_string());
-        let mut seen = self
-            .seen_incoming
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut seen = self.seen_incoming.lock().unwrap_or_else(|e| e.into_inner());
         if !seen.insert(key.clone()) {
             return false;
         }
@@ -2082,8 +2078,9 @@ fn load_slack_channel_map(path: &std::path::Path) -> Option<HashMap<i64, String>
 #[cfg(test)]
 mod slack_tests {
     use super::{
-        extract_slack_complete_upload_ts, load_slack_channel_map, normalize_slack_text_for_telegram,
-        slack_chat_id, telegram_html_to_slack_mrkdwn, SlackState,
+        extract_slack_complete_upload_ts, load_slack_channel_map,
+        normalize_slack_text_for_telegram, slack_chat_id, telegram_html_to_slack_mrkdwn,
+        SlackState,
     };
 
     #[test]
@@ -2095,10 +2092,7 @@ mod slack_tests {
             telegram_html_to_slack_mrkdwn("Use the &lt;button&gt; tag"),
             "Use the &lt;button&gt; tag"
         );
-        assert_eq!(
-            telegram_html_to_slack_mrkdwn("a &amp; b"),
-            "a &amp; b"
-        );
+        assert_eq!(telegram_html_to_slack_mrkdwn("a &amp; b"), "a &amp; b");
 
         // Bold/italic/code conversions still apply, and label text inside an
         // anchor is escaped without disturbing the surrounding `<URL|label>`.
@@ -2404,12 +2398,20 @@ fn extract_slack_complete_upload_ts(value: &serde_json::Value, channel: &str) ->
     value
         .get("files")
         .and_then(|files| files.as_array())
-        .and_then(|files| files.iter().find_map(|file| extract_from_file(file, channel)))
+        .and_then(|files| {
+            files
+                .iter()
+                .find_map(|file| extract_from_file(file, channel))
+        })
 }
 
 /// Decode a single Slack mrkdwn markup token (the contents between `<` and `>`).
 /// Slack documents this format under "Formatting message text" → mrkdwn.
-fn decode_slack_token(token: &str, bot_user_id: Option<&str>, bot_username: Option<&str>) -> String {
+fn decode_slack_token(
+    token: &str,
+    bot_user_id: Option<&str>,
+    bot_username: Option<&str>,
+) -> String {
     // <!here>, <!channel>, <!everyone>, <!subteam^...|label>
     if let Some(rest) = token.strip_prefix('!') {
         let (head, label) = match rest.split_once('|') {
@@ -2467,7 +2469,11 @@ fn decode_slack_token(token: &str, bot_user_id: Option<&str>, bot_username: Opti
     format!("<{}>", token)
 }
 
-fn decode_slack_markup(text: &str, bot_user_id: Option<&str>, bot_username: Option<&str>) -> String {
+fn decode_slack_markup(
+    text: &str,
+    bot_user_id: Option<&str>,
+    bot_username: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -2971,7 +2977,9 @@ fn is_allowed_slack_file_url(url: &str) -> bool {
         None => return false,
     };
     // Host ends at '/', '?', or '#' — see is_allowed_discord_file_url for why.
-    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+    let host_end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
     let host = &rest[..host_end].to_ascii_lowercase();
     // Slack file URLs are served from files.slack.com; allow subdomains of
     // slack.com only on a path-segment boundary so "files.slack.com.evil"
@@ -3007,8 +3015,8 @@ async fn process_slack_push_event(
     let bot_id_self = state.bot_id_value();
     let bot_user_id_self = state.bot_user_id_value();
     let from_user_id = msg.sender.user.as_ref().map(|u| u.to_string());
-    let bot_id_match = bot_id_self.is_some()
-        && msg.sender.bot_id.as_ref().map(|b| b.to_string()) == bot_id_self;
+    let bot_id_match =
+        bot_id_self.is_some() && msg.sender.bot_id.as_ref().map(|b| b.to_string()) == bot_id_self;
     let user_id_match = bot_user_id_self.is_some() && from_user_id == bot_user_id_self;
     let is_own = bot_id_match || user_id_match;
 
@@ -3032,11 +3040,7 @@ async fn process_slack_push_event(
                                 state.bind_message_id(tg_msg_id, event_chat_id, &ts_str);
                             } else {
                                 // Channel mismatch — restore so a later event can claim it.
-                                state.register_pending_upload(
-                                    &f_id,
-                                    expected_chat_id,
-                                    tg_msg_id,
-                                );
+                                state.register_pending_upload(&f_id, expected_chat_id, tg_msg_id);
                             }
                         }
                     }

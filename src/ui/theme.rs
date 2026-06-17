@@ -37,18 +37,18 @@ impl Default for ThemeChars {
 #[derive(Clone, Copy)]
 pub struct Palette {
     // 명도 기반 (배경/텍스트용)
-    pub bg: Color,           // 기본 배경
-    pub bg_alt: Color,       // 대체 배경 (헤더, 상태바)
-    pub fg: Color,           // 기본 텍스트
-    pub fg_dim: Color,       // 흐린 텍스트 (보조 정보)
-    pub fg_strong: Color,    // 강조 텍스트 (디렉토리, 제목)
-    pub fg_inverse: Color,   // 반전 텍스트 (선택된 항목)
+    pub bg: Color,         // 기본 배경
+    pub bg_alt: Color,     // 대체 배경 (헤더, 상태바)
+    pub fg: Color,         // 기본 텍스트
+    pub fg_dim: Color,     // 흐린 텍스트 (보조 정보)
+    pub fg_strong: Color,  // 강조 텍스트 (디렉토리, 제목)
+    pub fg_inverse: Color, // 반전 텍스트 (선택된 항목)
 
     // 용도 기반 (강조색)
-    pub accent: Color,       // 정보성 강조 (컬럼 헤더, 프롬프트)
-    pub shortcut: Color,     // 단축키 표시
-    pub positive: Color,     // 긍정/성공 (AI 응답, 체크, 진행바)
-    pub highlight: Color,    // 강조/경고/에러 (통합)
+    pub accent: Color,    // 정보성 강조 (컬럼 헤더, 프롬프트)
+    pub shortcut: Color,  // 단축키 표시
+    pub positive: Color,  // 긍정/성공 (AI 응답, 체크, 진행바)
+    pub highlight: Color, // 강조/경고/에러 (통합)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -75,7 +75,7 @@ pub struct PanelColors {
     pub header_bg: Color,
     pub header_bg_active: Color,
     pub header_text: Color,
-    pub header_text_active: Color,  // 활성 패널 헤더 텍스트
+    pub header_text_active: Color, // 활성 패널 헤더 텍스트
     pub file_text: Color,
     pub directory_text: Color,
     pub symlink_text: Color,
@@ -84,7 +84,7 @@ pub struct PanelColors {
     pub marked_text: Color,
     pub size_text: Color,
     pub date_text: Color,
-    pub remote_indicator: Color,    // [SSH] 인디케이터 색상
+    pub remote_indicator: Color, // [SSH] 인디케이터 색상
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -137,25 +137,25 @@ pub struct MessageColors {
 #[derive(Clone, Copy)]
 pub struct DialogColors {
     // === 다이얼로그 프레임 ===
-    pub bg: Color,                          // 배경
-    pub border: Color,                      // 테두리
-    pub title: Color,                       // 제목
+    pub bg: Color,     // 배경
+    pub border: Color, // 테두리
+    pub title: Color,  // 제목
 
     // === 일반 텍스트 ===
-    pub text: Color,                        // 일반 텍스트
-    pub text_dim: Color,                    // 흐린 텍스트
-    pub message_text: Color,                // 메시지 내용
+    pub text: Color,         // 일반 텍스트
+    pub text_dim: Color,     // 흐린 텍스트
+    pub message_text: Color, // 메시지 내용
 
     // === 입력 필드 ===
-    pub input_text: Color,                  // 입력 텍스트
-    pub input_cursor_fg: Color,             // 커서 전경색
-    pub input_cursor_bg: Color,             // 커서 배경색
-    pub input_prompt: Color,                // 프롬프트 ">"
+    pub input_text: Color,      // 입력 텍스트
+    pub input_cursor_fg: Color, // 커서 전경색
+    pub input_cursor_bg: Color, // 커서 배경색
+    pub input_prompt: Color,    // 프롬프트 ">"
 
     // === 버튼 (확인 다이얼로그) ===
-    pub button_text: Color,                 // 일반 버튼 텍스트
-    pub button_selected_bg: Color,          // 선택 버튼 배경
-    pub button_selected_text: Color,        // 선택 버튼 텍스트
+    pub button_text: Color,          // 일반 버튼 텍스트
+    pub button_selected_bg: Color,   // 선택 버튼 배경
+    pub button_selected_text: Color, // 선택 버튼 텍스트
 
     // === 자동완성 목록 ===
     pub autocomplete_bg: Color,             // 목록 배경
@@ -167,51 +167,51 @@ pub struct DialogColors {
     pub preview_suffix_text: Color,         // 미리보기 접미사
 
     // === 도움말 라인 ===
-    pub help_key_text: Color,               // 단축키 텍스트
-    pub help_label_text: Color,             // 설명 텍스트
+    pub help_key_text: Color,   // 단축키 텍스트
+    pub help_label_text: Color, // 설명 텍스트
 
     // === 진행률 다이얼로그 ===
-    pub progress_label_text: Color,         // "File:", "Total:" 레이블
-    pub progress_value_text: Color,         // 파일명, 수치
-    pub progress_bar_fill: Color,           // 진행바 채움
-    pub progress_bar_empty: Color,          // 진행바 빈 부분
-    pub progress_percent_text: Color,       // "45%"
+    pub progress_label_text: Color,   // "File:", "Total:" 레이블
+    pub progress_value_text: Color,   // 파일명, 수치
+    pub progress_bar_fill: Color,     // 진행바 채움
+    pub progress_bar_empty: Color,    // 진행바 빈 부분
+    pub progress_percent_text: Color, // "45%"
 
     // === 충돌 다이얼로그 ===
-    pub conflict_filename_text: Color,      // 강조된 파일명
-    pub conflict_count_text: Color,         // "(1 of 3 conflicts)"
-    pub conflict_shortcut_text: Color,      // 버튼 단축키 문자 (O, S, A, l)
+    pub conflict_filename_text: Color, // 강조된 파일명
+    pub conflict_count_text: Color,    // "(1 of 3 conflicts)"
+    pub conflict_shortcut_text: Color, // 버튼 단축키 문자 (O, S, A, l)
 
     // === Tar 제외 확인 다이얼로그 ===
-    pub tar_exclude_title: Color,           // 제목
-    pub tar_exclude_border: Color,          // 테두리
-    pub tar_exclude_bg: Color,              // 배경
-    pub tar_exclude_message_text: Color,    // 메시지 텍스트
-    pub tar_exclude_path_text: Color,       // 제외 경로 텍스트
-    pub tar_exclude_scroll_info: Color,     // 스크롤 정보 "[1-5/10]"
-    pub tar_exclude_button_text: Color,     // 버튼 텍스트
+    pub tar_exclude_title: Color,                // 제목
+    pub tar_exclude_border: Color,               // 테두리
+    pub tar_exclude_bg: Color,                   // 배경
+    pub tar_exclude_message_text: Color,         // 메시지 텍스트
+    pub tar_exclude_path_text: Color,            // 제외 경로 텍스트
+    pub tar_exclude_scroll_info: Color,          // 스크롤 정보 "[1-5/10]"
+    pub tar_exclude_button_text: Color,          // 버튼 텍스트
     pub tar_exclude_button_selected_bg: Color,   // 선택된 버튼 배경
     pub tar_exclude_button_selected_text: Color, // 선택된 버튼 텍스트
 
     // === Git Log Diff 다이얼로그 ===
-    pub git_log_diff_title: Color,               // 제목
-    pub git_log_diff_border: Color,              // 테두리
-    pub git_log_diff_bg: Color,                  // 배경
-    pub git_log_diff_message_text: Color,        // 안내 메시지
-    pub git_log_diff_entry_text: Color,          // 커밋 항목 텍스트
-    pub git_log_diff_selected_text: Color,       // 선택된(체크) 커밋 텍스트
-    pub git_log_diff_cursor_text: Color,         // 커서 위치 텍스트
-    pub git_log_diff_cursor_bg: Color,           // 커서 위치 배경
-    pub git_log_diff_button_text: Color,         // 비선택 버튼 텍스트
-    pub git_log_diff_button_selected_text: Color,  // 선택 버튼 텍스트
-    pub git_log_diff_button_selected_bg: Color,    // 선택 버튼 배경
-    pub git_log_diff_button_disabled_text: Color,  // 비활성 버튼 텍스트
-    pub git_log_diff_scroll_info: Color,         // 스크롤 정보
+    pub git_log_diff_title: Color,                // 제목
+    pub git_log_diff_border: Color,               // 테두리
+    pub git_log_diff_bg: Color,                   // 배경
+    pub git_log_diff_message_text: Color,         // 안내 메시지
+    pub git_log_diff_entry_text: Color,           // 커밋 항목 텍스트
+    pub git_log_diff_selected_text: Color,        // 선택된(체크) 커밋 텍스트
+    pub git_log_diff_cursor_text: Color,          // 커서 위치 텍스트
+    pub git_log_diff_cursor_bg: Color,            // 커서 위치 배경
+    pub git_log_diff_button_text: Color,          // 비선택 버튼 텍스트
+    pub git_log_diff_button_selected_text: Color, // 선택 버튼 텍스트
+    pub git_log_diff_button_selected_bg: Color,   // 선택 버튼 배경
+    pub git_log_diff_button_disabled_text: Color, // 비활성 버튼 텍스트
+    pub git_log_diff_scroll_info: Color,          // 스크롤 정보
 
     // === 원격 연결 다이얼로그 ===
-    pub remote_bookmark_text: Color,             // 북마크 목록 내 원격 항목 텍스트
-    pub remote_connect_field_label: Color,       // 원격 연결 다이얼로그 필드 레이블
-    pub remote_connect_field_value: Color,       // 원격 연결 다이얼로그 필드 값
+    pub remote_bookmark_text: Color, // 북마크 목록 내 원격 항목 텍스트
+    pub remote_connect_field_label: Color, // 원격 연결 다이얼로그 필드 레이블
+    pub remote_connect_field_value: Color, // 원격 연결 다이얼로그 필드 값
     pub remote_connect_field_selected_bg: Color, // 선택된 필드 배경
 }
 
@@ -221,13 +221,13 @@ pub struct DialogColors {
 
 #[derive(Clone, Copy)]
 pub struct ConfirmDialogColors {
-    pub bg: Color,                      // 배경
-    pub border: Color,                  // 테두리
-    pub title: Color,                   // 제목
-    pub message_text: Color,            // 메시지 텍스트
-    pub button_text: Color,             // 일반 버튼 텍스트
-    pub button_selected_bg: Color,      // 선택 버튼 배경
-    pub button_selected_text: Color,    // 선택 버튼 텍스트
+    pub bg: Color,                   // 배경
+    pub border: Color,               // 테두리
+    pub title: Color,                // 제목
+    pub message_text: Color,         // 메시지 텍스트
+    pub button_text: Color,          // 일반 버튼 텍스트
+    pub button_selected_bg: Color,   // 선택 버튼 배경
+    pub button_selected_text: Color, // 선택 버튼 텍스트
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -236,15 +236,15 @@ pub struct ConfirmDialogColors {
 
 #[derive(Clone, Copy)]
 pub struct SettingsColors {
-    pub bg: Color,              // 배경
-    pub border: Color,          // 테두리
-    pub title: Color,           // 제목
-    pub label_text: Color,      // "Theme:" 라벨
-    pub prompt: Color,          // ">" 프롬프트
-    pub value_text: Color,      // 선택된 값 텍스트
-    pub value_bg: Color,        // 선택된 값 배경
-    pub help_key: Color,        // 단축키
-    pub help_text: Color,       // 단축키 설명
+    pub bg: Color,         // 배경
+    pub border: Color,     // 테두리
+    pub title: Color,      // 제목
+    pub label_text: Color, // "Theme:" 라벨
+    pub prompt: Color,     // ">" 프롬프트
+    pub value_text: Color, // 선택된 값 텍스트
+    pub value_bg: Color,   // 선택된 값 배경
+    pub help_key: Color,   // 단축키
+    pub help_text: Color,  // 단축키 설명
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -283,19 +283,19 @@ pub struct EditorColors {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SyntaxColors {
-    pub keyword: Color,      // if, else, for, while, fn, let, etc.
-    pub type_name: Color,    // String, i32, Vec, etc.
-    pub string: Color,       // "hello", 'c'
-    pub number: Color,       // 123, 3.14
-    pub comment: Color,      // // comment, /* comment */
-    pub operator: Color,     // +, -, *, /, =, ==, etc.
-    pub function: Color,     // function names
-    pub macro_name: Color,   // println!, vec!, etc.
-    pub attribute: Color,    // #[derive], @decorator
-    pub variable: Color,     // variable names
-    pub constant: Color,     // CONST_VALUE, true, false
-    pub bracket: Color,      // (), [], {}
-    pub normal: Color,       // default text
+    pub keyword: Color,    // if, else, for, while, fn, let, etc.
+    pub type_name: Color,  // String, i32, Vec, etc.
+    pub string: Color,     // "hello", 'c'
+    pub number: Color,     // 123, 3.14
+    pub comment: Color,    // // comment, /* comment */
+    pub operator: Color,   // +, -, *, /, =, ==, etc.
+    pub function: Color,   // function names
+    pub macro_name: Color, // println!, vec!, etc.
+    pub attribute: Color,  // #[derive], @decorator
+    pub variable: Color,   // variable names
+    pub constant: Color,   // CONST_VALUE, true, false
+    pub bracket: Color,    // (), [], {}
+    pub normal: Color,     // default text
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -309,7 +309,7 @@ pub struct ViewerColors {
     pub header_text: Color,
     pub line_number: Color,
     pub text: Color,
-    pub bookmark_indicator: Color,  // 북마크 줄 표시 색상
+    pub bookmark_indicator: Color, // 북마크 줄 표시 색상
     pub search_input_text: Color,
     pub search_cursor_fg: Color,
     pub search_cursor_bg: Color,
@@ -356,45 +356,45 @@ pub struct AIScreenColors {
     pub bg: Color,
 
     // === 히스토리 영역 ===
-    pub history_border: Color,              // 히스토리 영역 테두리
-    pub history_title: Color,               // 히스토리 제목 (경로 + 세션)
-    pub history_placeholder: Color,         // 빈 상태 플레이스홀더
-    pub history_scroll_info: Color,         // 스크롤 정보 "[1/10]"
+    pub history_border: Color,      // 히스토리 영역 테두리
+    pub history_title: Color,       // 히스토리 제목 (경로 + 세션)
+    pub history_placeholder: Color, // 빈 상태 플레이스홀더
+    pub history_scroll_info: Color, // 스크롤 정보 "[1/10]"
 
     // === 메시지 프리픽스 (아이콘) ===
-    pub user_prefix: Color,                 // "> " 사용자 메시지
-    pub assistant_prefix: Color,            // "< " AI 응답
-    pub error_prefix: Color,                // "! " 에러
-    pub system_prefix: Color,               // "* " 시스템
+    pub user_prefix: Color,      // "> " 사용자 메시지
+    pub assistant_prefix: Color, // "< " AI 응답
+    pub error_prefix: Color,     // "! " 에러
+    pub system_prefix: Color,    // "* " 시스템
 
     // === 메시지 내용 ===
-    pub message_text: Color,                // 일반 메시지 텍스트
+    pub message_text: Color, // 일반 메시지 텍스트
 
     // === 입력 영역 ===
-    pub input_border: Color,                // 입력 영역 테두리
-    pub input_prompt: Color,                // "> " 입력 프롬프트
-    pub input_text: Color,                  // 입력 텍스트
-    pub input_cursor_fg: Color,             // 커서 전경색 (커서 위 문자)
-    pub input_cursor_bg: Color,             // 커서 배경색
-    pub input_placeholder: Color,           // 플레이스홀더
+    pub input_border: Color,      // 입력 영역 테두리
+    pub input_prompt: Color,      // "> " 입력 프롬프트
+    pub input_text: Color,        // 입력 텍스트
+    pub input_cursor_fg: Color,   // 커서 전경색 (커서 위 문자)
+    pub input_cursor_bg: Color,   // 커서 배경색
+    pub input_placeholder: Color, // 플레이스홀더
 
     // === 처리 중 상태 ===
-    pub processing_spinner: Color,          // 스피너
-    pub processing_text: Color,             // "Processing..." 텍스트
+    pub processing_spinner: Color, // 스피너
+    pub processing_text: Color,    // "Processing..." 텍스트
 
     // === 에러 상태 ===
-    pub error_text: Color,                  // "Claude CLI not available"
+    pub error_text: Color, // "Claude CLI not available"
 
     // === 도구 사용 표시 ===
-    pub tool_use_prefix: Color,             // "[]" 도구 사용 브래킷
-    pub tool_use_name: Color,               // 도구 이름 (Bash, Write 등)
-    pub tool_use_input: Color,              // 도구 입력 내용
-    pub tool_result_prefix: Color,          // "->" 도구 결과 프리픽스
-    pub tool_result_text: Color,            // 도구 결과 텍스트
+    pub tool_use_prefix: Color,    // "[]" 도구 사용 브래킷
+    pub tool_use_name: Color,      // 도구 이름 (Bash, Write 등)
+    pub tool_use_input: Color,     // 도구 입력 내용
+    pub tool_result_prefix: Color, // "->" 도구 결과 프리픽스
+    pub tool_result_text: Color,   // 도구 결과 텍스트
 
     // === 하단 도움말 ===
-    pub footer_key: Color,                  // 단축키 텍스트
-    pub footer_text: Color,                 // 설명 텍스트
+    pub footer_key: Color,  // 단축키 텍스트
+    pub footer_text: Color, // 설명 텍스트
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -410,10 +410,10 @@ pub struct SystemInfoColors {
     pub value: Color,
     pub bar_fill: Color,
     pub bar_empty: Color,
-    pub usage_low: Color,      // 낮은 사용량 (< 70%)
-    pub usage_medium: Color,   // 중간 사용량 (70-90%)
-    pub usage_high: Color,     // 높은 사용량 (>= 90%)
-    pub tab_active: Color,     // 활성 탭 색상
+    pub usage_low: Color,    // 낮은 사용량 (< 70%)
+    pub usage_medium: Color, // 중간 사용량 (70-90%)
+    pub usage_high: Color,   // 높은 사용량 (>= 90%)
+    pub tab_active: Color,   // 활성 탭 색상
     pub disk_header: Color,
     pub disk_text: Color,
     pub selected_bg: Color,
@@ -432,7 +432,7 @@ pub struct SearchResultColors {
     pub border: Color,
     pub header_text: Color,
     pub column_header: Color,
-    pub column_header_dim: Color,  // 흐린 컬럼 헤더
+    pub column_header_dim: Color, // 흐린 컬럼 헤더
     pub directory_text: Color,
     pub file_text: Color,
     pub selected_bg: Color,
@@ -450,22 +450,22 @@ pub struct SearchResultColors {
 #[derive(Clone, Copy)]
 pub struct ImageViewerColors {
     // === 프레임 ===
-    pub bg: Color,                    // 배경 (빈 영역)
-    pub border: Color,                // 테두리
-    pub title_text: Color,            // 제목 텍스트 (파일명, 해상도, 줌)
+    pub bg: Color,         // 배경 (빈 영역)
+    pub border: Color,     // 테두리
+    pub title_text: Color, // 제목 텍스트 (파일명, 해상도, 줌)
 
     // === 로딩 상태 ===
-    pub loading_spinner: Color,       // 로딩 스피너
-    pub loading_text: Color,          // "Loading image..." 텍스트
+    pub loading_spinner: Color, // 로딩 스피너
+    pub loading_text: Color,    // "Loading image..." 텍스트
 
     // === 에러 상태 ===
-    pub error_text: Color,            // 에러 메시지
-    pub hint_text: Color,             // "Press ESC to close" 힌트
+    pub error_text: Color, // 에러 메시지
+    pub hint_text: Color,  // "Press ESC to close" 힌트
 
     // === 하단 도움말 ===
-    pub footer_key: Color,            // 단축키 (PgUp, +, -, r, Esc)
-    pub footer_text: Color,           // 설명 (Prev/Next, Zoom, Pan)
-    pub footer_separator: Color,      // 구분자 (/)
+    pub footer_key: Color,       // 단축키 (PgUp, +, -, r, Esc)
+    pub footer_text: Color,      // 설명 (Prev/Next, Zoom, Pan)
+    pub footer_separator: Color, // 구분자 (/)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -480,15 +480,15 @@ pub struct FileInfoColors {
     pub title: Color,
 
     // === 정보 표시 ===
-    pub label: Color,               // 라벨 (Name, Path, Type 등)
-    pub value: Color,               // 기본 값
-    pub value_name: Color,          // 파일/폴더 이름
-    pub value_path: Color,          // 경로
-    pub value_type: Color,          // 파일 타입
-    pub value_size: Color,          // 크기 (숫자)
-    pub value_permission: Color,    // 권한
-    pub value_owner: Color,         // 소유자/그룹
-    pub value_date: Color,          // 날짜/시간
+    pub label: Color,            // 라벨 (Name, Path, Type 등)
+    pub value: Color,            // 기본 값
+    pub value_name: Color,       // 파일/폴더 이름
+    pub value_path: Color,       // 경로
+    pub value_type: Color,       // 파일 타입
+    pub value_size: Color,       // 크기 (숫자)
+    pub value_permission: Color, // 권한
+    pub value_owner: Color,      // 소유자/그룹
+    pub value_date: Color,       // 날짜/시간
 
     // === 상태 표시 ===
     pub calculating_spinner: Color, // 계산 중 스피너
@@ -496,7 +496,7 @@ pub struct FileInfoColors {
     pub error_text: Color,          // 에러 메시지
 
     // === 하단 도움말 ===
-    pub hint_text: Color,           // 도움말 텍스트
+    pub hint_text: Color, // 도움말 텍스트
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -511,16 +511,16 @@ pub struct HelpColors {
     pub title: Color,
 
     // === 섹션 ===
-    pub section_title: Color,       // 섹션 제목 (Navigation, Tools 등)
-    pub section_decorator: Color,   // 섹션 데코레이터 ("──")
+    pub section_title: Color,     // 섹션 제목 (Navigation, Tools 등)
+    pub section_decorator: Color, // 섹션 데코레이터 ("──")
 
     // === 단축키 목록 ===
-    pub key: Color,                 // 단축키 텍스트
-    pub key_highlight: Color,       // 강조 단축키 (첫 글자)
-    pub description: Color,         // 설명 텍스트
+    pub key: Color,           // 단축키 텍스트
+    pub key_highlight: Color, // 강조 단축키 (첫 글자)
+    pub description: Color,   // 설명 텍스트
 
     // === 하단 도움말 ===
-    pub hint_text: Color,           // "Press any key to close"
+    pub hint_text: Color, // "Press any key to close"
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -535,7 +535,7 @@ pub struct AdvancedSearchColors {
     pub label: Color,
     pub input_text: Color,
     pub input_cursor: Color,
-    pub field_bracket: Color,  // 필드 괄호 색상
+    pub field_bracket: Color, // 필드 괄호 색상
     pub checkbox_checked: Color,
     pub checkbox_unchecked: Color,
     pub button_text: Color,
@@ -745,18 +745,18 @@ impl Theme {
         // 기본 팔레트 정의
         let palette = Palette {
             // 명도 기반
-            bg: Color::Indexed(255),             // 기본 배경
-            bg_alt: Color::Indexed(254),         // 대체 배경
-            fg: Color::Indexed(243),             // 기본 텍스트
-            fg_dim: Color::Indexed(251),         // 흐린 텍스트
-            fg_strong: Color::Indexed(238),      // 강조 텍스트
-            fg_inverse: Color::Indexed(231),     // 반전 텍스트
+            bg: Color::Indexed(255),         // 기본 배경
+            bg_alt: Color::Indexed(254),     // 대체 배경
+            fg: Color::Indexed(243),         // 기본 텍스트
+            fg_dim: Color::Indexed(251),     // 흐린 텍스트
+            fg_strong: Color::Indexed(238),  // 강조 텍스트
+            fg_inverse: Color::Indexed(231), // 반전 텍스트
 
             // 용도 기반
-            accent: Color::Indexed(21),          // 정보성 강조
-            shortcut: Color::Indexed(74),        // 단축키
-            positive: Color::Indexed(34),        // 긍정/성공
-            highlight: Color::Indexed(198),      // 강조/경고/에러
+            accent: Color::Indexed(21),     // 정보성 강조
+            shortcut: Color::Indexed(74),   // 단축키
+            positive: Color::Indexed(34),   // 긍정/성공
+            highlight: Color::Indexed(198), // 강조/경고/에러
         };
 
         // 상태 색상
@@ -775,10 +775,10 @@ impl Theme {
             header_bg: Color::Indexed(254),
             header_bg_active: Color::Indexed(253),
             header_text: Color::Indexed(249),
-            header_text_active: Color::Indexed(242),  // 활성 패널 헤더 텍스트
+            header_text_active: Color::Indexed(242), // 활성 패널 헤더 텍스트
             file_text: Color::Indexed(243),
             directory_text: Color::Indexed(67),
-            symlink_text: Color::Indexed(37),  // cyan for symlinks
+            symlink_text: Color::Indexed(37), // cyan for symlinks
             selected_bg: Color::Indexed(67),
             selected_text: Color::Indexed(231),
             marked_text: Color::Indexed(198),
@@ -830,7 +830,7 @@ impl Theme {
             input_text: Color::Indexed(243),
             input_cursor_fg: Color::Indexed(255),
             input_cursor_bg: Color::Indexed(238),
-            input_prompt: Color::Indexed(74),       // 단축키 색상 (editor.footer_key)
+            input_prompt: Color::Indexed(74), // 단축키 색상 (editor.footer_key)
 
             // === 버튼 ===
             button_text: Color::Indexed(251),
@@ -847,30 +847,30 @@ impl Theme {
             preview_suffix_text: Color::Indexed(251),
 
             // === 도움말 ===
-            help_key_text: Color::Indexed(74),      // 단축키 색상 (editor.footer_key)
+            help_key_text: Color::Indexed(74), // 단축키 색상 (editor.footer_key)
             help_label_text: Color::Indexed(251),
 
             // === 진행률 ===
             progress_label_text: Color::Indexed(251),
             progress_value_text: Color::Indexed(243),
-            progress_bar_fill: Color::Indexed(67),  // 선택 배경색 (panel.selected_bg)
+            progress_bar_fill: Color::Indexed(67), // 선택 배경색 (panel.selected_bg)
             progress_bar_empty: Color::Indexed(251),
             progress_percent_text: Color::Indexed(243),
 
             // === 충돌 ===
-            conflict_filename_text: Color::Indexed(198),  // 강조된 파일명
-            conflict_count_text: Color::Indexed(251),     // 진행 정보
-            conflict_shortcut_text: Color::Indexed(117),  // 버튼 단축키 (O, S, A, l)
+            conflict_filename_text: Color::Indexed(198), // 강조된 파일명
+            conflict_count_text: Color::Indexed(251),    // 진행 정보
+            conflict_shortcut_text: Color::Indexed(117), // 버튼 단축키 (O, S, A, l)
 
             // === Tar 제외 확인 ===
-            tar_exclude_title: Color::Indexed(238),       // 제목 (dialog.title과 동일)
-            tar_exclude_border: Color::Indexed(238),      // 테두리 (dialog.border와 동일)
-            tar_exclude_bg: Color::Indexed(255),          // 배경 (dialog.bg와 동일)
+            tar_exclude_title: Color::Indexed(238), // 제목 (dialog.title과 동일)
+            tar_exclude_border: Color::Indexed(238), // 테두리 (dialog.border와 동일)
+            tar_exclude_bg: Color::Indexed(255),    // 배경 (dialog.bg와 동일)
             tar_exclude_message_text: Color::Indexed(243), // 메시지 텍스트 (dialog.message_text와 동일)
-            tar_exclude_path_text: Color::Indexed(208),   // 제외 경로 (주황색)
-            tar_exclude_scroll_info: Color::Indexed(251), // 스크롤 정보
+            tar_exclude_path_text: Color::Indexed(208),    // 제외 경로 (주황색)
+            tar_exclude_scroll_info: Color::Indexed(251),  // 스크롤 정보
             tar_exclude_button_text: Color::Indexed(251), // 버튼 텍스트 (dialog.button_text와 동일)
-            tar_exclude_button_selected_bg: Color::Indexed(67),   // 선택 버튼 배경
+            tar_exclude_button_selected_bg: Color::Indexed(67), // 선택 버튼 배경
             tar_exclude_button_selected_text: Color::Indexed(231), // 선택 버튼 텍스트
 
             // === Git Log Diff ===
@@ -945,19 +945,19 @@ impl Theme {
 
         // 코드 하이라이팅 (라이트 테마)
         let syntax = SyntaxColors {
-            keyword: Color::Indexed(127),     // 보라색 (if, else, fn, let)
-            type_name: Color::Indexed(37),    // 청록색 (String, i32, Vec)
-            string: Color::Indexed(28),       // 녹색 ("hello")
-            number: Color::Indexed(166),      // 주황색 (123, 3.14)
-            comment: Color::Indexed(102),     // 회색 (// comment)
-            operator: Color::Indexed(241),    // 진한 회색 (+, -, =)
-            function: Color::Indexed(130),    // 갈색/주황 (function names)
-            macro_name: Color::Indexed(91),   // 자주색 (println!, vec!)
-            attribute: Color::Indexed(243),   // 회색 (#[derive])
-            variable: Color::Indexed(236),    // 진한 회색 (variables)
-            constant: Color::Indexed(161),    // 마젠타 (CONST, true, false)
-            bracket: Color::Indexed(240),     // 회색 ((), [], {})
-            normal: Color::Indexed(236),      // 기본 텍스트
+            keyword: Color::Indexed(127),   // 보라색 (if, else, fn, let)
+            type_name: Color::Indexed(37),  // 청록색 (String, i32, Vec)
+            string: Color::Indexed(28),     // 녹색 ("hello")
+            number: Color::Indexed(166),    // 주황색 (123, 3.14)
+            comment: Color::Indexed(102),   // 회색 (// comment)
+            operator: Color::Indexed(241),  // 진한 회색 (+, -, =)
+            function: Color::Indexed(130),  // 갈색/주황 (function names)
+            macro_name: Color::Indexed(91), // 자주색 (println!, vec!)
+            attribute: Color::Indexed(243), // 회색 (#[derive])
+            variable: Color::Indexed(236),  // 진한 회색 (variables)
+            constant: Color::Indexed(161),  // 마젠타 (CONST, true, false)
+            bracket: Color::Indexed(240),   // 회색 ((), [], {})
+            normal: Color::Indexed(236),    // 기본 텍스트
         };
 
         // 뷰어
@@ -967,7 +967,7 @@ impl Theme {
             header_text: Color::Indexed(249),
             line_number: Color::Indexed(251),
             text: Color::Indexed(243),
-            bookmark_indicator: Color::Indexed(21),   // 북마크 표시 색상
+            bookmark_indicator: Color::Indexed(21), // 북마크 표시 색상
             search_input_text: Color::Indexed(67),
             search_cursor_fg: Color::Indexed(255),
             search_cursor_bg: Color::Indexed(67),
@@ -1003,48 +1003,48 @@ impl Theme {
         // AI 화면 (Panel/Viewer/Editor 색상만 사용)
         let ai_screen = AIScreenColors {
             // === 배경 ===
-            bg: Color::Indexed(255),                    // 흰색 배경 (editor.bg)
+            bg: Color::Indexed(255), // 흰색 배경 (editor.bg)
 
             // === 히스토리 영역 ===
-            history_border: Color::Indexed(238),        // 테두리 (editor.border)
-            history_title: Color::Indexed(238),         // 제목 (editor.border)
-            history_placeholder: Color::Indexed(251),   // 플레이스홀더 (editor.footer_text)
-            history_scroll_info: Color::Indexed(251),   // 스크롤 정보 (editor.footer_text)
+            history_border: Color::Indexed(238), // 테두리 (editor.border)
+            history_title: Color::Indexed(238),  // 제목 (editor.border)
+            history_placeholder: Color::Indexed(251), // 플레이스홀더 (editor.footer_text)
+            history_scroll_info: Color::Indexed(251), // 스크롤 정보 (editor.footer_text)
 
             // === 메시지 프리픽스 ===
-            user_prefix: Color::Indexed(67),            // 사용자 ">" (panel.directory_text)
-            assistant_prefix: Color::Indexed(74),       // AI "<" (editor.footer_key)
-            error_prefix: Color::Indexed(198),          // 에러 "!" (panel.marked_text)
-            system_prefix: Color::Indexed(251),         // 시스템 "*" (editor.footer_text)
+            user_prefix: Color::Indexed(67), // 사용자 ">" (panel.directory_text)
+            assistant_prefix: Color::Indexed(74), // AI "<" (editor.footer_key)
+            error_prefix: Color::Indexed(198), // 에러 "!" (panel.marked_text)
+            system_prefix: Color::Indexed(251), // 시스템 "*" (editor.footer_text)
 
             // === 메시지 내용 ===
-            message_text: Color::Indexed(243),          // 메시지 텍스트 (editor.text)
+            message_text: Color::Indexed(243), // 메시지 텍스트 (editor.text)
 
             // === 입력 영역 ===
-            input_border: Color::Indexed(238),          // 입력 테두리 (editor.border)
-            input_prompt: Color::Indexed(74),           // 입력 ">" (editor.footer_key)
-            input_text: Color::Indexed(243),            // 입력 텍스트 (editor.text)
-            input_cursor_fg: Color::Indexed(255),       // 커서 위 문자 (흰색 - 반전)
-            input_cursor_bg: Color::Indexed(238),       // 커서 배경 (어두운색)
-            input_placeholder: Color::Indexed(251),     // 플레이스홀더 (editor.footer_text)
+            input_border: Color::Indexed(238), // 입력 테두리 (editor.border)
+            input_prompt: Color::Indexed(74),  // 입력 ">" (editor.footer_key)
+            input_text: Color::Indexed(243),   // 입력 텍스트 (editor.text)
+            input_cursor_fg: Color::Indexed(255), // 커서 위 문자 (흰색 - 반전)
+            input_cursor_bg: Color::Indexed(238), // 커서 배경 (어두운색)
+            input_placeholder: Color::Indexed(251), // 플레이스홀더 (editor.footer_text)
 
             // === 처리 중 상태 ===
-            processing_spinner: Color::Indexed(74),     // 스피너 (editor.footer_key)
-            processing_text: Color::Indexed(251),       // 처리 중 텍스트 (editor.footer_text)
+            processing_spinner: Color::Indexed(74), // 스피너 (editor.footer_key)
+            processing_text: Color::Indexed(251),   // 처리 중 텍스트 (editor.footer_text)
 
             // === 에러 상태 ===
-            error_text: Color::Indexed(198),            // 에러 텍스트 (panel.marked_text)
+            error_text: Color::Indexed(198), // 에러 텍스트 (panel.marked_text)
 
             // === 도구 사용 표시 ===
-            tool_use_prefix: Color::Indexed(136),       // "[]" 도구 브래킷 (황색)
-            tool_use_name: Color::Indexed(67),          // 도구 이름 (디렉토리 색상)
-            tool_use_input: Color::Indexed(243),        // 도구 입력 (일반 텍스트)
-            tool_result_prefix: Color::Indexed(34),     // "->" 결과 프리픽스 (녹색)
-            tool_result_text: Color::Indexed(243),      // 결과 텍스트 (일반 텍스트)
+            tool_use_prefix: Color::Indexed(136), // "[]" 도구 브래킷 (황색)
+            tool_use_name: Color::Indexed(67),    // 도구 이름 (디렉토리 색상)
+            tool_use_input: Color::Indexed(243),  // 도구 입력 (일반 텍스트)
+            tool_result_prefix: Color::Indexed(34), // "->" 결과 프리픽스 (녹색)
+            tool_result_text: Color::Indexed(243), // 결과 텍스트 (일반 텍스트)
 
             // === 하단 도움말 ===
-            footer_key: Color::Indexed(74),             // 단축키 (editor.footer_key)
-            footer_text: Color::Indexed(251),           // 설명 (editor.footer_text)
+            footer_key: Color::Indexed(74), // 단축키 (editor.footer_key)
+            footer_text: Color::Indexed(251), // 설명 (editor.footer_text)
         };
 
         // 시스템 정보
@@ -1074,7 +1074,7 @@ impl Theme {
             border: Color::Indexed(238),
             header_text: Color::Indexed(249),
             column_header: Color::Indexed(21),
-            column_header_dim: Color::Indexed(251),  // 흐린 컬럼 헤더
+            column_header_dim: Color::Indexed(251), // 흐린 컬럼 헤더
             directory_text: Color::Indexed(238),
             file_text: Color::Indexed(243),
             selected_bg: Color::Indexed(67),
@@ -1088,21 +1088,21 @@ impl Theme {
         // 이미지 뷰어
         let image_viewer = ImageViewerColors {
             // === 프레임 ===
-            bg: Color::Indexed(255),              // 배경 (viewer.bg)
-            border: Color::Indexed(238),          // 테두리 (viewer.border)
-            title_text: Color::Indexed(249),      // 제목 텍스트 (viewer.header_text)
+            bg: Color::Indexed(255),         // 배경 (viewer.bg)
+            border: Color::Indexed(238),     // 테두리 (viewer.border)
+            title_text: Color::Indexed(249), // 제목 텍스트 (viewer.header_text)
 
             // === 로딩 상태 ===
-            loading_spinner: Color::Indexed(74),  // 스피너 (shortcut 색상)
-            loading_text: Color::Indexed(251),    // 로딩 텍스트
+            loading_spinner: Color::Indexed(74), // 스피너 (shortcut 색상)
+            loading_text: Color::Indexed(251),   // 로딩 텍스트
 
             // === 에러 상태 ===
-            error_text: Color::Indexed(198),      // 에러 (highlight 색상)
-            hint_text: Color::Indexed(251),       // 힌트 텍스트
+            error_text: Color::Indexed(198), // 에러 (highlight 색상)
+            hint_text: Color::Indexed(251),  // 힌트 텍스트
 
             // === 하단 도움말 ===
-            footer_key: Color::Indexed(74),       // 단축키 (shortcut 색상)
-            footer_text: Color::Indexed(251),     // 설명
+            footer_key: Color::Indexed(74),   // 단축키 (shortcut 색상)
+            footer_text: Color::Indexed(251), // 설명
             footer_separator: Color::Indexed(251), // 구분자
         };
 
@@ -1116,10 +1116,10 @@ impl Theme {
             // === 정보 표시 ===
             label: Color::Indexed(251),
             value: Color::Indexed(243),
-            value_name: Color::Indexed(67),         // 파일명은 폴더색 (파란)
+            value_name: Color::Indexed(67), // 파일명은 폴더색 (파란)
             value_path: Color::Indexed(243),
             value_type: Color::Indexed(243),
-            value_size: Color::Indexed(67),         // 크기는 숫자 강조 (파란)
+            value_size: Color::Indexed(67), // 크기는 숫자 강조 (파란)
             value_permission: Color::Indexed(243),
             value_owner: Color::Indexed(243),
             value_date: Color::Indexed(243),
@@ -1141,13 +1141,13 @@ impl Theme {
             title: Color::Indexed(238),
 
             // === 섹션 ===
-            section_title: Color::Indexed(67),      // 섹션 제목 (파란)
+            section_title: Color::Indexed(67), // 섹션 제목 (파란)
             section_decorator: Color::Indexed(251), // 섹션 데코레이터 ("──")
 
             // === 단축키 목록 ===
-            key: Color::Indexed(74),                // 단축키 텍스트 (청록)
-            key_highlight: Color::Indexed(74),      // 강조 단축키 (청록)
-            description: Color::Indexed(243),       // 설명 텍스트
+            key: Color::Indexed(74),           // 단축키 텍스트 (청록)
+            key_highlight: Color::Indexed(74), // 강조 단축키 (청록)
+            description: Color::Indexed(243),  // 설명 텍스트
 
             // === 하단 도움말 ===
             hint_text: Color::Indexed(251),
@@ -1161,7 +1161,7 @@ impl Theme {
             label: Color::Indexed(243),
             input_text: Color::Indexed(243),
             input_cursor: Color::Indexed(238),
-            field_bracket: Color::Indexed(21),  // 필드 괄호 색상
+            field_bracket: Color::Indexed(21), // 필드 괄호 색상
             checkbox_checked: Color::Indexed(34),
             checkbox_unchecked: Color::Indexed(251),
             button_text: Color::Indexed(251),
@@ -1313,16 +1313,16 @@ impl Theme {
     fn dark_256() -> Self {
         // 기본 팔레트 정의 (어두운 배경)
         let palette = Palette {
-            bg: Color::Indexed(235),             // 어두운 배경
-            bg_alt: Color::Indexed(236),         // 대체 배경
-            fg: Color::Indexed(252),             // 밝은 텍스트
-            fg_dim: Color::Indexed(245),         // 흐린 텍스트
-            fg_strong: Color::Indexed(255),      // 강조 텍스트
-            fg_inverse: Color::Indexed(235),     // 반전 텍스트
-            accent: Color::Indexed(81),          // 정보성 강조
-            shortcut: Color::Indexed(117),       // 단축키
-            positive: Color::Indexed(114),       // 긍정/성공
-            highlight: Color::Indexed(204),      // 강조/경고/에러
+            bg: Color::Indexed(235),         // 어두운 배경
+            bg_alt: Color::Indexed(236),     // 대체 배경
+            fg: Color::Indexed(252),         // 밝은 텍스트
+            fg_dim: Color::Indexed(245),     // 흐린 텍스트
+            fg_strong: Color::Indexed(255),  // 강조 텍스트
+            fg_inverse: Color::Indexed(235), // 반전 텍스트
+            accent: Color::Indexed(81),      // 정보성 강조
+            shortcut: Color::Indexed(117),   // 단축키
+            positive: Color::Indexed(114),   // 긍정/성공
+            highlight: Color::Indexed(204),  // 강조/경고/에러
         };
 
         let state = StateColors {
@@ -1339,10 +1339,10 @@ impl Theme {
             header_bg: Color::Indexed(236),
             header_bg_active: Color::Indexed(237),
             header_text: Color::Indexed(250),
-            header_text_active: Color::Indexed(255),  // 활성 패널 헤더 텍스트
+            header_text_active: Color::Indexed(255), // 활성 패널 헤더 텍스트
             file_text: Color::Indexed(252),
             directory_text: Color::Indexed(117),
-            symlink_text: Color::Indexed(44),  // cyan for symlinks
+            symlink_text: Color::Indexed(44), // cyan for symlinks
             selected_bg: Color::Indexed(117),
             selected_text: Color::Indexed(16),
             marked_text: Color::Indexed(204),
@@ -1402,19 +1402,19 @@ impl Theme {
             progress_bar_fill: Color::Indexed(117),
             progress_bar_empty: Color::Indexed(245),
             progress_percent_text: Color::Indexed(252),
-            conflict_filename_text: Color::Indexed(204),  // 강조된 파일명
-            conflict_count_text: Color::Indexed(245),     // 진행 정보
-            conflict_shortcut_text: Color::Indexed(33),   // 버튼 단축키 (O, S, A, l)
+            conflict_filename_text: Color::Indexed(204), // 강조된 파일명
+            conflict_count_text: Color::Indexed(245),    // 진행 정보
+            conflict_shortcut_text: Color::Indexed(33),  // 버튼 단축키 (O, S, A, l)
 
             // === Tar 제외 확인 ===
-            tar_exclude_title: Color::Indexed(255),       // 제목 (dialog.title과 동일)
-            tar_exclude_border: Color::Indexed(252),      // 테두리 (dialog.border와 동일)
-            tar_exclude_bg: Color::Indexed(236),          // 배경 (dialog.bg와 동일)
+            tar_exclude_title: Color::Indexed(255), // 제목 (dialog.title과 동일)
+            tar_exclude_border: Color::Indexed(252), // 테두리 (dialog.border와 동일)
+            tar_exclude_bg: Color::Indexed(236),    // 배경 (dialog.bg와 동일)
             tar_exclude_message_text: Color::Indexed(252), // 메시지 텍스트 (dialog.message_text와 동일)
-            tar_exclude_path_text: Color::Indexed(166),   // 제외 경로 (주황색)
-            tar_exclude_scroll_info: Color::Indexed(245), // 스크롤 정보
+            tar_exclude_path_text: Color::Indexed(166),    // 제외 경로 (주황색)
+            tar_exclude_scroll_info: Color::Indexed(245),  // 스크롤 정보
             tar_exclude_button_text: Color::Indexed(245), // 버튼 텍스트 (dialog.button_text와 동일)
-            tar_exclude_button_selected_bg: Color::Indexed(117),  // 선택 버튼 배경
+            tar_exclude_button_selected_bg: Color::Indexed(117), // 선택 버튼 배경
             tar_exclude_button_selected_text: Color::Indexed(235), // 선택 버튼 텍스트
 
             // === Git Log Diff ===
@@ -1487,19 +1487,19 @@ impl Theme {
 
         // 코드 하이라이팅 (다크 테마)
         let syntax = SyntaxColors {
-            keyword: Color::Indexed(176),     // 연한 보라색 (if, else, fn, let)
-            type_name: Color::Indexed(81),    // 밝은 청록색 (String, i32, Vec)
-            string: Color::Indexed(114),      // 밝은 녹색 ("hello")
-            number: Color::Indexed(209),      // 밝은 주황색 (123, 3.14)
-            comment: Color::Indexed(102),     // 회색 (// comment)
-            operator: Color::Indexed(252),    // 밝은 회색 (+, -, =)
-            function: Color::Indexed(222),    // 노란색 (function names)
-            macro_name: Color::Indexed(141),  // 밝은 자주색 (println!, vec!)
-            attribute: Color::Indexed(245),   // 회색 (#[derive])
-            variable: Color::Indexed(252),    // 밝은 회색 (variables)
-            constant: Color::Indexed(210),    // 밝은 빨강/핑크 (CONST, true, false)
-            bracket: Color::Indexed(250),     // 밝은 회색 ((), [], {})
-            normal: Color::Indexed(252),      // 기본 텍스트
+            keyword: Color::Indexed(176),    // 연한 보라색 (if, else, fn, let)
+            type_name: Color::Indexed(81),   // 밝은 청록색 (String, i32, Vec)
+            string: Color::Indexed(114),     // 밝은 녹색 ("hello")
+            number: Color::Indexed(209),     // 밝은 주황색 (123, 3.14)
+            comment: Color::Indexed(102),    // 회색 (// comment)
+            operator: Color::Indexed(252),   // 밝은 회색 (+, -, =)
+            function: Color::Indexed(222),   // 노란색 (function names)
+            macro_name: Color::Indexed(141), // 밝은 자주색 (println!, vec!)
+            attribute: Color::Indexed(245),  // 회색 (#[derive])
+            variable: Color::Indexed(252),   // 밝은 회색 (variables)
+            constant: Color::Indexed(210),   // 밝은 빨강/핑크 (CONST, true, false)
+            bracket: Color::Indexed(250),    // 밝은 회색 ((), [], {})
+            normal: Color::Indexed(252),     // 기본 텍스트
         };
 
         let viewer = ViewerColors {
@@ -1508,7 +1508,7 @@ impl Theme {
             header_text: Color::Indexed(250),
             line_number: Color::Indexed(245),
             text: Color::Indexed(252),
-            bookmark_indicator: Color::Indexed(81),   // 북마크 표시 색상
+            bookmark_indicator: Color::Indexed(81), // 북마크 표시 색상
             search_input_text: Color::Indexed(117),
             search_cursor_fg: Color::Indexed(235),
             search_cursor_bg: Color::Indexed(117),
@@ -1554,17 +1554,17 @@ impl Theme {
             input_border: Color::Indexed(252),
             input_prompt: Color::Indexed(117),
             input_text: Color::Indexed(252),
-            input_cursor_fg: Color::Indexed(235),   // 커서 위 문자 (배경색으로 반전)
-            input_cursor_bg: Color::Indexed(252),   // 커서 배경 (밝은색)
+            input_cursor_fg: Color::Indexed(235), // 커서 위 문자 (배경색으로 반전)
+            input_cursor_bg: Color::Indexed(252), // 커서 배경 (밝은색)
             input_placeholder: Color::Indexed(245),
             processing_spinner: Color::Indexed(117),
             processing_text: Color::Indexed(245),
             error_text: Color::Indexed(204),
-            tool_use_prefix: Color::Indexed(179),       // "[]" 도구 브래킷 (황색)
-            tool_use_name: Color::Indexed(81),          // 도구 이름 (시안)
-            tool_use_input: Color::Indexed(252),        // 도구 입력 (일반 텍스트)
-            tool_result_prefix: Color::Indexed(114),    // "->" 결과 프리픽스 (녹색)
-            tool_result_text: Color::Indexed(252),      // 결과 텍스트 (일반 텍스트)
+            tool_use_prefix: Color::Indexed(179), // "[]" 도구 브래킷 (황색)
+            tool_use_name: Color::Indexed(81),    // 도구 이름 (시안)
+            tool_use_input: Color::Indexed(252),  // 도구 입력 (일반 텍스트)
+            tool_result_prefix: Color::Indexed(114), // "->" 결과 프리픽스 (녹색)
+            tool_result_text: Color::Indexed(252), // 결과 텍스트 (일반 텍스트)
             footer_key: Color::Indexed(117),
             footer_text: Color::Indexed(245),
         };
@@ -1594,7 +1594,7 @@ impl Theme {
             border: Color::Indexed(252),
             header_text: Color::Indexed(250),
             column_header: Color::Indexed(81),
-            column_header_dim: Color::Indexed(245),  // 흐린 컬럼 헤더
+            column_header_dim: Color::Indexed(245), // 흐린 컬럼 헤더
             directory_text: Color::Indexed(255),
             file_text: Color::Indexed(252),
             selected_bg: Color::Indexed(117),
@@ -1606,9 +1606,9 @@ impl Theme {
         };
 
         let image_viewer = ImageViewerColors {
-            bg: Color::Indexed(235),              // 배경 (viewer.bg)
-            border: Color::Indexed(252),          // 테두리 (viewer.border)
-            title_text: Color::Indexed(250),      // 제목 텍스트 (viewer.header_text)
+            bg: Color::Indexed(235),         // 배경 (viewer.bg)
+            border: Color::Indexed(252),     // 테두리 (viewer.border)
+            title_text: Color::Indexed(250), // 제목 텍스트 (viewer.header_text)
             loading_spinner: Color::Indexed(117),
             loading_text: Color::Indexed(245),
             error_text: Color::Indexed(204),
@@ -1656,7 +1656,7 @@ impl Theme {
             label: Color::Indexed(252),
             input_text: Color::Indexed(252),
             input_cursor: Color::Indexed(252),
-            field_bracket: Color::Indexed(81),  // 필드 괄호 색상
+            field_bracket: Color::Indexed(81), // 필드 괄호 색상
             checkbox_checked: Color::Indexed(114),
             checkbox_unchecked: Color::Indexed(245),
             button_text: Color::Indexed(245),
@@ -2312,8 +2312,7 @@ impl Theme {
     }
 
     pub fn symlink_style(&self) -> Style {
-        Style::default()
-            .fg(self.panel.symlink_text)
+        Style::default().fg(self.panel.symlink_text)
     }
 
     pub fn header_style(&self) -> Style {
@@ -2390,7 +2389,8 @@ impl Theme {
     /// Theme을 JSON 문자열로 변환 (설정 파일 저장용)
     pub fn to_json(&self) -> String {
         let ci = Self::color_index;
-        format!(r#"{{
+        format!(
+            r#"{{
   "name": "{}",
 
   "__palette__": "=== 기본 팔레트: 앱 전체에서 참조되는 시맨틱 컬러 토큰. 개별 컴포넌트 색상의 기반이 되는 핵심 색상 정의 ===",
@@ -3250,195 +3250,407 @@ impl Theme {
             // name
             self.name(),
             // palette
-            ci(self.palette.bg), ci(self.palette.bg_alt), ci(self.palette.fg), ci(self.palette.fg_dim),
-            ci(self.palette.fg_strong), ci(self.palette.fg_inverse), ci(self.palette.accent),
-            ci(self.palette.shortcut), ci(self.palette.positive), ci(self.palette.highlight),
+            ci(self.palette.bg),
+            ci(self.palette.bg_alt),
+            ci(self.palette.fg),
+            ci(self.palette.fg_dim),
+            ci(self.palette.fg_strong),
+            ci(self.palette.fg_inverse),
+            ci(self.palette.accent),
+            ci(self.palette.shortcut),
+            ci(self.palette.positive),
+            ci(self.palette.highlight),
             // state
-            ci(self.state.success), ci(self.state.warning), ci(self.state.error), ci(self.state.info),
+            ci(self.state.success),
+            ci(self.state.warning),
+            ci(self.state.error),
+            ci(self.state.info),
             // panel
-            ci(self.panel.bg), ci(self.panel.border), ci(self.panel.border_active),
-            ci(self.panel.header_bg), ci(self.panel.header_bg_active),
-            ci(self.panel.header_text), ci(self.panel.header_text_active),
-            ci(self.panel.file_text), ci(self.panel.directory_text), ci(self.panel.symlink_text),
-            ci(self.panel.selected_bg), ci(self.panel.selected_text), ci(self.panel.marked_text),
-            ci(self.panel.size_text), ci(self.panel.date_text),
+            ci(self.panel.bg),
+            ci(self.panel.border),
+            ci(self.panel.border_active),
+            ci(self.panel.header_bg),
+            ci(self.panel.header_bg_active),
+            ci(self.panel.header_text),
+            ci(self.panel.header_text_active),
+            ci(self.panel.file_text),
+            ci(self.panel.directory_text),
+            ci(self.panel.symlink_text),
+            ci(self.panel.selected_bg),
+            ci(self.panel.selected_text),
+            ci(self.panel.marked_text),
+            ci(self.panel.size_text),
+            ci(self.panel.date_text),
             ci(self.panel.remote_indicator),
             // header
-            ci(self.header.bg), ci(self.header.text), ci(self.header.title),
+            ci(self.header.bg),
+            ci(self.header.text),
+            ci(self.header.title),
             // status_bar
-            ci(self.status_bar.bg), ci(self.status_bar.text), ci(self.status_bar.text_dim),
+            ci(self.status_bar.bg),
+            ci(self.status_bar.text),
+            ci(self.status_bar.text_dim),
             // function_bar
-            ci(self.function_bar.bg), ci(self.function_bar.key), ci(self.function_bar.label),
+            ci(self.function_bar.bg),
+            ci(self.function_bar.key),
+            ci(self.function_bar.label),
             // message
-            ci(self.message.bg), ci(self.message.text),
+            ci(self.message.bg),
+            ci(self.message.text),
             // dialog
-            ci(self.dialog.bg), ci(self.dialog.border), ci(self.dialog.title),
-            ci(self.dialog.text), ci(self.dialog.text_dim), ci(self.dialog.message_text),
-            ci(self.dialog.input_text), ci(self.dialog.input_cursor_fg), ci(self.dialog.input_cursor_bg),
-            ci(self.dialog.input_prompt), ci(self.dialog.button_text),
-            ci(self.dialog.button_selected_bg), ci(self.dialog.button_selected_text),
-            ci(self.dialog.autocomplete_bg), ci(self.dialog.autocomplete_text),
-            ci(self.dialog.autocomplete_directory_text), ci(self.dialog.autocomplete_selected_bg),
-            ci(self.dialog.autocomplete_selected_text), ci(self.dialog.autocomplete_scroll_info),
-            ci(self.dialog.preview_suffix_text), ci(self.dialog.help_key_text), ci(self.dialog.help_label_text),
-            ci(self.dialog.progress_label_text), ci(self.dialog.progress_value_text),
-            ci(self.dialog.progress_bar_fill), ci(self.dialog.progress_bar_empty),
-            ci(self.dialog.progress_percent_text), ci(self.dialog.conflict_filename_text),
-            ci(self.dialog.conflict_count_text), ci(self.dialog.conflict_shortcut_text),
-            ci(self.dialog.tar_exclude_title), ci(self.dialog.tar_exclude_border),
-            ci(self.dialog.tar_exclude_bg), ci(self.dialog.tar_exclude_message_text),
-            ci(self.dialog.tar_exclude_path_text), ci(self.dialog.tar_exclude_scroll_info),
-            ci(self.dialog.tar_exclude_button_text), ci(self.dialog.tar_exclude_button_selected_bg),
+            ci(self.dialog.bg),
+            ci(self.dialog.border),
+            ci(self.dialog.title),
+            ci(self.dialog.text),
+            ci(self.dialog.text_dim),
+            ci(self.dialog.message_text),
+            ci(self.dialog.input_text),
+            ci(self.dialog.input_cursor_fg),
+            ci(self.dialog.input_cursor_bg),
+            ci(self.dialog.input_prompt),
+            ci(self.dialog.button_text),
+            ci(self.dialog.button_selected_bg),
+            ci(self.dialog.button_selected_text),
+            ci(self.dialog.autocomplete_bg),
+            ci(self.dialog.autocomplete_text),
+            ci(self.dialog.autocomplete_directory_text),
+            ci(self.dialog.autocomplete_selected_bg),
+            ci(self.dialog.autocomplete_selected_text),
+            ci(self.dialog.autocomplete_scroll_info),
+            ci(self.dialog.preview_suffix_text),
+            ci(self.dialog.help_key_text),
+            ci(self.dialog.help_label_text),
+            ci(self.dialog.progress_label_text),
+            ci(self.dialog.progress_value_text),
+            ci(self.dialog.progress_bar_fill),
+            ci(self.dialog.progress_bar_empty),
+            ci(self.dialog.progress_percent_text),
+            ci(self.dialog.conflict_filename_text),
+            ci(self.dialog.conflict_count_text),
+            ci(self.dialog.conflict_shortcut_text),
+            ci(self.dialog.tar_exclude_title),
+            ci(self.dialog.tar_exclude_border),
+            ci(self.dialog.tar_exclude_bg),
+            ci(self.dialog.tar_exclude_message_text),
+            ci(self.dialog.tar_exclude_path_text),
+            ci(self.dialog.tar_exclude_scroll_info),
+            ci(self.dialog.tar_exclude_button_text),
+            ci(self.dialog.tar_exclude_button_selected_bg),
             ci(self.dialog.tar_exclude_button_selected_text),
-            ci(self.dialog.git_log_diff_title), ci(self.dialog.git_log_diff_border),
-            ci(self.dialog.git_log_diff_bg), ci(self.dialog.git_log_diff_message_text),
-            ci(self.dialog.git_log_diff_entry_text), ci(self.dialog.git_log_diff_selected_text),
-            ci(self.dialog.git_log_diff_cursor_text), ci(self.dialog.git_log_diff_cursor_bg),
-            ci(self.dialog.git_log_diff_button_text), ci(self.dialog.git_log_diff_button_selected_text),
-            ci(self.dialog.git_log_diff_button_selected_bg), ci(self.dialog.git_log_diff_button_disabled_text),
+            ci(self.dialog.git_log_diff_title),
+            ci(self.dialog.git_log_diff_border),
+            ci(self.dialog.git_log_diff_bg),
+            ci(self.dialog.git_log_diff_message_text),
+            ci(self.dialog.git_log_diff_entry_text),
+            ci(self.dialog.git_log_diff_selected_text),
+            ci(self.dialog.git_log_diff_cursor_text),
+            ci(self.dialog.git_log_diff_cursor_bg),
+            ci(self.dialog.git_log_diff_button_text),
+            ci(self.dialog.git_log_diff_button_selected_text),
+            ci(self.dialog.git_log_diff_button_selected_bg),
+            ci(self.dialog.git_log_diff_button_disabled_text),
             ci(self.dialog.git_log_diff_scroll_info),
             ci(self.dialog.remote_bookmark_text),
             ci(self.dialog.remote_connect_field_label),
             ci(self.dialog.remote_connect_field_value),
             ci(self.dialog.remote_connect_field_selected_bg),
             // confirm_dialog
-            ci(self.confirm_dialog.bg), ci(self.confirm_dialog.border), ci(self.confirm_dialog.title),
-            ci(self.confirm_dialog.message_text), ci(self.confirm_dialog.button_text),
-            ci(self.confirm_dialog.button_selected_bg), ci(self.confirm_dialog.button_selected_text),
+            ci(self.confirm_dialog.bg),
+            ci(self.confirm_dialog.border),
+            ci(self.confirm_dialog.title),
+            ci(self.confirm_dialog.message_text),
+            ci(self.confirm_dialog.button_text),
+            ci(self.confirm_dialog.button_selected_bg),
+            ci(self.confirm_dialog.button_selected_text),
             // settings
-            ci(self.settings.bg), ci(self.settings.border), ci(self.settings.title),
-            ci(self.settings.label_text), ci(self.settings.prompt),
-            ci(self.settings.value_text), ci(self.settings.value_bg),
-            ci(self.settings.help_key), ci(self.settings.help_text),
+            ci(self.settings.bg),
+            ci(self.settings.border),
+            ci(self.settings.title),
+            ci(self.settings.label_text),
+            ci(self.settings.prompt),
+            ci(self.settings.value_text),
+            ci(self.settings.value_bg),
+            ci(self.settings.help_key),
+            ci(self.settings.help_text),
             // editor
-            ci(self.editor.bg), ci(self.editor.border), ci(self.editor.header_bg),
-            ci(self.editor.header_text), ci(self.editor.header_info), ci(self.editor.line_number),
-            ci(self.editor.text), ci(self.editor.cursor), ci(self.editor.selection_bg), ci(self.editor.selection_text),
-            ci(self.editor.match_bg), ci(self.editor.match_current_bg), ci(self.editor.bracket_match),
-            ci(self.editor.modified_mark), ci(self.editor.footer_bg), ci(self.editor.footer_key),
-            ci(self.editor.footer_text), ci(self.editor.find_input_text),
-            ci(self.editor.find_option), ci(self.editor.find_option_active),
+            ci(self.editor.bg),
+            ci(self.editor.border),
+            ci(self.editor.header_bg),
+            ci(self.editor.header_text),
+            ci(self.editor.header_info),
+            ci(self.editor.line_number),
+            ci(self.editor.text),
+            ci(self.editor.cursor),
+            ci(self.editor.selection_bg),
+            ci(self.editor.selection_text),
+            ci(self.editor.match_bg),
+            ci(self.editor.match_current_bg),
+            ci(self.editor.bracket_match),
+            ci(self.editor.modified_mark),
+            ci(self.editor.footer_bg),
+            ci(self.editor.footer_key),
+            ci(self.editor.footer_text),
+            ci(self.editor.find_input_text),
+            ci(self.editor.find_option),
+            ci(self.editor.find_option_active),
             ci(self.editor.wrap_indicator),
             ci(self.editor.remote_path_text),
             // syntax
-            ci(self.syntax.keyword), ci(self.syntax.type_name), ci(self.syntax.string), ci(self.syntax.number),
-            ci(self.syntax.comment), ci(self.syntax.operator), ci(self.syntax.function), ci(self.syntax.macro_name),
-            ci(self.syntax.attribute), ci(self.syntax.variable), ci(self.syntax.constant),
-            ci(self.syntax.bracket), ci(self.syntax.normal),
+            ci(self.syntax.keyword),
+            ci(self.syntax.type_name),
+            ci(self.syntax.string),
+            ci(self.syntax.number),
+            ci(self.syntax.comment),
+            ci(self.syntax.operator),
+            ci(self.syntax.function),
+            ci(self.syntax.macro_name),
+            ci(self.syntax.attribute),
+            ci(self.syntax.variable),
+            ci(self.syntax.constant),
+            ci(self.syntax.bracket),
+            ci(self.syntax.normal),
             // viewer
-            ci(self.viewer.bg), ci(self.viewer.border), ci(self.viewer.header_text), ci(self.viewer.line_number),
-            ci(self.viewer.text), ci(self.viewer.bookmark_indicator), ci(self.viewer.search_input_text),
-            ci(self.viewer.search_cursor_fg), ci(self.viewer.search_cursor_bg),
-            ci(self.viewer.search_match_current_bg), ci(self.viewer.search_match_current_fg),
-            ci(self.viewer.search_match_other_bg), ci(self.viewer.search_match_other_fg),
-            ci(self.viewer.search_info), ci(self.viewer.hex_offset), ci(self.viewer.hex_bytes),
-            ci(self.viewer.hex_ascii), ci(self.viewer.wrap_indicator),
-            ci(self.viewer.footer_key), ci(self.viewer.footer_text),
+            ci(self.viewer.bg),
+            ci(self.viewer.border),
+            ci(self.viewer.header_text),
+            ci(self.viewer.line_number),
+            ci(self.viewer.text),
+            ci(self.viewer.bookmark_indicator),
+            ci(self.viewer.search_input_text),
+            ci(self.viewer.search_cursor_fg),
+            ci(self.viewer.search_cursor_bg),
+            ci(self.viewer.search_match_current_bg),
+            ci(self.viewer.search_match_current_fg),
+            ci(self.viewer.search_match_other_bg),
+            ci(self.viewer.search_match_other_fg),
+            ci(self.viewer.search_info),
+            ci(self.viewer.hex_offset),
+            ci(self.viewer.hex_bytes),
+            ci(self.viewer.hex_ascii),
+            ci(self.viewer.wrap_indicator),
+            ci(self.viewer.footer_key),
+            ci(self.viewer.footer_text),
             // process_manager
-            ci(self.process_manager.bg), ci(self.process_manager.border), ci(self.process_manager.header_text),
-            ci(self.process_manager.column_header), ci(self.process_manager.text),
-            ci(self.process_manager.selected_bg), ci(self.process_manager.selected_text),
-            ci(self.process_manager.cpu_high), ci(self.process_manager.mem_high),
-            ci(self.process_manager.confirm_text), ci(self.process_manager.footer_key),
+            ci(self.process_manager.bg),
+            ci(self.process_manager.border),
+            ci(self.process_manager.header_text),
+            ci(self.process_manager.column_header),
+            ci(self.process_manager.text),
+            ci(self.process_manager.selected_bg),
+            ci(self.process_manager.selected_text),
+            ci(self.process_manager.cpu_high),
+            ci(self.process_manager.mem_high),
+            ci(self.process_manager.confirm_text),
+            ci(self.process_manager.footer_key),
             ci(self.process_manager.footer_text),
             // ai_screen
-            ci(self.ai_screen.bg), ci(self.ai_screen.history_border), ci(self.ai_screen.history_title),
-            ci(self.ai_screen.history_placeholder), ci(self.ai_screen.history_scroll_info),
-            ci(self.ai_screen.user_prefix), ci(self.ai_screen.assistant_prefix),
-            ci(self.ai_screen.error_prefix), ci(self.ai_screen.system_prefix), ci(self.ai_screen.message_text),
-            ci(self.ai_screen.input_border), ci(self.ai_screen.input_prompt), ci(self.ai_screen.input_text),
-            ci(self.ai_screen.input_cursor_fg), ci(self.ai_screen.input_cursor_bg), ci(self.ai_screen.input_placeholder),
-            ci(self.ai_screen.processing_spinner), ci(self.ai_screen.processing_text),
+            ci(self.ai_screen.bg),
+            ci(self.ai_screen.history_border),
+            ci(self.ai_screen.history_title),
+            ci(self.ai_screen.history_placeholder),
+            ci(self.ai_screen.history_scroll_info),
+            ci(self.ai_screen.user_prefix),
+            ci(self.ai_screen.assistant_prefix),
+            ci(self.ai_screen.error_prefix),
+            ci(self.ai_screen.system_prefix),
+            ci(self.ai_screen.message_text),
+            ci(self.ai_screen.input_border),
+            ci(self.ai_screen.input_prompt),
+            ci(self.ai_screen.input_text),
+            ci(self.ai_screen.input_cursor_fg),
+            ci(self.ai_screen.input_cursor_bg),
+            ci(self.ai_screen.input_placeholder),
+            ci(self.ai_screen.processing_spinner),
+            ci(self.ai_screen.processing_text),
             ci(self.ai_screen.error_text),
-            ci(self.ai_screen.tool_use_prefix), ci(self.ai_screen.tool_use_name), ci(self.ai_screen.tool_use_input),
-            ci(self.ai_screen.tool_result_prefix), ci(self.ai_screen.tool_result_text),
-            ci(self.ai_screen.footer_key), ci(self.ai_screen.footer_text),
+            ci(self.ai_screen.tool_use_prefix),
+            ci(self.ai_screen.tool_use_name),
+            ci(self.ai_screen.tool_use_input),
+            ci(self.ai_screen.tool_result_prefix),
+            ci(self.ai_screen.tool_result_text),
+            ci(self.ai_screen.footer_key),
+            ci(self.ai_screen.footer_text),
             // system_info
-            ci(self.system_info.bg), ci(self.system_info.border), ci(self.system_info.section_title),
-            ci(self.system_info.label), ci(self.system_info.value),
-            ci(self.system_info.bar_fill), ci(self.system_info.bar_empty),
-            ci(self.system_info.usage_low), ci(self.system_info.usage_medium), ci(self.system_info.usage_high),
-            ci(self.system_info.tab_active), ci(self.system_info.disk_header), ci(self.system_info.disk_text),
-            ci(self.system_info.selected_bg), ci(self.system_info.selected_text),
-            ci(self.system_info.footer_key), ci(self.system_info.footer_text),
+            ci(self.system_info.bg),
+            ci(self.system_info.border),
+            ci(self.system_info.section_title),
+            ci(self.system_info.label),
+            ci(self.system_info.value),
+            ci(self.system_info.bar_fill),
+            ci(self.system_info.bar_empty),
+            ci(self.system_info.usage_low),
+            ci(self.system_info.usage_medium),
+            ci(self.system_info.usage_high),
+            ci(self.system_info.tab_active),
+            ci(self.system_info.disk_header),
+            ci(self.system_info.disk_text),
+            ci(self.system_info.selected_bg),
+            ci(self.system_info.selected_text),
+            ci(self.system_info.footer_key),
+            ci(self.system_info.footer_text),
             // search_result
-            ci(self.search_result.bg), ci(self.search_result.border), ci(self.search_result.header_text),
-            ci(self.search_result.column_header), ci(self.search_result.column_header_dim),
-            ci(self.search_result.directory_text), ci(self.search_result.file_text),
-            ci(self.search_result.selected_bg), ci(self.search_result.selected_text),
-            ci(self.search_result.match_highlight), ci(self.search_result.path_text),
-            ci(self.search_result.footer_key), ci(self.search_result.footer_text),
+            ci(self.search_result.bg),
+            ci(self.search_result.border),
+            ci(self.search_result.header_text),
+            ci(self.search_result.column_header),
+            ci(self.search_result.column_header_dim),
+            ci(self.search_result.directory_text),
+            ci(self.search_result.file_text),
+            ci(self.search_result.selected_bg),
+            ci(self.search_result.selected_text),
+            ci(self.search_result.match_highlight),
+            ci(self.search_result.path_text),
+            ci(self.search_result.footer_key),
+            ci(self.search_result.footer_text),
             // image_viewer
-            ci(self.image_viewer.bg), ci(self.image_viewer.border), ci(self.image_viewer.title_text),
-            ci(self.image_viewer.loading_spinner), ci(self.image_viewer.loading_text),
-            ci(self.image_viewer.error_text), ci(self.image_viewer.hint_text),
-            ci(self.image_viewer.footer_key), ci(self.image_viewer.footer_text),
+            ci(self.image_viewer.bg),
+            ci(self.image_viewer.border),
+            ci(self.image_viewer.title_text),
+            ci(self.image_viewer.loading_spinner),
+            ci(self.image_viewer.loading_text),
+            ci(self.image_viewer.error_text),
+            ci(self.image_viewer.hint_text),
+            ci(self.image_viewer.footer_key),
+            ci(self.image_viewer.footer_text),
             ci(self.image_viewer.footer_separator),
             // file_info
-            ci(self.file_info.bg), ci(self.file_info.border), ci(self.file_info.title),
-            ci(self.file_info.label), ci(self.file_info.value), ci(self.file_info.value_name),
-            ci(self.file_info.value_path), ci(self.file_info.value_type), ci(self.file_info.value_size),
-            ci(self.file_info.value_permission), ci(self.file_info.value_owner), ci(self.file_info.value_date),
-            ci(self.file_info.calculating_spinner), ci(self.file_info.calculating_text),
-            ci(self.file_info.error_text), ci(self.file_info.hint_text),
+            ci(self.file_info.bg),
+            ci(self.file_info.border),
+            ci(self.file_info.title),
+            ci(self.file_info.label),
+            ci(self.file_info.value),
+            ci(self.file_info.value_name),
+            ci(self.file_info.value_path),
+            ci(self.file_info.value_type),
+            ci(self.file_info.value_size),
+            ci(self.file_info.value_permission),
+            ci(self.file_info.value_owner),
+            ci(self.file_info.value_date),
+            ci(self.file_info.calculating_spinner),
+            ci(self.file_info.calculating_text),
+            ci(self.file_info.error_text),
+            ci(self.file_info.hint_text),
             // help
-            ci(self.help.bg), ci(self.help.border), ci(self.help.title), ci(self.help.section_title),
-            ci(self.help.section_decorator), ci(self.help.key), ci(self.help.key_highlight),
-            ci(self.help.description), ci(self.help.hint_text),
+            ci(self.help.bg),
+            ci(self.help.border),
+            ci(self.help.title),
+            ci(self.help.section_title),
+            ci(self.help.section_decorator),
+            ci(self.help.key),
+            ci(self.help.key_highlight),
+            ci(self.help.description),
+            ci(self.help.hint_text),
             // advanced_search
-            ci(self.advanced_search.bg), ci(self.advanced_search.border), ci(self.advanced_search.title),
-            ci(self.advanced_search.label), ci(self.advanced_search.input_text),
-            ci(self.advanced_search.input_cursor), ci(self.advanced_search.field_bracket),
-            ci(self.advanced_search.checkbox_checked), ci(self.advanced_search.checkbox_unchecked),
-            ci(self.advanced_search.button_text), ci(self.advanced_search.button_selected_bg),
+            ci(self.advanced_search.bg),
+            ci(self.advanced_search.border),
+            ci(self.advanced_search.title),
+            ci(self.advanced_search.label),
+            ci(self.advanced_search.input_text),
+            ci(self.advanced_search.input_cursor),
+            ci(self.advanced_search.field_bracket),
+            ci(self.advanced_search.checkbox_checked),
+            ci(self.advanced_search.checkbox_unchecked),
+            ci(self.advanced_search.button_text),
+            ci(self.advanced_search.button_selected_bg),
             ci(self.advanced_search.button_selected_text),
-            ci(self.advanced_search.footer_key), ci(self.advanced_search.footer_text),
+            ci(self.advanced_search.footer_key),
+            ci(self.advanced_search.footer_text),
             // diff
-            ci(self.diff.bg), ci(self.diff.border), ci(self.diff.header_text), ci(self.diff.header_label),
-            ci(self.diff.column_header_bg), ci(self.diff.column_header_text),
-            ci(self.diff.same_text), ci(self.diff.modified_text), ci(self.diff.modified_bg),
-            ci(self.diff.left_only_text), ci(self.diff.left_only_bg),
-            ci(self.diff.right_only_text), ci(self.diff.right_only_bg),
-            ci(self.diff.empty_bg), ci(self.diff.dir_same_text), ci(self.diff.dir_modified_text),
-            ci(self.diff.cursor_bg), ci(self.diff.cursor_text), ci(self.diff.marked_text),
-            ci(self.diff.size_text), ci(self.diff.date_text),
-            ci(self.diff.status_bar_bg), ci(self.diff.status_bar_text),
-            ci(self.diff.filter_label), ci(self.diff.stats_text),
-            ci(self.diff.footer_key), ci(self.diff.footer_text),
+            ci(self.diff.bg),
+            ci(self.diff.border),
+            ci(self.diff.header_text),
+            ci(self.diff.header_label),
+            ci(self.diff.column_header_bg),
+            ci(self.diff.column_header_text),
+            ci(self.diff.same_text),
+            ci(self.diff.modified_text),
+            ci(self.diff.modified_bg),
+            ci(self.diff.left_only_text),
+            ci(self.diff.left_only_bg),
+            ci(self.diff.right_only_text),
+            ci(self.diff.right_only_bg),
+            ci(self.diff.empty_bg),
+            ci(self.diff.dir_same_text),
+            ci(self.diff.dir_modified_text),
+            ci(self.diff.cursor_bg),
+            ci(self.diff.cursor_text),
+            ci(self.diff.marked_text),
+            ci(self.diff.size_text),
+            ci(self.diff.date_text),
+            ci(self.diff.status_bar_bg),
+            ci(self.diff.status_bar_text),
+            ci(self.diff.filter_label),
+            ci(self.diff.stats_text),
+            ci(self.diff.footer_key),
+            ci(self.diff.footer_text),
             ci(self.diff.panel_selected_border),
-            ci(self.diff.progress_spinner), ci(self.diff.progress_bar_fill),
-            ci(self.diff.progress_bar_empty), ci(self.diff.progress_percent_text),
-            ci(self.diff.progress_value_text), ci(self.diff.progress_hint_text),
+            ci(self.diff.progress_spinner),
+            ci(self.diff.progress_bar_fill),
+            ci(self.diff.progress_bar_empty),
+            ci(self.diff.progress_percent_text),
+            ci(self.diff.progress_value_text),
+            ci(self.diff.progress_hint_text),
             // diff_file_view
-            ci(self.diff_file_view.bg), ci(self.diff_file_view.border),
-            ci(self.diff_file_view.header_text), ci(self.diff_file_view.line_number),
-            ci(self.diff_file_view.same_text), ci(self.diff_file_view.modified_text),
-            ci(self.diff_file_view.modified_bg), ci(self.diff_file_view.left_only_text),
-            ci(self.diff_file_view.left_only_bg), ci(self.diff_file_view.right_only_text),
-            ci(self.diff_file_view.right_only_bg), ci(self.diff_file_view.empty_bg),
-            ci(self.diff_file_view.inline_change_bg), ci(self.diff_file_view.inline_change_text),
-            ci(self.diff_file_view.status_bar_bg), ci(self.diff_file_view.status_bar_text),
-            ci(self.diff_file_view.footer_key), ci(self.diff_file_view.footer_text),
+            ci(self.diff_file_view.bg),
+            ci(self.diff_file_view.border),
+            ci(self.diff_file_view.header_text),
+            ci(self.diff_file_view.line_number),
+            ci(self.diff_file_view.same_text),
+            ci(self.diff_file_view.modified_text),
+            ci(self.diff_file_view.modified_bg),
+            ci(self.diff_file_view.left_only_text),
+            ci(self.diff_file_view.left_only_bg),
+            ci(self.diff_file_view.right_only_text),
+            ci(self.diff_file_view.right_only_bg),
+            ci(self.diff_file_view.empty_bg),
+            ci(self.diff_file_view.inline_change_bg),
+            ci(self.diff_file_view.inline_change_text),
+            ci(self.diff_file_view.status_bar_bg),
+            ci(self.diff_file_view.status_bar_text),
+            ci(self.diff_file_view.footer_key),
+            ci(self.diff_file_view.footer_text),
             // git_screen
-            ci(self.git_screen.bg), ci(self.git_screen.border),
-            ci(self.git_screen.header_branch), ci(self.git_screen.header_path),
-            ci(self.git_screen.tab_active), ci(self.git_screen.tab_inactive), ci(self.git_screen.tab_bar_bg),
-            ci(self.git_screen.file_staged), ci(self.git_screen.file_modified),
-            ci(self.git_screen.file_untracked), ci(self.git_screen.file_deleted),
-            ci(self.git_screen.selected_bg), ci(self.git_screen.selected_text),
-            ci(self.git_screen.footer_key), ci(self.git_screen.footer_text),
-            ci(self.git_screen.commit_input_border), ci(self.git_screen.commit_input_text),
-            ci(self.git_screen.log_hash), ci(self.git_screen.log_message),
-            ci(self.git_screen.log_author), ci(self.git_screen.log_date),
-            ci(self.git_screen.branch_current), ci(self.git_screen.branch_normal),
-            ci(self.git_screen.diff_add), ci(self.git_screen.diff_remove), ci(self.git_screen.diff_header),
+            ci(self.git_screen.bg),
+            ci(self.git_screen.border),
+            ci(self.git_screen.header_branch),
+            ci(self.git_screen.header_path),
+            ci(self.git_screen.tab_active),
+            ci(self.git_screen.tab_inactive),
+            ci(self.git_screen.tab_bar_bg),
+            ci(self.git_screen.file_staged),
+            ci(self.git_screen.file_modified),
+            ci(self.git_screen.file_untracked),
+            ci(self.git_screen.file_deleted),
+            ci(self.git_screen.selected_bg),
+            ci(self.git_screen.selected_text),
+            ci(self.git_screen.footer_key),
+            ci(self.git_screen.footer_text),
+            ci(self.git_screen.commit_input_border),
+            ci(self.git_screen.commit_input_text),
+            ci(self.git_screen.log_hash),
+            ci(self.git_screen.log_message),
+            ci(self.git_screen.log_author),
+            ci(self.git_screen.log_date),
+            ci(self.git_screen.branch_current),
+            ci(self.git_screen.branch_normal),
+            ci(self.git_screen.diff_add),
+            ci(self.git_screen.diff_remove),
+            ci(self.git_screen.diff_header),
             // dedup_screen
-            ci(self.dedup_screen.bg), ci(self.dedup_screen.border), ci(self.dedup_screen.title),
-            ci(self.dedup_screen.phase_text), ci(self.dedup_screen.stats_text),
-            ci(self.dedup_screen.progress_bar_fill), ci(self.dedup_screen.progress_bar_empty),
-            ci(self.dedup_screen.progress_text), ci(self.dedup_screen.log_text), ci(self.dedup_screen.log_text_alt),
-            ci(self.dedup_screen.log_deleted), ci(self.dedup_screen.log_error),
-            ci(self.dedup_screen.footer_key), ci(self.dedup_screen.footer_text),
+            ci(self.dedup_screen.bg),
+            ci(self.dedup_screen.border),
+            ci(self.dedup_screen.title),
+            ci(self.dedup_screen.phase_text),
+            ci(self.dedup_screen.stats_text),
+            ci(self.dedup_screen.progress_bar_fill),
+            ci(self.dedup_screen.progress_bar_empty),
+            ci(self.dedup_screen.progress_text),
+            ci(self.dedup_screen.log_text),
+            ci(self.dedup_screen.log_text_alt),
+            ci(self.dedup_screen.log_deleted),
+            ci(self.dedup_screen.log_error),
+            ci(self.dedup_screen.footer_key),
+            ci(self.dedup_screen.footer_text),
         )
     }
 }

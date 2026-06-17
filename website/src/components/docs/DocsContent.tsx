@@ -20,6 +20,7 @@ import Schedules from './sections/Schedules'
 import GroupChat from './sections/GroupChat'
 import MultipleChats from './sections/MultipleChats'
 import ToolManagement from './sections/ToolManagement'
+import AgyProvider from './sections/AgyProvider'
 import CustomInstructions from './sections/CustomInstructions'
 import Settings from './sections/Settings'
 import EnvironmentVariables from './sections/EnvironmentVariables'
@@ -43,6 +44,7 @@ const sectionComponents: Record<string, React.ComponentType> = {
   'group-chat': GroupChat,
   'multiple-chats': MultipleChats,
   'tool-management': ToolManagement,
+  'agy-provider': AgyProvider,
   'instructions': CustomInstructions,
   'settings': Settings,
   'env-vars': EnvironmentVariables,

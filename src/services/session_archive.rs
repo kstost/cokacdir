@@ -1,6 +1,6 @@
 //! Full-fidelity session archive.
 //!
-//! Converts raw session data from Claude Code, Codex, OpenCode, and Gemini
+//! Converts raw session data from Claude Code, Codex, Agy/OpenCode, and Gemini
 //! into a normalized schema preserving all text, tool arguments, tool results,
 //! timestamps, model info, and usage. No truncation.
 //!
@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::services::claude::debug_log_to;
 
-fn dbg(msg: &str) { debug_log_to("session_archive.log", msg); }
+fn dbg(msg: &str) {
+    debug_log_to("session_archive.log", msg);
+}
 
 /// Short (12-hex-char) SHA-256 of the input, used for /loop verification
 /// forensic logs so consecutive-iteration transcripts can be compared at a
@@ -109,32 +111,66 @@ pub struct ContentBlock {
 
 impl ContentBlock {
     fn text(s: impl Into<String>) -> Self {
-        Self { kind: "text".into(), text: Some(s.into()),
-            tool_name: None, tool_id: None, tool_input: None,
-            tool_output: None, is_error: None, extra: BTreeMap::new() }
+        Self {
+            kind: "text".into(),
+            text: Some(s.into()),
+            tool_name: None,
+            tool_id: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            extra: BTreeMap::new(),
+        }
     }
     fn thinking(s: impl Into<String>) -> Self {
-        Self { kind: "thinking".into(), text: Some(s.into()),
-            tool_name: None, tool_id: None, tool_input: None,
-            tool_output: None, is_error: None, extra: BTreeMap::new() }
+        Self {
+            kind: "thinking".into(),
+            text: Some(s.into()),
+            tool_name: None,
+            tool_id: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            extra: BTreeMap::new(),
+        }
     }
     fn tool_use(name: impl Into<String>, id: Option<String>, input: Value) -> Self {
-        Self { kind: "tool_use".into(), text: None,
-            tool_name: Some(name.into()), tool_id: id,
-            tool_input: Some(input), tool_output: None, is_error: None,
-            extra: BTreeMap::new() }
+        Self {
+            kind: "tool_use".into(),
+            text: None,
+            tool_name: Some(name.into()),
+            tool_id: id,
+            tool_input: Some(input),
+            tool_output: None,
+            is_error: None,
+            extra: BTreeMap::new(),
+        }
     }
     fn tool_result(id: Option<String>, output: Value, is_error: Option<bool>) -> Self {
-        Self { kind: "tool_result".into(), text: None,
-            tool_name: None, tool_id: id,
-            tool_input: None, tool_output: Some(output), is_error,
-            extra: BTreeMap::new() }
+        Self {
+            kind: "tool_result".into(),
+            text: None,
+            tool_name: None,
+            tool_id: id,
+            tool_input: None,
+            tool_output: Some(output),
+            is_error,
+            extra: BTreeMap::new(),
+        }
     }
     fn other(kind: impl Into<String>, raw: Value) -> Self {
         let mut extra = BTreeMap::new();
         extra.insert("raw".into(), raw);
-        Self { kind: kind.into(), text: None, tool_name: None, tool_id: None,
-            tool_input: None, tool_output: None, is_error: None, extra }
+        Self {
+            kind: kind.into(),
+            text: None,
+            tool_name: None,
+            tool_id: None,
+            tool_input: None,
+            tool_output: None,
+            is_error: None,
+            extra,
+        }
     }
 }
 
@@ -186,12 +222,13 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     if !is_valid_session_id(session_id) {
         return Err(format!("Invalid session_id: {:?}", session_id));
     }
-    let archive_dir = archive_sessions_dir()
-        .ok_or_else(|| "Cannot locate archive dir".to_string())?;
+    let archive_dir =
+        archive_sessions_dir().ok_or_else(|| "Cannot locate archive dir".to_string())?;
     let path = archive_dir.join(format!("{}.json", session_id));
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Archive not found at {}: {}", path.display(), e))?;
-    let archive_mtime = std::fs::metadata(&path).ok()
+    let archive_mtime = std::fs::metadata(&path)
+        .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
@@ -199,8 +236,8 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     dbg(&format!(
         "[loop-verify transcript] archive_read sid={} path={} raw_len={} raw_sha={} archive_mtime_epoch={}",
         session_id, path.display(), raw.len(), short_sha(&raw), archive_mtime));
-    let archive: FullSession = serde_json::from_str(&raw)
-        .map_err(|e| format!("Archive parse error: {}", e))?;
+    let archive: FullSession =
+        serde_json::from_str(&raw).map_err(|e| format!("Archive parse error: {}", e))?;
 
     // Render a single message into a chunk. Honors PER_BLOCK_LIMIT per content
     // block but NOT TOTAL_LIMIT — callers compose selected chunks within the
@@ -233,22 +270,36 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
                 }
                 "tool_use" => {
                     let name = b.tool_name.as_deref().unwrap_or("?");
-                    let input = b.tool_input.as_ref()
+                    let input = b
+                        .tool_input
+                        .as_ref()
                         .map(|v| serde_json::to_string(v).unwrap_or_default())
                         .unwrap_or_default();
-                    s.push_str(&format!("(tool_use:{}) {}\n",
-                        name, truncate_utf8_boundary(&input, PER_BLOCK_LIMIT)));
+                    s.push_str(&format!(
+                        "(tool_use:{}) {}\n",
+                        name,
+                        truncate_utf8_boundary(&input, PER_BLOCK_LIMIT)
+                    ));
                 }
                 "tool_result" => {
-                    let output = b.tool_output.as_ref()
+                    let output = b
+                        .tool_output
+                        .as_ref()
                         .map(|v| match v {
                             Value::String(s) => s.clone(),
                             other => serde_json::to_string(other).unwrap_or_default(),
                         })
                         .unwrap_or_default();
-                    let err_tag = if b.is_error == Some(true) { " ERROR" } else { "" };
-                    s.push_str(&format!("(tool_result{}) {}\n",
-                        err_tag, truncate_utf8_boundary(&output, PER_BLOCK_LIMIT)));
+                    let err_tag = if b.is_error == Some(true) {
+                        " ERROR"
+                    } else {
+                        ""
+                    };
+                    s.push_str(&format!(
+                        "(tool_result{}) {}\n",
+                        err_tag,
+                        truncate_utf8_boundary(&output, PER_BLOCK_LIMIT)
+                    ));
                 }
                 "patch" => s.push_str("(patch applied)\n"),
                 _ => {}
@@ -258,28 +309,36 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     };
 
     // Indices of all visible messages (non-system, non-empty).
-    let visible_idx: Vec<usize> = archive.messages.iter().enumerate()
+    let visible_idx: Vec<usize> = archive
+        .messages
+        .iter()
+        .enumerate()
         .filter(|(_, m)| m.role != "system" && !m.content.is_empty())
         .map(|(i, _)| i)
         .collect();
 
     // The first user message is treated as the original request — pin it at
     // the top. If no user message exists yet, head is empty.
-    let head_idx: Option<usize> = visible_idx.iter().copied()
-        .find(|i| archive.messages.get(*i).map(|m| m.role == "user").unwrap_or(false));
+    let head_idx: Option<usize> = visible_idx.iter().copied().find(|i| {
+        archive
+            .messages
+            .get(*i)
+            .map(|m| m.role == "user")
+            .unwrap_or(false)
+    });
 
-    let head_rendered: Option<String> = head_idx
-        .and_then(|i| archive.messages.get(i))
-        .map(|m| {
-            let rendered = render_msg(m);
-            if rendered.len() > HEAD_BUDGET {
-                let mut end = HEAD_BUDGET;
-                while end > 0 && !rendered.is_char_boundary(end) { end -= 1; }
-                format!("{}\n[...head truncated...]\n", &rendered[..end])
-            } else {
-                rendered
+    let head_rendered: Option<String> = head_idx.and_then(|i| archive.messages.get(i)).map(|m| {
+        let rendered = render_msg(m);
+        if rendered.len() > HEAD_BUDGET {
+            let mut end = HEAD_BUDGET;
+            while end > 0 && !rendered.is_char_boundary(end) {
+                end -= 1;
             }
-        });
+            format!("{}\n[...head truncated...]\n", &rendered[..end])
+        } else {
+            rendered
+        }
+    });
 
     // Fill the tail from the END of the conversation backwards, stopping when
     // the next chunk would exceed the remaining budget. This guarantees the
@@ -288,7 +347,9 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     // the 60 KB front slice.
     let head_len = head_rendered.as_ref().map(|s| s.len()).unwrap_or(0);
     let separator = "\n[...earlier transcript truncated — middle turns omitted...]\n";
-    let tail_budget = TOTAL_LIMIT.saturating_sub(head_len).saturating_sub(separator.len());
+    let tail_budget = TOTAL_LIMIT
+        .saturating_sub(head_len)
+        .saturating_sub(separator.len());
 
     let mut tail_chunks_rev: Vec<String> = Vec::new();
     let mut tail_acc: usize = 0;
@@ -300,7 +361,9 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
             // between head and tail is already included, no middle dropped.
             break;
         }
-        let Some(m) = archive.messages.get(i) else { continue };
+        let Some(m) = archive.messages.get(i) else {
+            continue;
+        };
         let mut chunk = render_msg(m);
         // Guard: if the single newest turn alone exceeds the tail budget,
         // truncate it instead of dropping it. Losing the newest turn entirely
@@ -309,7 +372,9 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
             let marker = "\n[...turn truncated...]\n";
             let cap = tail_budget.saturating_sub(marker.len());
             let mut end = cap;
-            while end > 0 && !chunk.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
             chunk.truncate(end);
             chunk.push_str(marker);
             dropped_middle = true;
@@ -333,7 +398,9 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     let mut out = String::new();
     if let Some(h) = head_rendered.as_ref() {
         out.push_str(h);
-        if dropped_middle { out.push_str(separator); }
+        if dropped_middle {
+            out.push_str(separator);
+        }
     } else if dropped_middle {
         out.push_str(separator);
     }
@@ -345,7 +412,9 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     let num_msgs = visible_idx.len();
     let tail_start = out.len().saturating_sub(500);
     let mut tail_off = tail_start;
-    while tail_off < out.len() && !out.is_char_boundary(tail_off) { tail_off += 1; }
+    while tail_off < out.len() && !out.is_char_boundary(tail_off) {
+        tail_off += 1;
+    }
     let tail = &out[tail_off..];
     dbg(&format!(
         "[loop-verify transcript] built sid={} len={} sha={} non_system_msgs={} head={} dropped_middle={} tail_msgs={} tail_500={:?}",
@@ -356,31 +425,42 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
 }
 
 fn truncate_utf8_boundary(s: &str, max: usize) -> String {
-    if s.len() <= max { return s.to_string(); }
+    if s.len() <= max {
+        return s.to_string();
+    }
     let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}…", &s[..end])
 }
 
 fn is_valid_session_id(s: &str) -> bool {
-    if s.is_empty() || s.len() > 64 { return false; }
-    if s.contains('/') || s.contains('\\') || s.contains("..") { return false; }
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    if s.contains('/') || s.contains('\\') || s.contains("..") {
+        return false;
+    }
     // A leading `-` would be treated as a CLI flag if this id is ever
     // spliced into an argv list.
-    if s.starts_with('-') { return false; }
-    s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    if s.starts_with('-') {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Entry point: convert the given source and write the normalized archive.
 /// Skips work if the target JSON is newer than the source.
-pub fn archive_and_save_session(
-    provider: &str,
-    source_path: &Path,
-    session_id: &str,
-    cwd: &str,
-) {
-    dbg(&format!("[archive] start: provider={}, source={}, id={}, cwd={}",
-        provider, source_path.display(), session_id, cwd));
+pub fn archive_and_save_session(provider: &str, source_path: &Path, session_id: &str, cwd: &str) {
+    dbg(&format!(
+        "[archive] start: provider={}, source={}, id={}, cwd={}",
+        provider,
+        source_path.display(),
+        session_id,
+        cwd
+    ));
 
     if !is_valid_session_id(session_id) {
         dbg(&format!("[archive] invalid session_id: {:?}", session_id));
@@ -396,14 +476,20 @@ pub fn archive_and_save_session(
     // fall through and regenerate rather than silently refusing to update.
     // Track pre-regenerate size so the forensic log below can show a delta.
     let prev_target_size = target.metadata().ok().map(|m| m.len()).unwrap_or(0);
-    let src_epoch = source_path.metadata().ok()
+    let src_epoch = source_path
+        .metadata()
+        .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs()).unwrap_or(0);
-    let tgt_epoch = target.metadata().ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tgt_epoch = target
+        .metadata()
+        .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs()).unwrap_or(0);
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if target.exists() {
         let src_m = source_path.metadata().ok().and_then(|m| m.modified().ok());
         let tgt_m = target.metadata().ok().and_then(|m| m.modified().ok());
@@ -414,16 +500,18 @@ pub fn archive_and_save_session(
                      target is up-to-date (rollout has NOT grown since last refresh). \
                      If this fires on consecutive /loop iterations with no turn in between, \
                      the verifier will read the SAME transcript.",
-                    session_id, src_epoch, tgt_epoch, prev_target_size));
+                    session_id, src_epoch, tgt_epoch, prev_target_size
+                ));
                 return;
             }
         }
     }
 
     let result = match provider {
-        "claude"   => parse_claude(source_path, session_id, cwd),
-        "codex"    => parse_codex(source_path, session_id, cwd),
-        "gemini"   => parse_gemini(source_path, session_id, cwd),
+        "claude" => parse_claude(source_path, session_id, cwd),
+        "codex" => parse_codex(source_path, session_id, cwd),
+        "agy" => parse_agy(source_path, session_id, cwd),
+        "gemini" => parse_gemini(source_path, session_id, cwd),
         "opencode" => parse_opencode(source_path, session_id, cwd),
         _ => {
             dbg(&format!("[archive] unknown provider: {}", provider));
@@ -464,7 +552,9 @@ pub fn archive_and_save_session(
                         "[loop-verify archive] REGENERATED sid={} path={} new_size={} prev_size={} delta={:+} messages={} src_mtime={} rename={:?}",
                         session_id, target.display(), new_size, prev_target_size,
                         delta, session.messages.len(), src_epoch, r));
-                    if r.is_err() { let _ = fs::remove_file(&tmp); }
+                    if r.is_err() {
+                        let _ = fs::remove_file(&tmp);
+                    }
                 }
                 Err(e) => {
                     dbg(&format!("[archive] tmp write failed: {}", e));
@@ -500,12 +590,25 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
     let mut idx: u32 = 0;
 
     for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<Value>(&line) else { continue };
-        let rec_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let ts = val.get("timestamp").and_then(|v| v.as_str()).map(String::from);
-        if created_at.is_none() { created_at = ts.clone(); }
+        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let rec_type = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if created_at.is_none() {
+            created_at = ts.clone();
+        }
         if let Some(g) = val.get("gitBranch").and_then(|v| v.as_str()) {
-            if !g.is_empty() && git_branch.is_none() { git_branch = Some(g.to_string()); }
+            if !g.is_empty() && git_branch.is_none() {
+                git_branch = Some(g.to_string());
+            }
         }
 
         match rec_type.as_str() {
@@ -516,10 +619,14 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
 
                 let mut meta = BTreeMap::new();
                 if let Some(b) = val.get("isSidechain").and_then(|v| v.as_bool()) {
-                    if b { meta.insert("is_sidechain".into(), json!(true)); }
+                    if b {
+                        meta.insert("is_sidechain".into(), json!(true));
+                    }
                 }
                 if let Some(b) = val.get("isMeta").and_then(|v| v.as_bool()) {
-                    if b { meta.insert("is_meta".into(), json!(true)); }
+                    if b {
+                        meta.insert("is_meta".into(), json!(true));
+                    }
                 }
                 if let Some(u) = val.get("uuid").and_then(|v| v.as_str()) {
                     meta.insert("uuid".into(), json!(u));
@@ -529,26 +636,38 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                 }
 
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: "user".into(),
+                    index: idx,
+                    timestamp: ts,
+                    role: "user".into(),
                     source: "claude:user".into(),
                     content: blocks,
-                    model: None, usage: None, stop_reason: None,
-                    meta, raw: val,
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    meta,
+                    raw: val,
                 });
                 idx += 1;
             }
             "assistant" => {
                 let msg = val.get("message").cloned().unwrap_or(Value::Null);
                 let model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
-                if model.is_some() { last_model = model.clone(); }
+                if model.is_some() {
+                    last_model = model.clone();
+                }
                 let content_val = msg.get("content").cloned().unwrap_or(Value::Null);
                 let blocks = claude_content_blocks(&content_val);
-                let stop_reason = msg.get("stop_reason").and_then(|v| v.as_str()).map(String::from);
+                let stop_reason = msg
+                    .get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let usage = msg.get("usage").map(claude_parse_usage);
 
                 let mut meta = BTreeMap::new();
                 if let Some(b) = val.get("isSidechain").and_then(|v| v.as_bool()) {
-                    if b { meta.insert("is_sidechain".into(), json!(true)); }
+                    if b {
+                        meta.insert("is_sidechain".into(), json!(true));
+                    }
                 }
                 if let Some(u) = val.get("uuid").and_then(|v| v.as_str()) {
                     meta.insert("uuid".into(), json!(u));
@@ -564,32 +683,48 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                 }
 
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: "assistant".into(),
+                    index: idx,
+                    timestamp: ts,
+                    role: "assistant".into(),
                     source: "claude:assistant".into(),
-                    content: blocks, model, usage, stop_reason,
-                    meta, raw: val,
+                    content: blocks,
+                    model,
+                    usage,
+                    stop_reason,
+                    meta,
+                    raw: val,
                 });
                 idx += 1;
             }
             // Session-level metadata: preserve the last such record encountered.
             // `system` carries turn_duration/messageCount style telemetry — keep as metadata.
-            "session_meta" | "permission-mode" | "ai-title" | "skill_listing" |
-            "file-history-snapshot" | "last-prompt" | "attachment" |
-            "queue-operation" | "text" | "message" | "system" => {
+            "session_meta"
+            | "permission-mode"
+            | "ai-title"
+            | "skill_listing"
+            | "file-history-snapshot"
+            | "last-prompt"
+            | "attachment"
+            | "queue-operation"
+            | "text"
+            | "message"
+            | "system" => {
                 // Aggregate non-conversational records under session_meta[type].
                 let bucket = session_meta.get_or_insert_with(|| json!({}));
                 if let Some(obj) = bucket.as_object_mut() {
-                    let arr = obj.entry(rec_type.clone())
-                        .or_insert_with(|| json!([]));
-                    if let Some(a) = arr.as_array_mut() { a.push(val); }
+                    let arr = obj.entry(rec_type.clone()).or_insert_with(|| json!([]));
+                    if let Some(a) = arr.as_array_mut() {
+                        a.push(val);
+                    }
                 }
             }
             _ => {
                 let bucket = session_meta.get_or_insert_with(|| json!({}));
                 if let Some(obj) = bucket.as_object_mut() {
-                    let arr = obj.entry("_other".to_string())
-                        .or_insert_with(|| json!([]));
-                    if let Some(a) = arr.as_array_mut() { a.push(val); }
+                    let arr = obj.entry("_other".to_string()).or_insert_with(|| json!([]));
+                    if let Some(a) = arr.as_array_mut() {
+                        a.push(val);
+                    }
                 }
             }
         }
@@ -607,7 +742,10 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
         updated_at: None,
         source_path: path.display().to_string(),
         model: last_model,
-        git: git_branch.map(|b| GitInfo { branch: Some(b), commit: None }),
+        git: git_branch.map(|b| GitInfo {
+            branch: Some(b),
+            commit: None,
+        }),
         session_meta,
         messages,
     })
@@ -618,7 +756,9 @@ fn claude_content_blocks(content: &Value) -> Vec<ContentBlock> {
     if let Some(s) = content.as_str() {
         return vec![ContentBlock::text(s)];
     }
-    let Some(arr) = content.as_array() else { return Vec::new(); };
+    let Some(arr) = content.as_array() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for item in arr {
         let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -628,7 +768,9 @@ fn claude_content_blocks(content: &Value) -> Vec<ContentBlock> {
                 out.push(ContentBlock::text(text));
             }
             "thinking" => {
-                let text = item.get("thinking").and_then(|v| v.as_str())
+                let text = item
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
                     .or_else(|| item.get("text").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 let mut b = ContentBlock::thinking(text);
@@ -646,7 +788,10 @@ fn claude_content_blocks(content: &Value) -> Vec<ContentBlock> {
                 out.push(ContentBlock::tool_use(name, id, input));
             }
             "tool_result" => {
-                let id = item.get("tool_use_id").and_then(|v| v.as_str()).map(String::from);
+                let id = item
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let output = item.get("content").cloned().unwrap_or(Value::Null);
                 let is_err = item.get("is_error").and_then(|v| v.as_bool());
                 out.push(ContentBlock::tool_result(id, output, is_err));
@@ -713,10 +858,21 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
     let mut idx: u32 = 0;
 
     for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<Value>(&line) else { continue };
-        let outer_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let ts = val.get("timestamp").and_then(|v| v.as_str()).map(String::from);
-        if created_at.is_none() { created_at = ts.clone(); }
+        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let outer_type = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = val
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if created_at.is_none() {
+            created_at = ts.clone();
+        }
         let payload = val.get("payload").cloned().unwrap_or(Value::Null);
 
         match outer_type.as_str() {
@@ -724,7 +880,10 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                 if let Some(g) = payload.get("git") {
                     git = Some(GitInfo {
                         branch: g.get("branch").and_then(|v| v.as_str()).map(String::from),
-                        commit: g.get("commit_hash").and_then(|v| v.as_str()).map(String::from),
+                        commit: g
+                            .get("commit_hash")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
                     });
                 }
                 session_meta_payload = Some(payload);
@@ -732,14 +891,23 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
             "turn_context" => {
                 // Prefer top-level `model`; fall back to
                 // `collaboration_mode.settings.model` which some modes set instead.
-                let model_here = payload.get("model").and_then(|v| v.as_str()).map(String::from)
-                    .or_else(|| payload.get("collaboration_mode")
-                        .and_then(|c| c.get("settings"))
-                        .and_then(|s| s.get("model"))
-                        .and_then(|v| v.as_str()).map(String::from));
+                let model_here = payload
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| {
+                        payload
+                            .get("collaboration_mode")
+                            .and_then(|c| c.get("settings"))
+                            .and_then(|s| s.get("model"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    });
                 if let Some(m) = model_here {
                     current_model = Some(m);
-                    if session_model.is_none() { session_model = current_model.clone(); }
+                    if session_model.is_none() {
+                        session_model = current_model.clone();
+                    }
                 }
                 let mut meta = BTreeMap::new();
                 meta.insert("codex_source".into(), json!("turn_context"));
@@ -747,21 +915,37 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                     meta.insert("turn_id".into(), json!(tid));
                 }
                 // Promote a few stable turn-level fields into meta for easy access.
-                for k in ["approval_policy", "timezone", "current_date",
-                          "personality", "realtime_active"] {
-                    if let Some(v) = payload.get(k) { meta.insert(k.into(), v.clone()); }
+                for k in [
+                    "approval_policy",
+                    "timezone",
+                    "current_date",
+                    "personality",
+                    "realtime_active",
+                ] {
+                    if let Some(v) = payload.get(k) {
+                        meta.insert(k.into(), v.clone());
+                    }
                 }
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: "system".into(),
+                    index: idx,
+                    timestamp: ts,
+                    role: "system".into(),
                     source: "codex:turn_context".into(),
                     content: vec![ContentBlock::other("turn_context", payload.clone())],
-                    model: current_model.clone(), usage: None, stop_reason: None,
-                    meta, raw: val,
+                    model: current_model.clone(),
+                    usage: None,
+                    stop_reason: None,
+                    meta,
+                    raw: val,
                 });
                 idx += 1;
             }
             "event_msg" => {
-                let inner_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let inner_type = payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 match inner_type.as_str() {
                     // user_message / agent_message mirror the text content of
                     // `response_item.message` (which has richer structure).
@@ -776,37 +960,61 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                             if let Some(imgs) = payload.get("images").and_then(|v| v.as_array()) {
                                 for img in imgs {
                                     let mut b = ContentBlock::other("image", img.clone());
-                                    b.extra.insert("source".into(), json!("codex:user_message.images"));
+                                    b.extra.insert(
+                                        "source".into(),
+                                        json!("codex:user_message.images"),
+                                    );
                                     blocks.push(b);
                                 }
                             }
-                            if let Some(imgs) = payload.get("local_images").and_then(|v| v.as_array()) {
+                            if let Some(imgs) =
+                                payload.get("local_images").and_then(|v| v.as_array())
+                            {
                                 for img in imgs {
                                     let mut b = ContentBlock::other("image", img.clone());
-                                    b.extra.insert("source".into(), json!("codex:user_message.local_images"));
+                                    b.extra.insert(
+                                        "source".into(),
+                                        json!("codex:user_message.local_images"),
+                                    );
                                     blocks.push(b);
                                 }
                             }
                         }
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("event_msg.{}", inner_type)));
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("event_msg.{}", inner_type)),
+                        );
                         if inner_type == "user_message" && blocks.is_empty() {
-                            meta.insert("skipped_reason".into(), json!(
-                                "mirrored by response_item.message; kept for raw fidelity"));
+                            meta.insert(
+                                "skipped_reason".into(),
+                                json!("mirrored by response_item.message; kept for raw fidelity"),
+                            );
                         }
                         if let Some(mc) = payload.get("memory_citation") {
-                            if !mc.is_null() { meta.insert("memory_citation".into(), mc.clone()); }
+                            if !mc.is_null() {
+                                meta.insert("memory_citation".into(), mc.clone());
+                            }
                         }
                         if let Some(phase) = payload.get("phase").and_then(|v| v.as_str()) {
                             meta.insert("phase".into(), json!(phase));
                         }
-                        let role = if inner_type == "user_message" && !blocks.is_empty() { "user" } else { "system" };
+                        let role = if inner_type == "user_message" && !blocks.is_empty() {
+                            "user"
+                        } else {
+                            "system"
+                        };
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: role.into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: role.into(),
                             source: format!("codex:event_msg.{}", inner_type),
                             content: blocks,
-                            model: None, usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
@@ -815,11 +1023,16 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                         let mut meta = BTreeMap::new();
                         meta.insert("codex_source".into(), json!("event_msg.token_count"));
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "system".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "system".into(),
                             source: "codex:event_msg.token_count".into(),
                             content: vec![ContentBlock::other("token_count", payload.clone())],
-                            model: None, usage, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
@@ -829,24 +1042,43 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                     // preserve their raw payload as a system block.
                     "task_started" | "task_complete" => {
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("event_msg.{}", inner_type)));
-                        for k in ["turn_id", "started_at", "completed_at",
-                                  "duration_ms", "model_context_window",
-                                  "collaboration_mode_kind", "last_agent_message"] {
-                            if let Some(v) = payload.get(k) { meta.insert(k.into(), v.clone()); }
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("event_msg.{}", inner_type)),
+                        );
+                        for k in [
+                            "turn_id",
+                            "started_at",
+                            "completed_at",
+                            "duration_ms",
+                            "model_context_window",
+                            "collaboration_mode_kind",
+                            "last_agent_message",
+                        ] {
+                            if let Some(v) = payload.get(k) {
+                                meta.insert(k.into(), v.clone());
+                            }
                         }
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "system".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "system".into(),
                             source: format!("codex:event_msg.{}", inner_type),
                             content: vec![ContentBlock::other(&inner_type, payload.clone())],
-                            model: None, usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                     _ => {
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("event_msg.{}", inner_type)));
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("event_msg.{}", inner_type)),
+                        );
                         // Exec/patch/custom lifecycle events cross-reference via call_id.
                         if let Some(c) = payload.get("call_id").and_then(|v| v.as_str()) {
                             meta.insert("call_id".into(), json!(c));
@@ -855,21 +1087,34 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                             meta.insert("turn_id".into(), json!(c));
                         }
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "system".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "system".into(),
                             source: format!("codex:event_msg.{}", inner_type),
                             content: vec![ContentBlock::other(&inner_type, payload.clone())],
-                            model: None, usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                 }
             }
             "response_item" => {
-                let inner_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let inner_type = payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 match inner_type.as_str() {
                     "message" => {
-                        let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("assistant").to_string();
+                        let role = payload
+                            .get("role")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("assistant")
+                            .to_string();
                         let blocks = codex_message_content(payload.get("content"));
                         let mut meta = BTreeMap::new();
                         meta.insert("codex_source".into(), json!("response_item.message"));
@@ -877,65 +1122,103 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                             meta.insert("phase".into(), json!(p));
                         }
                         messages.push(Message {
-                            index: idx, timestamp: ts, role,
+                            index: idx,
+                            timestamp: ts,
+                            role,
                             source: "codex:response_item.message".into(),
                             content: blocks,
-                            model: current_model.clone(), usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: current_model.clone(),
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                     "function_call" | "custom_tool_call" => {
-                        let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(String::from);
+                        let name = payload
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         // function_call.arguments is a JSON-encoded string;
                         // custom_tool_call.input is a plain string.
                         let input_val = if inner_type == "function_call" {
                             match payload.get("arguments").and_then(|v| v.as_str()) {
-                                Some(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!(s)),
+                                Some(s) => {
+                                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!(s))
+                                }
                                 None => payload.get("arguments").cloned().unwrap_or(Value::Null),
                             }
                         } else {
                             payload.get("input").cloned().unwrap_or(Value::Null)
                         };
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("response_item.{}", inner_type)));
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("response_item.{}", inner_type)),
+                        );
                         if let Some(s) = payload.get("status").and_then(|v| v.as_str()) {
                             meta.insert("status".into(), json!(s));
                         }
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "assistant".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "assistant".into(),
                             source: format!("codex:response_item.{}", inner_type),
                             content: vec![ContentBlock::tool_use(name, call_id, input_val)],
-                            model: current_model.clone(), usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: current_model.clone(),
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                     "function_call_output" | "custom_tool_call_output" => {
-                        let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(String::from);
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
                         let output = payload.get("output").cloned().unwrap_or(Value::Null);
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("response_item.{}", inner_type)));
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("response_item.{}", inner_type)),
+                        );
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "tool".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "tool".into(),
                             source: format!("codex:response_item.{}", inner_type),
                             content: vec![ContentBlock::tool_result(call_id, output, None)],
-                            model: None, usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                     "reasoning" => {
                         // Codex ships encrypted_content; we preserve it verbatim.
-                        let summary_text = payload.get("summary").and_then(|v| v.as_array())
-                            .map(|arr| arr.iter()
-                                .filter_map(|x| x.get("text").and_then(|v| v.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("\n"))
+                        let summary_text = payload
+                            .get("summary")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.get("text").and_then(|v| v.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
                             .unwrap_or_default();
                         let mut block = ContentBlock::thinking(summary_text);
-                        if let Some(enc) = payload.get("encrypted_content").and_then(|v| v.as_str()) {
+                        if let Some(enc) = payload.get("encrypted_content").and_then(|v| v.as_str())
+                        {
                             block.extra.insert("encrypted_content".into(), json!(enc));
                         }
                         if let Some(c) = payload.get("content") {
@@ -944,23 +1227,36 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                         let mut meta = BTreeMap::new();
                         meta.insert("codex_source".into(), json!("response_item.reasoning"));
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "assistant".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "assistant".into(),
                             source: "codex:response_item.reasoning".into(),
                             content: vec![block],
-                            model: current_model.clone(), usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: current_model.clone(),
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
                     _ => {
                         let mut meta = BTreeMap::new();
-                        meta.insert("codex_source".into(), json!(format!("response_item.{}", inner_type)));
+                        meta.insert(
+                            "codex_source".into(),
+                            json!(format!("response_item.{}", inner_type)),
+                        );
                         messages.push(Message {
-                            index: idx, timestamp: ts, role: "system".into(),
+                            index: idx,
+                            timestamp: ts,
+                            role: "system".into(),
                             source: format!("codex:response_item.{}", inner_type),
                             content: vec![ContentBlock::other(&inner_type, payload.clone())],
-                            model: None, usage: None, stop_reason: None,
-                            meta, raw: val,
+                            model: None,
+                            usage: None,
+                            stop_reason: None,
+                            meta,
+                            raw: val,
                         });
                         idx += 1;
                     }
@@ -971,11 +1267,16 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
                 let mut meta = BTreeMap::new();
                 meta.insert("codex_source".into(), json!(outer_type.clone()));
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: "system".into(),
+                    index: idx,
+                    timestamp: ts,
+                    role: "system".into(),
                     source: format!("codex:{}", outer_type),
                     content: vec![ContentBlock::other(&outer_type, payload)],
-                    model: None, usage: None, stop_reason: None,
-                    meta, raw: val,
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    meta,
+                    raw: val,
                 });
                 idx += 1;
             }
@@ -1003,7 +1304,9 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
 /// `response_item.message.content` is an array of blocks like
 /// `{"type":"input_text","text":"..."}` or `{"type":"output_text","text":"..."}`.
 fn codex_message_content(content: Option<&Value>) -> Vec<ContentBlock> {
-    let Some(arr) = content.and_then(|v| v.as_array()) else { return Vec::new(); };
+    let Some(arr) = content.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for item in arr {
         let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1035,17 +1338,25 @@ fn codex_message_content(content: Option<&Value>) -> Vec<ContentBlock> {
 /// tolerated for forward-compat.
 fn codex_extract_usage_from_token_count(p: &Value) -> Option<Usage> {
     let info = p.get("info")?;
-    if info.is_null() { return None; }
+    if info.is_null() {
+        return None;
+    }
     // Prefer last_token_usage (per-turn), then total_token_usage, then flat.
-    let bucket = info.get("last_token_usage")
+    let bucket = info
+        .get("last_token_usage")
         .or_else(|| info.get("total_token_usage"))
         .unwrap_or(info);
     let g = |k: &str| bucket.get(k).and_then(|v| v.as_u64());
     // Guard: if none of the standard fields are present, don't emit Usage.
-    let any = g("input_tokens").is_some() || g("output_tokens").is_some()
-           || g("cached_input_tokens").is_some() || g("total_tokens").is_some()
-           || g("prompt_tokens").is_some() || g("completion_tokens").is_some();
-    if !any { return None; }
+    let any = g("input_tokens").is_some()
+        || g("output_tokens").is_some()
+        || g("cached_input_tokens").is_some()
+        || g("total_tokens").is_some()
+        || g("prompt_tokens").is_some()
+        || g("completion_tokens").is_some();
+    if !any {
+        return None;
+    }
     Some(Usage {
         input_tokens: g("input_tokens").or_else(|| g("prompt_tokens")),
         output_tokens: g("output_tokens").or_else(|| g("completion_tokens")),
@@ -1085,21 +1396,49 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
     let messages_val = val.get("messages")?.as_array()?;
     let mut messages: Vec<Message> = Vec::new();
     let mut idx: u32 = 0;
-    let session_id_val = val.get("sessionId").and_then(|v| v.as_str()).map(String::from);
-    let created_at = val.get("startTime").and_then(|v| v.as_str()).map(String::from);
-    let updated_at = val.get("lastUpdated").and_then(|v| v.as_str()).map(String::from);
+    let session_id_val = val
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let created_at = val
+        .get("startTime")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let updated_at = val
+        .get("lastUpdated")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let mut session_model: Option<String> = None;
 
     // Carry top-level metadata (projectHash, kind, etc.) forward.
     let mut session_meta_obj = serde_json::Map::new();
-    for k in ["projectHash", "kind", "startTime", "lastUpdated", "sessionId"] {
-        if let Some(v) = val.get(k) { session_meta_obj.insert(k.into(), v.clone()); }
+    for k in [
+        "projectHash",
+        "kind",
+        "startTime",
+        "lastUpdated",
+        "sessionId",
+    ] {
+        if let Some(v) = val.get(k) {
+            session_meta_obj.insert(k.into(), v.clone());
+        }
     }
-    let session_meta = if session_meta_obj.is_empty() { None } else { Some(Value::Object(session_meta_obj)) };
+    let session_meta = if session_meta_obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(session_meta_obj))
+    };
 
     for msg in messages_val {
-        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let ts = msg.get("timestamp").and_then(|v| v.as_str()).map(String::from);
+        let msg_type = msg
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ts = msg
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let msg_id = msg.get("id").and_then(|v| v.as_str()).map(String::from);
 
         match msg_type.as_str() {
@@ -1119,18 +1458,28 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                     _ => {}
                 }
                 let mut meta = BTreeMap::new();
-                if let Some(id) = msg_id.clone() { meta.insert("message_id".into(), json!(id)); }
+                if let Some(id) = msg_id.clone() {
+                    meta.insert("message_id".into(), json!(id));
+                }
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: "user".into(),
-                    source: "gemini:user".into(), content: blocks,
-                    model: None, usage: None, stop_reason: None,
-                    meta, raw: msg.clone(),
+                    index: idx,
+                    timestamp: ts,
+                    role: "user".into(),
+                    source: "gemini:user".into(),
+                    content: blocks,
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    meta,
+                    raw: msg.clone(),
                 });
                 idx += 1;
             }
             "gemini" => {
                 let model = msg.get("model").and_then(|v| v.as_str()).map(String::from);
-                if model.is_some() && session_model.is_none() { session_model = model.clone(); }
+                if model.is_some() && session_model.is_none() {
+                    session_model = model.clone();
+                }
                 let usage = msg.get("tokens").and_then(gemini_parse_usage);
 
                 let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -1140,14 +1489,22 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                 // thinking block whose extra carries the structured list.
                 if let Some(thoughts) = msg.get("thoughts").and_then(|v| v.as_array()) {
                     if !thoughts.is_empty() {
-                        let joined = thoughts.iter().filter_map(|t| {
-                            let s = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-                            let d = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                            if s.is_empty() && d.is_empty() { None }
-                            else { Some(format!("**{}**\n{}", s, d)) }
-                        }).collect::<Vec<_>>().join("\n\n");
+                        let joined = thoughts
+                            .iter()
+                            .filter_map(|t| {
+                                let s = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                                let d = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                if s.is_empty() && d.is_empty() {
+                                    None
+                                } else {
+                                    Some(format!("**{}**\n{}", s, d))
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
                         let mut b = ContentBlock::thinking(joined);
-                        b.extra.insert("thoughts".into(), Value::Array(thoughts.clone()));
+                        b.extra
+                            .insert("thoughts".into(), Value::Array(thoughts.clone()));
                         blocks.push(b);
                     }
                 }
@@ -1168,26 +1525,50 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                 }
 
                 // Inline tool_use blocks on the assistant message.
-                let tool_calls = msg.get("toolCalls").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let tool_calls = msg
+                    .get("toolCalls")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 for tc in &tool_calls {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = tc
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let id = tc.get("id").and_then(|v| v.as_str()).map(String::from);
                     let input = tc.get("args").cloned().unwrap_or(Value::Null);
                     let mut b = ContentBlock::tool_use(name, id, input);
-                    for k in ["status", "timestamp", "resultDisplay", "description",
-                             "displayName", "renderOutputAsMarkdown"] {
-                        if let Some(v) = tc.get(k) { b.extra.insert(k.into(), v.clone()); }
+                    for k in [
+                        "status",
+                        "timestamp",
+                        "resultDisplay",
+                        "description",
+                        "displayName",
+                        "renderOutputAsMarkdown",
+                    ] {
+                        if let Some(v) = tc.get(k) {
+                            b.extra.insert(k.into(), v.clone());
+                        }
                     }
                     blocks.push(b);
                 }
 
                 let mut meta = BTreeMap::new();
-                if let Some(id) = msg_id.clone() { meta.insert("message_id".into(), json!(id)); }
+                if let Some(id) = msg_id.clone() {
+                    meta.insert("message_id".into(), json!(id));
+                }
                 messages.push(Message {
-                    index: idx, timestamp: ts.clone(), role: "assistant".into(),
-                    source: "gemini:gemini".into(), content: blocks,
-                    model: model.clone(), usage, stop_reason: None,
-                    meta, raw: msg.clone(),
+                    index: idx,
+                    timestamp: ts.clone(),
+                    role: "assistant".into(),
+                    source: "gemini:gemini".into(),
+                    content: blocks,
+                    model: model.clone(),
+                    usage,
+                    stop_reason: None,
+                    meta,
+                    raw: msg.clone(),
                 });
                 idx += 1;
 
@@ -1195,31 +1576,55 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
                 for tc in &tool_calls {
                     let id = tc.get("id").and_then(|v| v.as_str()).map(String::from);
                     let result = tc.get("result").cloned().unwrap_or(Value::Null);
-                    let status = tc.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let is_err = if status == "error" || status == "failed" { Some(true) } else { None };
+                    let status = tc
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let is_err = if status == "error" || status == "failed" {
+                        Some(true)
+                    } else {
+                        None
+                    };
                     let mut b = ContentBlock::tool_result(id.clone(), result, is_err);
-                    if !status.is_empty() { b.extra.insert("status".into(), json!(status)); }
-                    if let Some(ts_tc) = tc.get("timestamp") { b.extra.insert("timestamp".into(), ts_tc.clone()); }
+                    if !status.is_empty() {
+                        b.extra.insert("status".into(), json!(status));
+                    }
+                    if let Some(ts_tc) = tc.get("timestamp") {
+                        b.extra.insert("timestamp".into(), ts_tc.clone());
+                    }
 
                     let mut m = BTreeMap::new();
-                    if let Some(i) = id { m.insert("tool_call_id".into(), json!(i)); }
+                    if let Some(i) = id {
+                        m.insert("tool_call_id".into(), json!(i));
+                    }
                     messages.push(Message {
-                        index: idx, timestamp: ts.clone(), role: "tool".into(),
+                        index: idx,
+                        timestamp: ts.clone(),
+                        role: "tool".into(),
                         source: "gemini:tool_result".into(),
                         content: vec![b],
-                        model: None, usage: None, stop_reason: None,
-                        meta: m, raw: tc.clone(),
+                        model: None,
+                        usage: None,
+                        stop_reason: None,
+                        meta: m,
+                        raw: tc.clone(),
                     });
                     idx += 1;
                 }
             }
             other => {
                 messages.push(Message {
-                    index: idx, timestamp: ts, role: other.into(),
+                    index: idx,
+                    timestamp: ts,
+                    role: other.into(),
                     source: format!("gemini:{}", other),
                     content: vec![ContentBlock::other(other, msg.clone())],
-                    model: None, usage: None, stop_reason: None,
-                    meta: BTreeMap::new(), raw: msg.clone(),
+                    model: None,
+                    usage: None,
+                    stop_reason: None,
+                    meta: BTreeMap::new(),
+                    raw: msg.clone(),
                 });
                 idx += 1;
             }
@@ -1238,6 +1643,45 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
         git: None,
         session_meta,
         messages,
+    })
+}
+
+// =====================================================================
+// Agy parser
+// =====================================================================
+
+fn parse_agy(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
+    if !path.is_file() {
+        return None;
+    }
+    let meta = json!({
+        "note": "Agy stores its full conversation in Antigravity CLI SQLite/protobuf data. cokacdir archives the external conversation metadata only.",
+        "source_size": path.metadata().ok().map(|m| m.len()),
+    });
+    Some(FullSession {
+        session_id: session_id.to_string(),
+        provider: "agy".into(),
+        cwd: cwd.to_string(),
+        created_at: None,
+        updated_at: None,
+        source_path: path.display().to_string(),
+        model: None,
+        git: None,
+        session_meta: Some(meta.clone()),
+        messages: vec![Message {
+            index: 0,
+            timestamp: None,
+            role: "system".into(),
+            source: "agy:metadata".into(),
+            content: vec![ContentBlock::text(
+                "Agy conversation metadata archived. Full transcript remains in Antigravity CLI storage.",
+            )],
+            model: None,
+            usage: None,
+            stop_reason: None,
+            meta: BTreeMap::new(),
+            raw: meta,
+        }],
     })
 }
 
@@ -1263,80 +1707,122 @@ fn gemini_parse_usage(t: &Value) -> Option<Usage> {
 /// under their parent message. Every column of message/part row is preserved
 /// in `raw`, so no info is lost.
 fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    if !db_path.is_file() { return None; }
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ).ok()?;
+    if !db_path.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
 
     // Session-level metadata. Column list mirrors the full `session` schema
     // observed in opencode 1.3.x so new fields (parent_id, workspace_id,
     // share_url, summary_*, revert, permission) are preserved verbatim.
-    let session_row: Option<OCSession> = conn.query_row(
-        "SELECT id, project_id, parent_id, slug, directory, title, version, \
+    let session_row: Option<OCSession> = conn
+        .query_row(
+            "SELECT id, project_id, parent_id, slug, directory, title, version, \
          share_url, summary_additions, summary_deletions, summary_files, \
          summary_diffs, revert, permission, \
          time_created, time_updated, time_compacting, time_archived, workspace_id \
          FROM session WHERE id = ?1",
-        rusqlite::params![session_id],
-        |row| Ok(OCSession {
-            id: row.get(0)?,
-            project_id: row.get(1)?,
-            parent_id: row.get(2).ok(),
-            slug: row.get(3)?,
-            directory: row.get(4)?,
-            title: row.get(5)?,
-            version: row.get(6)?,
-            share_url: row.get(7).ok(),
-            summary_additions: row.get(8).ok(),
-            summary_deletions: row.get(9).ok(),
-            summary_files: row.get(10).ok(),
-            summary_diffs: row.get(11).ok(),
-            revert: row.get(12).ok(),
-            permission: row.get(13).ok(),
-            time_created: row.get(14)?,
-            time_updated: row.get(15)?,
-            time_compacting: row.get(16).ok(),
-            time_archived: row.get(17).ok(),
-            workspace_id: row.get(18).ok(),
-        }),
-    ).ok();
+            rusqlite::params![session_id],
+            |row| {
+                Ok(OCSession {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    parent_id: row.get(2).ok(),
+                    slug: row.get(3)?,
+                    directory: row.get(4)?,
+                    title: row.get(5)?,
+                    version: row.get(6)?,
+                    share_url: row.get(7).ok(),
+                    summary_additions: row.get(8).ok(),
+                    summary_deletions: row.get(9).ok(),
+                    summary_files: row.get(10).ok(),
+                    summary_diffs: row.get(11).ok(),
+                    revert: row.get(12).ok(),
+                    permission: row.get(13).ok(),
+                    time_created: row.get(14)?,
+                    time_updated: row.get(15)?,
+                    time_compacting: row.get(16).ok(),
+                    time_archived: row.get(17).ok(),
+                    workspace_id: row.get(18).ok(),
+                })
+            },
+        )
+        .ok();
 
     // Load all messages for the session
-    let mut msg_stmt = conn.prepare(
-        "SELECT id, time_created, time_updated, data \
-         FROM message WHERE session_id = ?1 ORDER BY time_created ASC"
-    ).ok()?;
-    let msg_rows: Vec<(String, i64, i64, String)> = msg_stmt.query_map(
-        rusqlite::params![session_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-    ).ok()?.flatten().collect();
+    let mut msg_stmt = conn
+        .prepare(
+            "SELECT id, time_created, time_updated, data \
+         FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
+        )
+        .ok()?;
+    let msg_rows: Vec<(String, i64, i64, String)> = msg_stmt
+        .query_map(rusqlite::params![session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .ok()?
+        .flatten()
+        .collect();
 
     // Load all parts for the session, grouped by message_id
-    let mut part_stmt = conn.prepare(
-        "SELECT id, message_id, time_created, time_updated, data \
-         FROM part WHERE session_id = ?1 ORDER BY time_created ASC"
-    ).ok()?;
-    let part_rows: Vec<(String, String, i64, i64, String)> = part_stmt.query_map(
-        rusqlite::params![session_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-    ).ok()?.flatten().collect();
+    let mut part_stmt = conn
+        .prepare(
+            "SELECT id, message_id, time_created, time_updated, data \
+         FROM part WHERE session_id = ?1 ORDER BY time_created ASC",
+        )
+        .ok()?;
+    let part_rows: Vec<(String, String, i64, i64, String)> = part_stmt
+        .query_map(rusqlite::params![session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .ok()?
+        .flatten()
+        .collect();
 
     let mut parts_by_msg: BTreeMap<String, Vec<(String, i64, i64, String)>> = BTreeMap::new();
     for (pid, mid, tc, tu, data) in part_rows {
-        parts_by_msg.entry(mid).or_default().push((pid, tc, tu, data));
+        parts_by_msg
+            .entry(mid)
+            .or_default()
+            .push((pid, tc, tu, data));
     }
 
     let mut messages: Vec<Message> = Vec::new();
     let mut session_model: Option<String> = None;
     for (i, (msg_id, tc, _tu, data)) in msg_rows.iter().enumerate() {
         let msg_data: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-        let role = msg_data.get("role").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let role = msg_data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
         // Model lookup order: nested `model.modelID`, flat `modelID`, flat `model` string.
-        let model = msg_data.get("model").and_then(|m| m.get("modelID")).and_then(|v| v.as_str()).map(String::from)
-            .or_else(|| msg_data.get("modelID").and_then(|v| v.as_str()).map(String::from))
-            .or_else(|| msg_data.get("model").and_then(|v| v.as_str()).map(String::from));
-        if model.is_some() && session_model.is_none() { session_model = model.clone(); }
-        let agent = msg_data.get("agent").and_then(|v| v.as_str()).map(String::from);
+        let model = msg_data
+            .get("model")
+            .and_then(|m| m.get("modelID"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                msg_data
+                    .get("modelID")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .or_else(|| {
+                msg_data
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+        if model.is_some() && session_model.is_none() {
+            session_model = model.clone();
+        }
+        let agent = msg_data
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         // Message-level token usage (present on assistant messages in addition to
         // the per-step step-finish tokens). Prefer message-level when available
         // because it aggregates the whole message.
@@ -1356,9 +1842,13 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         });
         let msg_level_stop = msg_data.get("finish").and_then(|f| {
             // `finish` may be a string or an object with a `reason` field.
-            if let Some(s) = f.as_str() { Some(s.to_string()) }
-            else if let Some(r) = f.get("reason").and_then(|v| v.as_str()) { Some(r.to_string()) }
-            else { None }
+            if let Some(s) = f.as_str() {
+                Some(s.to_string())
+            } else if let Some(r) = f.get("reason").and_then(|v| v.as_str()) {
+                Some(r.to_string())
+            } else {
+                None
+            }
         });
 
         let parts = parts_by_msg.remove(msg_id).unwrap_or_default();
@@ -1372,7 +1862,11 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
                 "id": pid, "time_created": ptc, "time_updated": ptu,
                 "data": part_json.clone(),
             }));
-            let ptype = part_json.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let ptype = part_json
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             match ptype.as_str() {
                 "text" => {
                     let text = part_json.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -1387,29 +1881,48 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
                     blocks.push(b);
                 }
                 "tool" => {
-                    let tool_name = part_json.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let tool_name = part_json
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // OpenCode: the tool-use identifier is `callID` (capital ID),
                     // not `id`. Fall back to the part row id only if callID is
                     // absent so cross-referencing with tool_result still works.
-                    let tool_id = part_json.get("callID").and_then(|v| v.as_str()).map(String::from)
-                        .or_else(|| part_json.get("call_id").and_then(|v| v.as_str()).map(String::from))
+                    let tool_id = part_json
+                        .get("callID")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            part_json
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
                         .or(Some(pid.clone()));
                     let state = part_json.get("state").cloned().unwrap_or(Value::Null);
-                    let status = state.get("status").and_then(|v| v.as_str()).map(String::from);
+                    let status = state
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let input = state.get("input").cloned().unwrap_or(Value::Null);
                     let output = state.get("output").cloned();
                     // On success `error` is usually absent. Treat present and
                     // non-empty as an error marker; explicit status=="error"
                     // also counts.
                     let is_err = match state.get("error") {
-                        Some(e) if !e.is_null() && !(e.is_string() && e.as_str() == Some("")) => Some(true),
+                        Some(e) if !e.is_null() && !(e.is_string() && e.as_str() == Some("")) => {
+                            Some(true)
+                        }
                         _ if status.as_deref() == Some("error") => Some(true),
                         _ => None,
                     };
                     let mut b = ContentBlock::tool_use(tool_name, tool_id, input);
                     b.tool_output = output;
                     b.is_error = is_err;
-                    if let Some(s) = status { b.extra.insert("status".into(), json!(s)); }
+                    if let Some(s) = status {
+                        b.extra.insert("status".into(), json!(s));
+                    }
                     b.extra.insert("state".into(), state);
                     if let Some(m) = part_json.get("metadata") {
                         b.extra.insert("part_metadata".into(), m.clone());
@@ -1428,7 +1941,8 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
                         let g = |k: &str| tokens.get(k).and_then(|v| v.as_u64());
                         let cache = tokens.get("cache");
                         let cache_read = cache.and_then(|c| c.get("read")).and_then(|v| v.as_u64());
-                        let cache_write = cache.and_then(|c| c.get("write")).and_then(|v| v.as_u64());
+                        let cache_write =
+                            cache.and_then(|c| c.get("write")).and_then(|v| v.as_u64());
                         total_usage = Some(Usage {
                             input_tokens: g("input"),
                             output_tokens: g("output"),
@@ -1448,8 +1962,12 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
                     // hash and file list as structured fields; raw holds the
                     // entire record.
                     let mut b = ContentBlock::other("patch", part_json.clone());
-                    if let Some(h) = part_json.get("hash") { b.extra.insert("hash".into(), h.clone()); }
-                    if let Some(f) = part_json.get("files") { b.extra.insert("files".into(), f.clone()); }
+                    if let Some(h) = part_json.get("hash") {
+                        b.extra.insert("hash".into(), h.clone());
+                    }
+                    if let Some(f) = part_json.get("files") {
+                        b.extra.insert("files".into(), f.clone());
+                    }
                     blocks.push(b);
                 }
                 _ => {
@@ -1461,13 +1979,21 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         let mut meta = BTreeMap::new();
         meta.insert("message_id".into(), json!(msg_id));
         meta.insert("time_created".into(), json!(tc));
-        if let Some(a) = agent { meta.insert("agent".into(), json!(a)); }
+        if let Some(a) = agent {
+            meta.insert("agent".into(), json!(a));
+        }
         // Extra message-level fields observed in practice.
         for k in ["parentID", "providerID", "modelID", "mode", "path", "cost"] {
-            if let Some(v) = msg_data.get(k) { meta.insert(k.into(), v.clone()); }
+            if let Some(v) = msg_data.get(k) {
+                meta.insert(k.into(), v.clone());
+            }
         }
-        if let Some(t) = msg_data.get("time") { meta.insert("time".into(), t.clone()); }
-        if let Some(s) = msg_data.get("summary") { meta.insert("summary".into(), s.clone()); }
+        if let Some(t) = msg_data.get("time") {
+            meta.insert("time".into(), t.clone());
+        }
+        if let Some(s) = msg_data.get("summary") {
+            meta.insert("summary".into(), s.clone());
+        }
 
         // Prefer message-level tokens if present; otherwise the aggregated
         // step-finish usage.
@@ -1476,8 +2002,7 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         let effective_stop = msg_level_stop.or(stop_reason);
 
         // Synthesize a millisecond timestamp string
-        let ts = chrono::DateTime::from_timestamp_millis(*tc)
-            .map(|d| d.to_rfc3339());
+        let ts = chrono::DateTime::from_timestamp_millis(*tc).map(|d| d.to_rfc3339());
 
         let raw = json!({
             "message_row": { "id": msg_id, "time_created": tc, "data": msg_data },
@@ -1485,18 +2010,28 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         });
 
         messages.push(Message {
-            index: i as u32, timestamp: ts, role,
+            index: i as u32,
+            timestamp: ts,
+            role,
             source: "opencode:message".into(),
-            content: blocks, model, usage: effective_usage, stop_reason: effective_stop,
-            meta, raw,
+            content: blocks,
+            model,
+            usage: effective_usage,
+            stop_reason: effective_stop,
+            meta,
+            raw,
         });
     }
 
-    let session_meta_val = session_row.as_ref().map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
-    let created_at = session_row.as_ref()
+    let session_meta_val = session_row
+        .as_ref()
+        .map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
+    let created_at = session_row
+        .as_ref()
         .and_then(|s| chrono::DateTime::from_timestamp_millis(s.time_created))
         .map(|d| d.to_rfc3339());
-    let updated_at = session_row.as_ref()
+    let updated_at = session_row
+        .as_ref()
         .and_then(|s| chrono::DateTime::from_timestamp_millis(s.time_updated))
         .map(|d| d.to_rfc3339());
 

@@ -1,7 +1,7 @@
-use std::fs;
-use std::path::PathBuf;
 use ratatui::style::Color;
 use serde::Deserialize;
+use std::fs;
+use std::path::PathBuf;
 
 use super::theme::*;
 
@@ -905,14 +905,31 @@ pub struct GitScreenColorsJson {
 impl Default for GitScreenColorsJson {
     fn default() -> Self {
         Self {
-            bg: 234, border: 102, header_branch: 108, header_path: 188,
-            tab_active: 110, tab_inactive: 102, tab_bar_bg: 235,
-            file_staged: 108, file_modified: 180, file_untracked: 174,
-            file_deleted: 167, selected_bg: 239, selected_text: 195,
-            footer_key: 146, footer_text: 102, commit_input_border: 102,
-            commit_input_text: 188, log_hash: 146, log_message: 188,
-            log_author: 110, log_date: 102, branch_current: 108,
-            branch_normal: 188, diff_add: 108, diff_remove: 174,
+            bg: 234,
+            border: 102,
+            header_branch: 108,
+            header_path: 188,
+            tab_active: 110,
+            tab_inactive: 102,
+            tab_bar_bg: 235,
+            file_staged: 108,
+            file_modified: 180,
+            file_untracked: 174,
+            file_deleted: 167,
+            selected_bg: 239,
+            selected_text: 195,
+            footer_key: 146,
+            footer_text: 102,
+            commit_input_border: 102,
+            commit_input_text: 188,
+            log_hash: 146,
+            log_message: 188,
+            log_author: 110,
+            log_date: 102,
+            branch_current: 108,
+            branch_normal: 188,
+            diff_add: 108,
+            diff_remove: 174,
             diff_header: 110,
         }
     }
@@ -953,70 +970,190 @@ pub struct DedupScreenColorsJson {
 impl Default for DedupScreenColorsJson {
     fn default() -> Self {
         Self {
-            bg: 234, border: 102, title: 110, phase_text: 108,
-            stats_text: 188, progress_bar_fill: 108, progress_bar_empty: 236,
-            progress_text: 188, log_text: 188, log_text_alt: 144,
-            log_deleted: 174, log_error: 167, footer_key: 146, footer_text: 102,
+            bg: 234,
+            border: 102,
+            title: 110,
+            phase_text: 108,
+            stats_text: 188,
+            progress_bar_fill: 108,
+            progress_bar_empty: 236,
+            progress_text: 188,
+            log_text: 188,
+            log_text_alt: 144,
+            log_deleted: 174,
+            log_error: 167,
+            footer_key: 146,
+            footer_text: 102,
         }
     }
 }
 
 // 기본값 함수들
-fn default_21() -> u8 { 21 }
-fn default_22() -> u8 { 22 }
-fn default_24() -> u8 { 24 }
-fn default_25() -> u8 { 25 }
-fn default_28() -> u8 { 28 }
-fn default_34() -> u8 { 34 }
-fn default_136() -> u8 { 136 }
-fn default_37() -> u8 { 37 }
-fn default_58() -> u8 { 58 }
-fn default_67() -> u8 { 67 }
-fn default_74() -> u8 { 74 }
-fn default_91() -> u8 { 91 }
-fn default_94() -> u8 { 94 }
-fn default_102() -> u8 { 102 }
-fn default_117() -> u8 { 117 }
-fn default_127() -> u8 { 127 }
-fn default_130() -> u8 { 130 }
-fn default_161() -> u8 { 161 }
-fn default_166() -> u8 { 166 }
-fn default_189() -> u8 { 189 }
-fn default_194() -> u8 { 194 }
-fn default_198() -> u8 { 198 }
-fn default_208() -> u8 { 208 }
-fn default_220() -> u8 { 220 }
-fn default_222() -> u8 { 222 }
-fn default_230() -> u8 { 230 }
-fn default_231() -> u8 { 231 }
-fn default_235() -> u8 { 235 }
-fn default_236() -> u8 { 236 }
-fn default_237() -> u8 { 237 }
-fn default_238() -> u8 { 238 }
-fn default_239() -> u8 { 239 }
-fn default_240() -> u8 { 240 }
-fn default_241() -> u8 { 241 }
-fn default_242() -> u8 { 242 }
-fn default_243() -> u8 { 243 }
-fn default_245() -> u8 { 245 }
-fn default_248() -> u8 { 248 }
-fn default_249() -> u8 { 249 }
-fn default_252() -> u8 { 252 }
-fn default_251() -> u8 { 251 }
-fn default_253() -> u8 { 253 }
-fn default_254() -> u8 { 254 }
-fn default_255() -> u8 { 255 }
-fn default_108() -> u8 { 108 }
-fn default_110() -> u8 { 110 }
-fn default_167() -> u8 { 167 }
-fn default_174() -> u8 { 174 }
-fn default_180() -> u8 { 180 }
-fn default_188() -> u8 { 188 }
-fn default_195() -> u8 { 195 }
-fn default_144() -> u8 { 144 }
-fn default_146() -> u8 { 146 }
-fn default_214() -> u8 { 214 }
-fn default_234() -> u8 { 234 }
+fn default_21() -> u8 {
+    21
+}
+fn default_22() -> u8 {
+    22
+}
+fn default_24() -> u8 {
+    24
+}
+fn default_25() -> u8 {
+    25
+}
+fn default_28() -> u8 {
+    28
+}
+fn default_34() -> u8 {
+    34
+}
+fn default_136() -> u8 {
+    136
+}
+fn default_37() -> u8 {
+    37
+}
+fn default_58() -> u8 {
+    58
+}
+fn default_67() -> u8 {
+    67
+}
+fn default_74() -> u8 {
+    74
+}
+fn default_91() -> u8 {
+    91
+}
+fn default_94() -> u8 {
+    94
+}
+fn default_102() -> u8 {
+    102
+}
+fn default_117() -> u8 {
+    117
+}
+fn default_127() -> u8 {
+    127
+}
+fn default_130() -> u8 {
+    130
+}
+fn default_161() -> u8 {
+    161
+}
+fn default_166() -> u8 {
+    166
+}
+fn default_189() -> u8 {
+    189
+}
+fn default_194() -> u8 {
+    194
+}
+fn default_198() -> u8 {
+    198
+}
+fn default_208() -> u8 {
+    208
+}
+fn default_220() -> u8 {
+    220
+}
+fn default_222() -> u8 {
+    222
+}
+fn default_230() -> u8 {
+    230
+}
+fn default_231() -> u8 {
+    231
+}
+fn default_235() -> u8 {
+    235
+}
+fn default_236() -> u8 {
+    236
+}
+fn default_237() -> u8 {
+    237
+}
+fn default_238() -> u8 {
+    238
+}
+fn default_239() -> u8 {
+    239
+}
+fn default_240() -> u8 {
+    240
+}
+fn default_241() -> u8 {
+    241
+}
+fn default_242() -> u8 {
+    242
+}
+fn default_243() -> u8 {
+    243
+}
+fn default_245() -> u8 {
+    245
+}
+fn default_248() -> u8 {
+    248
+}
+fn default_249() -> u8 {
+    249
+}
+fn default_252() -> u8 {
+    252
+}
+fn default_251() -> u8 {
+    251
+}
+fn default_253() -> u8 {
+    253
+}
+fn default_254() -> u8 {
+    254
+}
+fn default_255() -> u8 {
+    255
+}
+fn default_108() -> u8 {
+    108
+}
+fn default_110() -> u8 {
+    110
+}
+fn default_167() -> u8 {
+    167
+}
+fn default_174() -> u8 {
+    174
+}
+fn default_180() -> u8 {
+    180
+}
+fn default_188() -> u8 {
+    188
+}
+fn default_195() -> u8 {
+    195
+}
+fn default_144() -> u8 {
+    144
+}
+fn default_146() -> u8 {
+    146
+}
+fn default_214() -> u8 {
+    214
+}
+fn default_234() -> u8 {
+    234
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 테마 로딩 함수
@@ -1049,9 +1186,13 @@ pub fn theme_path(name: &str) -> Option<PathBuf> {
     let path = themes.join(format!("{}.json", name));
 
     // Verify the path stays within themes directory after canonicalization
-    if let (Ok(canonical_path), Ok(canonical_themes)) =
-        (path.canonicalize().map(crate::utils::format::strip_unc_prefix), themes.canonicalize().map(crate::utils::format::strip_unc_prefix))
-    {
+    if let (Ok(canonical_path), Ok(canonical_themes)) = (
+        path.canonicalize()
+            .map(crate::utils::format::strip_unc_prefix),
+        themes
+            .canonicalize()
+            .map(crate::utils::format::strip_unc_prefix),
+    ) {
         if canonical_path.starts_with(&canonical_themes) {
             return Some(path);
         }

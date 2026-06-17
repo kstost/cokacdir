@@ -7,28 +7,15 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::services::remote;
-use crate::keybindings::PanelAction;
 use super::{
+    advanced_search, ai_screen,
     app::{App, Screen},
-    dialogs,
-    file_editor,
-    file_info,
-    file_viewer,
-    panel,
-    process_manager,
-    ai_screen,
-    system_info,
-    advanced_search,
-    image_viewer,
-    search_result,
-    help,
-    diff_screen,
-    diff_file_view,
-    git_screen,
-    dedup_screen,
+    dedup_screen, dialogs, diff_file_view, diff_screen, file_editor, file_info, file_viewer,
+    git_screen, help, image_viewer, panel, process_manager, search_result, system_info,
     theme::Theme,
 };
+use crate::keybindings::PanelAction;
+use crate::services::remote;
 
 const APP_TITLE: &str = concat!("COKACDIR v", env!("CARGO_PKG_VERSION"));
 
@@ -41,8 +28,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let frame_area = frame.area();
     if (frame_area.width as u32 * frame_area.height as u32) > 65534 {
         // Terminal too large, show warning message only
-        let msg = Paragraph::new("Terminal too large. Please resize smaller.")
-            .style(Style::default().fg(theme.message.text).add_modifier(Modifier::BOLD));
+        let msg = Paragraph::new("Terminal too large. Please resize smaller.").style(
+            Style::default()
+                .fg(theme.message.text)
+                .add_modifier(Modifier::BOLD),
+        );
         let safe_rect = Rect::new(0, 0, frame_area.width.min(80), 1);
         frame.render_widget(msg, safe_rect);
         return;
@@ -87,7 +77,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         Screen::SystemInfo => {
-            system_info::draw(frame, &app.system_info_state, area, &theme, &app.keybindings);
+            system_info::draw(
+                frame,
+                &app.system_info_state,
+                area,
+                &theme,
+                &app.keybindings,
+            );
         }
         Screen::ImageViewer => {
             // 이미지 뷰어는 항상 배경(패널) 위에 오버레이로 표시
@@ -95,7 +91,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             image_viewer::draw(frame, app, area, &theme);
         }
         Screen::SearchResult => {
-            search_result::draw(frame, &mut app.search_result_state, area, &theme, &app.keybindings);
+            search_result::draw(
+                frame,
+                &mut app.search_result_state,
+                area,
+                &theme,
+                &app.keybindings,
+            );
         }
         Screen::DiffScreen => {
             if let Some(ref mut state) = app.diff_state {
@@ -121,7 +123,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Draw advanced search dialog overlay if active
     if app.advanced_search_state.active && app.current_screen == Screen::FilePanel {
-        advanced_search::draw(frame, &app.advanced_search_state, area, &theme, &app.keybindings);
+        advanced_search::draw(
+            frame,
+            &app.advanced_search_state,
+            area,
+            &theme,
+            &app.keybindings,
+        );
     }
 
     // Draw dialog overlay on top of everything (모든 화면 위에 다이얼로그 표시)
@@ -217,7 +225,8 @@ fn draw_panels(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             } else {
                 app.settings.bookmarked_path.contains(&path_str)
             };
-            let focused = active_idx == i && !has_dialog && (!is_ai_mode || ai_panel_index != Some(i));
+            let focused =
+                active_idx == i && !has_dialog && (!is_ai_mode || ai_panel_index != Some(i));
             let diff_selected = diff_first_panel == Some(i);
             panel::draw(
                 frame,
@@ -283,7 +292,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let status = Line::from(vec![
         Span::styled(format!(" {} ", left_text), theme.status_bar_style()),
         Span::styled(
-            " ".repeat(area.width.saturating_sub(left_text.width() as u16 + right_text.width() as u16 + 4) as usize),
+            " ".repeat(
+                area.width
+                    .saturating_sub(left_text.width() as u16 + right_text.width() as u16 + 4)
+                    as usize,
+            ),
             theme.status_bar_style(),
         ),
         Span::styled(format!(" {} ", right_text), theme.status_bar_style()),
@@ -297,7 +310,9 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     if let Some(ref msg) = app.message {
         let message = Paragraph::new(Span::styled(
             format!(" {} ", msg),
-            Style::default().fg(theme.message.text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.message.text)
+                .add_modifier(Modifier::BOLD),
         ));
         frame.render_widget(message, area);
         return;
@@ -358,7 +373,8 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let label_style = Style::default().fg(theme.function_bar.label);
 
     // Build display strings for width calculation
-    let shortcuts: Vec<(String, &str)> = items.iter()
+    let shortcuts: Vec<(String, &str)> = items
+        .iter()
         .filter_map(|(action, label)| {
             let key = kb.panel_first_key(*action).to_string();
             if key.is_empty() {
@@ -377,11 +393,13 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     // Calculate shortcuts width and add padding + version
-    let shortcuts_width: usize = shortcuts.iter()
+    let shortcuts_width: usize = shortcuts
+        .iter()
         .map(|(k, l)| k.width() + 1 + l.width()) // +1 for ":"
         .sum();
     let version_text = format!(" {}", APP_TITLE);
-    let padding_width = (area.width as usize).saturating_sub(shortcuts_width + version_text.width());
+    let padding_width =
+        (area.width as usize).saturating_sub(shortcuts_width + version_text.width());
 
     spans.push(Span::styled(" ".repeat(padding_width), theme.dim_style()));
     spans.push(Span::styled(version_text, theme.dim_style()));
@@ -413,7 +431,10 @@ fn draw_editor_with_ai(frame: &mut Frame, app: &mut App, area: Rect, theme: &The
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[0]);
 
-        let ai_on_left = app.ai_panel_index.map(|i| i < app.active_panel_index).unwrap_or(false);
+        let ai_on_left = app
+            .ai_panel_index
+            .map(|i| i < app.active_panel_index)
+            .unwrap_or(false);
 
         if ai_on_left {
             // AI 왼쪽, 에디터 오른쪽
@@ -463,7 +484,10 @@ fn draw_viewer_with_ai(frame: &mut Frame, app: &mut App, area: Rect, theme: &The
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[0]);
 
-        let ai_on_left = app.ai_panel_index.map(|i| i < app.active_panel_index).unwrap_or(false);
+        let ai_on_left = app
+            .ai_panel_index
+            .map(|i| i < app.active_panel_index)
+            .unwrap_or(false);
 
         if ai_on_left {
             // AI 왼쪽, 뷰어 오른쪽
