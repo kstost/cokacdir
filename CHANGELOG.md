@@ -1,5 +1,51 @@
 # Changelog — cokacdir
 
+## 0.6.27 — 2026-06-20
+
+- **Agy execution now follows a simpler direct stdout streaming path.** The provider still invokes Antigravity CLI with `agy --print "" --print-timeout <duration> --log-file <temp-log> --dangerously-skip-permissions`, writes the composed system/user prompt through stdin, validates `--conversation <session_id>` before spawning, and validates explicit `agy:<model>` values against `agy models`. The adapter now streams every stdout line directly to the chat instead of maintaining a replay-suppression cache, so resumed Antigravity output is no longer hidden by cokacdir-side prefix matching. A successful run that produces empty stdout is reported as `Agy exited successfully but produced no stdout response.`, while non-zero exits still surface as provider errors with captured stdout/stderr.
+
+- **Agy session-id recovery is more tolerant of platform path formats.** `read_last_conversation_id` now looks up Antigravity's `~/.gemini/antigravity-cli/cache/last_conversations.json` with the original working directory, the canonicalized path, and Windows slash/backslash variants. This fixes cases where a Windows workspace was stored as `C:\...` but cokacdir later looked it up as `C:/...`, or vice versa.
+
+- **Windows Agy binary resolution now prefers the native executable.** `COKAC_AGY_PATH` is still honored when it points to a runnable binary, but Windows auto-discovery now tries `agy.exe` before `agy.cmd`, maps a discovered `.cmd` wrapper to a sibling `.exe` when present, and falls back to `where.exe agy`. The debug log records which path won and explicitly logs ignored non-runnable overrides, making startup/provider diagnostics clearer.
+
+- **Bot-server startup avoids an eager Agy model probe.** The `--ccserver` provider banner now prints the detected Agy version without also running `agy models` to count available models. `/model` still lists Agy models on demand, but starting a mixed Telegram/Discord/Slack server no longer pays that extra provider call up front.
+
+- **Repository hygiene cleanup.** Local CLI/runtime artifacts that had slipped into the tree were removed (`.antigravitycli/...` and `.claude/scheduled_tasks.lock`), leaving the repository focused on source, docs, and built web assets.
+
+---
+
+## 0.6.21 — 2026-06-17
+
+- **Agy / Google Antigravity CLI is now a first-class provider, replacing the old Gemini service path.** The new `src/services/agy.rs` adapter discovers `agy` via `COKAC_AGY_PATH`, `which`, shell PATH fallback, or Windows path lookup; caches `agy --version` and `agy models`; validates requested model labels before spawn; and runs Agy in measured print mode with an explicit empty `--print ""` argument. `gemini` and `gemini:<model>` settings are retained only as compatibility aliases and route through the Agy provider.
+
+- **Agy is wired through the chat-bot execution surface.** `/model agy` and `/model agy:<model>` are accepted, `/model` shows installed Agy models, provider detection can fall back to Agy when Claude is unavailable, and normal chat messages, scheduled tasks, inline schedules, and bot-to-bot messages can all dispatch through `agy::execute_command_streaming`. The provider composes the chat system prompt into the stdin prompt because Agy print mode does not expose the same structured system-prompt channel as Claude/Codex.
+
+- **Agy session discovery and restore are integrated with `/start`, `/session`, and cross-provider lookup.** cokacdir resolves Antigravity conversations from `~/.gemini/antigravity-cli/conversations/<session_id>.db|.pb`, reads `last_conversations.json` when possible to map a conversation back to its working directory, and falls back to scanning the conversation file for a cwd candidate. Restored Agy sessions are stored as minimal cokacdir session records while the full transcript remains owned by Antigravity CLI.
+
+- **Agy limitations are explicit instead of silently pretending to match other providers.** `/loop` rejects Agy because no isolated no-tools verifier mode has been measured for Antigravity CLI, and `/allowed` continues to apply only to Claude tool permissions. The new docs call out that Agy print mode emits plain stdout rather than structured JSON/tool events, so cokacdir streams text output instead of rendering per-tool cards.
+
+- **The docs and website now document the Agy provider contract.** `docs/how-to-use-agy-antigravity.md` records the measured `agy 1.0.8` invocation contract, session storage locations, stdout/stderr behavior, known failure shapes, model handling, and current provider limitations. The website adds a matching Agy Provider section and updates environment-variable, session-management, request-management, and tool-management pages from Gemini terminology to Agy terminology.
+
+- **A broad codebase audit fixed confirmed crash, data-loss, and security bugs.** `AUDIT_2026-06-11.md` records the audit scope and the fixes. Highlights include char-index corrections for editor, AI input, and remote-connect fields; terminal-size guards for help/search/git/dialog rendering; `diff_first_panel` index repair across panel close/add; safe handling for huge diff files and symlink-directory recursion; and UTF-8-safe token prefix masking in `--ccserver` diagnostics.
+
+- **Configuration, encryption, and file-operation safety were tightened.** A damaged `~/.cokacdir/settings.json` is preserved instead of being overwritten by defaults, with a backup path for later recovery. `.cokacenc` unpack now rejects metadata/header version downgrade attempts that could bypass v3 integrity checks, split-size multiplication uses saturating arithmetic, copy/move cleanup no longer deletes a destination that an external process created after an `AlreadyExists` race, and duplicate-name probing uses `symlink_metadata` so broken symlinks are treated consistently.
+
+- **Remote transfer handling is safer across rsync/SSH variants.** rsync 3.2.4+ is detected so modern arg-protection paths do not get wrapped in literal quotes, openrsync output is no longer misclassified as rsync 29.x, password transfer moved from `sshpass -p <password>` argv exposure to `sshpass -e` / `SSHPASS`, and known-host key-change errors now include a more actionable line-removal hint.
+
+- **Session/archive parsing was expanded for the newer provider mix.** The session archive code now has an Agy metadata parser, keeps richer structured handling for provider transcripts, and preserves OpenCode/Codex/Claude session details without forcing Agy into a fake JSON-event model.
+
+---
+
+## 0.6.20 — 2026-06-09
+
+- **Project licensing is now explicit in the repository.** Added a top-level `LICENSE` file with the MIT license text and updated the README license section to point at it instead of only saying "MIT License" inline.
+
+- **Runtime STT third-party notices are documented.** Added `THIRD_PARTY_NOTICES.md` covering cokacdir's MIT license, the runtime-downloaded `transcriptor` binary, Whisper model artifacts, whisper.cpp/ggml, dependency-notice expectations, and audio/transcript consent considerations. README, settings docs, file-transfer docs, and the website file-transfer page now point users to the notice.
+
+- **The website footer now links to license and third-party notices.** The generated website assets were rebuilt so the deployed docs expose both legal references alongside the existing docs/GitHub links.
+
+---
+
 ## 0.6.19 — 2026-06-08
 
 - **Telegram audio and album handling now keeps upload context atomic when STT fails or is cancelled.** Mixed albums can contain regular files plus Telegram audio/voice items that are transcribed instead of saved. If an STT item fails, `/stop` cancels processing, or the STT confirmation cannot be sent, the bot now removes only the `[File uploaded]` pending/history records created by that same album before releasing the reserved slot. Older pending uploads and unrelated session history are left intact, so a later prompt no longer receives stale file context from a failed album while still preserving pre-existing context.
@@ -17,6 +63,32 @@
 - **STT model overrides and transcriptor binary replacement are now safer under real runtime conditions.** Bare `/stt_model <name>` settings suppress only the child process's inherited `TRANSCRIPTOR_MODEL` value so the chat override is not hidden by the parent environment, while `/stt_model path:...` and reset keep transcriptor's documented path/env/config/default behavior. Transcriptor binary install and replacement are also serialized with process-local and lock-file guards, so concurrent first STT requests no longer race while replacing an older binary.
 
 - **Docs now match the Telegram STT behavior and settings surface.** The Markdown docs, website docs, and README command list state that non-audio uploads are saved to the workspace, Telegram audio and voice uploads are transcribed as STT input, model downloads are shown in the progress message, and `/stt_model` controls the chat's transcriptor model.
+
+---
+
+## 0.6.18 — 2026-06-04
+
+- **The file-panel AI assistant shortcut is disabled by default and cannot be re-enabled by stale keybinding config.** `PanelAction::AIScreen` no longer binds to `.` in the panel keymap, and `Keybindings::from_config` removes both the default and any legacy `settings.json` override for that panel action. The help screen and quick reference now hide the AI Assistant section/entry when no panel shortcut is active, while the underlying AI screen code remains available internally for paths that still use it.
+
+- **The editor now preserves line endings and trailing-newline shape instead of normalizing everything to `\n`.** File loading tracks per-line endings (`\n`, `\r\n`, or `\r`) plus trailing-newline state; save, copy/cut, insert, delete, duplicate, split/merge, move-line, undo, and redo all carry that metadata forward. Mixed-ending files, CRLF files, and files ending with a final blank line can now round-trip without invisible format churn.
+
+- **Editor saves are safer and preserve more filesystem metadata.** Saves go through a temporary sidecar and replacement path instead of directly overwriting the target. On Unix the editor captures and reapplies mode metadata, and on Linux it also attempts to preserve supported extended attributes. Failed replacement paths avoid clobbering a newly-created sibling target and report rollback failures explicitly.
+
+- **Find/replace, selection, and multi-cursor behavior were hardened.** Selection ranges are clamped before copy/delete/line operations, stale selections are cleared when find/replace input changes, invalid regexes report a find error without modifying the buffer, regex replacement can expand capture groups while literal mode keeps `$` text literal, whole-word matching applies to the whole pattern, and selected occurrences can be edited/deleted together through the multi-cursor path. Paste into find, replace, and goto modes now updates those input fields instead of editing the file buffer.
+
+- **Large-file and viewer/editor handoff behavior is safer.** Opening a pending large text file now sends it to the viewer rather than trying to initialize the editor, and returning from editor to viewer clamps the viewer cursor/scroll after reload so a changed file length cannot leave stale positions.
+
+- **File-operation progress and cancellation now report deterministic results.** Copy/move preparation cancellation emits a single `Cancelled` failure instead of a misleading count for every input file, worker disconnects are distinguished from real cancellation (`Operation worker exited without a completion message`), directory-copy child errors propagate to the parent operation, and copy-file-to-existing-destination is rejected with `AlreadyExists` rather than silently overwriting.
+
+- **Archive create/extract error reporting is much more useful.** The default archive name switched from `<file>.tar.gz` to `<file>.tar`, matching the actual tar command path. tar create/list/extract now capture stderr and `tar:`/`gtar:` error lines from stdout, combine all available error lines instead of keeping only the first, and display full archive failures in a scrollable `TarError` dialog. Cancelled archive operations still report `Error: Cancelled` in status but do not open the large error dialog.
+
+- **Same-folder copy now creates a duplicate instead of rejecting the paste.** Copying and pasting a file into the same directory creates a `_dup`-style duplicate (for example `file_dup.txt`) and leaves the copy clipboard intact so the action behaves like a normal copy rather than a failed paste.
+
+---
+
+## 0.6.17 — 2026-05-29
+
+- **The Telegram `/model` listing was updated for Claude Opus 4.8.** The Claude provider section now labels `/model claude:opus` as `Opus 4.8` instead of `Opus 4.7`, matching the currently advertised model family in the bot's model-selection help.
 
 ---
 
