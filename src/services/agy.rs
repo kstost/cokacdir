@@ -2,15 +2,13 @@
 //!
 //! `agy --print` is a plain-stdout interface, not a Claude/Gemini-compatible
 //! JSON event stream. This adapter synthesizes cokacdir's shared
-//! `StreamMessage` contract from stdout and treats known stdout warnings/errors
-//! as failures even when `agy` exits with status 0.
+//! `StreamMessage` contract from stdout.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -23,7 +21,6 @@ use crate::services::claude::{
 static AGY_PATH: OnceLock<Option<String>> = OnceLock::new();
 static AGY_VERSION: OnceLock<Option<String>> = OnceLock::new();
 static AGY_MODELS: OnceLock<Vec<String>> = OnceLock::new();
-static SESSION_OUTPUT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn agy_debug(msg: &str) {
     debug_log_to("agy.log", msg);
@@ -104,16 +101,67 @@ fn resolve_agy_path() -> Option<String> {
 fn resolve_agy_path() -> Option<String> {
     if let Ok(val) = std::env::var("COKAC_AGY_PATH") {
         if !val.is_empty() && agy_path_is_runnable(&val) {
+            agy_debug(&format!("[resolve_agy_path] COKAC_AGY_PATH={}", val));
             return Some(val);
+        } else if !val.is_empty() {
+            agy_debug(&format!(
+                "[resolve_agy_path] ignoring non-runnable COKAC_AGY_PATH={}",
+                val
+            ));
         }
     }
-    if let Some(path) = crate::services::claude::search_path_wide("agy", Some(".cmd")) {
-        return Some(path);
-    }
+
+    // Prefer Antigravity's native Windows binary over a .cmd wrapper. Batch
+    // wrappers add another argument/stdio layer, which is avoidable for agy.
     if let Some(path) = crate::services::claude::search_path_wide("agy", Some(".exe")) {
+        agy_debug(&format!("[resolve_agy_path] SearchPathW .exe -> {}", path));
         return Some(path);
     }
+    if let Some(path) = crate::services::claude::search_path_wide("agy", Some(".cmd")) {
+        if let Some(native) = agy_native_exe_for_wrapper(&path) {
+            agy_debug(&format!(
+                "[resolve_agy_path] SearchPathW .cmd -> native exe {}",
+                native
+            ));
+            return Some(native);
+        }
+        agy_debug(&format!("[resolve_agy_path] SearchPathW .cmd -> {}", path));
+        return Some(path);
+    }
+    if let Ok(output) = Command::new("where.exe").arg("agy").output() {
+        if output.status.success() {
+            let decoded = crate::services::claude::decode_windows_output(&output.stdout);
+            let mut fallback = None;
+            for path in decoded.lines().map(str::trim).filter(|p| !p.is_empty()) {
+                if !agy_path_is_runnable(path) {
+                    continue;
+                }
+                if path.to_ascii_lowercase().ends_with(".exe") {
+                    agy_debug(&format!("[resolve_agy_path] where.exe -> {}", path));
+                    return Some(path.to_string());
+                }
+                if fallback.is_none() {
+                    fallback = Some(path.to_string());
+                }
+            }
+            if let Some(path) = fallback {
+                agy_debug(&format!(
+                    "[resolve_agy_path] where.exe fallback -> {}",
+                    path
+                ));
+                return Some(path);
+            }
+        }
+    }
+    agy_debug("[resolve_agy_path] not found");
     None
+}
+
+#[cfg(windows)]
+fn agy_native_exe_for_wrapper(wrapper_path: &str) -> Option<String> {
+    let exe = Path::new(wrapper_path).with_extension("exe");
+    let exe = exe.to_string_lossy().to_string();
+    agy_path_is_runnable(&exe).then_some(exe)
 }
 
 fn get_agy_path() -> Option<&'static str> {
@@ -243,18 +291,8 @@ pub fn read_last_conversation_id(working_dir: &str) -> Option<String> {
     let content = std::fs::read_to_string(cache).ok()?;
     let val: Value = serde_json::from_str(&content).ok()?;
     let obj = val.as_object()?;
-    if let Some(sid) = obj.get(working_dir).and_then(|v| v.as_str()) {
-        if !sid.is_empty() {
-            return Some(sid.to_string());
-        }
-    }
-    let canonical = Path::new(working_dir)
-        .canonicalize()
-        .ok()
-        .map(crate::utils::format::strip_unc_prefix)
-        .map(|p| p.display().to_string());
-    if let Some(canonical) = canonical {
-        if let Some(sid) = obj.get(&canonical).and_then(|v| v.as_str()) {
+    for key in working_dir_cache_keys(working_dir) {
+        if let Some(sid) = obj.get(&key).and_then(|v| v.as_str()) {
             if !sid.is_empty() {
                 return Some(sid.to_string());
             }
@@ -263,205 +301,40 @@ pub fn read_last_conversation_id(working_dir: &str) -> Option<String> {
     None
 }
 
-fn session_output_cache() -> &'static Mutex<HashMap<String, String>> {
-    SESSION_OUTPUT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn cached_output_prefix(session_id: &str) -> Option<String> {
-    session_output_cache()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(session_id).cloned())
-        .or_else(|| bot_session_assistant_prefix(session_id))
-}
-
-fn remember_output_prefix(session_id: &str, raw_stdout: &str) {
-    if raw_stdout.is_empty() {
-        return;
-    }
-    if let Ok(mut map) = session_output_cache().lock() {
-        map.insert(session_id.to_string(), raw_stdout.to_string());
+fn push_unique(vec: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !vec.iter().any(|v| v == &value) {
+        vec.push(value);
     }
 }
 
-fn bot_session_assistant_prefix(session_id: &str) -> Option<String> {
-    let path = dirs::home_dir()?
-        .join(".cokacdir")
-        .join("ai_sessions")
-        .join(format!("{}.json", session_id));
-    let content = std::fs::read_to_string(path).ok()?;
-    let val: Value = serde_json::from_str(&content).ok()?;
-    let history = val.get("history")?.as_array()?;
-    let mut parts = Vec::new();
-    for item in history {
-        let ty = item.get("item_type").and_then(|v| v.as_str()).unwrap_or("");
-        if ty != "Assistant" {
-            continue;
-        }
-        if let Some(text) = item.get("content").and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                parts.push(text.trim_end_matches('\n').to_string());
-            }
-        }
+fn add_path_key_variants(vec: &mut Vec<String>, value: &str) {
+    push_unique(vec, value.to_string());
+    let looks_windows = value.contains('\\') || value.as_bytes().get(1) == Some(&b':');
+    if value.contains('\\') {
+        push_unique(vec, value.replace('\\', "/"));
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!("{}\n", parts.join("\n")))
+    if looks_windows && value.contains('/') {
+        push_unique(vec, value.replace('/', "\\"));
     }
 }
 
-fn strip_seen_prefix<'a>(chunk: &'a str, prefix: &str, skipped: &mut usize) -> &'a str {
-    if *skipped >= prefix.len() {
-        return chunk;
+fn working_dir_cache_keys(working_dir: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    add_path_key_variants(&mut keys, working_dir);
+
+    if let Ok(canonical) = Path::new(working_dir).canonicalize() {
+        let canonical = crate::utils::format::strip_unc_prefix(canonical);
+        add_path_key_variants(&mut keys, &canonical.display().to_string());
     }
-    let remaining = &prefix[*skipped..];
-    if remaining.starts_with(chunk) {
-        *skipped += chunk.len();
-        ""
-    } else if chunk.starts_with(remaining) {
-        *skipped = prefix.len();
-        &chunk[remaining.len()..]
-    } else {
-        // Prefix from cache/history no longer matches agy's output. Stop
-        // suppressing rather than risk hiding fresh content.
-        *skipped = prefix.len();
-        chunk
-    }
+
+    keys
 }
 
-fn stdout_error_message(stdout: &str, status_success: bool) -> Option<String> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+fn stdout_absence_error_message(raw_stdout: &str) -> Option<String> {
+    if !raw_stdout.trim().is_empty() {
         return None;
     }
-    if trimmed == "Error: timed out waiting for response"
-        || trimmed.starts_with("Error: failed to send message:")
-        || (trimmed.starts_with("Warning: conversation ") && trimmed.contains(" not found"))
-    {
-        return Some(trimmed.lines().next().unwrap_or(trimmed).to_string());
-    }
-    if !status_success && trimmed.starts_with("Error:") {
-        return Some(trimmed.lines().next().unwrap_or(trimmed).to_string());
-    }
-    None
-}
-
-fn truncate_diagnostic(s: &str, max: usize) -> String {
-    let clean = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if clean.len() <= max {
-        return clean;
-    }
-    let mut end = max;
-    while end > 0 && !clean.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &clean[..end])
-}
-
-fn extract_agy_log_reason(line: &str, pattern: &str) -> String {
-    if pattern == "You are not logged into Antigravity" {
-        return "You are not logged into Antigravity.".to_string();
-    }
-    if pattern == "PlannerResponse without ModifiedResponse" {
-        return "PlannerResponse without ModifiedResponse encountered; no final stdout was emitted."
-            .to_string();
-    }
-    if let Some(pos) = line.find("agent executor error:") {
-        return line[pos + "agent executor error:".len()..]
-            .trim()
-            .to_string();
-    }
-    line.find(pattern)
-        .map(|pos| line[pos..].trim().to_string())
-        .unwrap_or_else(|| line.trim().to_string())
-}
-
-fn is_auth_transient_pattern(pattern: &str) -> bool {
-    pattern == "You are not logged into Antigravity" || pattern == "UNAUTHENTICATED"
-}
-
-fn is_auth_success_line(line: &str) -> bool {
-    line.contains("Print mode: silent auth succeeded")
-        || line.contains("OAuth: authenticated successfully")
-        || line.contains("applyAuthResult:")
-        || line.contains("ChainedAuth: authenticated")
-}
-
-fn auth_succeeded_after(lines: &[&str], idx: usize) -> bool {
-    lines
-        .get(idx + 1..)
-        .map(|tail| tail.iter().any(|line| is_auth_success_line(line)))
-        .unwrap_or(false)
-}
-
-fn agy_log_failure_summary(log_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(log_path).ok()?;
-    let lines: Vec<&str> = content.lines().collect();
-    let patterns = [
-        "RESOURCE_EXHAUSTED",
-        "Individual quota reached",
-        "PERMISSION_DENIED",
-        "agent executor error:",
-        "PlannerResponse without ModifiedResponse",
-        "UNAUTHENTICATED",
-        "You are not logged into Antigravity",
-    ];
-    for pattern in patterns {
-        if let Some((idx, line)) = lines
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, line)| line.contains(pattern))
-        {
-            if is_auth_transient_pattern(pattern) && auth_succeeded_after(&lines, idx) {
-                continue;
-            }
-            let reason = extract_agy_log_reason(line, pattern);
-            return Some(format!(
-                "Agy log reports: {}",
-                truncate_diagnostic(&reason, 360)
-            ));
-        }
-    }
-    None
-}
-
-fn stdout_absence_error_message(
-    raw_stdout: &str,
-    visible_output: &str,
-    had_prior_prefix: bool,
-    log_summary: Option<&str>,
-) -> Option<String> {
-    if !raw_stdout.trim().is_empty() && !visible_output.trim().is_empty() {
-        return None;
-    }
-    let suffix = log_summary
-        .map(|s| format!(" {}", s))
-        .unwrap_or_else(|| " Check the Antigravity CLI log for details.".to_string());
-    if raw_stdout.trim().is_empty() {
-        return Some(format!(
-            "Agy exited successfully but produced no stdout response.{}",
-            suffix
-        ));
-    }
-    if had_prior_prefix {
-        return Some(format!(
-            "Agy exited successfully but produced no new stdout response after replaying previous conversation output.{}",
-            suffix
-        ));
-    }
-    Some(format!(
-        "Agy exited successfully but produced no visible stdout response.{}",
-        suffix
-    ))
-}
-
-fn line_is_fatal_stdout_error(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed == "Error: timed out waiting for response"
-        || trimmed.starts_with("Error: failed to send message:")
-        || (trimmed.starts_with("Warning: conversation ") && trimmed.contains(" not found"))
+    Some("Agy exited successfully but produced no stdout response.".to_string())
 }
 
 fn build_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
@@ -571,7 +444,6 @@ pub fn execute_command_streaming(
             ));
         }
     }
-
     let agy_bin = get_agy_path()
         .ok_or_else(|| "Agy CLI not found. Is Antigravity CLI installed?".to_string())?;
 
@@ -645,13 +517,8 @@ pub fn execute_command_streaming(
         .ok_or_else(|| "Failed to capture agy stdout".to_string())?;
     let mut reader = BufReader::new(stdout);
 
-    let prior_prefix = session_id
-        .and_then(cached_output_prefix)
-        .unwrap_or_default();
-    let mut skipped_prefix_len = 0usize;
     let mut raw_stdout = String::new();
     let mut visible_output = String::new();
-    let mut stdout_error: Option<String> = None;
 
     loop {
         if let Some(ref token) = cancel_token {
@@ -678,26 +545,15 @@ pub fn execute_command_streaming(
             log_preview(&chunk, 200)
         ));
 
-        if line_is_fatal_stdout_error(&chunk) {
-            let msg = chunk.trim().to_string();
-            agy_debug(&format!("[stream] fatal stdout line: {}", msg));
-            stdout_error = Some(msg);
-            kill_child_tree(&mut child);
+        visible_output.push_str(&chunk);
+        if sender
+            .send(StreamMessage::Text {
+                content: chunk.to_string(),
+            })
+            .is_err()
+        {
+            agy_debug("[stream] receiver dropped");
             break;
-        }
-
-        let emit = strip_seen_prefix(&chunk, &prior_prefix, &mut skipped_prefix_len);
-        if !emit.is_empty() {
-            visible_output.push_str(emit);
-            if sender
-                .send(StreamMessage::Text {
-                    content: emit.to_string(),
-                })
-                .is_err()
-            {
-                agy_debug("[stream] receiver dropped");
-                break;
-            }
         }
     }
 
@@ -724,25 +580,15 @@ pub fn execute_command_streaming(
         ));
     }
 
-    let log_failure_summary = agy_log_failure_summary(&agy_log_path);
-    if let Some(ref summary) = log_failure_summary {
-        agy_debug(&format!("[stream] {}", summary));
-    }
+    let last_session_id = session_id
+        .map(ToString::to_string)
+        .or_else(|| read_last_conversation_id(working_dir));
 
-    let detected_error = stdout_error
-        .or_else(|| stdout_error_message(&raw_stdout, status.success()))
-        .or_else(|| {
-            if status.success() {
-                stdout_absence_error_message(
-                    &raw_stdout,
-                    &visible_output,
-                    !prior_prefix.is_empty(),
-                    log_failure_summary.as_deref(),
-                )
-            } else {
-                log_failure_summary
-            }
-        });
+    let detected_error = if status.success() {
+        stdout_absence_error_message(&raw_stdout)
+    } else {
+        None
+    };
     if detected_error.is_some() || !status.success() {
         let message =
             detected_error.unwrap_or_else(|| format!("Agy exited with code {:?}", status.code()));
@@ -762,13 +608,6 @@ pub fn execute_command_streaming(
         return Ok(());
     }
 
-    let last_session_id = session_id
-        .map(ToString::to_string)
-        .or_else(|| read_last_conversation_id(working_dir));
-    if let Some(ref sid) = last_session_id {
-        remember_output_prefix(sid, &raw_stdout);
-    }
-
     let _ = sender.send(StreamMessage::Done {
         result: visible_output,
         session_id: last_session_id,
@@ -779,126 +618,25 @@ pub fn execute_command_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        agy_log_failure_summary, stdout_absence_error_message, stdout_error_message,
-        strip_seen_prefix,
-    };
-
-    #[test]
-    fn strips_seen_prefix_across_line_chunks() {
-        let prefix = "SESSION_ONE\nSESSION_TWO\n";
-        let mut skipped = 0usize;
-
-        assert_eq!(strip_seen_prefix("SESSION_ONE\n", prefix, &mut skipped), "");
-        assert_eq!(strip_seen_prefix("SESSION_TWO\n", prefix, &mut skipped), "");
-        assert_eq!(
-            strip_seen_prefix("SESSION_THREE\n", prefix, &mut skipped),
-            "SESSION_THREE\n"
-        );
-    }
-
-    #[test]
-    fn emits_suffix_when_chunk_crosses_prefix_boundary() {
-        let prefix = "OLD";
-        let mut skipped = 0usize;
-        assert_eq!(strip_seen_prefix("OLDNEW\n", prefix, &mut skipped), "NEW\n");
-    }
-
-    #[test]
-    fn detects_agy_stdout_errors_even_on_success() {
-        assert_eq!(
-            stdout_error_message("Error: timed out waiting for response\n", true).as_deref(),
-            Some("Error: timed out waiting for response")
-        );
-        assert_eq!(
-            stdout_error_message(
-                "Warning: conversation \"000\" not found.\nSHOULD_NOT_RUN\n",
-                true
-            )
-            .as_deref(),
-            Some("Warning: conversation \"000\" not found.")
-        );
-    }
+    use super::{stdout_absence_error_message, working_dir_cache_keys};
 
     #[test]
     fn detects_successful_empty_stdout_as_error() {
         assert_eq!(
-            stdout_absence_error_message("", "", false, None).as_deref(),
-            Some(
-                "Agy exited successfully but produced no stdout response. Check the Antigravity CLI log for details."
-            )
-        );
-    }
-
-    #[test]
-    fn detects_replayed_resume_without_new_output_as_error() {
-        assert_eq!(
-            stdout_absence_error_message("OLD\n", "", true, Some("Agy log reports: RESOURCE_EXHAUSTED (code 429).")).as_deref(),
-            Some(
-                "Agy exited successfully but produced no new stdout response after replaying previous conversation output. Agy log reports: RESOURCE_EXHAUSTED (code 429)."
-            )
+            stdout_absence_error_message("").as_deref(),
+            Some("Agy exited successfully but produced no stdout response.")
         );
     }
 
     #[test]
     fn allows_successful_visible_stdout() {
-        assert!(stdout_absence_error_message("OLD\nNEW\n", "NEW\n", true, None).is_none());
+        assert!(stdout_absence_error_message("OLD\nNEW\n").is_none());
     }
 
     #[test]
-    fn summarizes_quota_log_before_planner_absence() {
-        let path = std::env::temp_dir().join(format!(
-            "cokacdir-agy-test-{}-{}.log",
-            std::process::id(),
-            "quota"
-        ));
-        std::fs::write(
-            &path,
-            "E log.go:398] agent executor error: RESOURCE_EXHAUSTED (code 429): Individual quota reached.\nI printmode_manager.go:90] PlannerResponse without ModifiedResponse encountered\n",
-        )
-        .unwrap();
-        let summary = agy_log_failure_summary(&path);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            summary.as_deref(),
-            Some("Agy log reports: RESOURCE_EXHAUSTED (code 429): Individual quota reached.")
-        );
-    }
-
-    #[test]
-    fn ignores_transient_auth_errors_after_silent_auth_success() {
-        let path = std::env::temp_dir().join(format!(
-            "cokacdir-agy-test-{}-{}.log",
-            std::process::id(),
-            "auth-transient"
-        ));
-        std::fs::write(
-            &path,
-            "E log.go:398] error getting token source: You are not logged into Antigravity.\nI server_oauth.go:212] applyAuthResult: email=user@example.com, authMethod=consumer, quotaProject=\nI printmode.go:192] Print mode: silent auth succeeded\n",
-        )
-        .unwrap();
-        let summary = agy_log_failure_summary(&path);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(summary, None);
-    }
-
-    #[test]
-    fn reports_auth_error_when_auth_never_succeeds() {
-        let path = std::env::temp_dir().join(format!(
-            "cokacdir-agy-test-{}-{}.log",
-            std::process::id(),
-            "auth-failure"
-        ));
-        std::fs::write(
-            &path,
-            "E log.go:398] error getting token source: You are not logged into Antigravity.\nE server.go:640] Failed to get OAuth token: error getting token source from auth provider: You are not logged into Antigravity.\n",
-        )
-        .unwrap();
-        let summary = agy_log_failure_summary(&path);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            summary.as_deref(),
-            Some("Agy log reports: You are not logged into Antigravity.")
-        );
+    fn includes_windows_and_slash_cache_key_variants() {
+        let keys = working_dir_cache_keys(r"C:\Users\kst\.cokacdir\workspace\eikfuccw");
+        assert!(keys.contains(&r"C:\Users\kst\.cokacdir\workspace\eikfuccw".to_string()));
+        assert!(keys.contains(&"C:/Users/kst/.cokacdir/workspace/eikfuccw".to_string()));
     }
 }

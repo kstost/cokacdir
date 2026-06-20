@@ -14574,7 +14574,8 @@ async fn handle_model_command(
         if has_agy {
             msg.push_str("\n<b>Agy (Antigravity):</b>\n");
             msg.push_str("<code>/model agy</code> — default\n");
-            for model_id in agy::list_models() {
+            let agy_models = agy::list_models();
+            for model_id in agy_models {
                 msg.push_str(&format!(
                     "<code>/model agy:{}</code>\n",
                     html_escape(&model_id)

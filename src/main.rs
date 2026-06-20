@@ -1143,13 +1143,7 @@ fn handle_ccserver(tokens: Vec<String>) {
 
     if has_agy {
         let ver = agy::agy_version().map(|s| s.as_str()).unwrap_or("unknown");
-        let model_count = agy::list_models().len();
-        println!(
-            "  ▸ Agy          : v{} ({} model{})",
-            ver,
-            model_count,
-            if model_count == 1 { "" } else { "s" }
-        );
+        println!("  ▸ Agy          : v{}", ver);
     }
 
     if !has_claude && !has_codex && !has_agy && !has_opencode {
