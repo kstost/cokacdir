@@ -960,6 +960,9 @@ struct BotSettings {
     /// chat_id (string) -> transcriptor model setting for STT.
     /// Bare values are passed as `--model-name`; `path:<PATH>` is passed as `--model`.
     stt_models: HashMap<String, String>,
+    /// chat_id (string) -> true if responses containing a Markdown table should
+    /// be rendered as native Telegram Rich Messages (Bot API 10.1). Opt-in.
+    rich_messages: HashMap<String, bool>,
 }
 
 impl Default for BotSettings {
@@ -985,6 +988,7 @@ impl Default for BotSettings {
             codex_fast: HashMap::new(),
             claude_effort: HashMap::new(),
             stt_models: HashMap::new(),
+            rich_messages: HashMap::new(),
         }
     }
 }
@@ -1065,6 +1069,23 @@ fn is_codex_fast(settings: &BotSettings, chat_id: ChatId) -> bool {
         .get(&chat_id.0.to_string())
         .copied()
         .unwrap_or(false)
+}
+
+/// True if this chat has opted in to native Telegram table rendering
+/// (Bot API 10.1 Rich Messages). Defaults to false.
+fn is_rich_messages_enabled(settings: &BotSettings, chat_id: ChatId) -> bool {
+    settings
+        .rich_messages
+        .get(&chat_id.0.to_string())
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Async convenience wrapper that locks shared state to read the per-chat
+/// `rich_messages` opt-in flag.
+async fn rich_messages_on(state: &SharedState, chat_id: ChatId) -> bool {
+    let data = state.lock().await;
+    is_rich_messages_enabled(&data.settings, chat_id)
 }
 
 fn get_stt_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
@@ -2895,6 +2916,7 @@ fn build_system_prompt(
     user_message: Option<&str>,
     context_count: usize,
     platform: &str,
+    rich_messages_enabled: bool,
 ) -> String {
     msg_debug(&format!("[build_system_prompt] chat_id={}, bot_username={:?}, bot_display_name={:?}, session_id={:?}, disabled_notice_len={}, role_len={}",
         chat_id, bot_username, bot_display_name, session_id, disabled_notice.len(), role.len()));
@@ -3161,6 +3183,11 @@ fn build_system_prompt(
     } else {
         String::new()
     };
+    let table_instruction = if rich_messages_enabled {
+        "Markdown tables are supported and render as native Telegram tables."
+    } else {
+        "Do NOT use Markdown tables."
+    };
     format!(
         "{role}\n\
          {bot_username_line}\
@@ -3172,7 +3199,7 @@ fn build_system_prompt(
          IMPORTANT: The user is on {platform} and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
          Never use tools that expect user interaction. If you need clarification, just ask in plain text.\n\n\
-         Response format: Use Markdown by default, but do NOT use Markdown tables.\n\n\
+         Response format: Use Markdown by default. {table_instruction}\n\n\
          If the user asks about how to use cokacdir, refer to the documentation files in ~/.cokacdir/docs/ for accurate guidance.\n\n\
          ═══════════════════════════════════════\n\
          COKACDIR COMMAND REFERENCE\n\
@@ -3983,6 +4010,16 @@ fn load_bot_settings(token: &str) -> BotSettings {
         })
         .unwrap_or_default();
 
+    let rich_messages: HashMap<String, bool> = entry
+        .get("rich_messages")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
+        .unwrap_or_default();
+
     BotSettings {
         allowed_tools,
         last_sessions,
@@ -4004,6 +4041,7 @@ fn load_bot_settings(token: &str) -> BotSettings {
         codex_fast,
         claude_effort,
         stt_models,
+        rich_messages,
     }
 }
 
@@ -4063,6 +4101,7 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "codex_fast": settings.codex_fast,
         "claude_effort": settings.claude_effort,
         "stt_models": settings.stt_models,
+        "rich_messages": settings.rich_messages,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
@@ -4308,6 +4347,7 @@ fn is_owner_only_command(text: &str) -> bool {
             | "stt_model"
             | "effort"
             | "fast"
+            | "richmessages"
             | "greeting"
             | "debug"
             | "envvars"
@@ -5065,6 +5105,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("stt_model", "Set speech recognition model"),
         teloxide::types::BotCommand::new("effort", "Set Claude/Codex effort level"),
         teloxide::types::BotCommand::new("fast", "Toggle Codex fast service tier"),
+        teloxide::types::BotCommand::new("richmessages", "Toggle native Markdown table rendering"),
         teloxide::types::BotCommand::new("debug", "Toggle debug logging"),
         teloxide::types::BotCommand::new("envvars", "Show all environment variables"),
         teloxide::types::BotCommand::new("silent", "Toggle silent mode (hide tool calls)"),
@@ -9212,6 +9253,13 @@ async fn handle_message(
             command_args(&text)
         );
         handle_fast_command(&bot, chat_id, &text, &state, token).await?;
+    } else if is_cmd(&text, "richmessages") {
+        msg_debug("[handle_message] routing → /richmessages");
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /richmessages {}",
+            command_args(&text)
+        );
+        handle_richmessages_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "greeting") {
         msg_debug("[handle_message] routing → /greeting");
         println!("  [{timestamp}] ◀ [{user_name}] /greeting");
@@ -9515,6 +9563,7 @@ Ask in natural language to manage schedules.
 <code>/effort</code> — Show current Claude/Codex effort
 <code>/effort &lt;level&gt;</code> — Set effort (Claude: low/medium/high/xhigh/max, Codex: minimal/low/medium/high/xhigh, or reset)
 <code>/fast</code> — Toggle Codex fast service tier
+<code>/richmessages</code> — Toggle native Markdown table rendering
 <code>/setpollingtime &lt;ms&gt;</code> — Set API polling interval
   Too low may cause API rate limits.
   Minimum 2500ms, recommended 3000ms+.
@@ -14412,6 +14461,73 @@ async fn handle_fast_command(
     Ok(())
 }
 
+/// Handle /richmessages command — toggle native Telegram table rendering
+/// (Bot API 10.1 Rich Messages) for the current chat.
+async fn handle_richmessages_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg = command_args(text).trim().to_lowercase();
+
+    if arg == "status" || arg == "show" {
+        let enabled = rich_messages_on(state, chat_id).await;
+        let status = if enabled {
+            "📊 Rich tables: ON (Markdown tables render natively)"
+        } else {
+            "📊 Rich tables: OFF (Markdown tables shown as plain text)"
+        };
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, status).await)?;
+        return Ok(());
+    }
+
+    let requested = match arg.as_str() {
+        "" => None,
+        "on" | "enable" | "enabled" | "true" | "1" => Some(true),
+        "off" | "disable" | "disabled" | "false" | "0" | "reset" | "clear" | "default" => {
+            Some(false)
+        }
+        _ => {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    "Usage: /richmessages, /richmessages on, /richmessages off, /richmessages status",
+                )
+                .await
+            )?;
+            return Ok(());
+        }
+    };
+
+    let next = {
+        let mut data = state.lock().await;
+        let key = chat_id.0.to_string();
+        let prev = is_rich_messages_enabled(&data.settings, chat_id);
+        let next = requested.unwrap_or(!prev);
+        if next {
+            data.settings.rich_messages.insert(key, true);
+        } else {
+            data.settings.rich_messages.remove(&key);
+        }
+        save_bot_settings(token, &data.settings);
+        next
+    };
+
+    let status = if next {
+        "📊 Rich tables: ON (Markdown tables render natively)"
+    } else {
+        "📊 Rich tables: OFF (Markdown tables shown as plain text)"
+    };
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, status).await)?;
+    Ok(())
+}
+
 /// Handle /stt_model command - set or view transcriptor model for this chat.
 async fn handle_stt_model_command(
     bot: &Bot,
@@ -15475,6 +15591,7 @@ async fn handle_text_message(
         role.len(),
         current_path
     ));
+    let rich_messages_enabled = rich_messages_on(&state, chat_id).await;
     let system_prompt_owned = build_system_prompt(
         &role,
         &current_path,
@@ -15487,6 +15604,7 @@ async fn handle_text_message(
         Some(user_text),
         context_count,
         &platform,
+        rich_messages_enabled,
     );
 
     // Create channel for streaming
@@ -16223,6 +16341,19 @@ async fn handle_text_message(
                         "response",
                     )
                     .await;
+                } else if last_confirmed_len == 0
+                    && contains_markdown_table(&final_response)
+                    && rich_messages_on(&state_owned, chat_id).await
+                    && finalize_as_rich_table(
+                        &bot_owned,
+                        chat_id,
+                        placeholder_msg_id,
+                        &final_response,
+                        &state_owned,
+                    )
+                    .await
+                {
+                    msg_debug("[rolling_ph] FINAL sent as Rich Message (table)");
                 } else {
                     let normalized_remaining = normalize_empty_lines(remaining);
                     let html_remaining = markdown_to_telegram_html(&normalized_remaining);
@@ -17612,6 +17743,113 @@ async fn send_long_message(
     Ok(())
 }
 
+/// True if `md` contains a GitHub-flavored Markdown table: a header row
+/// immediately followed by a separator row such as `|---|---|`. Lines inside
+/// fenced code blocks are skipped so pipes in code do not trigger a false match.
+fn contains_markdown_table(md: &str) -> bool {
+    let mut in_fence = false;
+    let mut prev_has_pipe = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            prev_has_pipe = false;
+            continue;
+        }
+        if in_fence {
+            prev_has_pipe = false;
+            continue;
+        }
+        let is_separator = !t.is_empty()
+            && t.contains('|')
+            && t.contains('-')
+            && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '));
+        if is_separator && prev_has_pipe {
+            return true;
+        }
+        prev_has_pipe = t.contains('|');
+    }
+    false
+}
+
+/// Send `markdown` as a Telegram Rich Message via the Bot API 10.1
+/// `sendRichMessage` method (which renders tables, headings, lists, etc.
+/// natively). teloxide 0.13 does not yet wrap this method, so the request is
+/// issued directly with reqwest. Returns `Ok(())` only when Telegram answers
+/// `ok: true`.
+async fn send_rich_markdown(
+    bot: &Bot,
+    chat_id: ChatId,
+    markdown: &str,
+    state: &SharedState,
+) -> Result<(), String> {
+    let base = {
+        let data = state.lock().await;
+        data.api_base_url.clone()
+    };
+    let token = bot.token().to_string();
+    let url = format!("{}/bot{}/sendRichMessage", base, token);
+    let scrub = |s: String| s.replace(&token, "<bot_token_redacted>");
+    let body = serde_json::json!({
+        "chat_id": chat_id.0,
+        "rich_message": { "markdown": markdown },
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| scrub(format!("client build failed: {e}")))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| scrub(format!("request failed: {e}")))?;
+    let status = resp.status();
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| scrub(format!("invalid JSON response: {e}")))?;
+    if json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        Ok(())
+    } else {
+        let desc = json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        Err(format!("sendRichMessage failed (HTTP {status}): {desc}"))
+    }
+}
+
+/// Finalize a streamed response that contains a Markdown table by replacing the
+/// rolling placeholder with a Telegram Rich Message. On success the placeholder
+/// is deleted and `true` is returned; on any failure `false` is returned so the
+/// caller transparently falls back to the existing HTML rendering path.
+async fn finalize_as_rich_table(
+    bot: &Bot,
+    chat_id: ChatId,
+    placeholder_msg_id: teloxide::types::MessageId,
+    markdown: &str,
+    state: &SharedState,
+) -> bool {
+    shared_rate_limit_wait(state, chat_id).await;
+    match send_rich_markdown(bot, chat_id, markdown, state).await {
+        Ok(()) => {
+            shared_rate_limit_wait(state, chat_id).await;
+            let _ = tg!(
+                "delete_message",
+                bot.delete_message(chat_id, placeholder_msg_id).await
+            );
+            true
+        }
+        Err(e) => {
+            msg_debug(&format!(
+                "[rich_table] sendRichMessage failed, falling back to HTML: {e}"
+            ));
+            false
+        }
+    }
+}
+
 /// Send a large AI response as a .txt file attachment.
 /// Returns true if the file was successfully sent.
 async fn send_response_as_file(
@@ -18796,6 +19034,7 @@ async fn execute_schedule(
             None => base,
         }
     };
+    let rich_messages_enabled = rich_messages_on(&state, chat_id).await;
     let system_prompt_owned = build_system_prompt(
         &sched_role,
         &crate::utils::format::to_shell_path(&workspace_path),
@@ -18808,6 +19047,7 @@ async fn execute_schedule(
         None, // scheduled tasks: no user message dedup
         sched_context_count,
         &platform,
+        rich_messages_enabled,
     );
 
     // Retrieve pre-inserted cancel token (from scheduler_loop), or create a new one
@@ -19485,6 +19725,21 @@ async fn execute_schedule(
                     format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
                 send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule")
                     .await;
+            } else if last_confirmed_len == 0 && {
+                let rich_md =
+                    format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                contains_markdown_table(&rich_md)
+                    && rich_messages_on(&state_owned, chat_id).await
+                    && finalize_as_rich_table(
+                        &bot_owned,
+                        chat_id,
+                        placeholder_msg_id,
+                        &rich_md,
+                        &state_owned,
+                    )
+                    .await
+            } {
+                msg_debug("[rolling_ph/sched] FINAL sent as Rich Message (table)");
             } else {
                 let normalized_remaining = normalize_empty_lines(remaining);
                 let final_text = format!("{}{}", normalized_remaining, continue_hint);
@@ -20179,6 +20434,7 @@ async fn process_bot_message(
             format!("You are chatting with a user through {}.", platform)
         }
     };
+    let rich_messages_enabled = rich_messages_on(&state, chat_id).await;
     let system_prompt_owned = build_system_prompt(
         &role,
         &current_path,
@@ -20191,6 +20447,7 @@ async fn process_bot_message(
         None, // bot-to-bot messages: no user message dedup
         context_count,
         &platform,
+        rich_messages_enabled,
     );
     msg_debug(&format!(
         "[process_bot_message] system_prompt built, len={}",
@@ -20860,6 +21117,19 @@ async fn process_bot_message(
                         "botmsg",
                     )
                     .await;
+                } else if last_confirmed_len == 0
+                    && contains_markdown_table(&final_response)
+                    && rich_messages_on(&state_owned, chat_id).await
+                    && finalize_as_rich_table(
+                        &bot_owned,
+                        chat_id,
+                        placeholder_msg_id,
+                        &final_response,
+                        &state_owned,
+                    )
+                    .await
+                {
+                    msg_debug("[rolling_ph/botmsg] FINAL sent as Rich Message (table)");
                 } else {
                     let normalized_remaining = normalize_empty_lines(remaining);
                     let html_remaining = markdown_to_telegram_html(&normalized_remaining);
