@@ -29,6 +29,13 @@ fn short_sha(s: &str) -> String {
     hex::encode(&r[..6])
 }
 
+enum CodexJsonLine {
+    Blank,
+    Json(Value),
+}
+
+const CODEX_SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Cached path to the codex binary.
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
 
@@ -368,6 +375,460 @@ pub fn verify_completion_codex(
     codex_debug_log("=== verify_completion_codex END ===");
 
     Ok(crate::services::claude::VerifyResult { complete, feedback })
+}
+
+fn codex_home_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".codex"))
+}
+
+fn codex_state_5_path() -> Option<PathBuf> {
+    Some(codex_home_dir()?.join("state_5.sqlite"))
+}
+
+fn make_codex_uuid() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
+fn codex_rollout_path(codex_home: &Path, session_id: &str) -> PathBuf {
+    let ts = chrono::Utc::now();
+    codex_home
+        .join("sessions")
+        .join(format!("{:04}", ts.format("%Y")))
+        .join(format!("{:02}", ts.format("%m")))
+        .join(format!("{:02}", ts.format("%d")))
+        .join(format!(
+            "rollout-{}-{}.jsonl",
+            ts.format("%Y-%m-%dT%H-%M-%S"),
+            session_id
+        ))
+}
+
+fn quote_sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn set_codex_busy_timeout(conn: &rusqlite::Connection, label: &str) {
+    if let Err(e) = conn.busy_timeout(CODEX_SQLITE_BUSY_TIMEOUT) {
+        codex_debug_log(&format!(
+            "[session-clone] failed to set Codex SQLite busy timeout for {}: {}",
+            label, e
+        ));
+    }
+}
+
+fn ordered_table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", quote_sql_ident(table)))
+        .map_err(|e| format!("Failed to inspect Codex state table {}: {}", table, e))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("Failed to read Codex state table info: {}", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect Codex state columns: {}", e))?;
+    if names.is_empty() {
+        return Err(format!(
+            "Codex state table `{}` not found or has no columns",
+            table
+        ));
+    }
+    Ok(names)
+}
+
+fn find_codex_rollout_from_state(session_id: &str) -> Option<PathBuf> {
+    let state_5 = codex_state_5_path()?;
+    if !state_5.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&state_5, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    set_codex_busy_timeout(&conn, "state lookup");
+    let path: String = conn
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let path = PathBuf::from(path);
+    path.is_file().then_some(path)
+}
+
+fn collect_codex_rollouts(dir: &Path, session_id: &str, out: &mut Vec<(u64, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let exact_suffix = format!("-{}.jsonl", session_id);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_codex_rollouts(&path, session_id, out);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(&exact_suffix) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push((mtime, path));
+    }
+}
+
+fn find_codex_rollout_by_scan(session_id: &str) -> Option<PathBuf> {
+    let root = codex_home_dir()?.join("sessions");
+    let mut matches = Vec::new();
+    collect_codex_rollouts(&root, session_id, &mut matches);
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.into_iter().map(|(_, path)| path).next()
+}
+
+fn find_codex_rollout(session_id: &str) -> Result<PathBuf, String> {
+    find_codex_rollout_from_state(session_id)
+        .or_else(|| find_codex_rollout_by_scan(session_id))
+        .ok_or_else(|| format!("Codex rollout not found for session {}", session_id))
+}
+
+fn read_codex_jsonl_lines(path: &Path) -> Result<Vec<CodexJsonLine>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read Codex rollout {}: {}", path.display(), e))?;
+    let ended_with_newline = content.ends_with('\n') || content.is_empty();
+    let raw_lines = content.split('\n').collect::<Vec<_>>();
+    let line_count = if ended_with_newline {
+        raw_lines.len().saturating_sub(1)
+    } else {
+        raw_lines.len()
+    };
+    let mut lines = Vec::new();
+    for (idx, line) in raw_lines.into_iter().take(line_count).enumerate() {
+        if line.trim().is_empty() {
+            lines.push(CodexJsonLine::Blank);
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => lines.push(CodexJsonLine::Json(value)),
+            Err(e) => {
+                if !ended_with_newline && idx + 1 == line_count && !lines.is_empty() {
+                    codex_debug_log(&format!(
+                        "[session-clone] ignoring incomplete final Codex rollout line {} in {}: {}",
+                        idx + 1,
+                        path.display(),
+                        e
+                    ));
+                    break;
+                }
+                return Err(format!(
+                    "Failed to parse Codex rollout line {} in {}: {}",
+                    idx + 1,
+                    path.display(),
+                    e
+                ));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+fn first_codex_payload_string(lines: &[CodexJsonLine], key: &str) -> Option<String> {
+    for line in lines {
+        let CodexJsonLine::Json(Value::Object(map)) = line else {
+            continue;
+        };
+        let Some(Value::Object(payload)) = map.get("payload") else {
+            continue;
+        };
+        if let Some(value) = payload.get(key).and_then(|v| v.as_str()) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn rewrite_payload_string_if_equal(
+    payload: &mut serde_json::Map<String, Value>,
+    key: &str,
+    old: &str,
+    new: &str,
+) {
+    if let Some(Value::String(value)) = payload.get_mut(key) {
+        if value == old {
+            *value = new.to_string();
+        }
+    }
+}
+
+fn patch_codex_jsonl_lines(
+    lines: &mut [CodexJsonLine],
+    old_sid: &str,
+    new_sid: &str,
+    old_cwd: &str,
+    new_cwd: &str,
+) {
+    for line in lines {
+        let CodexJsonLine::Json(Value::Object(map)) = line else {
+            continue;
+        };
+        let Some(Value::Object(payload)) = map.get_mut("payload") else {
+            continue;
+        };
+        rewrite_payload_string_if_equal(payload, "id", old_sid, new_sid);
+        rewrite_payload_string_if_equal(payload, "cwd", old_cwd, new_cwd);
+    }
+}
+
+fn write_codex_jsonl_lines_atomic(path: &Path, lines: &[CodexJsonLine]) -> Result<u64, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create Codex rollout dir {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("clone.jsonl");
+    let tmp_path = path.with_file_name(format!(".{}.tmp-{}", file_name, make_codex_uuid()));
+    let result = (|| -> Result<u64, String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to create temp Codex rollout {}: {}",
+                    tmp_path.display(),
+                    e
+                )
+            })?;
+        for line in lines {
+            match line {
+                CodexJsonLine::Blank => {
+                    writeln!(file)
+                        .map_err(|e| format!("Failed to write blank Codex rollout line: {}", e))?;
+                }
+                CodexJsonLine::Json(value) => {
+                    serde_json::to_writer(&mut file, value)
+                        .map_err(|e| format!("Failed to write Codex rollout JSON: {}", e))?;
+                    writeln!(file)
+                        .map_err(|e| format!("Failed to finish Codex rollout line: {}", e))?;
+                }
+            }
+        }
+        file.sync_all()
+            .map_err(|e| format!("Failed to sync Codex rollout {}: {}", tmp_path.display(), e))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| {
+            format!(
+                "Failed to move Codex rollout {} -> {}: {}",
+                tmp_path.display(),
+                path.display(),
+                e
+            )
+        })?;
+        Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn copy_codex_state_thread_row(
+    source_session_id: &str,
+    new_session_id: &str,
+    rollout_path: &Path,
+    cwd: &str,
+) -> Result<Option<PathBuf>, String> {
+    use rusqlite::types::Value as SqlValue;
+
+    let Some(state_5) = codex_state_5_path() else {
+        return Ok(None);
+    };
+    if !state_5.is_file() {
+        return Ok(None);
+    }
+
+    let mut conn = rusqlite::Connection::open(&state_5)
+        .map_err(|e| format!("Failed to open Codex state DB {}: {}", state_5.display(), e))?;
+    set_codex_busy_timeout(&conn, "state row copy");
+    let columns = ordered_table_columns(&conn, "threads")?;
+    for required in ["id", "rollout_path", "cwd"] {
+        if !columns.iter().any(|column| column == required) {
+            return Err(format!(
+                "Codex threads table missing expected column `{}`",
+                required
+            ));
+        }
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to start Codex state transaction: {}", e))?;
+    let select_sql = format!(
+        "SELECT {} FROM threads WHERE id = ?1",
+        columns
+            .iter()
+            .map(|column| quote_sql_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut stmt = tx
+        .prepare(&select_sql)
+        .map_err(|e| format!("Failed to prepare Codex state row copy: {}", e))?;
+    let mut values = match stmt.query_row(rusqlite::params![source_session_id], |row| {
+        let mut values = Vec::with_capacity(columns.len());
+        for idx in 0..columns.len() {
+            values.push(row.get::<_, SqlValue>(idx)?);
+        }
+        Ok(values)
+    }) {
+        Ok(values) => values,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(format!(
+                "Source Codex state row not found for {}; cannot clone session",
+                source_session_id
+            ));
+        }
+        Err(e) => return Err(format!("Failed to read source Codex state row: {}", e)),
+    };
+    drop(stmt);
+
+    for (column, value) in columns.iter().zip(values.iter_mut()) {
+        match column.as_str() {
+            "id" => *value = SqlValue::Text(new_session_id.to_string()),
+            "rollout_path" => *value = SqlValue::Text(rollout_path.display().to_string()),
+            "cwd" => *value = SqlValue::Text(cwd.to_string()),
+            _ => {}
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM threads WHERE id = ?1",
+        rusqlite::params![new_session_id],
+    )
+    .map_err(|e| format!("Failed to clear existing Codex clone state row: {}", e))?;
+    let placeholders = (1..=columns.len())
+        .map(|idx| format!("?{}", idx))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!(
+        "INSERT INTO threads ({}) VALUES ({})",
+        columns
+            .iter()
+            .map(|column| quote_sql_ident(column))
+            .collect::<Vec<_>>()
+            .join(", "),
+        placeholders
+    );
+    tx.execute(&insert_sql, rusqlite::params_from_iter(values.iter()))
+        .map_err(|e| format!("Failed to insert Codex clone state row: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("Failed to commit Codex clone state row: {}", e))?;
+    Ok(Some(state_5))
+}
+
+fn clone_codex_session_raw(
+    source_session_id: &str,
+    working_dir: &str,
+) -> Result<(String, PathBuf, Option<PathBuf>), String> {
+    codex_debug_log(&format!(
+        "[session-clone] cloning Codex session {}",
+        source_session_id
+    ));
+    let source = find_codex_rollout(source_session_id)?;
+    let codex_home = codex_home_dir().ok_or_else(|| "Cannot locate ~/.codex".to_string())?;
+    let new_session_id = make_codex_uuid();
+    let target = codex_rollout_path(&codex_home, &new_session_id);
+    let mut lines = read_codex_jsonl_lines(&source)?;
+    if !lines
+        .iter()
+        .any(|line| matches!(line, CodexJsonLine::Json(_)))
+    {
+        return Err(format!(
+            "Codex rollout has no complete JSON records: {}",
+            source.display()
+        ));
+    }
+    let old_cwd =
+        first_codex_payload_string(&lines, "cwd").unwrap_or_else(|| working_dir.to_string());
+    patch_codex_jsonl_lines(
+        &mut lines,
+        source_session_id,
+        &new_session_id,
+        &old_cwd,
+        working_dir,
+    );
+    let bytes = write_codex_jsonl_lines_atomic(&target, &lines)?;
+    let state_5_path =
+        match copy_codex_state_thread_row(source_session_id, &new_session_id, &target, working_dir)
+        {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = std::fs::remove_file(&target);
+                return Err(e);
+            }
+        };
+    codex_debug_log(&format!(
+        "[session-clone] cloned Codex rollout {} -> {}, new_session={}, bytes={}, indexed={}",
+        source.display(),
+        target.display(),
+        new_session_id,
+        bytes,
+        state_5_path.is_some()
+    ));
+    Ok((new_session_id, target, state_5_path))
+}
+
+/// Clone a Codex session for a scheduled run and leave the clone on disk.
+/// The scheduled task resumes the returned session id; the source session is
+/// never mutated.
+pub fn clone_session_for_schedule(
+    source_session_id: &str,
+    working_dir: &str,
+) -> Result<String, String> {
+    if !crate::services::process::is_valid_session_id(source_session_id) {
+        return Err(format!("Invalid session_id: {}", source_session_id));
+    }
+    let (new_session_id, _, _) = clone_codex_session_raw(source_session_id, working_dir)?;
+    Ok(new_session_id)
 }
 
 /// Execute a command using Codex CLI with streaming output.

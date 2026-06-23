@@ -262,7 +262,6 @@ fn handle_cron_register(
     once: bool,
     session_id: Option<&str>,
 ) {
-    use services::claude;
     use services::telegram;
 
     cron_debug("========================================");
@@ -343,8 +342,18 @@ fn handle_cron_register(
         });
     cron_debug(&format!("  current_path: {}", current_path));
 
-    // Step 1: Register schedule immediately (without context_summary) and output result
-    cron_debug("  Writing schedule entry (without context_summary)...");
+    // Resolve the current chat model/provider now. The scheduled task may run
+    // later, but the captured session_id belongs to the provider active at
+    // registration time.
+    cron_debug("  Resolving current model/provider...");
+    let current_model = telegram::resolve_model_for_chat(chat_id, hash_key);
+    let provider = telegram::detect_provider_pub(current_model.as_deref()).to_string();
+    cron_debug(&format!("  current_model: {:?}", current_model));
+    cron_debug(&format!("  provider: {}", provider));
+
+    // Register the schedule with the source session metadata needed for
+    // execution-time cloning.
+    cron_debug("  Writing schedule entry with source session metadata...");
     telegram::write_schedule_entry_pub(&telegram::ScheduleEntryData {
         id: id.clone(),
         chat_id,
@@ -360,6 +369,9 @@ fn handle_cron_register(
         },
         last_run: None,
         created_at: now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        session_id: session_id.map(str::to_string),
+        provider: Some(provider.clone()),
+        model: current_model.clone(),
         context_summary: None,
     })
     .unwrap_or_else(|e| {
@@ -417,168 +429,17 @@ fn handle_cron_register(
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // Step 2: Spawn a detached child process to extract context summary and update the schedule
-    if let Some(sid) = session_id {
-        cron_debug(&format!(
-            "  Spawning background process for context summary extraction: session={}",
-            sid
-        ));
-        let child = std::process::Command::new(bin_path())
-            .arg("--cron-context")
-            .arg(&id)
-            .arg(sid)
-            .arg(prompt)
-            .arg(&current_path)
-            .arg(chat_id.to_string())
-            .arg(hash_key)
-            .arg(&schedule_value)
-            .arg(&schedule_type)
-            .arg(if once { "1" } else { "0" })
-            .arg(now.format("%Y-%m-%d %H:%M:%S").to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match child {
-            Ok(c) => cron_debug(&format!("  Background process spawned: pid={:?}", c.id())),
-            Err(e) => cron_debug(&format!(
-                "  WARNING: Failed to spawn background process: {}",
-                e
-            )),
-        }
+    // Scheduled runs clone the source provider session at execution time, so
+    // registration only persists metadata and exits after writing the schedule.
+    if session_id.is_some() {
+        cron_debug(
+            "  Source session stored; schedule will clone provider session at execution time",
+        );
     } else {
-        cron_debug("  No session_id provided, skipping context summary");
+        cron_debug("  No session_id provided; schedule will run without source-session clone");
     }
 
     cron_debug("=== handle_cron_register END ===");
-}
-
-struct CronContextArgs {
-    id: String,
-    session_id: String,
-    prompt: String,
-    current_path: String,
-    chat_id: i64,
-    hash_key: String,
-    schedule: String,
-    schedule_type: String,
-    once: bool,
-    created_at: String,
-}
-
-impl CronContextArgs {
-    fn from_args(args: &[String]) -> Option<Self> {
-        if args.len() < 10 {
-            return None;
-        }
-        Some(Self {
-            id: args[0].clone(),
-            session_id: args[1].clone(),
-            prompt: args[2].clone(),
-            current_path: args[3].clone(),
-            chat_id: args[4].parse().unwrap_or(0),
-            hash_key: args[5].clone(),
-            schedule: args[6].clone(),
-            schedule_type: args[7].clone(),
-            once: args[8] == "1",
-            created_at: args[9].clone(),
-        })
-    }
-}
-
-/// Background process: extract context summary and update a schedule entry.
-/// Called as: cokacdir --cron-context <id> <session_id> <prompt> <current_path> <chat_id> <hash_key> <schedule> <schedule_type> <once> <created_at>
-fn handle_cron_context(args: &[String]) {
-    use services::claude;
-    use services::telegram;
-
-    cron_debug("=== handle_cron_context START ===");
-    let ctx = match CronContextArgs::from_args(args) {
-        Some(c) => c,
-        None => {
-            cron_debug(&format!("  ERROR: insufficient args: {:?}", args));
-            return;
-        }
-    };
-
-    // `--cron-context` is invoked as a detached subprocess from
-    // `handle_cron_register`, but the binary remains externally callable —
-    // a malformed `id` from outside would compose a path-traversal segment
-    // into the eventual `dir.join(format!("{}.json", id))` write. Reject
-    // anything outside the generator format ([0-9A-F]{8}) up front. The
-    // legitimate caller always supplies a freshly generated id, so this
-    // never triggers in normal use.
-    if !telegram::is_valid_schedule_id_pub(&ctx.id) {
-        cron_debug(&format!(
-            "  ERROR: rejected malformed schedule_id: {:?}",
-            ctx.id
-        ));
-        return;
-    }
-
-    cron_debug(&format!(
-        "  id={}, session_id={}, prompt_len={}",
-        ctx.id,
-        ctx.session_id,
-        ctx.prompt.len()
-    ));
-
-    let extract_start = std::time::Instant::now();
-    match claude::extract_context_summary(&ctx.session_id, &ctx.prompt, &ctx.current_path) {
-        Ok(summary) => {
-            cron_debug(&format!(
-                "  Context summary extracted in {:?}, len={}",
-                extract_start.elapsed(),
-                summary.len()
-            ));
-
-            // 실행 중 삭제된 스케줄 부활 방지: 파일이 아직 존재하는지 확인
-            if let Some(home) = dirs::home_dir() {
-                let path = home
-                    .join(".cokacdir")
-                    .join("schedule")
-                    .join(format!("{}.json", ctx.id));
-                if !path.exists() {
-                    cron_debug(&format!(
-                        "  Schedule {} already deleted, skipping context_summary write",
-                        ctx.id
-                    ));
-                    cron_debug("=== handle_cron_context END ===");
-                    return;
-                }
-            }
-
-            telegram::write_schedule_entry_pub(&telegram::ScheduleEntryData {
-                id: ctx.id.clone(),
-                chat_id: ctx.chat_id,
-                bot_key: ctx.hash_key.clone(),
-                current_path: ctx.current_path.clone(),
-                prompt: ctx.prompt.clone(),
-                schedule: ctx.schedule.clone(),
-                schedule_type: ctx.schedule_type.clone(),
-                once: if ctx.schedule_type == "cron" {
-                    Some(ctx.once)
-                } else {
-                    None
-                },
-                last_run: None,
-                created_at: ctx.created_at.clone(),
-                context_summary: Some(summary),
-            })
-            .unwrap_or_else(|e| {
-                cron_debug(&format!("  ERROR: write_schedule_entry failed: {}", e));
-            });
-            cron_debug("  Schedule entry updated with context_summary");
-        }
-        Err(e) => {
-            cron_debug(&format!(
-                "  WARNING: extract_context_summary failed in {:?}: {}",
-                extract_start.elapsed(),
-                e
-            ));
-        }
-    }
-    cron_debug("=== handle_cron_context END ===");
 }
 
 fn handle_cron_list(chat_id: i64, hash_key: &str) {
@@ -607,6 +468,21 @@ fn handle_cron_list(chat_id: i64, hash_key: &str) {
                 obj.as_object_mut()
                     .unwrap()
                     .insert("once".to_string(), serde_json::json!(once_val));
+            }
+            if let Some(ref sid) = e.session_id {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("session_id".to_string(), serde_json::json!(sid));
+            }
+            if let Some(ref provider) = e.provider {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("provider".to_string(), serde_json::json!(provider));
+            }
+            if let Some(ref model) = e.model {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("model".to_string(), serde_json::json!(model));
             }
             obj
         })
@@ -1478,6 +1354,7 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
                 call_cancel,
                 model.as_deref(),
                 false,
+                false,
             )
         });
 
@@ -1949,9 +1826,11 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--cron-context" => {
-                // Background process: extract context summary and update schedule
-                let remaining: Vec<String> = args[i + 1..].to_vec();
-                handle_cron_context(&remaining);
+                cron_debug("  ERROR: --cron-context is no longer supported");
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status":"error","message":"--cron-context is no longer supported; scheduled runs clone provider sessions at execution time"})
+                );
                 return Ok(());
             }
             "--cron-list" => {

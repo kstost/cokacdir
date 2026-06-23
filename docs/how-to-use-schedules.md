@@ -50,17 +50,17 @@ Remove all schedules
 
 When a scheduled task is currently running, you can use `/stop` to cancel its execution.
 
-### Resume a Schedule Workspace
+### Continuing After a Scheduled Run
 
-In the default isolated mode, each scheduled task runs in its own workspace under `~/.cokacdir/workspace/<schedule_id>/`. After the schedule completes, you can resume work in that workspace:
+Scheduled tasks no longer create a separate workspace under `~/.cokacdir/workspace/<schedule_id>/`. The old resume commands below therefore have no schedule workspace to open:
 
 ```
 /start <schedule_id>
 ```
 
-Or type `/<schedule_id>` as a shortcut.
+The `/<schedule_id>` shortcut has the same limitation.
 
-When `COKAC_SCHEDULE_INLINE=1` is set (inline mode), no separate workspace is created — the scheduled task runs directly in the chat's current session. There is nothing to resume because the conversation is already in the chat itself; just send your next message normally to continue. The `/<schedule_id>` shortcut will return "no workspace found" if attempted, and the bot no longer appends the "Use /<id> to continue this schedule session" hint to inline-mode replies for that reason.
+In the default mode, the scheduled run happens in a cloned or forked provider session, and the reply is streamed back to the chat. Your normal chat session is restored afterward. In inline mode (`COKAC_SCHEDULE_INLINE=1`), the scheduled prompt is sent directly into the chat's current session. In both modes, the bot does not append a "Use /<id> to continue this schedule session" hint.
 
 ---
 
@@ -68,13 +68,14 @@ When `COKAC_SCHEDULE_INLINE=1` is set (inline mode), no separate workspace is cr
 
 The bot has two execution modes for scheduled tasks. The mode is chosen by the `COKAC_SCHEDULE_INLINE` environment variable (see `how-to-configure-environment-variables.md`).
 
-### Isolated mode (default)
+### Default mode
 
-1. When the scheduled time arrives, the bot creates an isolated workspace under `~/.cokacdir/workspace/<schedule_id>/`.
-2. A brand-new AI session is started with your prompt — context from any conversation you were having in the chat is **not** carried in (recurring cron schedules instead carry forward a separate one-line `context_summary` text that the bot extracted at registration time).
-3. The result is streamed to the chat as if it were a normal reply.
-4. Your current chat session is not affected — it is backed up before the schedule runs and restored after the schedule completes.
-5. One-time schedules are automatically deleted after execution; their workspace folder is preserved on disk so you can re-enter it with `/<schedule_id>`.
+1. When the scheduled time arrives, the bot uses the provider, model, session id, and working directory captured when the schedule was registered.
+2. If a source session id was captured, the provider session is cloned or forked first. Codex, OpenCode, and Agy run from a copied session; Claude uses its native fork-session mode.
+3. The schedule prompt is sent to that cloned or forked session in the captured working directory. No separate schedule workspace is created, and no `context_summary` text is injected into the prompt.
+4. The result is streamed to the chat as if it were a normal reply.
+5. Your current chat session is not affected — it is backed up before the schedule runs and restored after the schedule completes.
+6. Recurring schedules clone or fork the captured source session again on every run. One-time schedules are automatically deleted after execution.
 
 ### Inline mode (`COKAC_SCHEDULE_INLINE=1`)
 
@@ -84,7 +85,7 @@ Set this when you want scheduled tasks to feel like they were typed into your ac
 2. The schedule's prompt is sent into the chat's **current** session (same `session_id`, same working directory), so the task continues whatever conversation is already in progress.
 3. The result streams into the chat as normal; the prompt and the reply are appended to the live session history, just as if you had typed them yourself at that moment.
 4. The reply does **not** include the `Use /<schedule_id> to continue this schedule session` hint, because the chat itself is already the continuation point — just send your next message to follow up.
-5. If the chat has no active session at trigger time, inline mode falls back silently to the isolated path so the schedule still runs.
+5. If the chat has no active session at trigger time, inline mode falls back silently to the default cloned-session path so the schedule still runs.
 
 #### Example user flow (inline mode)
 
@@ -108,7 +109,7 @@ You can then keep typing as if nothing unusual happened — the bot has full con
 #### Things to be aware of
 
 - Recurring cron schedules in inline mode accumulate into the same chat session every run. Use `/clear` if the context gets too long.
-- One-time inline schedules cannot be re-entered via `/<schedule_id>` because no isolated workspace exists — the conversation is already in the chat.
+- One-time inline schedules cannot be re-entered via `/<schedule_id>` because schedules do not create schedule workspaces — the conversation is already in the chat.
 - The flag is global per bot process. To switch modes, edit `~/.cokacdir/.env.json` and restart the bot.
 
 ---

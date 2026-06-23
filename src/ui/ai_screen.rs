@@ -949,6 +949,7 @@ Keep responses concise and terminal-friendly.",
                 None,
                 false,
                 false,
+                false,
                 None,
             );
 

@@ -344,6 +344,71 @@ fn build_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     }
 }
 
+fn make_conversation_clone_id(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}_{}_{}", prefix, std::process::id(), nanos)
+}
+
+fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String> {
+    let dir = source
+        .parent()
+        .ok_or_else(|| format!("Invalid Agy conversation path: {}", source.display()))?;
+    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("db");
+    let target = dir.join(format!("{}.{}", target_id, ext));
+    std::fs::copy(source, &target).map_err(|e| {
+        format!(
+            "Failed to copy Agy conversation {} -> {}: {}",
+            source.display(),
+            target.display(),
+            e
+        )
+    })?;
+
+    if ext == "db" {
+        for suffix in ["db-wal", "db-shm"] {
+            let sidecar = source.with_extension(suffix);
+            if sidecar.is_file() {
+                let target_sidecar = dir.join(format!("{}.{}", target_id, suffix));
+                std::fs::copy(&sidecar, &target_sidecar).map_err(|e| {
+                    format!(
+                        "Failed to copy Agy conversation sidecar {} -> {}: {}",
+                        sidecar.display(),
+                        target_sidecar.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Clone an Agy conversation for a scheduled run and leave the clone on disk.
+/// Agy resumes by writing directly to the conversation file, so scheduled runs
+/// must operate on a copied conversation id rather than the source id.
+pub fn clone_session_for_schedule(session_id: &str, _working_dir: &str) -> Result<String, String> {
+    agy_debug(&format!(
+        "[session-clone] cloning Agy conversation {}",
+        session_id
+    ));
+    if !crate::services::process::is_valid_session_id(session_id) {
+        return Err(format!("Invalid session_id format: {}", session_id));
+    }
+    let source = conversation_path(session_id)
+        .ok_or_else(|| format!("Agy conversation not found: {}", session_id))?;
+    let clone_id = make_conversation_clone_id("cokacsched");
+    copy_conversation_to_id(&source, &clone_id)?;
+    agy_debug(&format!(
+        "[session-clone] cloned Agy conversation {} -> {}",
+        session_id, clone_id
+    ));
+    Ok(clone_id)
+}
+
 pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,

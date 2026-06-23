@@ -1005,25 +1005,33 @@ fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
         })
 }
 
-/// Get the configured model for a specific chat_id, if any.
+/// Normalize a stored model setting.
 /// Migrates legacy bare names (e.g. "sonnet") and deprecated Gemini settings.
-fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
-    let key = chat_id.0.to_string();
-    settings.models.get(&key).map(|m| match m.as_str() {
+fn normalize_model_setting(model: &str) -> String {
+    match model {
         "sonnet" | "opus" | "haiku" | "sonnet[1m]" | "opus[1m]" | "haiku[1m]" => {
-            format!("claude:{}", m)
+            format!("claude:{}", model)
         }
         "gemini" => "agy".to_string(),
         s if s.starts_with("gemini:") => {
-            let model = s.trim_start_matches("gemini:");
-            if agy::is_valid_agy_model(model) {
+            let model_name = s.trim_start_matches("gemini:");
+            if agy::is_valid_agy_model(model_name) {
                 s.to_string()
             } else {
                 "agy".to_string()
             }
         }
-        _ => m.clone(),
-    })
+        _ => model.to_string(),
+    }
+}
+
+/// Get the configured model for a specific chat_id, if any.
+fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
+    let key = chat_id.0.to_string();
+    settings
+        .models
+        .get(&key)
+        .map(|m| normalize_model_setting(m))
 }
 
 /// Check if silent mode is enabled for a chat (default: ON)
@@ -1173,7 +1181,15 @@ struct ScheduleEntry {
     once: Option<bool>,    // only meaningful for cron (None for absolute)
     last_run: Option<String>, // "2026-02-23 14:00:00"
     created_at: String,
-    context_summary: Option<String>, // context summary text for session-isolated schedule
+    /// Original provider session captured when the schedule was registered.
+    /// Non-inline scheduled runs clone this session and resume the clone so the
+    /// source conversation is never mutated by the scheduled task.
+    session_id: Option<String>,
+    /// Provider/model captured at registration. A later chat model switch must
+    /// not change what backend an already-registered schedule resumes.
+    provider: Option<String>,
+    model: Option<String>,
+    context_summary: Option<String>, // legacy field read from old schedule files; ignored on execution
 }
 
 /// Verifier hash for a live schedule entry's owning bot_key. Binding to
@@ -1200,8 +1216,8 @@ fn schedule_dir() -> Option<std::path::PathBuf> {
 }
 
 /// When `COKAC_SCHEDULE_INLINE=1`, scheduled tasks run inline in the chat's
-/// current session (reusing `session_id` and `current_path`) instead of being
-/// isolated into `~/.cokacdir/workspace/<schedule_id>` with a fresh session.
+/// current session (reusing `session_id` and `current_path`) instead of cloning
+/// the session captured when the schedule was registered.
 /// Any value other than the literal string `"1"` (including unset) is false.
 fn is_schedule_inline_enabled() -> bool {
     std::env::var("COKAC_SCHEDULE_INLINE")
@@ -1587,7 +1603,7 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
     // Modern files carry `bot_key_verifier`; pre-migration files still carry a
     // plaintext `bot_key`. Compute the verifier in-memory for legacy entries so
     // the rest of the read path is uniform; the next `write_schedule_entry`
-    // (e.g. context update or last_run after a cron fire) will rewrite the
+    // (e.g. last_run after a cron fire) will rewrite the
     // file without the plaintext field. We deliberately do NOT rewrite the
     // file from the read path: a concurrent `delete_schedule_entry` could let
     // such a rewrite resurrect an already-removed schedule.
@@ -1611,6 +1627,21 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
         once: v.get("once").and_then(|v| v.as_bool()),
         last_run: v.get("last_run").and_then(|v| v.as_str()).map(String::from),
         created_at: v.get("created_at")?.as_str()?.to_string(),
+        session_id: v
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        provider: v.get("provider").and_then(|v| v.as_str()).map(|provider| {
+            if provider == "gemini" {
+                "agy".to_string()
+            } else {
+                provider.to_string()
+            }
+        }),
+        model: v
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(normalize_model_setting),
         context_summary: v
             .get("context_summary")
             .and_then(|v| v.as_str())
@@ -1663,8 +1694,24 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
         "schedule_type": entry.schedule_type,
         "last_run": entry.last_run,
         "created_at": entry.created_at,
-        "context_summary": entry.context_summary,
     });
+    if let Some(ref session_id) = entry.session_id {
+        json.as_object_mut()
+            .unwrap()
+            .insert("session_id".to_string(), serde_json::json!(session_id));
+    }
+    if let Some(ref provider) = entry.provider {
+        json.as_object_mut()
+            .unwrap()
+            .insert("provider".to_string(), serde_json::json!(provider));
+    }
+    if let Some(ref model) = entry.model {
+        json.as_object_mut()
+            .unwrap()
+            .insert("model".to_string(), serde_json::json!(model));
+    }
+    // `context_summary` was used by older schedule files. New writes
+    // intentionally omit it; scheduled runs now clone provider sessions instead.
     if let Some(once_val) = entry.once {
         json.as_object_mut()
             .unwrap()
@@ -1805,7 +1852,7 @@ fn append_schedule_history(
     status: &str, // "ok" | "cancelled" | "error"
     response: &str,
     error: Option<&str>,
-    workspace_path: &str,
+    working_dir: &str,
     duration_ms: u64,
 ) {
     let Some(dir) = schedule_history_dir() else {
@@ -1846,7 +1893,10 @@ fn append_schedule_history(
         "prompt": prompt,
         "status": status,
         "response": response_capped,
-        "workspace_path": workspace_path,
+        // Keep the historical JSON key name for compatibility. In current
+        // schedule execution this value is the run's working directory, not a
+        // per-schedule workspace folder.
+        "workspace_path": working_dir,
         "duration_ms": duration_ms,
     });
     if let Some(err) = error {
@@ -2167,6 +2217,9 @@ mod live_schedule_tests {
             once: Some(false),
             last_run: None,
             created_at: "2026-01-01 00:00:00".to_string(),
+            session_id: None,
+            provider: None,
+            model: None,
             context_summary: None,
         }
     }
@@ -2681,6 +2734,9 @@ pub struct ScheduleEntryData {
     pub once: Option<bool>, // only meaningful for cron (None for absolute)
     pub last_run: Option<String>,
     pub created_at: String,
+    pub session_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub context_summary: Option<String>,
 }
 
@@ -2701,6 +2757,9 @@ impl From<&ScheduleEntry> for ScheduleEntryData {
             once: e.once,
             last_run: e.last_run.clone(),
             created_at: e.created_at.clone(),
+            session_id: e.session_id.clone(),
+            provider: e.provider.clone(),
+            model: e.model.clone(),
             context_summary: e.context_summary.clone(),
         }
     }
@@ -2719,6 +2778,9 @@ impl From<&ScheduleEntryData> for ScheduleEntry {
             once: d.once,
             last_run: d.last_run.clone(),
             created_at: d.created_at.clone(),
+            session_id: d.session_id.clone(),
+            provider: d.provider.clone(),
+            model: d.model.clone(),
             context_summary: d.context_summary.clone(),
         }
     }
@@ -2786,11 +2848,9 @@ pub fn delete_schedule_entry_pub(id: &str) -> bool {
 }
 
 /// Public wrapper for `is_valid_schedule_id` so CLI handlers in `main.rs`
-/// (notably `--cron-context`, which is externally invokable as a CLI
-/// subcommand) can refuse a malformed `id` before it reaches any
-/// path-composing function. The internal `write_schedule_entry` itself
-/// stays unchecked so unit tests using non-generator ids (`sched-1`,
-/// `sched-guard`, …) keep passing.
+/// can refuse a malformed `id` before it reaches any path-composing function.
+/// The internal `write_schedule_entry` itself stays unchecked so unit tests
+/// using non-generator ids (`sched-1`, `sched-guard`, …) keep passing.
 pub fn is_valid_schedule_id_pub(id: &str) -> bool {
     is_valid_schedule_id(id)
 }
@@ -2804,6 +2864,18 @@ pub fn resolve_current_path_for_chat(chat_id: i64, hash_key: &str) -> Option<Str
     let last_sessions = entry.get("last_sessions")?.as_object()?;
     let chat_key = chat_id.to_string();
     last_sessions.get(&chat_key)?.as_str().map(String::from)
+}
+
+/// Resolve the configured model for a chat from bot_settings.json.
+pub fn resolve_model_for_chat(chat_id: i64, hash_key: &str) -> Option<String> {
+    let path = bot_settings_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let entry = json.get(hash_key)?;
+    let models = entry.get("models")?.as_object()?;
+    let chat_key = chat_id.to_string();
+    let model = models.get(&chat_key)?.as_str()?;
+    Some(normalize_model_setting(model))
 }
 
 /// Get the binary path normalized for shell commands (backslashes → forward slashes on Windows)
@@ -10278,6 +10350,12 @@ fn detect_provider(model: Option<&str>) -> &'static str {
     }
 }
 
+/// Public wrapper for CLI-only flows that need to match the bot's provider
+/// routing without holding a BotSettings instance.
+pub fn detect_provider_pub(model: Option<&str>) -> &'static str {
+    detect_provider(model)
+}
+
 /// Convert provider name to SessionProvider enum.
 fn provider_to_session(provider: &str) -> SessionProvider {
     match provider {
@@ -15381,7 +15459,7 @@ async fn handle_text_message(
             .copied()
             .unwrap_or(false);
         let provider = detect_provider(mdl.as_deref());
-        let effort = get_effort_for_provider(&data.settings, chat_id, provider);
+        let effort = get_effort_for_provider(&data.settings, chat_id, &provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
@@ -15616,6 +15694,7 @@ async fn handle_text_message(
                     Some(cancel_token_clone),
                     opencode_model,
                     false,
+                    false,
                 )
             } else if provider == "agy" {
                 let agy_model = model_clone.as_deref().and_then(agy::strip_agy_prefix);
@@ -15703,6 +15782,7 @@ async fn handle_text_message(
                     Some(&allowed_tools),
                     Some(cancel_token_clone),
                     claude_model,
+                    false,
                     false,
                     chrome_enabled,
                     effort_clone.as_deref(),
@@ -18424,16 +18504,12 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
     }
 }
 
-/// Update schedule entry after a run: set last_run, delete if once
-fn update_schedule_after_run(entry: &ScheduleEntry, new_context_summary: Option<String>) {
+/// Update schedule entry after a run: set last_run for recurring schedules.
+fn update_schedule_after_run(entry: &ScheduleEntry) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     sched_debug(&format!(
-        "[update_schedule_after_run] id={}, type={}, once={:?}, now={}, has_new_context={}",
-        entry.id,
-        entry.schedule_type,
-        entry.once,
-        now,
-        new_context_summary.is_some()
+        "[update_schedule_after_run] id={}, type={}, once={:?}, now={}",
+        entry.id, entry.schedule_type, entry.once, now
     ));
 
     // 실행 중 사용자가 삭제한 경우 부활 방지
@@ -18464,9 +18540,7 @@ fn update_schedule_after_run(entry: &ScheduleEntry, new_context_summary: Option<
     ));
     let mut updated = entry.clone();
     updated.last_run = Some(now);
-    if new_context_summary.is_some() {
-        updated.context_summary = new_context_summary;
-    }
+    updated.context_summary = None;
     if let Err(e) = write_schedule_entry(&updated) {
         sched_debug(&format!(
             "[update_schedule_after_run] id={}, write failed: {}",
@@ -18491,8 +18565,8 @@ async fn execute_schedule(
     prev_session: Option<ChatSession>,
     inline_mode: bool,
 ) {
-    sched_debug(&format!("[execute_schedule] START id={}, chat_id={}, prompt={:?}, has_context={}, has_prev_session={}, inline_mode={}",
-        entry.id, chat_id, truncate_str(&entry.prompt, 60), entry.context_summary.is_some(), prev_session.is_some(), inline_mode));
+    sched_debug(&format!("[execute_schedule] START id={}, chat_id={}, prompt={:?}, has_source_session={}, provider={:?}, model={:?}, has_legacy_context_summary={}, has_prev_session={}, inline_mode={}",
+        entry.id, chat_id, truncate_str(&entry.prompt, 60), entry.session_id.is_some(), entry.provider, entry.model, entry.context_summary.is_some(), prev_session.is_some(), inline_mode));
 
     // Inline mode: capture the chat's current session_id, current_path, and the
     // chat's clear_epoch under a single lock so we can (a) route the provider
@@ -18501,9 +18575,9 @@ async fn execute_schedule(
     // /start <other-sid>, or model change). scheduler_cycle already verified
     // the session exists with a current_path before dispatching an inline run;
     // if it disappeared in between we still respect inline_mode and fall back
-    // to entry.current_path with no session_id, which is the same shape
-    // isolated mode would have used. clear_epoch defaults to 0 (a /clear
-    // bumps it, matching the post-completion guard in handle_text_message).
+    // to entry.current_path with no session_id. clear_epoch defaults to 0
+    // (a /clear bumps it, matching the post-completion guard in
+    // handle_text_message).
     let (inline_session_id, inline_path, inline_clear_epoch): (
         Option<String>,
         Option<String>,
@@ -18561,25 +18635,7 @@ async fn execute_schedule(
         return;
     }
 
-    // Build prompt with context summary if available.
-    // Inline mode runs in the chat's current session, so context_summary (which
-    // exists to bridge the isolated-session gap) would just duplicate context
-    // the model already has — skip injection.
     let user_prompt = entry.prompt.clone();
-    let prompt = match (&entry.context_summary, inline_mode) {
-        (Some(summary), false) => {
-            sched_debug(&format!(
-                "[execute_schedule] id={}, injecting context summary ({} chars)",
-                entry.id,
-                summary.len()
-            ));
-            format!(
-                "[이전 작업 맥락]\n{}\n\n[작업 지시]\n{}",
-                summary, user_prompt
-            )
-        }
-        _ => user_prompt.clone(),
-    };
     let project_path = crate::utils::format::to_shell_path(&entry.current_path);
     let schedule_id = entry.id.clone();
 
@@ -18595,10 +18651,10 @@ async fn execute_schedule(
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ⏰ Schedule Starting: {user_prompt}");
 
-    // Resolve the working directory. Inline mode runs in the chat's current path
-    // (no isolated workspace), so we skip the create_dir_all entirely. Isolated
-    // mode creates ~/.cokacdir/workspace/<schedule_id> as before.
-    let workspace_path: String = if inline_mode {
+    // Resolve the working directory. Scheduled tasks run in the original project
+    // path captured at registration time; non-inline mode clones the provider
+    // session instead of creating a separate ~/.cokacdir/workspace/<id> directory.
+    let working_dir: String = if inline_mode {
         let path = inline_path
             .clone()
             .unwrap_or_else(|| entry.current_path.clone());
@@ -18608,67 +18664,19 @@ async fn execute_schedule(
         ));
         path
     } else {
-        let Some(home) = dirs::home_dir() else {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ [Schedule] Failed to get home directory");
-            {
-                let mut data = state.lock().await;
-                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                    set.remove(&schedule_id);
-                }
-                remove_cancel_token_locked(&mut data, chat_id);
-                if let Some(prev) = prev_session {
-                    data.sessions.insert(chat_id, prev);
-                } else {
-                    data.sessions.remove(&chat_id);
-                }
-            }
-            msg_debug(&format!(
-                "[queue:trigger] chat_id={}, source=schedule_no_home",
-                chat_id.0
-            ));
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return;
-        };
-        let workspace_dir = home.join(".cokacdir").join("workspace").join(&schedule_id);
         sched_debug(&format!(
-            "[execute_schedule] id={}, creating workspace: {}",
-            schedule_id,
-            workspace_dir.display()
+            "[execute_schedule] id={}, non-inline mode → working dir={}",
+            schedule_id, entry.current_path
         ));
-        if let Err(e) = fs::create_dir_all(&workspace_dir) {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ [Schedule] Failed to create workspace: {e}");
-            sched_debug(&format!(
-                "[execute_schedule] id={}, workspace creation failed: {}, restoring session",
-                schedule_id, e
-            ));
-            {
-                let mut data = state.lock().await;
-                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                    set.remove(&schedule_id);
-                }
-                remove_cancel_token_locked(&mut data, chat_id);
-                if let Some(prev) = prev_session {
-                    data.sessions.insert(chat_id, prev);
-                } else {
-                    data.sessions.remove(&chat_id);
-                }
-            }
-            msg_debug(&format!(
-                "[queue:trigger] chat_id={}, source=schedule_workspace_error",
-                chat_id.0
-            ));
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return;
-        }
-        workspace_dir.display().to_string()
+        entry.current_path.clone()
     };
 
-    // Get allowed tools, model, and provider options for this chat
-    let (allowed_tools, model, sched_chrome_enabled, effort, codex_fast_enabled) = {
+    // Get allowed tools, model, and provider options. Non-inline schedules
+    // prefer the provider/model captured at registration so later chat changes
+    // do not silently reroute an existing schedule. Inline mode is different:
+    // it resumes the chat's live session, so it must use the chat's current
+    // provider/model to avoid resuming a session id with the wrong backend.
+    let (allowed_tools, model, provider_owned, sched_chrome_enabled, effort, codex_fast_enabled) = {
         let data = state.lock().await;
         let chrome = data
             .settings
@@ -18676,20 +18684,38 @@ async fn execute_schedule(
             .get(&chat_id.0.to_string())
             .copied()
             .unwrap_or(false);
-        let model = get_model(&data.settings, chat_id);
-        let provider = detect_provider(model.as_deref());
-        let effort = get_effort_for_provider(&data.settings, chat_id, provider);
+        let current_model = get_model(&data.settings, chat_id);
+        let model = if inline_mode {
+            current_model
+        } else {
+            entry.model.clone().or(current_model)
+        };
+        let provider = if inline_mode {
+            detect_provider(model.as_deref()).to_string()
+        } else {
+            entry
+                .provider
+                .clone()
+                .unwrap_or_else(|| detect_provider(model.as_deref()).to_string())
+        };
+        let effort = get_effort_for_provider(&data.settings, chat_id, &provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         (
             get_allowed_tools(&data.settings, chat_id),
             model,
+            provider,
             chrome,
             effort,
             codex_fast,
         )
     };
+    let provider = provider_owned.as_str();
 
-    // Send placeholder (show only the user's original prompt, not the context summary)
+    // Scheduled runs resume cloned provider sessions. Legacy context summaries
+    // from old schedule files are deliberately ignored.
+    let prompt = user_prompt.clone();
+
+    // Send placeholder with only the user's original prompt.
     shared_rate_limit_wait(state, chat_id).await;
     let placeholder = match tg!(
         "send_message",
@@ -18702,7 +18728,7 @@ async fn execute_schedule(
                 "  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}",
                 redact_err(&e)
             );
-            // Clean up pending + cancel_token, restore session (workspace preserved)
+            // Clean up pending + cancel_token, restore session.
             {
                 let mut data = state.lock().await;
                 if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
@@ -18773,6 +18799,15 @@ async fn execute_schedule(
     };
     let platform = capitalize_platform(detect_platform(token));
     let sched_role = {
+        let session_note = if entry.session_id.is_some()
+            && matches!(provider, "claude" | "codex" | "opencode" | "agy")
+        {
+            "The provider session was cloned or forked from the original conversation for this scheduled run; do not assume this reply will be appended to the source chat session."
+        } else if entry.session_id.is_some() {
+            "The source provider session is attached to this schedule, but this backend has no clone path here; do not assume this reply will be appended to the source chat session."
+        } else {
+            "No source provider session was attached to this schedule; treat this as a standalone scheduled run."
+        };
         let base = if inline_mode {
             format!(
                 "You are executing a scheduled task through {}.\n\
@@ -18784,9 +18819,8 @@ async fn execute_schedule(
             format!(
                 "You are executing a scheduled task through {}.\n\
                  Project directory: {project_path}\n\
-                 Your current working directory is a dedicated workspace for this schedule.\n\
-                 This workspace will be preserved after execution. The user can continue work here via /start.\n\
-                 To work with project files, use absolute paths to the project directory.\n\
+                 Your current working directory is that project directory.\n\
+                 {session_note}\n\
                  Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
                 platform, shell_bin_path()
             )
@@ -18798,7 +18832,7 @@ async fn execute_schedule(
     };
     let system_prompt_owned = build_system_prompt(
         &sched_role,
-        &crate::utils::format::to_shell_path(&workspace_path),
+        &crate::utils::format::to_shell_path(&working_dir),
         chat_id.0,
         &bot_key,
         &disabled_notice,
@@ -18825,20 +18859,18 @@ async fn execute_schedule(
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
     let cancel_token_clone = cancel_token.clone();
-    let model_for_summary = model.clone();
 
     // Run AI backend in a blocking thread.
-    // - Isolated mode: always a new provider session (session_id=None); context arrives via the prompt.
+    // - Non-inline mode: clone/fork the source provider session captured at
+    //   registration and resume the clone so the original chat session is not mutated.
     // - Inline mode: resume the chat's current provider session by id so the schedule's
     //   prompt and reply are appended to that conversation.
-    // Session persistence must be kept so users can resume via /SCHEDULE_ID
-    let workspace_path_for_claude = workspace_path.clone();
-    let resume_session_id: Option<String> = if inline_mode {
-        inline_session_id.clone()
-    } else {
-        None
-    };
+    let working_dir_for_exec = working_dir.clone();
     let model_clone_for_exec = model.clone();
+    let provider_clone_for_exec = provider_owned.clone();
+    let source_session_for_exec = entry.session_id.clone();
+    let inline_mode_for_exec = inline_mode;
+    let inline_session_id_for_exec = inline_session_id.clone();
     let effort_for_exec: Option<String> = effort.clone();
     let codex_fast_for_exec = codex_fast_enabled;
     let bot_key_for_codex = bot_key.clone();
@@ -18847,39 +18879,127 @@ async fn execute_schedule(
         data.request_tasks.clone()
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
-        let provider = detect_provider(model_clone_for_exec.as_deref());
+        let provider = provider_clone_for_exec.as_str();
+        let mut resume_session_id: Option<String> = if inline_mode_for_exec {
+            inline_session_id_for_exec.clone()
+        } else {
+            None
+        };
+        let mut claude_fork_session = false;
+        if !inline_mode_for_exec {
+            if let Some(source_sid) = source_session_for_exec.as_deref() {
+                match provider {
+                    "codex" => {
+                        match codex::clone_session_for_schedule(source_sid, &working_dir_for_exec) {
+                            Ok(cloned_sid) => {
+                                sched_debug(&format!(
+                                "[execute_schedule:spawn_blocking] cloned Codex session {} -> {}",
+                                source_sid, cloned_sid
+                            ));
+                                resume_session_id = Some(cloned_sid);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamMessage::Error {
+                                    message: format!(
+                                        "Failed to clone Codex session for scheduled run: {}",
+                                        e
+                                    ),
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    exit_code: None,
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    "claude" => {
+                        resume_session_id = Some(source_sid.to_string());
+                        claude_fork_session = true;
+                    }
+                    "opencode" => match opencode::clone_session_for_schedule(
+                        source_sid,
+                        &working_dir_for_exec,
+                    ) {
+                        Ok(cloned_sid) => {
+                            sched_debug(&format!(
+                                "[execute_schedule:spawn_blocking] cloned OpenCode session {} -> {}",
+                                source_sid, cloned_sid
+                            ));
+                            resume_session_id = Some(cloned_sid);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(StreamMessage::Error {
+                                message: format!(
+                                    "Failed to clone OpenCode session for scheduled run: {}",
+                                    e
+                                ),
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: None,
+                            });
+                            return;
+                        }
+                    },
+                    "agy" => {
+                        match agy::clone_session_for_schedule(source_sid, &working_dir_for_exec) {
+                            Ok(cloned_sid) => {
+                                sched_debug(&format!(
+                                    "[execute_schedule:spawn_blocking] cloned Agy session {} -> {}",
+                                    source_sid, cloned_sid
+                                ));
+                                resume_session_id = Some(cloned_sid);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(StreamMessage::Error {
+                                    message: format!(
+                                        "Failed to clone Agy session for scheduled run: {}",
+                                        e
+                                    ),
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    exit_code: None,
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         sched_debug(&format!(
-            "[execute_schedule:spawn_blocking] provider={}, model={:?}, resume_session_id={:?}",
-            provider, model_clone_for_exec, resume_session_id
+            "[execute_schedule:spawn_blocking] provider={}, model={:?}, resume_session_id={:?}, claude_fork={}",
+            provider, model_clone_for_exec, resume_session_id, claude_fork_session
         ));
         let resume_ref = resume_session_id.as_deref();
         let result = if provider == "opencode" {
             let opencode_model = model_clone_for_exec
                 .as_deref()
                 .and_then(opencode::strip_opencode_prefix);
-            sched_debug(&format!("[execute_schedule] → opencode::execute, opencode_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
-                opencode_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            sched_debug(&format!("[execute_schedule] → opencode::execute, opencode_model={:?}, session_id={:?}, working_dir={}, prompt_len={}, system_prompt_len={}",
+                opencode_model, resume_ref, working_dir_for_exec, prompt.len(), system_prompt_owned.len()));
             opencode::execute_command_streaming(
                 &prompt,
                 resume_ref,
-                &workspace_path_for_claude,
+                &working_dir_for_exec,
                 tx.clone(),
                 Some(&system_prompt_owned),
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
                 opencode_model,
                 false,
+                false,
             )
         } else if provider == "agy" {
             let agy_model = model_clone_for_exec
                 .as_deref()
                 .and_then(agy::strip_agy_prefix);
-            sched_debug(&format!("[execute_schedule] → agy::execute, agy_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
-                agy_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            sched_debug(&format!("[execute_schedule] → agy::execute, agy_model={:?}, session_id={:?}, working_dir={}, prompt_len={}, system_prompt_len={}",
+                agy_model, resume_ref, working_dir_for_exec, prompt.len(), system_prompt_owned.len()));
             agy::execute_command_streaming(
                 &prompt,
                 resume_ref,
-                &workspace_path_for_claude,
+                &working_dir_for_exec,
                 tx.clone(),
                 Some(&system_prompt_owned),
                 Some(&allowed_tools),
@@ -18901,7 +19021,7 @@ async fn execute_schedule(
             codex::execute_command_streaming(
                 &prompt,
                 resume_ref,
-                &workspace_path_for_claude,
+                &working_dir_for_exec,
                 tx.clone(),
                 Some(&codex_system_prompt),
                 Some(&allowed_tools),
@@ -18919,13 +19039,14 @@ async fn execute_schedule(
             claude::execute_command_streaming(
                 &prompt,
                 resume_ref,
-                &workspace_path_for_claude,
+                &working_dir_for_exec,
                 tx.clone(),
                 Some(&system_prompt_owned),
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
                 claude_model,
                 false,
+                claude_fork_session,
                 sched_chrome_enabled,
                 effort_for_exec.as_deref(),
             )
@@ -18944,16 +19065,16 @@ async fn execute_schedule(
     let bot_owned = bot.clone();
     let state_owned = state.clone();
     let entry_clone = entry.clone();
-    let workspace_path_owned = workspace_path.clone();
+    let working_dir_owned = working_dir.clone();
     let inline_mode_owned = inline_mode;
     // Owned copies of the inline-mode start-state, moved into the polling closure
     // so its cleanup block can run the session_changed guard before writing back
-    // to the chat's session. provider comparison uses provider_str (already
-    // captured below from the same `model` snapshot taken at execute start).
+    // to the chat's session. provider comparison uses the provider captured at
+    // registration/execution start.
     let inline_session_id_for_guard = inline_session_id.clone();
     let inline_path_for_guard = inline_path.clone();
     let inline_clear_epoch_for_guard = inline_clear_epoch;
-    let provider_str: &'static str = detect_provider(model.as_deref());
+    let provider_str = provider_owned.clone();
     // Captured for schedule_history append at the end of this run.
     // Wall-clock duration is measured from this point (just after placeholder send +
     // pre-execution setup) to the polling loop's completion — close to the user-visible
@@ -19369,18 +19490,9 @@ async fn execute_schedule(
         // persisted to disk — the chat would otherwise show a phantom assistant
         // turn that the provider's own JSONL transcript does not have.
         let had_real_response = !full_response.is_empty();
-        // The "Use /<id> to continue this schedule session" hint points users
-        // at the isolated workspace's resume shortcut. Inline mode does not
-        // create an isolated workspace, so that shortcut would fail — the
-        // continuation is the chat session itself. Suppress the hint there.
-        let continue_hint: String = if inline_mode_owned {
-            String::new()
-        } else {
-            format!(
-                "\n\nUse /{} to continue this schedule session.",
-                schedule_id
-            )
-        };
+        // Scheduled runs no longer create a ~/.cokacdir/workspace/<id> session
+        // shortcut, so there is no /<id> continuation hint to show.
+        let continue_hint = String::new();
         if cancelled {
             sched_debug(&format!(
                 "[execute_schedule] id={}, cancelled — killing child process",
@@ -19397,7 +19509,7 @@ async fn execute_schedule(
                 last_confirmed_len = 0;
             }
             let remaining = &full_response[last_confirmed_len..];
-            if should_attach_response_as_file(full_response.len(), provider_str) {
+            if should_attach_response_as_file(full_response.len(), &provider_str) {
                 let notice = format!(
                     "\u{1f4c4} Response attached as file [Stopped]{}",
                     continue_hint
@@ -19469,7 +19581,7 @@ async fn execute_schedule(
                     "delete_message",
                     bot_owned.delete_message(chat_id, placeholder_msg_id).await
                 );
-            } else if should_attach_response_as_file(full_response.len(), provider_str) {
+            } else if should_attach_response_as_file(full_response.len(), &provider_str) {
                 msg_debug(&format!(
                     "[rolling_ph/sched] FINAL FILE ATTACH: total={}",
                     full_response.len()
@@ -19583,112 +19695,6 @@ async fn execute_schedule(
             }
         }
 
-        // For cron entries with context_summary, extract result summary for next run
-        // Skip if execution was cancelled or encountered an error.
-        // Inline mode also skips: the chat's live session already carries the
-        // conversation forward, so an extra summary text would be redundant.
-        sched_debug(&format!("[execute_schedule] id={}, checking context summary: cancelled={}, had_error={}, type={}, once={:?}, has_context={}, inline={}",
-            schedule_id, cancelled, had_error, entry_clone.schedule_type, entry_clone.once, entry_clone.context_summary.is_some(), inline_mode_owned));
-        let sched_provider = detect_provider(model_for_summary.as_deref());
-        let new_context_summary = if inline_mode_owned {
-            sched_debug(&format!(
-                "[execute_schedule] id={}, inline mode — skipping context summary extraction",
-                schedule_id
-            ));
-            None
-        } else if sched_provider != "claude" {
-            // Codex/Agy/OpenCode: skip summary extraction (not supported via Claude API)
-            sched_debug(&format!(
-                "[execute_schedule] id={}, non-Claude backend — skipping context summary",
-                schedule_id
-            ));
-            None
-        } else if !cancelled
-            && !had_error
-            && entry_clone.schedule_type == "cron"
-            && !entry_clone.once.unwrap_or(false)
-            && entry_clone.context_summary.is_some()
-        {
-            sched_debug(&format!(
-                "[execute_schedule] id={}, extracting result summary",
-                schedule_id
-            ));
-            if let Some(ref sid) = exec_session_id {
-                let sid = sid.clone();
-                let path = workspace_path_owned.clone();
-                let model = model_for_summary.clone();
-                let request_tasks = {
-                    let data = state_owned.lock().await;
-                    data.request_tasks.clone()
-                };
-                let summary_result = spawn_tracked_blocking_result(request_tasks, move || {
-                    let claude_model = model.as_deref().and_then(claude::strip_claude_prefix);
-                    claude::extract_result_summary(&sid, &path, claude_model)
-                })
-                .await;
-                match summary_result {
-                    Ok(Some(Ok(ref summary))) => {
-                        sched_debug(&format!(
-                            "[execute_schedule] id={}, new context summary: {} chars",
-                            schedule_id,
-                            summary.len()
-                        ));
-                        Some(summary.clone())
-                    }
-                    _ => {
-                        sched_debug(&format!(
-                            "[execute_schedule] id={}, summary extraction failed",
-                            schedule_id
-                        ));
-                        None
-                    }
-                }
-            } else {
-                sched_debug(&format!(
-                    "[execute_schedule] id={}, no session_id for summary",
-                    schedule_id
-                ));
-                None
-            }
-        } else {
-            None
-        };
-
-        // Save schedule session to file so user can resume via /start [workspace_path].
-        // Inline mode has no isolated workspace — the provider session is part of
-        // the chat's normal session, which persists through the live ChatSession
-        // and provider-side JSONL. Skipping the workspace write avoids littering
-        // the chat's working directory with an unrelated session snapshot.
-        if !inline_mode_owned {
-            if let Some(ref sid) = exec_session_id {
-                let mut sched_session = ChatSession {
-                    session_id: Some(sid.clone()),
-                    current_path: Some(workspace_path_owned.clone()),
-                    history: Vec::new(),
-                    pending_uploads: Vec::new(),
-                    pending_uploads_added_at: None,
-                };
-                // Add user prompt and AI response to history for session continuity.
-                // Use had_real_response (not !full_response.is_empty()) so the
-                // "(No response)" UI sentinel does not leak into the isolated
-                // workspace's session file either — keeping all three paths
-                // (inline cleanup, isolated workspace, /start preview) free of
-                // a phantom assistant turn the user never saw.
-                sched_session.history.push(HistoryItem {
-                    item_type: HistoryType::User,
-                    content: entry_clone.prompt.clone(),
-                });
-                if had_real_response {
-                    sched_session.history.push(HistoryItem {
-                        item_type: HistoryType::Assistant,
-                        content: full_response.clone(),
-                    });
-                }
-                // sched_provider already computed above
-                save_session_to_file(&sched_session, &workspace_path_owned, sched_provider);
-            }
-        }
-
         // Write to group chat shared log (scheduled task)
         sched_debug(&format!(
             "[sched] JSONL check: chat_id={}, raw_entries_count={}",
@@ -19759,7 +19765,7 @@ async fn execute_schedule(
             history_status,
             &full_response,
             None,
-            &workspace_path_owned,
+            &working_dir_owned,
             history_duration_ms,
         );
 
@@ -19768,13 +19774,11 @@ async fn execute_schedule(
             "[execute_schedule] id={}, calling update_schedule_after_run",
             schedule_id
         ));
-        update_schedule_after_run(&entry_clone, new_context_summary);
-
-        // Workspace directory is preserved for user to continue work via /start
+        update_schedule_after_run(&entry_clone);
 
         // Clean up.
-        // - Isolated mode: restore the user's pre-schedule session (the temp session
-        //   we inserted in scheduler_cycle is discarded).
+        // - Non-inline mode: restore the user's pre-schedule session (the temp
+        //   session we inserted in scheduler_cycle is discarded).
         // - Inline mode: leave the chat session in place; if the provider issued a
         //   new session_id during this run (e.g. Claude fork on resume), propagate
         //   it so the user's next message continues the same provider session.
@@ -19806,7 +19810,7 @@ async fn execute_schedule(
                     .get(&chat_id)
                     .map(|s| (s.session_id.clone(), s.current_path.clone()))
                     .unwrap_or((None, None));
-                let session_changed = now_provider != provider_str
+                let session_changed = now_provider != provider_str.as_str()
                     || now_path != inline_path_for_guard
                     || now_sid != inline_session_id_for_guard
                     || now_clear_epoch != inline_clear_epoch_for_guard;
@@ -19846,7 +19850,7 @@ async fn execute_schedule(
                     // do not need to share a live borrow of `session`.
                     let cp = session.current_path.clone().unwrap_or_default();
                     if !cp.is_empty() {
-                        save_session_to_file(session, &cp, provider_str);
+                        save_session_to_file(session, &cp, &provider_str);
                     } else {
                         sched_debug(&format!("[execute_schedule] id={}, inline cleanup: session has no current_path — skipping save_session_to_file", schedule_id));
                     }
@@ -20247,6 +20251,7 @@ async fn process_bot_message(
                 Some(cancel_token_clone),
                 opencode_model,
                 false,
+                false,
             )
         } else if provider == "agy" {
             let agy_model = model_clone.as_deref().and_then(agy::strip_agy_prefix);
@@ -20330,6 +20335,7 @@ async fn process_bot_message(
                 Some(&allowed_tools),
                 Some(cancel_token_clone),
                 claude_model,
+                false,
                 false,
                 botmsg_chrome_enabled,
                 effort_clone.as_deref(),
@@ -21463,8 +21469,8 @@ async fn scheduler_cycle(
             DiscardExpired,
             Execute(Option<ChatSession>, u64),
             /// Inline mode: run the scheduled task inside the chat's current
-            /// session (no backup, no isolated workspace). Carries dispatch_id only —
-            /// the existing session is left in place.
+            /// session. Carries dispatch_id only — the existing session is left
+            /// in place.
             ExecuteInline(u64),
         }
         let inline_env_on = is_schedule_inline_enabled();
@@ -21544,7 +21550,7 @@ async fn scheduler_cycle(
                     SchedAction::Skip
                 } else {
                     // Inline mode requires an active chat session with a current_path;
-                    // otherwise fall back to isolated mode so the schedule still runs.
+                    // otherwise fall back to non-inline mode so the schedule still runs.
                     let inline_usable = inline_env_on
                         && data
                             .sessions
@@ -21562,7 +21568,8 @@ async fn scheduler_cycle(
                         insert_cancel_token_locked(&mut data, chat_id, cancel_token);
                         SchedAction::ExecuteInline(dispatch_id)
                     } else {
-                        // Not busy — backup session, replace with schedule-specific session, and execute
+                        // Not busy — backup the visible chat session, install a temporary
+                        // schedule session for cancellation/accounting, and execute.
                         let prev = data.sessions.get(&chat_id).cloned();
                         sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
                         data.sessions.insert(
@@ -21662,7 +21669,7 @@ async fn scheduler_cycle(
             // (e.g. very late in cleanup), the writes here are
             // overwriting equivalent state — safe and idempotent.
             // Inline mode never mutated `sessions` upfront, so we only
-            // touch sessions on the isolated path.
+            // touch sessions on the non-inline path.
             let mut data = state.lock().await;
             if !inline_mode {
                 match prev_for_recover {

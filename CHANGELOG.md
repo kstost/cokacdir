@@ -1,5 +1,23 @@
 # Changelog — cokacdir
 
+## 0.6.28 — 2026-06-23
+
+- **Scheduled tasks now clone or fork the source provider session at execution time instead of relying on `context_summary`.** `--cron` / `--at` registration now persists the prompt, schedule, captured working directory, provider, model, and source `session_id`, then exits immediately. It no longer starts the detached `--cron-context` summarizer, and a successful register response now means "the schedule metadata was saved", not "a summary or execution session was prepared".
+
+- **The default non-inline schedule path preserves the original chat session by running against a copied provider session.** Codex schedules clone the Codex rollout plus `state_5.sqlite` thread row, OpenCode schedules clone the relevant SQLite `session` / `message` / `part` rows with remapped ids, and Agy schedules copy the Antigravity conversation file plus SQLite sidecars. Claude schedules use Claude's native `--fork-session`. The saved prompt is sent to that clone/fork, so the source provider session is not directly resumed or mutated by the scheduled run.
+
+- **Recurring cron schedules now start from the same original source session on every firing.** Repeated runs no longer carry forward a generated summary or the previous run's AI transcript. Each execution clones/forks the captured source session again, updates only `last_run` for recurring entries, and leaves cross-run state sharing to explicit files, databases, or external systems.
+
+- **Default scheduled runs no longer create `~/.cokacdir/workspace/<schedule_id>` workspaces or continuation hints.** Non-inline schedules execute in the `current_path` captured at registration time, restore the visible chat session afterward, and no longer append `Use /<schedule_id> to continue this schedule session.`. Schedule history keeps the historical `workspace_path` JSON key for compatibility, but the value now represents the execution working directory.
+
+- **Legacy schedule summary plumbing was removed from active provider paths.** Claude, Codex, and OpenCode context/result summary helpers were removed, Agy remains summary-free, and `--cron-context` now returns an explicit unsupported error instead of doing work. Old schedule JSON files may still contain `context_summary`; cokacdir reads that field only for compatibility, ignores it during execution, and drops it on the next legitimate schedule write.
+
+- **OpenCode schedule cloning now follows the same DB discovery shape as `cokacmux`.** The OpenCode adapter looks for `opencode.db` under `LOCALAPPDATA`, `APPDATA`, and the Linux `~/.local/share/opencode/opencode.db` path, using the first existing candidate before falling back to the first configured candidate for clearer errors.
+
+- **Schedule documentation now matches the cloned-session model.** `docs/how-to-use-schedules.md` and `docs/how-to-configure-environment-variables.md` describe default cloned-session execution versus `COKAC_SCHEDULE_INLINE=1`, and the new `devdoc/schedule-session-clone-goal.md` records the detailed design goal, non-goals, provider-specific strategy, compatibility rules, and regression risks for this change.
+
+---
+
 ## 0.6.27 — 2026-06-20
 
 - **Agy execution now follows a simpler direct stdout streaming path.** The provider still invokes Antigravity CLI with `agy --print "" --print-timeout <duration> --log-file <temp-log> --dangerously-skip-permissions`, writes the composed system/user prompt through stdin, validates `--conversation <session_id>` before spawning, and validates explicit `agy:<model>` values against `agy models`. The adapter now streams every stdout line directly to the chat instead of maintaining a replay-suppression cache, so resumed Antigravity output is no longer hidden by cokacdir-side prefix matching. A successful run that produces empty stdout is reported as `Agy exited successfully but produced no stdout response.`, while non-zero exits still surface as provider errors with captured stdout/stderr.

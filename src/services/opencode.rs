@@ -5,11 +5,13 @@
 //! with minimal code changes.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::services::claude::{
     debug_log_to, kill_child_tree, CancelToken, ClaudeResponse, StreamMessage,
@@ -37,6 +39,7 @@ const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// declare the turn dead. Covers the "opencode serve crashed mid-turn" case.
 /// 6 * 500ms = ~3s of grace before bailing out.
 const POLL_MAX_CONSECUTIVE_ERRORS: u32 = 6;
+static OPENCODE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn opencode_debug(msg: &str) {
     debug_log_to("opencode.log", msg);
@@ -208,6 +211,494 @@ pub fn verify_completion_opencode(
     opencode_debug("=== verify_completion_opencode END ===");
 
     Ok(crate::services::claude::VerifyResult { complete, feedback })
+}
+
+fn opencode_db_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        paths.push(
+            PathBuf::from(local_app_data)
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
+    if let Ok(app_data) = std::env::var("APPDATA") {
+        paths.push(PathBuf::from(app_data).join("opencode").join("opencode.db"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db"),
+        );
+    }
+    paths
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    let candidates = opencode_db_candidates();
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn set_opencode_busy_timeout(conn: &rusqlite::Connection, label: &str) {
+    if let Err(e) = conn.busy_timeout(Duration::from_secs(5)) {
+        opencode_debug(&format!(
+            "[opencode-db] failed to set OpenCode SQLite busy timeout for {}: {}",
+            label, e
+        ));
+    }
+}
+
+fn make_opencode_id(prefix: &str) -> String {
+    let descending = prefix == "ses_";
+    format!("{}{}", prefix, opencode_identifier(descending))
+}
+
+fn opencode_identifier(descending: bool) -> String {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    let base = unix_ms.wrapping_mul(0x1000);
+    let sequence = loop {
+        let last = OPENCODE_SEQUENCE.load(std::sync::atomic::Ordering::SeqCst);
+        let next = if last < base {
+            base.wrapping_add(1)
+        } else {
+            last.wrapping_add(1)
+        };
+        if OPENCODE_SEQUENCE
+            .compare_exchange(
+                last,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            break next;
+        }
+    };
+    let mask = 0xffff_ffff_ffffu64;
+    let mut timestamp_prefix = sequence & mask;
+    if descending {
+        timestamp_prefix = (!timestamp_prefix) & mask;
+    }
+    format!("{timestamp_prefix:012x}{}", random_base62(14))
+}
+
+fn random_base62(len: usize) -> String {
+    use rand::RngCore;
+
+    const CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        for byte in bytes {
+            if out.len() >= len {
+                break;
+            }
+            out.push(CHARS[byte as usize % CHARS.len()] as char);
+        }
+    }
+    out
+}
+
+fn opencode_session_path_for_cwd(cwd: &str) -> String {
+    cwd.replace('/', "-")
+}
+
+fn quote_sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn ordered_table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec<String>, String> {
+    let pragma_sql = format!("PRAGMA table_info({})", quote_sql_ident(table));
+    let mut stmt = conn
+        .prepare(&pragma_sql)
+        .map_err(|e| format!("Failed to inspect OpenCode table {}: {}", table, e))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("Failed to read OpenCode table {} columns: {}", table, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect OpenCode table {} columns: {}", table, e))?;
+    if columns.is_empty() {
+        return Err(format!("OpenCode table {} has no columns", table));
+    }
+    Ok(columns)
+}
+
+fn opencode_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1")
+        .map_err(|e| format!("Failed to inspect OpenCode schema: {}", e))?;
+    match stmt.query_row(rusqlite::params![table], |_| Ok(())) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(format!("Failed to inspect OpenCode table {}: {}", table, e)),
+    }
+}
+
+fn column_index(columns: &[String], name: &str) -> Result<usize, String> {
+    columns
+        .iter()
+        .position(|column| column == name)
+        .ok_or_else(|| format!("OpenCode row clone missing expected column `{}`", name))
+}
+
+fn optional_column_index(columns: &[String], name: &str) -> Option<usize> {
+    columns.iter().position(|column| column == name)
+}
+
+fn sql_text(value: &rusqlite::types::Value) -> Option<&str> {
+    match value {
+        rusqlite::types::Value::Text(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn read_opencode_rows(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    columns: &[String],
+    where_column: &str,
+    where_value: &str,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, String> {
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} = ?1",
+        columns
+            .iter()
+            .map(|column| quote_sql_ident(column))
+            .collect::<Vec<_>>()
+            .join(", "),
+        quote_sql_ident(table),
+        quote_sql_ident(where_column)
+    );
+    let mut stmt = tx
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare OpenCode {} clone read: {}", table, e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![where_value], |row| {
+            let mut values = Vec::with_capacity(columns.len());
+            for idx in 0..columns.len() {
+                values.push(row.get::<_, rusqlite::types::Value>(idx)?);
+            }
+            Ok(values)
+        })
+        .map_err(|e| format!("Failed to query OpenCode {} rows: {}", table, e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect OpenCode {} rows: {}", table, e))?;
+    Ok(rows)
+}
+
+fn insert_opencode_row(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    columns: &[String],
+    values: &[rusqlite::types::Value],
+) -> Result<(), String> {
+    let placeholders = (1..=columns.len())
+        .map(|idx| format!("?{}", idx))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_sql_ident(table),
+        columns
+            .iter()
+            .map(|column| quote_sql_ident(column))
+            .collect::<Vec<_>>()
+            .join(", "),
+        placeholders
+    );
+    tx.execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .map_err(|e| format!("Failed to insert cloned OpenCode {} row: {}", table, e))?;
+    Ok(())
+}
+
+fn rewrite_opencode_message_data_json(
+    data: &str,
+    msg_id_map: &HashMap<String, String>,
+    old_cwd: Option<&str>,
+    new_cwd: &str,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+        return data.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return data.to_string();
+    };
+    if let Some(parent_id) = obj.get("parentID").and_then(|v| v.as_str()) {
+        if let Some(new_parent_id) = msg_id_map.get(parent_id) {
+            obj.insert("parentID".to_string(), Value::String(new_parent_id.clone()));
+        }
+    }
+    if let Some(old_cwd) = old_cwd {
+        if let Some(path_obj) = obj.get_mut("path").and_then(|v| v.as_object_mut()) {
+            if path_obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
+                path_obj.insert("cwd".to_string(), Value::String(new_cwd.to_string()));
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
+}
+
+fn clone_opencode_session_rows(
+    conn: &mut rusqlite::Connection,
+    source_session_id: &str,
+    new_session_id: &str,
+    working_dir: &str,
+) -> Result<(usize, usize, usize), String> {
+    if !opencode_table_exists(conn, "session")? {
+        return Err("OpenCode DB missing `session` table".to_string());
+    }
+    if !opencode_table_exists(conn, "message")? {
+        return Err("OpenCode DB missing `message` table".to_string());
+    }
+    if !opencode_table_exists(conn, "part")? {
+        return Err("OpenCode DB missing `part` table".to_string());
+    }
+    let has_session_message = opencode_table_exists(conn, "session_message")?;
+
+    let session_columns = ordered_table_columns(conn, "session")?;
+    let message_columns = ordered_table_columns(conn, "message")?;
+    let part_columns = ordered_table_columns(conn, "part")?;
+    let session_message_columns = if has_session_message {
+        ordered_table_columns(conn, "session_message")?
+    } else {
+        Vec::new()
+    };
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to start OpenCode clone transaction: {}", e))?;
+
+    let mut session_rows =
+        read_opencode_rows(&tx, "session", &session_columns, "id", source_session_id)?;
+    let mut session_row = match session_rows.pop() {
+        Some(row) if session_rows.is_empty() => row,
+        Some(_) => {
+            return Err(format!(
+                "Multiple OpenCode session rows for {}",
+                source_session_id
+            ))
+        }
+        None => return Err(format!("OpenCode session not found: {}", source_session_id)),
+    };
+    let old_directory = optional_column_index(&session_columns, "directory")
+        .and_then(|idx| sql_text(&session_row[idx]).map(ToString::to_string));
+
+    let message_rows = read_opencode_rows(
+        &tx,
+        "message",
+        &message_columns,
+        "session_id",
+        source_session_id,
+    )?;
+    let part_rows =
+        read_opencode_rows(&tx, "part", &part_columns, "session_id", source_session_id)?;
+    let session_message_rows = if has_session_message {
+        read_opencode_rows(
+            &tx,
+            "session_message",
+            &session_message_columns,
+            "session_id",
+            source_session_id,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    let session_id_idx = column_index(&session_columns, "id")?;
+    session_row[session_id_idx] = rusqlite::types::Value::Text(new_session_id.to_string());
+    if let Some(idx) = optional_column_index(&session_columns, "directory") {
+        session_row[idx] = rusqlite::types::Value::Text(working_dir.to_string());
+    }
+    if let Some(idx) = optional_column_index(&session_columns, "path") {
+        session_row[idx] = rusqlite::types::Value::Text(opencode_session_path_for_cwd(working_dir));
+    }
+
+    let message_id_idx = column_index(&message_columns, "id")?;
+    let message_session_idx = column_index(&message_columns, "session_id")?;
+    let mut msg_id_map = HashMap::<String, String>::new();
+    for row in &message_rows {
+        let Some(old_id) = sql_text(&row[message_id_idx]) else {
+            return Err("OpenCode message row has non-text id".to_string());
+        };
+        msg_id_map.insert(old_id.to_string(), make_opencode_id("msg_"));
+    }
+
+    let part_id_idx = column_index(&part_columns, "id")?;
+    let part_session_idx = column_index(&part_columns, "session_id")?;
+    let mut part_id_map = HashMap::<String, String>::new();
+    for row in &part_rows {
+        let Some(old_id) = sql_text(&row[part_id_idx]) else {
+            return Err("OpenCode part row has non-text id".to_string());
+        };
+        part_id_map.insert(old_id.to_string(), make_opencode_id("prt_"));
+    }
+
+    let mut event_id_map = HashMap::<String, String>::new();
+    let session_message_id_idx = if has_session_message {
+        let idx = column_index(&session_message_columns, "id")?;
+        for row in &session_message_rows {
+            let Some(old_id) = sql_text(&row[idx]) else {
+                return Err("OpenCode session_message row has non-text id".to_string());
+            };
+            event_id_map.insert(old_id.to_string(), make_opencode_id("evt_"));
+        }
+        Some(idx)
+    } else {
+        None
+    };
+
+    tx.execute(
+        "DELETE FROM part WHERE session_id = ?1",
+        rusqlite::params![new_session_id],
+    )
+    .map_err(|e| format!("Failed to clear OpenCode clone parts: {}", e))?;
+    tx.execute(
+        "DELETE FROM message WHERE session_id = ?1",
+        rusqlite::params![new_session_id],
+    )
+    .map_err(|e| format!("Failed to clear OpenCode clone messages: {}", e))?;
+    if has_session_message {
+        tx.execute(
+            "DELETE FROM session_message WHERE session_id = ?1",
+            rusqlite::params![new_session_id],
+        )
+        .map_err(|e| format!("Failed to clear OpenCode clone events: {}", e))?;
+    }
+    tx.execute(
+        "DELETE FROM session WHERE id = ?1",
+        rusqlite::params![new_session_id],
+    )
+    .map_err(|e| format!("Failed to clear OpenCode clone session: {}", e))?;
+
+    insert_opencode_row(&tx, "session", &session_columns, &session_row)?;
+
+    let message_data_idx = optional_column_index(&message_columns, "data");
+    let message_parent_idx = optional_column_index(&message_columns, "parent_id");
+    for mut row in message_rows {
+        let old_id = sql_text(&row[message_id_idx])
+            .ok_or_else(|| "OpenCode message row has non-text id".to_string())?
+            .to_string();
+        let new_id = msg_id_map
+            .get(&old_id)
+            .ok_or_else(|| format!("OpenCode message id map missing {}", old_id))?;
+        row[message_id_idx] = rusqlite::types::Value::Text(new_id.clone());
+        row[message_session_idx] = rusqlite::types::Value::Text(new_session_id.to_string());
+        if let Some(idx) = message_parent_idx {
+            if let Some(parent_id) = sql_text(&row[idx]).map(ToString::to_string) {
+                if let Some(new_parent_id) = msg_id_map.get(&parent_id) {
+                    row[idx] = rusqlite::types::Value::Text(new_parent_id.clone());
+                }
+            }
+        }
+        if let Some(idx) = message_data_idx {
+            if let Some(data) = sql_text(&row[idx]).map(ToString::to_string) {
+                row[idx] = rusqlite::types::Value::Text(rewrite_opencode_message_data_json(
+                    &data,
+                    &msg_id_map,
+                    old_directory.as_deref(),
+                    working_dir,
+                ));
+            }
+        }
+        insert_opencode_row(&tx, "message", &message_columns, &row)?;
+    }
+
+    let part_message_idx = optional_column_index(&part_columns, "message_id");
+    for mut row in part_rows {
+        let old_id = sql_text(&row[part_id_idx])
+            .ok_or_else(|| "OpenCode part row has non-text id".to_string())?
+            .to_string();
+        let new_id = part_id_map
+            .get(&old_id)
+            .ok_or_else(|| format!("OpenCode part id map missing {}", old_id))?;
+        row[part_id_idx] = rusqlite::types::Value::Text(new_id.clone());
+        row[part_session_idx] = rusqlite::types::Value::Text(new_session_id.to_string());
+        if let Some(idx) = part_message_idx {
+            let old_message_id = sql_text(&row[idx])
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("OpenCode part {} has non-text message_id", old_id))?;
+            let new_message_id = msg_id_map.get(&old_message_id).ok_or_else(|| {
+                format!(
+                    "OpenCode part {} references unknown message_id {}",
+                    old_id, old_message_id
+                )
+            })?;
+            row[idx] = rusqlite::types::Value::Text(new_message_id.clone());
+        }
+        insert_opencode_row(&tx, "part", &part_columns, &row)?;
+    }
+
+    if has_session_message {
+        let session_message_id_idx = session_message_id_idx.expect("checked above");
+        let session_message_session_idx = column_index(&session_message_columns, "session_id")?;
+        for mut row in session_message_rows {
+            let old_id = sql_text(&row[session_message_id_idx])
+                .ok_or_else(|| "OpenCode session_message row has non-text id".to_string())?
+                .to_string();
+            let new_id = event_id_map
+                .get(&old_id)
+                .ok_or_else(|| format!("OpenCode event id map missing {}", old_id))?;
+            row[session_message_id_idx] = rusqlite::types::Value::Text(new_id.clone());
+            row[session_message_session_idx] =
+                rusqlite::types::Value::Text(new_session_id.to_string());
+            insert_opencode_row(&tx, "session_message", &session_message_columns, &row)?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit OpenCode clone transaction: {}", e))?;
+    Ok((msg_id_map.len(), part_id_map.len(), event_id_map.len()))
+}
+
+/// Clone an OpenCode session by copying its SQLite rows and remapping only the
+/// row identifiers/references that must be unique. The clone is then safe to
+/// resume through the normal serve/SSE execution path.
+pub fn clone_session_for_schedule(
+    source_session_id: &str,
+    working_dir: &str,
+) -> Result<String, String> {
+    opencode_debug(&format!(
+        "[session-clone] cloning OpenCode session {}",
+        source_session_id
+    ));
+    if !crate::services::process::is_valid_session_id(source_session_id) {
+        return Err(format!("Invalid session_id format: {}", source_session_id));
+    }
+    let db_path = opencode_db_path().ok_or_else(|| "Cannot locate OpenCode DB".to_string())?;
+    if !db_path.is_file() {
+        return Err(format!("OpenCode DB not found: {}", db_path.display()));
+    }
+    let mut conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open OpenCode DB {}: {}", db_path.display(), e))?;
+    set_opencode_busy_timeout(&conn, "session clone");
+    conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .map_err(|e| {
+            format!(
+                "Failed to acquire OpenCode DB write lock for {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
+
+    let new_session_id = make_opencode_id("ses_");
+    let (messages, parts, events) =
+        clone_opencode_session_rows(&mut conn, source_session_id, &new_session_id, working_dir)?;
+    opencode_debug(&format!(
+        "[session-clone] cloned OpenCode session {} -> {} (messages={}, parts={}, events={})",
+        source_session_id, new_session_id, messages, parts, events
+    ));
+    Ok(new_session_id)
 }
 
 /// Truncate a string for log previews (char-boundary safe).
@@ -899,6 +1390,7 @@ fn build_opencode_command(
     working_dir: &str,
     system_prompt_file: Option<&str>,
     model: Option<&str>,
+    fork_session: bool,
 ) -> (Command, Option<std::path::PathBuf>) {
     let opencode_bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
     opencode_debug(&format!(
@@ -925,6 +1417,9 @@ fn build_opencode_command(
     if let Some(sid) = session_id {
         args.push("--session".into());
         args.push(sid.to_string());
+        if fork_session {
+            args.push("--fork".into());
+        }
     }
 
     // System prompt is written to AGENTS.md in working_dir by the caller
@@ -1266,7 +1761,7 @@ pub fn execute_command(
         }
     }
 
-    let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model);
+    let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model, false);
 
     // When --model is specified, opencode ignores stdin → must use positional arg.
     // When no --model, stdin works and avoids shell arg size limits.
@@ -1584,6 +2079,7 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     no_session_persistence: bool,
+    fork_session: bool,
 ) -> Result<(), String> {
     if let Some(sid) = session_id {
         if !crate::services::process::is_valid_session_id(sid) {
@@ -1593,8 +2089,11 @@ pub fn execute_command_streaming(
     let force_legacy = std::env::var("COKACDIR_OPENCODE_LEGACY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if force_legacy {
-        opencode_debug("[dispatch] COKACDIR_OPENCODE_LEGACY=1 → legacy path");
+    if force_legacy || fork_session {
+        opencode_debug(&format!(
+            "[dispatch] legacy path (force_legacy={}, fork_session={})",
+            force_legacy, fork_session
+        ));
         return execute_command_streaming_legacy(
             prompt,
             session_id,
@@ -1605,6 +2104,7 @@ pub fn execute_command_streaming(
             cancel_token,
             model,
             no_session_persistence,
+            fork_session,
         );
     }
     match tokio::runtime::Handle::try_current() {
@@ -1643,6 +2143,7 @@ pub fn execute_command_streaming(
                 cancel_token,
                 model,
                 no_session_persistence,
+                false,
             )
         }
     }
@@ -1660,6 +2161,7 @@ fn execute_command_streaming_legacy(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     _no_session_persistence: bool,
+    fork_session: bool,
 ) -> Result<(), String> {
     opencode_debug("=== opencode execute_command_streaming_legacy START ===");
     opencode_debug(&format!(
@@ -1696,7 +2198,8 @@ fn execute_command_streaming_legacy(
         }
     };
 
-    let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model);
+    let (mut cmd, _sp_path) =
+        build_opencode_command(session_id, working_dir, None, model, fork_session);
 
     // When --model is specified, opencode ignores stdin → must use positional arg.
     // When no --model, stdin works and avoids shell arg size limits.

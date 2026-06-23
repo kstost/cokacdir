@@ -199,9 +199,8 @@ pub fn archive_sessions_dir() -> Option<PathBuf> {
 }
 
 /// Load the full-fidelity archive for a session and render it as a compact
-/// transcript suitable for a verification prompt. Used by the Codex `/loop`
-/// verifier only — Claude forks its live session natively and OpenCode uses
-/// its native `--fork`, so neither needs this transcript.
+/// transcript suitable for isolated follow-up prompts. Used by the Codex
+/// `/loop` verifier, which must not resume the original session directly.
 ///
 /// System breadcrumbs (role="system") are dropped because they carry no
 /// completion signal. Per-block text is capped at PER_BLOCK_LIMIT and the
