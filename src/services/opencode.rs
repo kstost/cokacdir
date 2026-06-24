@@ -310,10 +310,6 @@ fn random_base62(len: usize) -> String {
     out
 }
 
-fn opencode_session_path_for_cwd(cwd: &str) -> String {
-    cwd.replace('/', "-")
-}
-
 fn quote_sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -422,30 +418,134 @@ fn insert_opencode_row(
     Ok(())
 }
 
-fn rewrite_opencode_message_data_json(
+type TodoFingerprintCounts = HashMap<String, usize>;
+
+fn remap_known_opencode_id(
+    id: &str,
+    msg_id_map: &HashMap<String, String>,
+    part_id_map: &HashMap<String, String>,
+    event_id_map: &HashMap<String, String>,
+    old_session_id: &str,
+    new_session_id: &str,
+) -> Option<String> {
+    msg_id_map
+        .get(id)
+        .or_else(|| part_id_map.get(id))
+        .or_else(|| event_id_map.get(id))
+        .cloned()
+        .or_else(|| {
+            if id == old_session_id {
+                Some(new_session_id.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn remap_opencode_json_refs(
+    value: &mut Value,
+    msg_id_map: &HashMap<String, String>,
+    part_id_map: &HashMap<String, String>,
+    event_id_map: &HashMap<String, String>,
+    old_session_id: &str,
+    new_session_id: &str,
+    old_cwd: Option<&str>,
+    new_cwd: &str,
+) {
+    match value {
+        Value::Object(obj) => {
+            for (key, child) in obj.iter_mut() {
+                if let Some(s) = child.as_str() {
+                    let replacement = match key.as_str() {
+                        "parentID" | "parent_id" | "messageID" | "message_id" => {
+                            msg_id_map.get(s).cloned()
+                        }
+                        "partID" | "part_id" => part_id_map.get(s).cloned(),
+                        "sessionID" | "session_id" => {
+                            if s == old_session_id {
+                                Some(new_session_id.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        "id" => remap_known_opencode_id(
+                            s,
+                            msg_id_map,
+                            part_id_map,
+                            event_id_map,
+                            old_session_id,
+                            new_session_id,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(new_value) = replacement {
+                        *child = Value::String(new_value);
+                        continue;
+                    }
+                }
+                if key == "path" {
+                    if let Some(old_cwd) = old_cwd {
+                        if let Some(path_obj) = child.as_object_mut() {
+                            if path_obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
+                                path_obj
+                                    .insert("cwd".to_string(), Value::String(new_cwd.to_string()));
+                            }
+                        }
+                    }
+                }
+                remap_opencode_json_refs(
+                    child,
+                    msg_id_map,
+                    part_id_map,
+                    event_id_map,
+                    old_session_id,
+                    new_session_id,
+                    old_cwd,
+                    new_cwd,
+                );
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                remap_opencode_json_refs(
+                    child,
+                    msg_id_map,
+                    part_id_map,
+                    event_id_map,
+                    old_session_id,
+                    new_session_id,
+                    old_cwd,
+                    new_cwd,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_opencode_data_json(
     data: &str,
     msg_id_map: &HashMap<String, String>,
+    part_id_map: &HashMap<String, String>,
+    event_id_map: &HashMap<String, String>,
+    old_session_id: &str,
+    new_session_id: &str,
     old_cwd: Option<&str>,
     new_cwd: &str,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
         return data.to_string();
     };
-    let Some(obj) = value.as_object_mut() else {
-        return data.to_string();
-    };
-    if let Some(parent_id) = obj.get("parentID").and_then(|v| v.as_str()) {
-        if let Some(new_parent_id) = msg_id_map.get(parent_id) {
-            obj.insert("parentID".to_string(), Value::String(new_parent_id.clone()));
-        }
-    }
-    if let Some(old_cwd) = old_cwd {
-        if let Some(path_obj) = obj.get_mut("path").and_then(|v| v.as_object_mut()) {
-            if path_obj.get("cwd").and_then(|v| v.as_str()) == Some(old_cwd) {
-                path_obj.insert("cwd".to_string(), Value::String(new_cwd.to_string()));
-            }
-        }
-    }
+    remap_opencode_json_refs(
+        &mut value,
+        msg_id_map,
+        part_id_map,
+        event_id_map,
+        old_session_id,
+        new_session_id,
+        old_cwd,
+        new_cwd,
+    );
     serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
 }
 
@@ -454,7 +554,7 @@ fn clone_opencode_session_rows(
     source_session_id: &str,
     new_session_id: &str,
     working_dir: &str,
-) -> Result<(usize, usize, usize), String> {
+) -> Result<(usize, usize, usize, usize), String> {
     if !opencode_table_exists(conn, "session")? {
         return Err("OpenCode DB missing `session` table".to_string());
     }
@@ -465,12 +565,19 @@ fn clone_opencode_session_rows(
         return Err("OpenCode DB missing `part` table".to_string());
     }
     let has_session_message = opencode_table_exists(conn, "session_message")?;
+    let has_session_share = opencode_table_exists(conn, "session_share")?;
+    let has_todo = opencode_table_exists(conn, "todo")?;
 
     let session_columns = ordered_table_columns(conn, "session")?;
     let message_columns = ordered_table_columns(conn, "message")?;
     let part_columns = ordered_table_columns(conn, "part")?;
     let session_message_columns = if has_session_message {
         ordered_table_columns(conn, "session_message")?
+    } else {
+        Vec::new()
+    };
+    let todo_columns = if has_todo {
+        ordered_table_columns(conn, "todo")?
     } else {
         Vec::new()
     };
@@ -514,14 +621,26 @@ fn clone_opencode_session_rows(
     } else {
         Vec::new()
     };
+    let todo_rows = if has_todo {
+        read_opencode_rows(&tx, "todo", &todo_columns, "session_id", source_session_id)?
+    } else {
+        Vec::new()
+    };
+    let todo_count = todo_rows.len();
 
     let session_id_idx = column_index(&session_columns, "id")?;
     session_row[session_id_idx] = rusqlite::types::Value::Text(new_session_id.to_string());
     if let Some(idx) = optional_column_index(&session_columns, "directory") {
         session_row[idx] = rusqlite::types::Value::Text(working_dir.to_string());
     }
-    if let Some(idx) = optional_column_index(&session_columns, "path") {
-        session_row[idx] = rusqlite::types::Value::Text(opencode_session_path_for_cwd(working_dir));
+    if let Some(idx) = optional_column_index(&session_columns, "share_url") {
+        session_row[idx] = rusqlite::types::Value::Null;
+    }
+    if let Some(idx) = optional_column_index(&session_columns, "time_compacting") {
+        session_row[idx] = rusqlite::types::Value::Null;
+    }
+    if let Some(idx) = optional_column_index(&session_columns, "time_archived") {
+        session_row[idx] = rusqlite::types::Value::Null;
     }
 
     let message_id_idx = column_index(&message_columns, "id")?;
@@ -557,6 +676,11 @@ fn clone_opencode_session_rows(
     } else {
         None
     };
+    let todo_session_idx = if has_todo {
+        Some(column_index(&todo_columns, "session_id")?)
+    } else {
+        None
+    };
 
     tx.execute(
         "DELETE FROM part WHERE session_id = ?1",
@@ -574,6 +698,20 @@ fn clone_opencode_session_rows(
             rusqlite::params![new_session_id],
         )
         .map_err(|e| format!("Failed to clear OpenCode clone events: {}", e))?;
+    }
+    if has_todo {
+        tx.execute(
+            "DELETE FROM todo WHERE session_id = ?1",
+            rusqlite::params![new_session_id],
+        )
+        .map_err(|e| format!("Failed to clear OpenCode clone todos: {}", e))?;
+    }
+    if has_session_share {
+        tx.execute(
+            "DELETE FROM session_share WHERE session_id = ?1",
+            rusqlite::params![new_session_id],
+        )
+        .map_err(|e| format!("Failed to clear OpenCode clone shares: {}", e))?;
     }
     tx.execute(
         "DELETE FROM session WHERE id = ?1",
@@ -603,9 +741,13 @@ fn clone_opencode_session_rows(
         }
         if let Some(idx) = message_data_idx {
             if let Some(data) = sql_text(&row[idx]).map(ToString::to_string) {
-                row[idx] = rusqlite::types::Value::Text(rewrite_opencode_message_data_json(
+                row[idx] = rusqlite::types::Value::Text(rewrite_opencode_data_json(
                     &data,
                     &msg_id_map,
+                    &part_id_map,
+                    &event_id_map,
+                    source_session_id,
+                    new_session_id,
                     old_directory.as_deref(),
                     working_dir,
                 ));
@@ -615,6 +757,7 @@ fn clone_opencode_session_rows(
     }
 
     let part_message_idx = optional_column_index(&part_columns, "message_id");
+    let part_data_idx = optional_column_index(&part_columns, "data");
     for mut row in part_rows {
         let old_id = sql_text(&row[part_id_idx])
             .ok_or_else(|| "OpenCode part row has non-text id".to_string())?
@@ -636,12 +779,27 @@ fn clone_opencode_session_rows(
             })?;
             row[idx] = rusqlite::types::Value::Text(new_message_id.clone());
         }
+        if let Some(idx) = part_data_idx {
+            if let Some(data) = sql_text(&row[idx]).map(ToString::to_string) {
+                row[idx] = rusqlite::types::Value::Text(rewrite_opencode_data_json(
+                    &data,
+                    &msg_id_map,
+                    &part_id_map,
+                    &event_id_map,
+                    source_session_id,
+                    new_session_id,
+                    old_directory.as_deref(),
+                    working_dir,
+                ));
+            }
+        }
         insert_opencode_row(&tx, "part", &part_columns, &row)?;
     }
 
     if has_session_message {
         let session_message_id_idx = session_message_id_idx.expect("checked above");
         let session_message_session_idx = column_index(&session_message_columns, "session_id")?;
+        let session_message_data_idx = optional_column_index(&session_message_columns, "data");
         for mut row in session_message_rows {
             let old_id = sql_text(&row[session_message_id_idx])
                 .ok_or_else(|| "OpenCode session_message row has non-text id".to_string())?
@@ -652,13 +810,40 @@ fn clone_opencode_session_rows(
             row[session_message_id_idx] = rusqlite::types::Value::Text(new_id.clone());
             row[session_message_session_idx] =
                 rusqlite::types::Value::Text(new_session_id.to_string());
+            if let Some(idx) = session_message_data_idx {
+                if let Some(data) = sql_text(&row[idx]).map(ToString::to_string) {
+                    row[idx] = rusqlite::types::Value::Text(rewrite_opencode_data_json(
+                        &data,
+                        &msg_id_map,
+                        &part_id_map,
+                        &event_id_map,
+                        source_session_id,
+                        new_session_id,
+                        old_directory.as_deref(),
+                        working_dir,
+                    ));
+                }
+            }
             insert_opencode_row(&tx, "session_message", &session_message_columns, &row)?;
+        }
+    }
+
+    if has_todo {
+        let todo_session_idx = todo_session_idx.expect("checked above");
+        for mut row in todo_rows {
+            row[todo_session_idx] = rusqlite::types::Value::Text(new_session_id.to_string());
+            insert_opencode_row(&tx, "todo", &todo_columns, &row)?;
         }
     }
 
     tx.commit()
         .map_err(|e| format!("Failed to commit OpenCode clone transaction: {}", e))?;
-    Ok((msg_id_map.len(), part_id_map.len(), event_id_map.len()))
+    Ok((
+        msg_id_map.len(),
+        part_id_map.len(),
+        event_id_map.len(),
+        todo_count,
+    ))
 }
 
 /// Clone an OpenCode session by copying its SQLite rows and remapping only the
@@ -692,13 +877,476 @@ pub fn clone_session_for_schedule(
         })?;
 
     let new_session_id = make_opencode_id("ses_");
-    let (messages, parts, events) =
+    let (messages, parts, events, todos) =
         clone_opencode_session_rows(&mut conn, source_session_id, &new_session_id, working_dir)?;
     opencode_debug(&format!(
-        "[session-clone] cloned OpenCode session {} -> {} (messages={}, parts={}, events={})",
-        source_session_id, new_session_id, messages, parts, events
+        "[session-clone] cloned OpenCode session {} -> {} (messages={}, parts={}, events={}, todos={})",
+        source_session_id, new_session_id, messages, parts, events, todos
     ));
     Ok(new_session_id)
+}
+
+#[cfg(test)]
+mod session_clone_tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn seed_opencode_clone_schema(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                share_url TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_compacting INTEGER,
+                time_archived INTEGER,
+                workspace_id TEXT,
+                path TEXT
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                parent_id TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session_share (
+                session_id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                url TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE todo (
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                PRIMARY KEY(session_id, position)
+            );
+            "#,
+        )
+        .unwrap();
+    }
+
+    fn seed_opencode_clone_rows(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO session VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "ses_source",
+                "project_1",
+                "source-slug",
+                "/old/work",
+                "Source",
+                "1.0.0",
+                "https://share.example/source",
+                10_i64,
+                20_i64,
+                30_i64,
+                40_i64,
+                "workspace_1",
+                "project-relative/path",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+            params![
+                "msg_parent",
+                "ses_source",
+                11_i64,
+                12_i64,
+                r#"{"path":{"cwd":"/old/work"},"text":"root"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "msg_child",
+                "ses_source",
+                "msg_parent",
+                13_i64,
+                14_i64,
+                r#"{"parentID":"msg_parent","path":{"cwd":"/old/work"},"text":"child"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "prt_parent",
+                "msg_parent",
+                "ses_source",
+                15_i64,
+                16_i64,
+                r#"{"type":"text","text":"root"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "prt_child",
+                "msg_child",
+                "ses_source",
+                17_i64,
+                18_i64,
+                r#"{"type":"text","text":"child","id":"prt_child","messageID":"msg_child","sessionID":"ses_source"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "evt_source",
+                "ses_source",
+                "message",
+                19_i64,
+                20_i64,
+                r#"{"id":"evt_source","messageID":"msg_child","partID":"prt_child","sessionID":"ses_source"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO todo VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "ses_source",
+                "first task",
+                "pending",
+                "high",
+                0_i64,
+                21_i64,
+                22_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO todo VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "ses_source",
+                "done task",
+                "completed",
+                "low",
+                1_i64,
+                23_i64,
+                24_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_share VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "ses_source",
+                "share_1",
+                "secret_1",
+                "https://share.example/source",
+                25_i64,
+                26_i64,
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO session VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11)",
+            params![
+                "ses_clone",
+                "old_project",
+                "stale-slug",
+                "/stale",
+                "Stale",
+                "1.0.0",
+                "https://share.example/stale",
+                1_i64,
+                2_i64,
+                "stale_ws",
+                "stale/path",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?1, ?2, NULL, ?3, ?4, ?5)",
+            params![
+                "msg_stale",
+                "ses_clone",
+                1_i64,
+                2_i64,
+                r#"{"text":"stale"}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "prt_stale",
+                "msg_stale",
+                "ses_clone",
+                1_i64,
+                2_i64,
+                r#"{"text":"stale"}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO todo VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params!["ses_clone", "stale", "pending", "low", 0_i64, 1_i64, 2_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_share VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "ses_clone",
+                "share_stale",
+                "secret_stale",
+                "https://share.example/stale",
+                1_i64,
+                2_i64,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn clone_opencode_session_rows_preserves_project_path_and_copies_todos() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        seed_opencode_clone_schema(&conn);
+        seed_opencode_clone_rows(&conn);
+
+        let counts =
+            clone_opencode_session_rows(&mut conn, "ses_source", "ses_clone", "/new/work").unwrap();
+        assert_eq!(counts, (2, 2, 1, 2));
+
+        let (directory, path, share_url, compacting, archived): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT directory, path, share_url, time_compacting, time_archived FROM session WHERE id = ?1",
+                params!["ses_clone"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(directory, "/new/work");
+        assert_eq!(path.as_deref(), Some("project-relative/path"));
+        assert_eq!(share_url, None);
+        assert_eq!(compacting, None);
+        assert_eq!(archived, None);
+
+        let root_id: String = conn
+            .query_row(
+                "SELECT id FROM message WHERE session_id = ?1 AND data LIKE '%root%'",
+                params!["ses_clone"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (child_id, child_parent_id, child_data): (String, String, String) = conn
+            .query_row(
+                "SELECT id, parent_id, data FROM message WHERE session_id = ?1 AND data LIKE '%child%'",
+                params!["ses_clone"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_ne!(root_id, "msg_parent");
+        assert_ne!(child_id, "msg_child");
+        assert_eq!(child_parent_id, root_id);
+
+        let child_json: Value = serde_json::from_str(&child_data).unwrap();
+        assert_eq!(child_json["parentID"].as_str(), Some(root_id.as_str()));
+        assert_eq!(child_json["path"]["cwd"].as_str(), Some("/new/work"));
+
+        let part_message_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM part WHERE session_id = ?1 AND message_id IN (?2, ?3)",
+                params!["ses_clone", root_id, child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(part_message_count, 2);
+
+        let (child_part_id, child_part_data): (String, String) = conn
+            .query_row(
+                "SELECT id, data FROM part WHERE session_id = ?1 AND message_id = ?2 AND data LIKE '%child%'",
+                params!["ses_clone", child_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(child_part_id, "prt_child");
+        let child_part_json: Value = serde_json::from_str(&child_part_data).unwrap();
+        assert_eq!(child_part_json["id"].as_str(), Some(child_part_id.as_str()));
+        assert_eq!(
+            child_part_json["messageID"].as_str(),
+            Some(child_id.as_str())
+        );
+        assert_eq!(child_part_json["sessionID"].as_str(), Some("ses_clone"));
+
+        let (event_id, event_data): (String, String) = conn
+            .query_row(
+                "SELECT id, data FROM session_message WHERE session_id = ?1",
+                params!["ses_clone"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(event_id, "evt_source");
+        let event_json: Value = serde_json::from_str(&event_data).unwrap();
+        assert_eq!(event_json["id"].as_str(), Some(event_id.as_str()));
+        assert_eq!(event_json["messageID"].as_str(), Some(child_id.as_str()));
+        assert_eq!(event_json["partID"].as_str(), Some(child_part_id.as_str()));
+        assert_eq!(event_json["sessionID"].as_str(), Some("ses_clone"));
+
+        let todo_rows: Vec<(String, String, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content, status, priority, position FROM todo WHERE session_id = ?1 ORDER BY position",
+                )
+                .unwrap();
+            stmt.query_map(params!["ses_clone"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            todo_rows,
+            vec![
+                (
+                    "first task".to_string(),
+                    "pending".to_string(),
+                    "high".to_string(),
+                    0,
+                ),
+                (
+                    "done task".to_string(),
+                    "completed".to_string(),
+                    "low".to_string(),
+                    1,
+                ),
+            ]
+        );
+
+        let clone_share_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_share WHERE session_id = ?1",
+                params!["ses_clone"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(clone_share_rows, 0);
+    }
+
+    #[test]
+    fn todo_pending_check_ignores_unchanged_baseline_todos() {
+        let baseline_todos = vec![
+            json!({
+                "content": "old task",
+                "status": "pending",
+                "priority": "high",
+                "position": 0,
+            }),
+            json!({
+                "content": "done task",
+                "status": "completed",
+                "priority": "low",
+                "position": 1,
+            }),
+        ];
+        let baseline = unfinished_todo_fingerprints(&baseline_todos);
+
+        assert!(!todos_pending_after_baseline(&baseline_todos, &baseline));
+
+        let new_pending = vec![
+            baseline_todos[0].clone(),
+            json!({
+                "content": "new task",
+                "status": "pending",
+                "priority": "medium",
+                "position": 2,
+            }),
+        ];
+        assert!(todos_pending_after_baseline(&new_pending, &baseline));
+
+        let changed_existing = vec![json!({
+            "content": "old task",
+            "status": "in_progress",
+            "priority": "high",
+            "position": 0,
+        })];
+        assert!(todos_pending_after_baseline(&changed_existing, &baseline));
+
+        // The HTTP todo endpoint exposes content/status/priority, but current
+        // OpenCode SDK types do not expose the DB `position` column. Keep counts
+        // so a newly-created duplicate unfinished todo is still detected.
+        let http_todos = vec![json!({
+            "content": "repeatable task",
+            "status": "pending",
+            "priority": "high",
+        })];
+        let http_baseline = unfinished_todo_fingerprints(&http_todos);
+        assert!(!todos_pending_after_baseline(&http_todos, &http_baseline));
+
+        let duplicated_http_todos = vec![http_todos[0].clone(), http_todos[0].clone()];
+        assert!(todos_pending_after_baseline(
+            &duplicated_http_todos,
+            &http_baseline
+        ));
+
+        let id_baseline_todos = vec![json!({
+            "id": "todo_a",
+            "content": "same visible task",
+            "status": "pending",
+            "priority": "medium",
+        })];
+        let id_baseline = unfinished_todo_fingerprints(&id_baseline_todos);
+        let same_visible_new_id = vec![json!({
+            "id": "todo_b",
+            "content": "same visible task",
+            "status": "pending",
+            "priority": "medium",
+        })];
+        assert!(todos_pending_after_baseline(
+            &same_visible_new_id,
+            &id_baseline
+        ));
+    }
 }
 
 /// Truncate a string for log previews (char-boundary safe).
@@ -2893,6 +3541,29 @@ async fn execute_command_streaming_serve(
         },
     };
 
+    // Existing unfinished todos are part of the cloned session's context. They
+    // must not keep this new turn alive forever unless the turn touches them or
+    // creates new unfinished todos.
+    let todo_baseline =
+        match get_unfinished_todo_fingerprints(&client, &base_url, &parent_sid).await {
+            Ok(baseline) => {
+                let unfinished_count: usize = baseline.values().sum();
+                opencode_debug(&format!(
+                    "[serve] todo baseline unfinished_count={} distinct_fingerprints={}",
+                    unfinished_count,
+                    baseline.len()
+                ));
+                baseline
+            }
+            Err(e) => {
+                opencode_debug(&format!(
+                    "[serve] todo baseline failed; using empty baseline: {}",
+                    e
+                ));
+                TodoFingerprintCounts::new()
+            }
+        };
+
     // Announce the session id so the UI can pin it immediately.
     if sender
         .send(StreamMessage::Init {
@@ -3018,8 +3689,14 @@ async fn execute_command_streaming_serve(
     }
 
     // ---- 8. Poll until everything (parent + children + todos) is idle ----
-    let poll_result =
-        poll_until_complete(&client, &base_url, &parent_sid, cancel_token.as_ref()).await;
+    let poll_result = poll_until_complete(
+        &client,
+        &base_url,
+        &parent_sid,
+        &todo_baseline,
+        cancel_token.as_ref(),
+    )
+    .await;
 
     // ---- 9. Shut everything down ----
     sse_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3798,6 +4475,7 @@ async fn poll_until_complete(
     client: &reqwest::Client,
     base_url: &str,
     parent_sid: &str,
+    todo_baseline: &TodoFingerprintCounts,
     cancel_token: Option<&Arc<CancelToken>>,
 ) -> Result<(), PollError> {
     let start = Instant::now();
@@ -3893,7 +4571,9 @@ async fn poll_until_complete(
         }
 
         // ---- unfinished todos ----
-        let todos_pending = match get_todos_pending(client, base_url, parent_sid).await {
+        let todos_pending = match get_todos_pending(client, base_url, parent_sid, todo_baseline)
+            .await
+        {
             Ok(p) => {
                 consecutive_http_errors = 0;
                 p
@@ -4018,7 +4698,26 @@ async fn get_todos_pending(
     client: &reqwest::Client,
     base_url: &str,
     session_id: &str,
+    baseline: &TodoFingerprintCounts,
 ) -> Result<bool, String> {
+    let list = get_todo_list(client, base_url, session_id).await?;
+    Ok(todos_pending_after_baseline(&list, baseline))
+}
+
+async fn get_unfinished_todo_fingerprints(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+) -> Result<TodoFingerprintCounts, String> {
+    let list = get_todo_list(client, base_url, session_id).await?;
+    Ok(unfinished_todo_fingerprints(&list))
+}
+
+async fn get_todo_list(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+) -> Result<Vec<Value>, String> {
     let url = format!("{}/session/{}/todo", base_url, session_id);
     let resp = client
         .get(&url)
@@ -4027,7 +4726,7 @@ async fn get_todos_pending(
         .map_err(|e| format!("http: {}", e))?;
     let status = resp.status();
     if status.as_u16() == 404 {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let text = resp.text().await.map_err(|e| format!("body: {}", e))?;
     if !status.is_success() {
@@ -4038,23 +4737,61 @@ async fn get_todos_pending(
             status,
             log_preview(&text, 200)
         ));
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let arr: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(Vec::new()),
     };
-    let list = match arr.as_array() {
-        Some(l) => l,
-        None => return Ok(false),
+    Ok(arr.as_array().cloned().unwrap_or_default())
+}
+
+fn todo_is_unfinished(todo: &Value) -> bool {
+    let status = todo.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    status != "completed" && status != "cancelled"
+}
+
+fn todo_fingerprint(todo: &Value) -> String {
+    let canonical = |key: &str| {
+        todo.get(key)
+            .map(|value| serde_json::to_string(value).unwrap_or_default())
+            .unwrap_or_default()
     };
-    for t in list {
-        let st = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if st != "completed" && st != "cancelled" {
-            return Ok(true);
+    [
+        canonical("id"),
+        canonical("content"),
+        canonical("status"),
+        canonical("priority"),
+        canonical("position"),
+    ]
+    .join("\u{1f}")
+}
+
+fn unfinished_todo_fingerprints(todos: &[Value]) -> TodoFingerprintCounts {
+    let mut counts = TodoFingerprintCounts::new();
+    for fingerprint in todos
+        .iter()
+        .filter(|todo| todo_is_unfinished(todo))
+        .map(todo_fingerprint)
+    {
+        *counts.entry(fingerprint).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn todos_pending_after_baseline(todos: &[Value], baseline: &TodoFingerprintCounts) -> bool {
+    let mut remaining_baseline = baseline.clone();
+    for fingerprint in todos
+        .iter()
+        .filter(|todo| todo_is_unfinished(todo))
+        .map(todo_fingerprint)
+    {
+        match remaining_baseline.get_mut(&fingerprint) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => return true,
         }
     }
-    Ok(false)
+    false
 }
 
 /// Minimal URL-encoder for path segments / query values. Covers the subset we

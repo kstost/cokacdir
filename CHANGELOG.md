@@ -1,6 +1,8 @@
 # Changelog — cokacdir
 
-## 0.6.28 — 2026-06-23
+## 0.6.29 — 2026-06-23
+
+- **OpenCode scheduled-session polling now treats cloned unfinished todos as a counted baseline.** Cloned sessions can legitimately start with unfinished todos from the source session, so the serve adapter ignores those unchanged baseline todos while still waiting for new, duplicated, or modified unfinished todos created by the current turn.
 
 - **Scheduled tasks now clone or fork the source provider session at execution time instead of relying on `context_summary`.** `--cron` / `--at` registration now persists the prompt, schedule, captured working directory, provider, model, and source `session_id`, then exits immediately. It no longer starts the detached `--cron-context` summarizer, and a successful register response now means "the schedule metadata was saved", not "a summary or execution session was prepared".
 
