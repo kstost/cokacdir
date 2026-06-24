@@ -13,7 +13,7 @@ Configures output verbosity for the current chat. Default: **compact**.
 ```
 
 - **compact** — Tool calls and normal tool results are hidden, while normal AI text/progress remains visible. This is the default and matches the old silent-on behavior.
-- **final** — Tool calls, tool results, task notifications, cokacdir tool summaries, placeholders, and progress edits are hidden. The chat receives only the final response.
+- **final** — Tool calls, tool results, task notifications, cokacdir tool summaries, and intermediate response content are hidden. The existing animated clock/`Processing` placeholder is shown first, then replaced with the final response.
 - **verbose** — Full tool call details are displayed, including commands run, tool summaries, tool results, and tool errors.
 
 Running `/silent` with no argument does not change the setting. It shows the current mode and the available `/silent compact`, `/silent final`, and `/silent verbose` options.

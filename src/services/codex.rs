@@ -1651,11 +1651,10 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
             }]
         }
 
-        // Ignored events — avoid duplicates (completed handles the final state)
-        // Note: item.updated is intentionally ignored because StreamMessage::Text
-        // appends to full_response. Processing todo_list updates would produce
-        // duplicate lists in the Telegram output. The final state is captured
-        // by item.completed → todo_list handler.
+        // Ignored events — avoid duplicates (completed handles the final state).
+        // Processing todo_list updates would produce duplicate lists in the
+        // Telegram output. The final state is captured by the item.completed
+        // todo_list handler as a task notification, not assistant answer text.
         "turn.started" | "item.started" | "item.updated" => vec![],
 
         // Unknown event types — ignore
@@ -2000,9 +1999,16 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                         format!("[{}] {}", if done { "x" } else { " " }, text)
                     })
                     .collect();
-                vec![StreamMessage::Text {
-                    content: summary.join("\n"),
-                }]
+                let summary = summary.join("\n");
+                if summary.is_empty() {
+                    vec![]
+                } else {
+                    vec![StreamMessage::TaskNotification {
+                        task_id: "todo_list".to_string(),
+                        status: "updated".to_string(),
+                        summary,
+                    }]
+                }
             } else {
                 vec![]
             }

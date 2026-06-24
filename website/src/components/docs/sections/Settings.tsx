@@ -13,7 +13,7 @@ export default function Settings() {
         <CommandTable
           headers={[String(t('Command', '명령어')), String(t('Description', '설명'))]}
           rows={[
-            ['/silent', String(t('Toggle silent mode (hide/show tool call details)', '무음 모드 전환 (도구 호출 세부사항 숨기기/표시)'))],
+            ['/silent', String(t('View/set output mode (compact/final/verbose)', '출력 모드 보기/설정 (compact/final/verbose)'))],
             ['/debug', String(t('Enable/disable debug logging', '디버그 로깅 활성화/비활성화'))],
             ['/effort <level>', String(t('Set Claude/Codex effort level', 'Claude/Codex effort 수준 설정'))],
             ['/fast', String(t('Toggle Codex fast service tier', 'Codex fast service tier 전환'))],
@@ -26,10 +26,16 @@ export default function Settings() {
       </SubSection>
 
       <SubSection title="/silent">
-        <P>{t(<>Toggles silent mode. Default: <strong className="text-zinc-300">ON</strong>.</>, <>무음 모드를 전환합니다. 기본값: <strong className="text-zinc-300">ON</strong>.</>)}</P>
+        <P>{t(<>Configures output verbosity for the current chat. Default: <strong className="text-zinc-300">compact</strong>.</>, <>현재 채팅의 출력 상세도를 설정합니다. 기본값: <strong className="text-zinc-300">compact</strong>입니다.</>)}</P>
+        <CodeBlock code={`/silent
+/silent status
+/silent compact
+/silent final
+/silent verbose`} />
         <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
-          <li>{t(<><strong className="text-zinc-300">ON:</strong> Hides tool call details for cleaner output</>, <><strong className="text-zinc-300">ON:</strong> 깔끔한 출력을 위해 도구 호출 세부사항을 숨깁니다</>)}</li>
-          <li>{t(<><strong className="text-zinc-300">OFF:</strong> Shows full details of every tool call</>, <><strong className="text-zinc-300">OFF:</strong> 모든 도구 호출의 전체 세부사항을 표시합니다</>)}</li>
+          <li>{t(<><strong className="text-zinc-300">compact:</strong> hides tool calls/results while keeping normal AI text and progress visible</>, <><strong className="text-zinc-300">compact:</strong> 도구 호출/결과는 숨기고 일반 AI 텍스트와 진행 표시는 유지합니다</>)}</li>
+          <li>{t(<><strong className="text-zinc-300">final:</strong> shows the animated clock/<IC>Processing</IC> placeholder, then replaces it with the final response</>, <><strong className="text-zinc-300">final:</strong> 시계/<IC>Processing</IC> 애니메이션 placeholder를 먼저 보여주고 최종 응답으로 교체합니다</>)}</li>
+          <li>{t(<><strong className="text-zinc-300">verbose:</strong> shows full tool call details, summaries, results, and errors</>, <><strong className="text-zinc-300">verbose:</strong> 도구 호출 상세, 요약, 결과, 오류를 모두 표시합니다</>)}</li>
         </ul>
       </SubSection>
 

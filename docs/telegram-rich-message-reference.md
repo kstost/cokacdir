@@ -1,7 +1,7 @@
 # Telegram Rich Message 고급 렌더링 참고 문서
 
 작성일: 2026-06-24  
-대상 구현: cokacdir `0.6.35`의 Telegram `/rich` 및 고급 렌더링 경로
+대상 구현: cokacdir `0.6.37`의 Telegram `/rich` 및 고급 렌더링 경로
 
 이 문서는 cokacdir에 Telegram Bot API 10.1 Rich Message 기반 고급 렌더링을 적용할 때 참고한 외부 공식 문서와 내부 구현 판단을 한곳에 정리한 것이다. 원문 문서를 그대로 복제하기보다, 구현에 필요한 요건·제약·설계 결정을 추적 가능한 형태로 요약한다.
 
@@ -89,7 +89,7 @@
 - 서버 API가 지원되더라도 모든 클라이언트가 완전히 같은 렌더링 품질을 보장하지 않을 수 있다.
 - 따라서 기본 delivery 값은 `auto`, 기본 profile은 `safe`로 두고, 기존 `sendMessage`/split/file fallback을 보존했다. 단, `auto`에서도 Markdown 표처럼 classic 경로에서 구조가 사라지는 Rich 전용 블록은 Rich Message를 시도한다.
 - Rich delivery가 `auto` 또는 `on`이면 시스템 프롬프트에 명시적인 Rich 응답 형식 지침을 자동 삽입한다. 이 지침은 최종 답변이 source-code 예시가 아니라 렌더링될 메시지 본문임을 알리고, AI가 Telegram Rich Markdown/HTML로 렌더링 가능한 응답을 작성하며, 요청된 표를 실제 Markdown table로 직접 출력하고, literal Markdown/HTML source를 요구받은 경우가 아니면 Rich markup을 코드블록으로 감싸지 않도록 한다.
-- draft 스트리밍은 opt-in으로만 제공한다. `/rich draft on`일 때 final-only private chat에서 `sendRichMessageDraft` preview를 전송하고, 최종 응답은 별도 `sendRichMessage`/fallback 경로로 영속 전송한다.
+- draft 스트리밍은 opt-in으로만 제공한다. `/rich draft on`일 때 final-only private chat에서 `sendRichMessageDraft` preview를 전송하고, 최종 응답은 animated processing placeholder의 rich edit/fallback 경로로 영속 전송한다.
 
 ### 1.5 내부 구현 문서와 코드
 
@@ -332,11 +332,11 @@ Rich 경로는 항상 best-effort다.
 
 ### 6.2 전송 경로
 
-새 final 메시지 전송:
+placeholder 없는 final 메시지 전송:
 
 - 함수: `send_final_response_without_placeholder`
 - 사용 사례:
-  - `/silent final`과 같이 placeholder 없이 최종 응답만 보내는 모드
+  - 기존 placeholder가 없는 fallback/stopped/cancelled tail 전송
 - 동작:
   1. 원문 응답을 `sanitize_rich_markdown`으로 정리
   2. `/rich` 설정에 따라 `sendRichMessage` 시도

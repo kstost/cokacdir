@@ -943,7 +943,9 @@ impl OutputMode {
         match self {
             Self::Verbose => "show tool calls, tool results, and streaming progress",
             Self::Compact => "hide tool details, keep normal AI text/progress",
-            Self::FinalOnly => "hide tool details and progress; show only the final response",
+            Self::FinalOnly => {
+                "hide tool details/intermediate text; show animated processing, then final response"
+            }
         }
     }
 
@@ -967,6 +969,15 @@ fn parse_output_mode(s: &str) -> Option<OutputMode> {
         "compact" | "silent" | "on" => Some(OutputMode::Compact),
         "final" | "final_only" | "final-only" | "quiet" | "quietest" => Some(OutputMode::FinalOnly),
         _ => None,
+    }
+}
+
+fn format_output_mode_prompt_guidance(mode: OutputMode) -> &'static str {
+    match mode {
+        OutputMode::FinalOnly => {
+            "OUTPUT MODE: /silent final is enabled. This overrides the general progress narration instruction above. The user will only see an animated processing placeholder while you work, then your final answer. Do NOT narrate progress, announce tool use, or write interim status updates in assistant text. If you need tools, use them silently and put only the final answer in your last assistant message.\n\n"
+        }
+        OutputMode::Verbose | OutputMode::Compact => "",
     }
 }
 
@@ -1545,6 +1556,7 @@ mod rich_message_mode_tests {
             12,
             "Telegram",
             &guidance,
+            "",
         );
 
         assert!(prompt.contains("Telegram Rich Message delivery for this chat is ON"));
@@ -3563,6 +3575,7 @@ fn build_system_prompt(
     context_count: usize,
     platform: &str,
     rich_message_prompt_guidance: &str,
+    output_mode_prompt_guidance: &str,
 ) -> String {
     msg_debug(&format!("[build_system_prompt] chat_id={}, bot_username={:?}, bot_display_name={:?}, session_id={:?}, disabled_notice_len={}, role_len={}",
         chat_id, bot_username, bot_display_name, session_id, disabled_notice.len(), role.len()));
@@ -3837,6 +3850,7 @@ fn build_system_prompt(
          Always keep the user informed about what you are doing. \
          Briefly explain each step as you work (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
          The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\n\
+         {output_mode_prompt_guidance}\
          IMPORTANT: The user is on {platform} and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
          Never use tools that expect user interaction. If you need clarification, just ask in plain text.\n\n\
@@ -4365,6 +4379,113 @@ async fn auto_create_workspace_session(
 
 /// Telegram message length limit
 const TELEGRAM_MSG_LIMIT: usize = 4096;
+const PROCESSING_SPINNER: &[&str] = &[
+    "🕐 P",
+    "🕑 Pr",
+    "🕒 Pro",
+    "🕓 Proc",
+    "🕔 Proce",
+    "🕕 Proces",
+    "🕖 Process",
+    "🕗 Processi",
+    "🕘 Processin",
+    "🕙 Processing",
+    "🕚 Processing.",
+    "🕛 Processing..",
+];
+
+async fn update_processing_spinner(
+    bot: &Bot,
+    state: &SharedState,
+    chat_id: ChatId,
+    message_id: teloxide::types::MessageId,
+    spin_idx: &mut usize,
+    last_edit_text: &mut String,
+    log_prefix: Option<&str>,
+    failure_context: &str,
+) {
+    let indicator = PROCESSING_SPINNER[*spin_idx % PROCESSING_SPINNER.len()];
+    *spin_idx += 1;
+    let display_text = indicator.to_string();
+    if display_text != *last_edit_text {
+        if let Some(prefix) = log_prefix {
+            msg_debug(&format!("{prefix} spinner update spin_idx={}", *spin_idx));
+        }
+        shared_rate_limit_wait(state, chat_id).await;
+        let html_text = markdown_to_telegram_html(&display_text);
+        if let Err(e) = tg!(
+            "edit_message",
+            state,
+            chat_id,
+            bot.edit_message_text(chat_id, message_id, &html_text)
+                .parse_mode(ParseMode::Html)
+                .await
+        ) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}]   ⚠ edit_message failed ({failure_context}): {}",
+                redact_err(&e)
+            );
+        }
+        *last_edit_text = display_text;
+    } else {
+        shared_rate_limit_wait(state, chat_id).await;
+        let _ = tg!(
+            "send_chat_action",
+            bot.send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                .await
+        );
+    }
+}
+
+fn append_final_only_text_candidate(
+    final_only_mode: bool,
+    candidate: &mut String,
+    saw_any_text: &mut bool,
+    content: &str,
+) {
+    if !final_only_mode {
+        return;
+    }
+    candidate.push_str(content);
+    if !content.trim().is_empty() {
+        *saw_any_text = true;
+    }
+}
+
+fn reset_final_only_text_candidate(final_only_mode: bool, candidate: &mut String) {
+    if final_only_mode {
+        candidate.clear();
+    }
+}
+
+fn maybe_use_done_result_for_final_only(
+    final_only_mode: bool,
+    provider: &str,
+    candidate: &mut String,
+    saw_any_text: &mut bool,
+    result: &str,
+) {
+    if !final_only_mode || result.trim().is_empty() {
+        return;
+    }
+
+    // Claude's terminal result is the final assistant answer. Other adapters
+    // may report the whole accumulated stdout/text, so only use their Done
+    // result when no streamed text was seen at all.
+    if provider == "claude" || !*saw_any_text {
+        candidate.clear();
+        candidate.push_str(result);
+        *saw_any_text = true;
+    }
+}
+
+fn set_final_only_terminal_text(final_only_mode: bool, candidate: &mut String, text: &str) {
+    if final_only_mode {
+        candidate.clear();
+        candidate.push_str(text);
+    }
+}
 /// Threshold for switching to file attachment mode: responses above this size
 /// are sent as a .txt file instead of multiple messages.
 /// Can be overridden with the COKAC_FILE_ATTACH_THRESHOLD environment variable.
@@ -13662,20 +13783,6 @@ async fn handle_shell_command(
             let _ = tx.send(ShellOutput::Done { exit_code });
         });
 
-        const SPINNER: &[&str] = &[
-            "🕐 P",
-            "🕑 Pr",
-            "🕒 Pro",
-            "🕓 Proc",
-            "🕔 Proce",
-            "🕕 Proces",
-            "🕖 Process",
-            "🕗 Processi",
-            "🕘 Processin",
-            "🕙 Processing",
-            "🕚 Processing.",
-            "🕛 Processing..",
-        ];
         let mut full_output = String::new();
         let mut last_edit_text = String::new();
         let mut done = false;
@@ -13738,7 +13845,7 @@ async fn handle_shell_command(
 
                 // Update placeholder with spinner
                 if !done {
-                    let indicator = SPINNER[spin_idx % SPINNER.len()];
+                    let indicator = PROCESSING_SPINNER[spin_idx % PROCESSING_SPINNER.len()];
                     spin_idx += 1;
 
                     let display_text = format!(
@@ -16300,6 +16407,7 @@ async fn handle_text_message(
         chrome_enabled,
         effort,
         codex_fast_enabled,
+        output_mode_for_prompt,
     ) = {
         let mut data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
@@ -16350,6 +16458,7 @@ async fn handle_text_message(
         let provider = detect_provider(mdl.as_deref());
         let effort = get_effort_for_provider(&data.settings, chat_id, &provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
+        let output_mode = get_output_mode(&data.settings, chat_id);
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
         (
@@ -16366,6 +16475,7 @@ async fn handle_text_message(
             chrome,
             effort,
             codex_fast,
+            output_mode,
         )
     };
 
@@ -16398,8 +16508,8 @@ async fn handle_text_message(
     // only on successful completion. On cancel, nothing is recorded.
 
     // User-visible start notification is deferred into the spawned polling
-    // task. In verbose/compact modes this is a placeholder sent after the
-    // group_lock is acquired; in final-only mode it is intentionally skipped.
+    // task. The placeholder is sent after the group_lock is acquired, including
+    // final-only mode where it animates until the terminal response.
     // This preserves cross-bot serialization and avoids leaving an orphan
     // placeholder if `/stop` arrives during lock wait.
 
@@ -16466,6 +16576,7 @@ async fn handle_text_message(
         context_count,
         &platform,
         &rich_message_prompt_guidance,
+        format_output_mode_prompt_guidance(output_mode_for_prompt),
     );
 
     // Create channel for streaming
@@ -16542,46 +16653,47 @@ async fn handle_text_message(
         }
         let _group_lock = group_lock; // hold group chat lock until task ends
 
-        let (polling_time_ms, output_mode, rich_draft_enabled) = {
+        let (polling_time_ms, rich_draft_enabled) = {
             let data = state_owned.lock().await;
             (
                 data.polling_time_ms,
-                get_output_mode(&data.settings, chat_id),
                 get_rich_message_draft(&data.settings, chat_id),
             )
         };
+        let output_mode = output_mode_for_prompt;
         let final_only_mode = output_mode.is_final_only();
 
-        // Send placeholder message unless the chat is in final-only mode.
+        // Send a placeholder before starting the backend. Final-only mode keeps
+        // the existing processing animation but suppresses all response content
+        // until the terminal response replaces the placeholder.
         //
-        // AI is spawned only after this decision. In normal/compact modes, a
-        // placeholder failure still aborts before any AI subprocess/API call.
-        // In final-only mode there is intentionally no visible "safe point":
-        // the user asked for only the terminal message.
-        let mut placeholder_msg_id = if final_only_mode {
-            msg_debug(&format!(
-                "[handle_text_message] final-only mode: skipping placeholder for chat_id={}",
-                chat_id.0
-            ));
-            None
+        // AI is spawned only after this decision, so a placeholder failure
+        // aborts before any AI subprocess/API call.
+        let initial_placeholder = if final_only_mode {
+            PROCESSING_SPINNER[0]
         } else {
+            "..."
+        };
+        let mut placeholder_msg_id = {
             shared_rate_limit_wait(&state_owned, chat_id).await;
-            let placeholder =
-                match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        msg_debug(&format!(
-                            "[queue:trigger] chat_id={}, source=text_placeholder_error: {}",
-                            chat_id.0, e
-                        ));
-                        {
-                            let mut data = state_owned.lock().await;
-                            remove_cancel_token_locked(&mut data, chat_id);
-                        }
-                        process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
-                        return;
+            let placeholder = match tg!(
+                "send_message",
+                bot_owned.send_message(chat_id, initial_placeholder).await
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    msg_debug(&format!(
+                        "[queue:trigger] chat_id={}, source=text_placeholder_error: {}",
+                        chat_id.0, e
+                    ));
+                    {
+                        let mut data = state_owned.lock().await;
+                        remove_cancel_token_locked(&mut data, chat_id);
                     }
-                };
+                    process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+                    return;
+                }
+            };
             Some(placeholder.id)
         };
 
@@ -16733,28 +16845,20 @@ async fn handle_text_message(
             }
         });
 
-        const SPINNER: &[&str] = &[
-            "🕐 P",
-            "🕑 Pr",
-            "🕒 Pro",
-            "🕓 Proc",
-            "🕔 Proce",
-            "🕕 Proces",
-            "🕖 Process",
-            "🕗 Processi",
-            "🕘 Processin",
-            "🕙 Processing",
-            "🕚 Processing.",
-            "🕛 Processing..",
-        ];
         let mut full_response = String::new();
+        let mut final_only_response = String::new();
+        let mut final_only_saw_text = false;
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
-        let mut last_edit_text = String::new();
+        let mut last_edit_text = if final_only_mode {
+            PROCESSING_SPINNER[0].to_string()
+        } else {
+            String::new()
+        };
         let mut done = false;
         let mut cancelled = false;
         let mut loop_reinjected = false;
         let mut new_session_id: Option<String> = None;
-        let mut spin_idx: usize = 0;
+        let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
@@ -16814,10 +16918,20 @@ async fn handle_text_message(
                                 });
                                 let _fr_before = full_response.len();
                                 full_response.push_str(&content);
+                                append_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &content,
+                                );
                                 msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 pending_cokacdir = detect_cokacdir_command(&name, &input);
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
@@ -16865,6 +16979,10 @@ async fn handle_text_message(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
                                     msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -16932,6 +17050,10 @@ async fn handle_text_message(
                                 }
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 if !summary.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "TaskNotification".into(),
@@ -16967,6 +17089,13 @@ async fn handle_text_message(
                                     msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
                                             chat_id.0, result.len(), full_response.len()));
                                 }
+                                maybe_use_done_result_for_final_only(
+                                    final_only_mode,
+                                    provider_str,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &result,
+                                );
                                 if !result.is_empty() && raw_entries.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "Text".into(),
@@ -17010,6 +17139,11 @@ async fn handle_text_message(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
+                                set_final_only_terminal_text(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &full_response,
+                                );
                                 msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                         chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
                                 raw_entries.push(RawPayloadEntry {
@@ -17044,7 +17178,7 @@ async fn handle_text_message(
                         )
                     };
                     if rich_mode != RichMessageMode::Off {
-                        let draft_markdown = if full_response.trim().is_empty() {
+                        let draft_markdown = if final_only_response.trim().is_empty() {
                             if rich_profile == RichMessageProfile::Full && !sent_empty_rich_draft {
                                 sent_empty_rich_draft = true;
                                 Some("<tg-thinking>Thinking...</tg-thinking>".to_string())
@@ -17053,13 +17187,13 @@ async fn handle_text_message(
                             }
                         } else {
                             let draft_end = floor_char_boundary(
-                                &full_response,
-                                full_response.len().min(RICH_MESSAGE_CHAR_LIMIT),
+                                &final_only_response,
+                                final_only_response.len().min(RICH_MESSAGE_CHAR_LIMIT),
                             );
                             if draft_end > last_rich_draft_len {
                                 last_rich_draft_len = draft_end;
                                 Some(sanitize_rich_markdown(
-                                    &normalize_empty_lines(&full_response[..draft_end]),
+                                    &normalize_empty_lines(&final_only_response[..draft_end]),
                                     rich_profile,
                                 ))
                             } else {
@@ -17080,7 +17214,22 @@ async fn handle_text_message(
                     }
                 }
 
-                if !done && !final_only_mode {
+                if !done && final_only_mode {
+                    let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                        continue;
+                    };
+                    update_processing_spinner(
+                        &bot_owned,
+                        &state_owned,
+                        chat_id,
+                        current_placeholder_msg_id,
+                        &mut spin_idx,
+                        &mut last_edit_text,
+                        None,
+                        "final spinner",
+                    )
+                    .await;
+                } else if !done {
                     // ── Rolling placeholder pattern (unified for all chats) ──
                     let Some(current_placeholder_msg_id) = placeholder_msg_id else {
                         continue;
@@ -17173,41 +17322,17 @@ async fn handle_text_message(
                         }
                     } else {
                         // No new content — spinner update on current placeholder
-                        let indicator = SPINNER[spin_idx % SPINNER.len()];
-                        spin_idx += 1;
-                        let display_text = indicator.to_string();
-                        if display_text != last_edit_text {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let html_text = markdown_to_telegram_html(&display_text);
-                            if let Err(e) = tg!(
-                                "edit_message",
-                                &state_owned,
-                                chat_id,
-                                bot_owned
-                                    .edit_message_text(
-                                        chat_id,
-                                        current_placeholder_msg_id,
-                                        &html_text
-                                    )
-                                    .parse_mode(ParseMode::Html)
-                                    .await
-                            ) {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!(
-                                    "  [{ts}]   ⚠ edit_message failed (streaming): {}",
-                                    redact_err(&e)
-                                );
-                            }
-                            last_edit_text = display_text;
-                        } else {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!(
-                                "send_chat_action",
-                                bot_owned
-                                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                                    .await
-                            );
-                        }
+                        update_processing_spinner(
+                            &bot_owned,
+                            &state_owned,
+                            chat_id,
+                            current_placeholder_msg_id,
+                            &mut spin_idx,
+                            &mut last_edit_text,
+                            None,
+                            "streaming",
+                        )
+                        .await;
                     }
                 }
             }
@@ -17230,10 +17355,15 @@ async fn handle_text_message(
                 // "(No response)" string, and (b) the session writeback below
                 // can skip the assistant push so the sentinel does not end up
                 // in saved history / future /start preview / future --resume.
-                let was_originally_empty = full_response.is_empty();
+                let mut render_response = if final_only_mode {
+                    final_only_response.clone()
+                } else {
+                    full_response.clone()
+                };
+                let was_originally_empty = render_response.is_empty();
                 if was_originally_empty {
                     ai_trace(&format!("[FINAL] full_response is EMPTY → (No response). cancelled={}, last_confirmed_len={}", cancelled, last_confirmed_len));
-                    full_response = "(No response)".to_string();
+                    render_response = "(No response)".to_string();
                     msg_debug(&format!(
                         "[fr_trace][{}] =NoResponse: set to '(No response)', cancelled={}",
                         chat_id.0, cancelled
@@ -17241,24 +17371,29 @@ async fn handle_text_message(
                 } else {
                     ai_trace(&format!(
                         "[FINAL] full_response_len={}, last_confirmed_len={}, remaining_len={}",
-                        full_response.len(),
+                        render_response.len(),
                         last_confirmed_len,
-                        full_response.len().saturating_sub(last_confirmed_len)
+                        render_response.len().saturating_sub(last_confirmed_len)
                     ));
                 }
 
-                let final_response = normalize_empty_lines(&full_response);
+                let final_response = normalize_empty_lines(&render_response);
 
                 // ── Send only remaining delta (unified rolling placeholder) ──
-                if full_response.len() < last_confirmed_len
-                    || !full_response.is_char_boundary(last_confirmed_len)
+                let mut render_confirmed_len = if final_only_mode {
+                    0
+                } else {
+                    last_confirmed_len
+                };
+                if render_response.len() < render_confirmed_len
+                    || !render_response.is_char_boundary(render_confirmed_len)
                 {
-                    last_confirmed_len = 0;
+                    render_confirmed_len = 0;
                 }
-                let remaining = &full_response[last_confirmed_len..];
+                let remaining = &render_response[render_confirmed_len..];
                 if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                     msg_debug(&format!("[rolling_ph] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                        current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                        current_placeholder_msg_id, render_confirmed_len, render_response.len(), remaining.trim().len()));
                     if was_originally_empty || remaining.trim().is_empty() {
                         // No new content — delete the spinner placeholder
                         msg_debug(&format!(
@@ -17272,7 +17407,14 @@ async fn handle_text_message(
                                 .delete_message(chat_id, current_placeholder_msg_id)
                                 .await
                         );
-                    } else if should_attach_response_as_file(full_response.len(), provider_str) {
+                    } else if should_attach_response_as_file(
+                        if final_only_mode {
+                            final_response.len()
+                        } else {
+                            full_response.len()
+                        },
+                        provider_str,
+                    ) {
                         // Response too large — send as file attachment
                         msg_debug(&format!(
                             "[rolling_ph] FINAL FILE ATTACH: total={}",
@@ -17980,35 +18122,44 @@ async fn handle_text_message(
             // Re-send SIGKILL as a safety belt (cancel_now is idempotent).
             cancel_token.cancel_now();
 
-            // stopped_response (full) is used for session history
-            let stopped_response = if full_response.trim().is_empty() {
+            let stopped_visible_response = if final_only_mode {
+                String::new()
+            } else {
+                full_response.clone()
+            };
+            let stopped_response = if stopped_visible_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let normalized = normalize_empty_lines(&full_response);
+                let normalized = normalize_empty_lines(&stopped_visible_response);
                 format!("{}\n\n[Stopped]", normalized)
             };
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Show only remaining delta + [Stopped] (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len
-                || !full_response.is_char_boundary(last_confirmed_len)
+            let mut stopped_confirmed_len = if final_only_mode {
+                0
+            } else {
+                last_confirmed_len
+            };
+            if stopped_visible_response.len() < stopped_confirmed_len
+                || !stopped_visible_response.is_char_boundary(stopped_confirmed_len)
             {
-                last_confirmed_len = 0;
+                stopped_confirmed_len = 0;
             }
-            let remaining = &full_response[last_confirmed_len..];
+            let remaining = &stopped_visible_response[stopped_confirmed_len..];
             if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                 msg_debug(&format!(
                     "[rolling_ph] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
                     current_placeholder_msg_id,
-                    last_confirmed_len,
+                    stopped_confirmed_len,
                     remaining.trim().len()
                 ));
-                if should_attach_response_as_file(full_response.len(), provider_str) {
+                if should_attach_response_as_file(stopped_visible_response.len(), provider_str) {
                     // Large stopped response — send as file
                     msg_debug(&format!(
                         "[rolling_ph] STOPPED FILE ATTACH: total={}",
-                        full_response.len()
+                        stopped_visible_response.len()
                     ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
                     let _ = tg!(
@@ -18135,7 +18286,8 @@ async fn handle_text_message(
                     format!("{}\n\n[Stopped]", normalized)
                 };
                 let stopped_without_placeholder =
-                    if should_attach_response_as_file(full_response.len(), provider_str) {
+                    if should_attach_response_as_file(stopped_visible_response.len(), provider_str)
+                    {
                         &stopped_response
                     } else {
                         &display_stopped
@@ -19383,8 +19535,8 @@ async fn try_edit_rich_message_markdown_if_enabled(
 
 /// Send the final AI response without a pre-existing placeholder.
 ///
-/// This is used by the quietest output mode. It deliberately avoids sending a
-/// spinner/progress placeholder, so the chat receives only the terminal result.
+/// This is used by final-send paths that do not already have a placeholder to
+/// edit, such as long-message fallbacks and stopped/cancelled tails.
 async fn send_final_response_without_placeholder(
     bot: &Bot,
     chat_id: ChatId,
@@ -20553,20 +20705,19 @@ async fn execute_schedule(
     };
     let final_only_mode = output_mode.is_final_only();
 
-    // Send placeholder with only the user's original prompt unless final-only
-    // mode is active. Final-only mode is intentionally silent until the
-    // terminal response.
-    let placeholder_msg_id = if final_only_mode {
-        sched_debug(&format!(
-            "[execute_schedule] id={}, final-only mode → skipping placeholder",
-            schedule_id
-        ));
-        None
+    // Send a placeholder before starting the backend. Final-only mode keeps the
+    // existing processing animation but suppresses response content until the
+    // terminal response replaces the placeholder.
+    let initial_placeholder = if final_only_mode {
+        PROCESSING_SPINNER[0].to_string()
     } else {
+        format!("⏰ {user_prompt}")
+    };
+    let placeholder_msg_id = {
         shared_rate_limit_wait(state, chat_id).await;
         let placeholder = match tg!(
             "send_message",
-            bot.send_message(chat_id, format!("⏰ {user_prompt}")).await
+            bot.send_message(chat_id, initial_placeholder).await
         ) {
             Ok(msg) => msg,
             Err(e) => {
@@ -20702,6 +20853,7 @@ async fn execute_schedule(
         sched_context_count,
         &platform,
         &sched_rich_message_prompt_guidance,
+        format_output_mode_prompt_guidance(output_mode),
     );
 
     // Retrieve pre-inserted cancel token (from scheduler_loop), or create a new one
@@ -20946,27 +21098,19 @@ async fn execute_schedule(
     };
     let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
-        const SPINNER: &[&str] = &[
-            "🕐 P",
-            "🕑 Pr",
-            "🕒 Pro",
-            "🕓 Proc",
-            "🕔 Proce",
-            "🕕 Proces",
-            "🕖 Process",
-            "🕗 Processi",
-            "🕘 Processin",
-            "🕙 Processing",
-            "🕚 Processing.",
-            "🕛 Processing..",
-        ];
         let mut full_response = String::new();
+        let mut final_only_response = String::new();
+        let mut final_only_saw_text = false;
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
-        let mut last_edit_text = String::new();
+        let mut last_edit_text = if final_only_mode {
+            PROCESSING_SPINNER[0].to_string()
+        } else {
+            String::new()
+        };
         let mut done = false;
         let mut cancelled = false;
         let mut had_error = false;
-        let mut spin_idx: usize = 0;
+        let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
@@ -21014,10 +21158,20 @@ async fn execute_schedule(
                                 });
                                 let _fr_before = full_response.len();
                                 full_response.push_str(&content);
+                                append_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &content,
+                                );
                                 sched_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
                                     chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 pending_cokacdir = detect_cokacdir_command(&name, &input);
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
@@ -21062,6 +21216,10 @@ async fn execute_schedule(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 sched_debug(&format!("[schedule_polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
                                     sched_debug(&format!("[schedule_polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -21127,6 +21285,10 @@ async fn execute_schedule(
                                 }
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 if !summary.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "TaskNotification".into(),
@@ -21161,6 +21323,13 @@ async fn execute_schedule(
                                     sched_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
                                         chat_id.0, result.len(), full_response.len()));
                                 }
+                                maybe_use_done_result_for_final_only(
+                                    final_only_mode,
+                                    &provider_str,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &result,
+                                );
                                 if !result.is_empty() && raw_entries.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "Text".into(),
@@ -21201,6 +21370,11 @@ async fn execute_schedule(
                                     "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                     message, code_display, stdout_display, stderr_display
                                 );
+                                set_final_only_terminal_text(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &full_response,
+                                );
                                 sched_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                     chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
                                 raw_entries.push(RawPayloadEntry {
@@ -21227,7 +21401,22 @@ async fn execute_schedule(
             }
 
             // Update placeholder with progress
-            if !done && !final_only_mode {
+            if !done && final_only_mode {
+                let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                    continue;
+                };
+                update_processing_spinner(
+                    &bot_owned,
+                    &state_owned,
+                    chat_id,
+                    current_placeholder_msg_id,
+                    &mut spin_idx,
+                    &mut last_edit_text,
+                    None,
+                    "schedule spinner",
+                )
+                .await;
+            } else if !done {
                 // ── Rolling placeholder pattern (unified for all chats) ──
                 let Some(current_placeholder_msg_id) = placeholder_msg_id else {
                     continue;
@@ -21313,31 +21502,17 @@ async fn execute_schedule(
                         spin_idx = 0;
                     }
                 } else {
-                    let indicator = SPINNER[spin_idx % SPINNER.len()];
-                    spin_idx += 1;
-                    let display_text = indicator.to_string();
-                    if display_text != last_edit_text {
-                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let html_text = markdown_to_telegram_html(&display_text);
-                        let _ = tg!(
-                            "edit_message",
-                            &state_owned,
-                            chat_id,
-                            bot_owned
-                                .edit_message_text(chat_id, current_placeholder_msg_id, &html_text)
-                                .parse_mode(ParseMode::Html)
-                                .await
-                        );
-                        last_edit_text = display_text;
-                    } else {
-                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!(
-                            "send_chat_action",
-                            bot_owned
-                                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                                .await
-                        );
-                    }
+                    update_processing_spinner(
+                        &bot_owned,
+                        &state_owned,
+                        chat_id,
+                        current_placeholder_msg_id,
+                        &mut spin_idx,
+                        &mut last_edit_text,
+                        None,
+                        "schedule streaming",
+                    )
+                    .await;
                 }
             }
 
@@ -21356,13 +21531,18 @@ async fn execute_schedule(
             had_error,
             full_response.len()
         ));
-        // Snapshot whether the AI actually produced any output, taken BEFORE the
-        // not-cancelled branch below replaces an empty `full_response` with the
+        let mut render_response = if final_only_mode {
+            final_only_response.clone()
+        } else {
+            full_response.clone()
+        };
+        // Snapshot whether the AI actually produced any user-visible output,
+        // taken BEFORE the not-cancelled branch below replaces an empty response with the
         // user-facing "(No response)" sentinel. Inline cleanup uses this flag so
         // the sentinel does not leak into the chat's session history or get
         // persisted to disk — the chat would otherwise show a phantom assistant
         // turn that the provider's own JSONL transcript does not have.
-        let had_real_response = !full_response.is_empty();
+        let had_real_response = !render_response.is_empty();
         // Scheduled runs no longer create a ~/.cokacdir/workspace/<id> session
         // shortcut, so there is no /<id> continuation hint to show.
         let continue_hint = String::new();
@@ -21375,15 +21555,34 @@ async fn execute_schedule(
             cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
+            let stopped_visible_response = if final_only_mode {
+                String::new()
+            } else {
+                full_response.clone()
+            };
+            let stopped_content = if stopped_visible_response.trim().is_empty() {
+                "[Stopped]".to_string()
+            } else {
+                format!(
+                    "{}\n\n[Stopped]",
+                    normalize_empty_lines(&stopped_visible_response)
+                )
+            };
+
             // ── Show remaining delta + stopped (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len
-                || !full_response.is_char_boundary(last_confirmed_len)
+            let mut stopped_confirmed_len = if final_only_mode {
+                0
+            } else {
+                last_confirmed_len
+            };
+            if stopped_visible_response.len() < stopped_confirmed_len
+                || !stopped_visible_response.is_char_boundary(stopped_confirmed_len)
             {
-                last_confirmed_len = 0;
+                stopped_confirmed_len = 0;
             }
-            let remaining = &full_response[last_confirmed_len..];
+            let remaining = &stopped_visible_response[stopped_confirmed_len..];
             if let Some(current_placeholder_msg_id) = placeholder_msg_id {
-                if should_attach_response_as_file(full_response.len(), &provider_str) {
+                if should_attach_response_as_file(stopped_visible_response.len(), &provider_str) {
                     let notice = format!(
                         "\u{1f4c4} Response attached as file [Stopped]{}",
                         continue_hint
@@ -21394,8 +21593,6 @@ async fn execute_schedule(
                             .edit_message_text(chat_id, current_placeholder_msg_id, &notice)
                             .await
                     );
-                    let stopped_content =
-                        format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
                     send_response_as_file(
                         &bot_owned,
                         chat_id,
@@ -21423,20 +21620,20 @@ async fn execute_schedule(
                     );
                 }
             } else {
-                let stopped_content =
-                    format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
                 let display_stopped = if remaining.trim().is_empty() {
                     format!("⛔ Stopped{}", continue_hint)
                 } else {
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n⛔ Stopped{}", normalized, continue_hint)
                 };
-                let stopped_without_placeholder =
-                    if should_attach_response_as_file(full_response.len(), &provider_str) {
-                        &stopped_content
-                    } else {
-                        &display_stopped
-                    };
+                let stopped_without_placeholder = if should_attach_response_as_file(
+                    stopped_visible_response.len(),
+                    &provider_str,
+                ) {
+                    &stopped_content
+                } else {
+                    &display_stopped
+                };
                 send_final_response_without_placeholder(
                     &bot_owned,
                     chat_id,
@@ -21457,8 +21654,8 @@ async fn execute_schedule(
             // final-only mode) rather than surfacing the "(No response)"
             // sentinel — that string was confusing users and is also gated out
             // of session history below.
-            if full_response.is_empty() {
-                full_response = "(No response)".to_string();
+            if render_response.is_empty() {
+                render_response = "(No response)".to_string();
                 sched_debug(&format!(
                     "[fr_trace][{}] =NoResponse: set to '(No response)'",
                     chat_id.0
@@ -21468,15 +21665,20 @@ async fn execute_schedule(
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Send only remaining delta (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len
-                || !full_response.is_char_boundary(last_confirmed_len)
+            let mut render_confirmed_len = if final_only_mode {
+                0
+            } else {
+                last_confirmed_len
+            };
+            if render_response.len() < render_confirmed_len
+                || !render_response.is_char_boundary(render_confirmed_len)
             {
-                last_confirmed_len = 0;
+                render_confirmed_len = 0;
             }
-            let remaining = &full_response[last_confirmed_len..];
+            let remaining = &render_response[render_confirmed_len..];
             if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                 msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                    current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                    current_placeholder_msg_id, render_confirmed_len, render_response.len(), remaining.trim().len()));
                 if !had_real_response || remaining.trim().is_empty() {
                     msg_debug(&format!(
                         "[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}",
@@ -21488,7 +21690,14 @@ async fn execute_schedule(
                             .delete_message(chat_id, current_placeholder_msg_id)
                             .await
                     );
-                } else if should_attach_response_as_file(full_response.len(), &provider_str) {
+                } else if should_attach_response_as_file(
+                    if final_only_mode {
+                        normalize_empty_lines(&render_response).len() + continue_hint.len()
+                    } else {
+                        full_response.len()
+                    },
+                    &provider_str,
+                ) {
                     msg_debug(&format!(
                         "[rolling_ph/sched] FINAL FILE ATTACH: total={}",
                         full_response.len()
@@ -21500,8 +21709,11 @@ async fn execute_schedule(
                             .edit_message_text(chat_id, current_placeholder_msg_id, &notice)
                             .await
                     );
-                    let final_text =
-                        format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                    let final_text = format!(
+                        "{}{}",
+                        normalize_empty_lines(&render_response),
+                        continue_hint
+                    );
                     send_response_as_file(
                         &bot_owned,
                         chat_id,
@@ -21621,8 +21833,11 @@ async fn execute_schedule(
                     }
                 }
             } else if had_real_response && !remaining.trim().is_empty() {
-                let final_text =
-                    format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                let final_text = format!(
+                    "{}{}",
+                    normalize_empty_lines(&render_response),
+                    continue_hint
+                );
                 msg_debug(&format!(
                     "[rolling_ph/sched] FINAL SEND without placeholder: len={}",
                     final_text.len()
@@ -21799,9 +22014,14 @@ async fn execute_schedule(
                     // would contain a phantom assistant turn that no provider
                     // JSONL backs.
                     if had_real_response {
+                        let assistant_history = if final_only_mode {
+                            normalize_empty_lines(&render_response)
+                        } else {
+                            full_response.clone()
+                        };
                         session.history.push(HistoryItem {
                             item_type: HistoryType::Assistant,
-                            content: full_response.clone(),
+                            content: assistant_history,
                         });
                     }
                     // Persist to disk so the inline run is durable across restarts.
@@ -22055,73 +22275,79 @@ async fn process_bot_message(
     };
     let final_only_mode = output_mode.is_final_only();
 
-    // Send placeholder unless final-only mode is active.
+    // Send a placeholder before starting the backend. Final-only mode keeps the
+    // existing processing animation but suppresses response content until the
+    // terminal response replaces the placeholder.
     msg_debug(&format!(
         "[process_bot_message] output_mode={}, final_only={}",
         output_mode.as_str(),
         final_only_mode
     ));
-    let placeholder_msg_id = if final_only_mode {
-        msg_debug("[process_bot_message] final-only mode: skipping placeholder");
-        None
+    let initial_placeholder = if final_only_mode {
+        PROCESSING_SPINNER[0]
     } else {
-        msg_debug("[process_bot_message] sending placeholder");
-        shared_rate_limit_wait(state, chat_id).await;
-        let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
-            Ok(m) => {
-                msg_debug(&format!(
-                    "[process_bot_message] placeholder sent: msg_id={}",
-                    m.id
-                ));
-                m
-            }
-            Err(e) => {
-                msg_debug(&format!(
-                    "[process_bot_message] failed to send placeholder: {}, aborting",
-                    e
-                ));
-                msg_debug(&format!(
-                    "[queue:trigger] chat_id={}, source=botmsg_placeholder_error",
-                    chat_id.0
-                ));
-                {
-                    let mut data = state.lock().await;
-                    remove_cancel_token_locked(&mut data, chat_id);
-                }
-                // Discard the on-disk file: leaving it would let the scheduler
-                // re-attempt every 5s, which for a permanent failure (bot kicked,
-                // chat closed, token revoked) becomes log spam with the same
-                // error class. A transient failure forces the user to manually
-                // re-send, but that matches the "Please try again" notice below.
-                let remove_result = fs::remove_file(&msg.file_path);
-                msg_debug(&format!(
-                    "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
-                    msg.id,
-                    remove_result.is_ok()
-                ));
-                // Best-effort surface the dropped bot-to-bot message. The notice
-                // itself may also fail (the original placeholder error was likely
-                // a network / rate-limit / permissions issue affecting all
-                // outbound messages in this chat) — that's why this is `let _ =`.
-                shared_rate_limit_wait(state, chat_id).await;
-                let _ =
-                    tg!("send_message", bot.send_message(chat_id,
-                    format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
-                        msg.from, truncate_str(&msg.content, 200), e)).await);
-                drop(group_lock); // release before queue processing to avoid deadlock
-                process_next_queued_message(bot, chat_id, state).await;
-                return;
-            }
-        };
-        Some(placeholder.id)
+        "..."
     };
+    msg_debug(&format!(
+        "[process_bot_message] sending placeholder: text={:?}",
+        initial_placeholder
+    ));
+    shared_rate_limit_wait(state, chat_id).await;
+    let placeholder = match tg!(
+        "send_message",
+        bot.send_message(chat_id, initial_placeholder).await
+    ) {
+        Ok(m) => {
+            msg_debug(&format!(
+                "[process_bot_message] placeholder sent: msg_id={}",
+                m.id
+            ));
+            m
+        }
+        Err(e) => {
+            msg_debug(&format!(
+                "[process_bot_message] failed to send placeholder: {}, aborting",
+                e
+            ));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=botmsg_placeholder_error",
+                chat_id.0
+            ));
+            {
+                let mut data = state.lock().await;
+                remove_cancel_token_locked(&mut data, chat_id);
+            }
+            // Discard the on-disk file: leaving it would let the scheduler
+            // re-attempt every 5s, which for a permanent failure (bot kicked,
+            // chat closed, token revoked) becomes log spam with the same
+            // error class. A transient failure forces the user to manually
+            // re-send, but that matches the "Please try again" notice below.
+            let remove_result = fs::remove_file(&msg.file_path);
+            msg_debug(&format!(
+                "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
+                msg.id,
+                remove_result.is_ok()
+            ));
+            // Best-effort surface the dropped bot-to-bot message. The notice
+            // itself may also fail (the original placeholder error was likely
+            // a network / rate-limit / permissions issue affecting all
+            // outbound messages in this chat) — that's why this is `let _ =`.
+            shared_rate_limit_wait(state, chat_id).await;
+            let _ =
+                tg!("send_message", bot.send_message(chat_id,
+                format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
+                    msg.from, truncate_str(&msg.content, 200), e)).await);
+            drop(group_lock); // release before queue processing to avoid deadlock
+            process_next_queued_message(bot, chat_id, state).await;
+            return;
+        }
+    };
+    let placeholder_msg_id = Some(placeholder.id);
 
     // Delete the on-disk message once the task is committed to execution.
     //
-    // In verbose/compact modes, the placeholder is the visible safe point. In
-    // final-only mode there is no visible safe point by design; deleting here
-    // avoids replaying a bot-to-bot message and duplicating side effects after
-    // a restart.
+    // The placeholder is the visible safe point. Deleting here avoids replaying
+    // a bot-to-bot message and duplicating side effects after a restart.
     let remove_result = fs::remove_file(&msg.file_path);
     msg_debug(&format!(
         "[process_bot_message] deleted message file after output-mode gate: id={}, path={}, ok={}",
@@ -22193,6 +22419,7 @@ async fn process_bot_message(
         context_count,
         &platform,
         &botmsg_rich_message_prompt_guidance,
+        format_output_mode_prompt_guidance(output_mode),
     );
     msg_debug(&format!(
         "[process_bot_message] system_prompt built, len={}",
@@ -22374,27 +22601,19 @@ async fn process_bot_message(
     };
     let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
-        const SPINNER: &[&str] = &[
-            "🕐 P",
-            "🕑 Pr",
-            "🕒 Pro",
-            "🕓 Proc",
-            "🕔 Proce",
-            "🕕 Proces",
-            "🕖 Process",
-            "🕗 Processi",
-            "🕘 Processin",
-            "🕙 Processing",
-            "🕚 Processing.",
-            "🕛 Processing..",
-        ];
         let mut full_response = String::new();
+        let mut final_only_response = String::new();
+        let mut final_only_saw_text = false;
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
-        let mut last_edit_text = String::new();
+        let mut last_edit_text = if final_only_mode {
+            PROCESSING_SPINNER[0].to_string()
+        } else {
+            String::new()
+        };
         let mut done = false;
         let mut cancelled = false;
         let mut new_session_id: Option<String> = None;
-        let mut spin_idx: usize = 0;
+        let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
@@ -22457,10 +22676,20 @@ async fn process_bot_message(
                                 });
                                 let _fr_before = full_response.len();
                                 full_response.push_str(&content);
+                                append_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &content,
+                                );
                                 msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 pending_cokacdir = detect_cokacdir_command(&name, &input);
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
@@ -22502,6 +22731,10 @@ async fn process_bot_message(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 msg_debug(&format!("[botmsg_poll:{}] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}",
                                         bmsg_id_for_log, is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
@@ -22580,6 +22813,10 @@ async fn process_bot_message(
                                 }
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
+                                reset_final_only_text_candidate(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                );
                                 msg_debug(&format!(
                                     "[botmsg_poll:{}] TaskNotification: summary_len={}",
                                     bmsg_id_for_log,
@@ -22616,6 +22853,13 @@ async fn process_bot_message(
                                     msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
                                             chat_id.0, result.len(), full_response.len()));
                                 }
+                                maybe_use_done_result_for_final_only(
+                                    final_only_mode,
+                                    provider_str,
+                                    &mut final_only_response,
+                                    &mut final_only_saw_text,
+                                    &result,
+                                );
                                 if !result.is_empty() && raw_entries.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "Text".into(),
@@ -22658,6 +22902,11 @@ async fn process_bot_message(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
+                                set_final_only_terminal_text(
+                                    final_only_mode,
+                                    &mut final_only_response,
+                                    &full_response,
+                                );
                                 msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                         chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
                                 raw_entries.push(RawPayloadEntry {
@@ -22682,7 +22931,23 @@ async fn process_bot_message(
                     }
                 }
 
-                if !done && !final_only_mode {
+                if !done && final_only_mode {
+                    let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                        continue;
+                    };
+                    let log_prefix = format!("[botmsg_poll:{bmsg_id_for_log}] final");
+                    update_processing_spinner(
+                        &bot_owned,
+                        &state_owned,
+                        chat_id,
+                        current_placeholder_msg_id,
+                        &mut spin_idx,
+                        &mut last_edit_text,
+                        Some(&log_prefix),
+                        "botmsg final spinner",
+                    )
+                    .await;
+                } else if !done {
                     // ── Rolling placeholder pattern (unified for all chats) ──
                     let Some(current_placeholder_msg_id) = placeholder_msg_id else {
                         continue;
@@ -22767,39 +23032,18 @@ async fn process_bot_message(
                             spin_idx = 0;
                         }
                     } else {
-                        let indicator = SPINNER[spin_idx % SPINNER.len()];
-                        spin_idx += 1;
-                        let display_text = indicator.to_string();
-                        if display_text != last_edit_text {
-                            msg_debug(&format!(
-                                "[botmsg_poll:{}] spinner update spin_idx={}",
-                                bmsg_id_for_log, spin_idx
-                            ));
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let html_text = markdown_to_telegram_html(&display_text);
-                            let _ = tg!(
-                                "edit_message",
-                                &state_owned,
-                                chat_id,
-                                bot_owned
-                                    .edit_message_text(
-                                        chat_id,
-                                        current_placeholder_msg_id,
-                                        &html_text
-                                    )
-                                    .parse_mode(ParseMode::Html)
-                                    .await
-                            );
-                            last_edit_text = display_text;
-                        } else {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!(
-                                "send_chat_action",
-                                bot_owned
-                                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                                    .await
-                            );
-                        }
+                        let log_prefix = format!("[botmsg_poll:{bmsg_id_for_log}]");
+                        update_processing_spinner(
+                            &bot_owned,
+                            &state_owned,
+                            chat_id,
+                            current_placeholder_msg_id,
+                            &mut spin_idx,
+                            &mut last_edit_text,
+                            Some(&log_prefix),
+                            "botmsg streaming",
+                        )
+                        .await;
                     }
                 }
             }
@@ -22816,23 +23060,28 @@ async fn process_bot_message(
                 shared_rate_limit_wait(&state_owned, chat_id).await;
 
                 // Capture pre-replacement emptiness so the UI silently deletes
-                // any placeholder (or sends nothing in final-only mode) when the
-                // AI produced nothing, and the session writeback below skips the
-                // assistant push — see handle_text_message for the same pattern.
-                let was_originally_empty = full_response.is_empty();
+                // the placeholder when the AI produced nothing, and the session
+                // writeback below skips the assistant push — see
+                // handle_text_message for the same pattern.
+                let mut render_response = if final_only_mode {
+                    final_only_response.clone()
+                } else {
+                    full_response.clone()
+                };
+                let was_originally_empty = render_response.is_empty();
                 if was_originally_empty {
                     msg_debug(&format!(
                         "[botmsg_poll:{}] empty response, using placeholder text",
                         bmsg_id_for_log
                     ));
-                    full_response = "(No response)".to_string();
+                    render_response = "(No response)".to_string();
                     msg_debug(&format!(
                         "[fr_trace][{}] =NoResponse: set to '(No response)'",
                         chat_id.0
                     ));
                 }
 
-                let final_response = normalize_empty_lines(&full_response);
+                let final_response = normalize_empty_lines(&render_response);
                 msg_debug(&format!(
                     "[botmsg_poll:{}] final: response_len={}, msg_limit={}",
                     bmsg_id_for_log,
@@ -22841,15 +23090,20 @@ async fn process_bot_message(
                 ));
 
                 // ── Send only remaining delta (unified rolling placeholder) ──
-                if full_response.len() < last_confirmed_len
-                    || !full_response.is_char_boundary(last_confirmed_len)
+                let mut render_confirmed_len = if final_only_mode {
+                    0
+                } else {
+                    last_confirmed_len
+                };
+                if render_response.len() < render_confirmed_len
+                    || !render_response.is_char_boundary(render_confirmed_len)
                 {
-                    last_confirmed_len = 0;
+                    render_confirmed_len = 0;
                 }
-                let remaining = &full_response[last_confirmed_len..];
+                let remaining = &render_response[render_confirmed_len..];
                 if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                     msg_debug(&format!("[rolling_ph/botmsg] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                        current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                        current_placeholder_msg_id, render_confirmed_len, render_response.len(), remaining.trim().len()));
                     if was_originally_empty || remaining.trim().is_empty() {
                         msg_debug(&format!(
                             "[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}",
@@ -22862,7 +23116,14 @@ async fn process_bot_message(
                                 .delete_message(chat_id, current_placeholder_msg_id)
                                 .await
                         );
-                    } else if should_attach_response_as_file(full_response.len(), provider_str) {
+                    } else if should_attach_response_as_file(
+                        if final_only_mode {
+                            final_response.len()
+                        } else {
+                            full_response.len()
+                        },
+                        provider_str,
+                    ) {
                         msg_debug(&format!(
                             "[rolling_ph/botmsg] FINAL FILE ATTACH: total={}",
                             full_response.len()
@@ -23189,11 +23450,15 @@ async fn process_bot_message(
             }
             cancel_token.cancel_now();
 
-            // stopped_response (full) for session history
-            let stopped_response = if full_response.trim().is_empty() {
+            let stopped_visible_response = if final_only_mode {
+                String::new()
+            } else {
+                full_response.clone()
+            };
+            let stopped_response = if stopped_visible_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let normalized = normalize_empty_lines(&full_response);
+                let normalized = normalize_empty_lines(&stopped_visible_response);
                 format!("{}\n\n[Stopped]", normalized)
             };
             msg_debug(&format!(
@@ -23205,19 +23470,24 @@ async fn process_bot_message(
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Show remaining delta + [Stopped] (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len
-                || !full_response.is_char_boundary(last_confirmed_len)
+            let mut stopped_confirmed_len = if final_only_mode {
+                0
+            } else {
+                last_confirmed_len
+            };
+            if stopped_visible_response.len() < stopped_confirmed_len
+                || !stopped_visible_response.is_char_boundary(stopped_confirmed_len)
             {
-                last_confirmed_len = 0;
+                stopped_confirmed_len = 0;
             }
-            let remaining = &full_response[last_confirmed_len..];
+            let remaining = &stopped_visible_response[stopped_confirmed_len..];
             if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                 msg_debug(&format!("[rolling_ph/botmsg] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
-                    current_placeholder_msg_id, last_confirmed_len, remaining.trim().len()));
-                if should_attach_response_as_file(full_response.len(), provider_str) {
+                    current_placeholder_msg_id, stopped_confirmed_len, remaining.trim().len()));
+                if should_attach_response_as_file(stopped_visible_response.len(), provider_str) {
                     msg_debug(&format!(
                         "[rolling_ph/botmsg] STOPPED FILE ATTACH: total={}",
-                        full_response.len()
+                        stopped_visible_response.len()
                     ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
                     let _ = tg!(
@@ -23279,7 +23549,8 @@ async fn process_bot_message(
                     format!("{}\n\n[Stopped]", normalized)
                 };
                 let stopped_without_placeholder =
-                    if should_attach_response_as_file(full_response.len(), provider_str) {
+                    if should_attach_response_as_file(stopped_visible_response.len(), provider_str)
+                    {
                         &stopped_response
                     } else {
                         &display_stopped

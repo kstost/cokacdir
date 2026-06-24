@@ -1,5 +1,11 @@
 # Changelog — cokacdir
 
+## 0.6.38 — 2026-06-24
+
+- **`/silent final` now shows the existing animated processing placeholder before the terminal response.** Final mode still hides tool calls, tool results, task notifications, and intermediate AI text, but normal chat, scheduled tasks, and bot-to-bot processing now show the clock/typing `Processing` animation and replace that message with the final response when the run completes. Final mode now renders the final assistant answer candidate after the latest tool/tool-result/task boundary instead of dumping every streamed assistant text chunk accumulated during the run, cancelled final-only runs no longer reveal partial accumulated text, and Codex todo-list updates are treated as task notifications so they cannot leak into the final-only response.
+
+---
+
 ## 0.6.35 — 2026-06-24
 
 - **Telegram Rich Message settings now shape the AI system prompt automatically.** When `/rich auto` or `/rich on` is active, cokacdir injects explicit response-format rules that tell the model to treat the final answer as the rendered Telegram message body, prefer Telegram Rich Markdown, output requested Markdown tables directly, and avoid wrapping Rich Markdown/HTML or tables in code fences unless the user explicitly asks to see literal source. The injected guidance also reflects the active `safe`/`full` profile and RTL setting, while `/rich off` tells the model not to rely on Rich-only features.
