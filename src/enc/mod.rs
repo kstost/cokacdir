@@ -380,7 +380,7 @@ fn pack_file(
     let total_chunks = if info.size == 0 {
         1
     } else {
-        ((info.size + split_size - 1) / split_size) as usize
+        ((info.size - 1) / split_size + 1) as usize
     };
 
     // ── Pass 2: encrypt ──

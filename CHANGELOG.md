@@ -1,5 +1,49 @@
 # Changelog — cokacdir
 
+## 0.6.35 — 2026-06-24
+
+- **Telegram Rich Message settings now shape the AI system prompt automatically.** When `/rich auto` or `/rich on` is active, cokacdir injects explicit response-format rules that tell the model to treat the final answer as the rendered Telegram message body, prefer Telegram Rich Markdown, output requested Markdown tables directly, and avoid wrapping Rich Markdown/HTML or tables in code fences unless the user explicitly asks to see literal source. The injected guidance also reflects the active `safe`/`full` profile and RTL setting, while `/rich off` tells the model not to rely on Rich-only features.
+
+- **`/rich auto` now recognizes short rich-only structures before falling back to the classic path.** Auto mode still keeps short plain text on the classic `sendMessage` route, but it now tries Rich delivery for Markdown tables and Rich HTML-style blocks such as table tags and `<tg-*>` tags. Code-fenced Markdown/HTML remains literal source and is not promoted to Rich rendering. Regression tests cover Markdown tables, Rich HTML blocks, prompt-guidance insertion, and the existing sanitizer/fallback behavior.
+
+---
+
+## 0.6.34 — 2026-06-24
+
+- **Telegram Rich Messages now expose the full Bot API 10.1 formatting surface.** `/rich safe|full` separates the safe text-focused default from a full passthrough profile. `/rich full` enables media blocks, maps, collages, slideshows, anchors, references, date-time entities, custom emoji syntax, official Rich HTML tags, arbitrary Rich Markdown HTML, and the draft-only `<tg-thinking>` tag. `/rich rtl on|off` sets `InputRichMessage.is_rtl`, and `/rich draft on|off` enables opt-in `sendRichMessageDraft` previews for final-only private chats. Settings are persisted and documented in the new `docs/telegram-rich-message-reference.md` reference document.
+
+---
+
+## 0.6.33 — 2026-06-24
+
+- **Telegram final responses can now use Bot API 10.1 Rich Messages.** The `/rich off|auto|on` setting controls per-chat Rich Message delivery. The default `auto` mode keeps short responses on the classic path and uses raw `sendRichMessage` / `editMessageText.rich_message` for eligible final responses when it avoids Telegram splitting or file attachment; `/rich on` prefers Rich Messages for all eligible final responses, while `/rich off` restores the classic `sendMessage` / split-message / file path. Rich delivery sends sanitized Telegram Rich Markdown so headings, tables, task lists, LaTeX formulas, footnotes, and details blocks can render natively. Safe rendering passes `skip_entity_detection=true`, honors raw API `retry_after` values, redacts bot tokens from raw reqwest errors, and falls back to the classic path on every API/client/format failure.
+
+- **Bare `/silent` now reports status instead of cycling modes.** Running `/silent` with no argument shows the current mode and available `/silent compact`, `/silent final`, and `/silent verbose` options without changing settings. Explicit commands continue to set the mode, and `/silent status` / `/silent show` remain read-only aliases.
+
+---
+
+## 0.6.32 — 2026-06-24
+
+- **Telegram `/silent` is now a three-level output mode instead of a boolean toggle.** The default mode is `compact`, bare `/silent` cycles `compact → final → verbose → compact`, and explicit commands such as `/silent status`, `/silent compact`, `/silent final`, and `/silent verbose` are supported. Existing settings migrate safely: legacy `silent=true` maps to `compact`, legacy `silent=false` maps to `verbose`, and the new `final` mode still writes `silent=true` for rollback compatibility with older binaries.
+
+- **The new `final` output mode suppresses intermediate Telegram noise across normal chat, scheduled tasks, and bot-to-bot message processing.** Tool calls, tool results, task notifications, `cokacdir` tool summaries, placeholders, and progress edits are hidden; the chat receives only the terminal response. Long final responses still use the existing file-attachment path when eligible, while final-only bot-to-bot message handling deletes its queue file once execution is committed to avoid duplicate side effects after a restart.
+
+- **Final-mode file attachment decisions are based on the terminal response, not hidden intermediate output.** The final-only send path measures the normalized response that would actually be shown or attached, so suppressed tool calls/results, progress text, placeholders, and task notifications do not push an otherwise short final answer into file mode. The threshold remains byte-length based (`COKAC_FILE_ATTACH_THRESHOLD`, default `8192` bytes), preserving the existing `opencode` no-file-attachment exception.
+
+---
+
+## 0.6.31 — 2026-06-24
+
+- **Cokacdir CLI result rendering now uses explicit cron result kinds instead of inferring destructive actions from shared JSON fields.** `--cron-register`, `--cron-list`, `--cron-remove`, `--cron-history`, and `--cron-update` success JSON now include a `kind` field, and the Telegram result formatter gives `cron_history` / `cron_remove` explicit priority before falling back to legacy shape handling. This prevents `--cron-history` responses such as `{"id":"CD52CBA0","count":...,"history":[...]}` from being shown as `✅ Removed` merely because they contain an `id`.
+
+- **Schedule removal preserves run history for later inspection.** Manual `--cron-remove` now deletes the live schedule entry without deleting `/home/kst/.cokacdir/schedule_history/<ID>.log`, so follow-up questions can still inspect what happened. New schedule ID generation treats retained history files as reserved, preventing a future schedule from reusing an ID with prior history.
+
+- **Schedule-result formatting is safer for unknown `id`-bearing JSON.** The legacy removal fallback is now restricted to the old minimal `{"status":"ok","id":"..."}` shape, while unknown successful JSON carrying an `id` plus extra fields is left raw instead of being labeled as a deletion. Regression tests cover explicit `cron_history`, explicit `cron_remove`, legacy history, legacy remove, id-only, and unknown-extra-field outputs.
+
+- **Encryption split chunk counting avoids overflow in no-split mode.** The packer now computes non-empty chunk counts as `(size - 1) / split_size + 1`, avoiding `size + split_size - 1` overflow when the effective split size is `u64::MAX`.
+
+---
+
 ## 0.6.29 — 2026-06-23
 
 - **OpenCode scheduled-session polling now treats cloned unfinished todos as a counted baseline.** Cloned sessions can legitimately start with unfinished todos from the source session, so the serve adapter ignores those unchanged baseline todos while still waiting for new, duplicated, or modified unfinished todos created by the current turn.

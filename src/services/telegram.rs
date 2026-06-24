@@ -915,6 +915,140 @@ mod pending_upload_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputMode {
+    Verbose,
+    Compact,
+    FinalOnly,
+}
+
+impl OutputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verbose => "verbose",
+            Self::Compact => "compact",
+            Self::FinalOnly => "final",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Verbose => "🔊 Verbose",
+            Self::Compact => "🔇 Compact",
+            Self::FinalOnly => "🤫 Final only",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Verbose => "show tool calls, tool results, and streaming progress",
+            Self::Compact => "hide tool details, keep normal AI text/progress",
+            Self::FinalOnly => "hide tool details and progress; show only the final response",
+        }
+    }
+
+    /// Best-effort fallback for older binaries that only understand `silent`.
+    fn legacy_silent(self) -> bool {
+        !matches!(self, Self::Verbose)
+    }
+
+    fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+
+    fn is_final_only(self) -> bool {
+        matches!(self, Self::FinalOnly)
+    }
+}
+
+fn parse_output_mode(s: &str) -> Option<OutputMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "verbose" | "full" | "details" | "detail" | "off" => Some(OutputMode::Verbose),
+        "compact" | "silent" | "on" => Some(OutputMode::Compact),
+        "final" | "final_only" | "final-only" | "quiet" | "quietest" => Some(OutputMode::FinalOnly),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RichMessageMode {
+    Off,
+    Auto,
+    On,
+}
+
+impl RichMessageMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::On => "on",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Auto => "Auto",
+            Self::On => "On",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Off => "use the classic Telegram sendMessage/file fallback path",
+            Self::Auto => "use Rich Messages for eligible final responses when it avoids splitting/file attachment or preserves rich-only blocks such as Markdown tables",
+            Self::On => "prefer Rich Messages for all eligible final responses",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RichMessageProfile {
+    Safe,
+    Full,
+}
+
+impl RichMessageProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Full => "full",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Safe => "Safe",
+            Self::Full => "Full",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Safe => "text-focused rich rendering; media blocks and unsupported raw HTML are escaped",
+            Self::Full => "full Telegram Rich Markdown/HTML surface; media, maps, collages, slideshows, anchors, references, and official tags are passed through",
+        }
+    }
+}
+
+fn parse_rich_message_profile(s: &str) -> Option<RichMessageProfile> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "safe" | "secure" | "text" | "text-only" | "text_only" => Some(RichMessageProfile::Safe),
+        "full" | "all" | "complete" | "100" | "100%" => Some(RichMessageProfile::Full),
+        _ => None,
+    }
+}
+
+fn parse_rich_message_mode(s: &str) -> Option<RichMessageMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "disabled" | "disable" => Some(RichMessageMode::Off),
+        "auto" | "default" => Some(RichMessageMode::Auto),
+        "on" | "true" | "enabled" | "enable" | "rich" => Some(RichMessageMode::On),
+        _ => None,
+    }
+}
+
 /// Bot-level settings persisted to disk
 #[derive(Clone)]
 struct BotSettings {
@@ -931,6 +1065,16 @@ struct BotSettings {
     debug: bool,
     /// chat_id (string) → true if silent mode enabled
     silent: HashMap<String, bool>,
+    /// chat_id (string) → output verbosity: verbose | compact | final
+    output_mode: HashMap<String, String>,
+    /// chat_id (string) → Rich Message mode: off | auto | on
+    rich_message_mode: HashMap<String, String>,
+    /// chat_id (string) → Rich Message profile: safe | full
+    rich_message_profile: HashMap<String, String>,
+    /// chat_id (string) → true if Rich Messages should be rendered right-to-left
+    rich_message_rtl: HashMap<String, bool>,
+    /// chat_id (string) → true if Rich Message drafts should be streamed in final-only private chats
+    rich_message_draft: HashMap<String, bool>,
     /// chat_id (string) → true if direct mode enabled (group chat without ; prefix)
     direct: HashMap<String, bool>,
     /// chat_id (string) → number of recent group chat log entries to embed in system prompt (default 12)
@@ -972,6 +1116,11 @@ impl Default for BotSettings {
             models: HashMap::new(),
             debug: false,
             silent: HashMap::new(),
+            output_mode: HashMap::new(),
+            rich_message_mode: HashMap::new(),
+            rich_message_profile: HashMap::new(),
+            rich_message_rtl: HashMap::new(),
+            rich_message_draft: HashMap::new(),
             direct: HashMap::new(),
             context: HashMap::new(),
             instructions: HashMap::new(),
@@ -1034,13 +1183,506 @@ fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
         .map(|m| normalize_model_setting(m))
 }
 
-/// Check if silent mode is enabled for a chat (default: ON)
-fn is_silent(settings: &BotSettings, chat_id: ChatId) -> bool {
+/// Resolve output mode for a chat.
+///
+/// Precedence:
+/// 1. New `output_mode` string map.
+/// 2. Legacy `silent` bool map (`true` => compact, `false` => verbose).
+/// 3. Default compact mode.
+fn get_output_mode(settings: &BotSettings, chat_id: ChatId) -> OutputMode {
+    let key = chat_id.0.to_string();
+    if let Some(mode) = settings
+        .output_mode
+        .get(&key)
+        .and_then(|s| parse_output_mode(s))
+    {
+        return mode;
+    }
+    if let Some(silent) = settings.silent.get(&key).copied() {
+        return if silent {
+            OutputMode::Compact
+        } else {
+            OutputMode::Verbose
+        };
+    }
+    OUTPUT_MODE_DEFAULT
+}
+
+fn set_output_mode(settings: &mut BotSettings, chat_id: ChatId, mode: OutputMode) {
+    let key = chat_id.0.to_string();
     settings
-        .silent
+        .output_mode
+        .insert(key.clone(), mode.as_str().to_string());
+    // Keep legacy `silent` in sync for rollback compatibility. `final` falls
+    // back to compact on older binaries because both are "not verbose".
+    settings.silent.insert(key, mode.legacy_silent());
+}
+
+fn get_rich_message_mode(settings: &BotSettings, chat_id: ChatId) -> RichMessageMode {
+    let key = chat_id.0.to_string();
+    settings
+        .rich_message_mode
+        .get(&key)
+        .and_then(|s| parse_rich_message_mode(s))
+        .unwrap_or(RICH_MESSAGE_MODE_DEFAULT)
+}
+
+fn set_rich_message_mode(settings: &mut BotSettings, chat_id: ChatId, mode: RichMessageMode) {
+    settings
+        .rich_message_mode
+        .insert(chat_id.0.to_string(), mode.as_str().to_string());
+}
+
+fn get_rich_message_profile(settings: &BotSettings, chat_id: ChatId) -> RichMessageProfile {
+    let key = chat_id.0.to_string();
+    settings
+        .rich_message_profile
+        .get(&key)
+        .and_then(|s| parse_rich_message_profile(s))
+        .unwrap_or(RICH_MESSAGE_PROFILE_DEFAULT)
+}
+
+fn set_rich_message_profile(
+    settings: &mut BotSettings,
+    chat_id: ChatId,
+    profile: RichMessageProfile,
+) {
+    settings
+        .rich_message_profile
+        .insert(chat_id.0.to_string(), profile.as_str().to_string());
+}
+
+fn get_rich_message_rtl(settings: &BotSettings, chat_id: ChatId) -> bool {
+    settings
+        .rich_message_rtl
         .get(&chat_id.0.to_string())
         .copied()
-        .unwrap_or(SILENT_MODE_DEFAULT)
+        .unwrap_or(RICH_MESSAGE_RTL_DEFAULT)
+}
+
+fn set_rich_message_rtl(settings: &mut BotSettings, chat_id: ChatId, enabled: bool) {
+    settings
+        .rich_message_rtl
+        .insert(chat_id.0.to_string(), enabled);
+}
+
+fn get_rich_message_draft(settings: &BotSettings, chat_id: ChatId) -> bool {
+    settings
+        .rich_message_draft
+        .get(&chat_id.0.to_string())
+        .copied()
+        .unwrap_or(RICH_MESSAGE_DRAFT_DEFAULT)
+}
+
+fn set_rich_message_draft(settings: &mut BotSettings, chat_id: ChatId, enabled: bool) {
+    settings
+        .rich_message_draft
+        .insert(chat_id.0.to_string(), enabled);
+}
+
+fn format_rich_message_prompt_guidance(
+    mode: RichMessageMode,
+    profile: RichMessageProfile,
+    is_rtl: bool,
+) -> String {
+    let direction_guidance = if is_rtl {
+        "Rich Message direction is RTL. Keep the user's language natural, but expect Telegram to render the Rich Message right-to-left."
+    } else {
+        "Rich Message direction is LTR."
+    };
+
+    match mode {
+        RichMessageMode::Off => format!(
+            "Telegram Rich Message delivery for this chat is OFF. Use ordinary Markdown for readability, and do not rely on Telegram Rich Message-only Markdown/HTML features because the final response will use the classic Telegram path. {direction_guidance}\n\n"
+        ),
+        RichMessageMode::Auto | RichMessageMode::On => {
+            let delivery = match mode {
+                RichMessageMode::Auto => {
+                    "AUTO: Telegram Rich Messages are used when they avoid splitting/file attachments or preserve rich-only blocks such as Markdown tables"
+                }
+                RichMessageMode::On => {
+                    "ON: Telegram Rich Messages are preferred for all eligible final responses"
+                }
+                RichMessageMode::Off => unreachable!(),
+            };
+            let profile_guidance = match profile {
+                RichMessageProfile::Safe => {
+                    "Profile is SAFE: prefer Telegram Rich Markdown text structures. Media attachment blocks and unsupported raw HTML are escaped by the bot, so do not use arbitrary HTML/media syntax unless the user explicitly asks for literal source."
+                }
+                RichMessageProfile::Full => {
+                    "Profile is FULL: Telegram Rich Markdown and official Rich HTML tags may be used when they improve the answer. Still avoid surprising media/HTML unless it directly helps the user's request."
+                }
+            };
+
+            format!(
+                "Telegram Rich Message delivery for this chat is {delivery}.\n\
+                 RICH MESSAGE RESPONSE FORMAT RULES:\n\
+                 - Treat your final answer as the rendered message body, not as a source-code example.\n\
+                 - Preferred final-answer format: Telegram Rich Markdown. Use normal Markdown syntax directly in the answer: headings, paragraphs, bullet/numbered lists, task lists, block quotes, Markdown tables, details/summary, footnotes, and math blocks when useful.\n\
+                 - Rich HTML may be used only when it is appropriate for the active profile. {profile_guidance}\n\
+                 - Never wrap the whole final answer in triple-backtick fences just because it contains Markdown or HTML.\n\
+                 - Never wrap Markdown tables or Rich HTML/Markdown markup in code fences unless the user explicitly asks to see literal Markdown/HTML source.\n\
+                 - Use fenced code blocks only for actual code, logs, shell commands, JSON/source snippets, or other content that should visually render as code.\n\
+                 - If the user asks for a table/table-like Markdown, output the table directly, for example:\n\
+                   | 항목 | 설명 | 상태 |\n\
+                   |---|---|---|\n\
+                   | 기획 | 요구사항 정리 | 완료 |\n\
+                 - If the user asks for literal Markdown/HTML source, then and only then show that source in an appropriate fenced code block labeled markdown or html.\n\
+                 - {direction_guidance}\n\n"
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_mode_tests {
+    use super::{
+        format_output_mode_status, get_output_mode, set_output_mode, BotSettings, OutputMode,
+    };
+    use teloxide::types::ChatId;
+
+    #[test]
+    fn output_mode_defaults_to_compact() {
+        let settings = BotSettings::default();
+
+        assert_eq!(get_output_mode(&settings, ChatId(1)), OutputMode::Compact);
+    }
+
+    #[test]
+    fn legacy_silent_true_maps_to_compact() {
+        let mut settings = BotSettings::default();
+        settings.silent.insert("1".to_string(), true);
+
+        assert_eq!(get_output_mode(&settings, ChatId(1)), OutputMode::Compact);
+    }
+
+    #[test]
+    fn legacy_silent_false_maps_to_verbose() {
+        let mut settings = BotSettings::default();
+        settings.silent.insert("1".to_string(), false);
+
+        assert_eq!(get_output_mode(&settings, ChatId(1)), OutputMode::Verbose);
+    }
+
+    #[test]
+    fn explicit_output_mode_wins_over_legacy_silent() {
+        let mut settings = BotSettings::default();
+        settings.silent.insert("1".to_string(), false);
+        settings
+            .output_mode
+            .insert("1".to_string(), "final".to_string());
+
+        assert_eq!(get_output_mode(&settings, ChatId(1)), OutputMode::FinalOnly);
+    }
+
+    #[test]
+    fn setting_final_mode_updates_legacy_silent_for_safe_rollback() {
+        let mut settings = BotSettings::default();
+        set_output_mode(&mut settings, ChatId(1), OutputMode::FinalOnly);
+
+        assert_eq!(
+            settings.output_mode.get("1").map(String::as_str),
+            Some("final")
+        );
+        assert_eq!(settings.silent.get("1").copied(), Some(true));
+    }
+
+    #[test]
+    fn silent_status_lists_options_without_cycle_prompt() {
+        let status = format_output_mode_status(OutputMode::Compact, false);
+
+        assert!(status.contains("Current output mode"));
+        assert!(status.contains("/silent compact"));
+        assert!(status.contains("/silent final"));
+        assert!(status.contains("/silent verbose"));
+        assert!(!status.contains("Cycle:"));
+    }
+}
+
+#[cfg(test)]
+mod rich_message_mode_tests {
+    use super::{
+        build_system_prompt, format_rich_message_mode_status, format_rich_message_prompt_guidance,
+        get_rich_message_draft, get_rich_message_mode, get_rich_message_profile,
+        get_rich_message_rtl, parse_rich_message_mode, parse_rich_message_profile,
+        rich_message_content_is_within_limits, sanitize_rich_markdown, set_rich_message_draft,
+        set_rich_message_mode, set_rich_message_profile, set_rich_message_rtl,
+        should_try_rich_message, telegram_retry_after_seconds, BotSettings, RichMessageMode,
+        RichMessageProfile, TELEGRAM_MSG_LIMIT,
+    };
+    use teloxide::types::ChatId;
+
+    #[test]
+    fn rich_message_mode_defaults_to_auto() {
+        let settings = BotSettings::default();
+
+        assert_eq!(
+            get_rich_message_mode(&settings, ChatId(1)),
+            RichMessageMode::Auto
+        );
+        assert_eq!(
+            get_rich_message_profile(&settings, ChatId(1)),
+            RichMessageProfile::Safe
+        );
+        assert!(!get_rich_message_rtl(&settings, ChatId(1)));
+        assert!(!get_rich_message_draft(&settings, ChatId(1)));
+    }
+
+    #[test]
+    fn rich_message_mode_parse_aliases() {
+        assert_eq!(parse_rich_message_mode("off"), Some(RichMessageMode::Off));
+        assert_eq!(parse_rich_message_mode("auto"), Some(RichMessageMode::Auto));
+        assert_eq!(parse_rich_message_mode("on"), Some(RichMessageMode::On));
+        assert_eq!(
+            parse_rich_message_mode("enabled"),
+            Some(RichMessageMode::On)
+        );
+        assert_eq!(parse_rich_message_mode("bogus"), None);
+        assert_eq!(
+            parse_rich_message_profile("full"),
+            Some(RichMessageProfile::Full)
+        );
+        assert_eq!(
+            parse_rich_message_profile("safe"),
+            Some(RichMessageProfile::Safe)
+        );
+    }
+
+    #[test]
+    fn setting_rich_message_options_persist_per_chat() {
+        let mut settings = BotSettings::default();
+
+        set_rich_message_mode(&mut settings, ChatId(1), RichMessageMode::Off);
+        set_rich_message_mode(&mut settings, ChatId(2), RichMessageMode::On);
+        set_rich_message_profile(&mut settings, ChatId(2), RichMessageProfile::Full);
+        set_rich_message_rtl(&mut settings, ChatId(2), true);
+        set_rich_message_draft(&mut settings, ChatId(2), true);
+
+        assert_eq!(
+            get_rich_message_mode(&settings, ChatId(1)),
+            RichMessageMode::Off
+        );
+        assert_eq!(
+            get_rich_message_mode(&settings, ChatId(2)),
+            RichMessageMode::On
+        );
+        assert_eq!(
+            get_rich_message_profile(&settings, ChatId(2)),
+            RichMessageProfile::Full
+        );
+        assert!(get_rich_message_rtl(&settings, ChatId(2)));
+        assert!(get_rich_message_draft(&settings, ChatId(2)));
+    }
+
+    #[test]
+    fn rich_message_status_lists_options() {
+        let status = format_rich_message_mode_status(
+            RichMessageMode::Auto,
+            RichMessageProfile::Safe,
+            false,
+            false,
+            false,
+        );
+
+        assert!(status.contains("Current Rich Message settings"));
+        assert!(status.contains("/rich off"));
+        assert!(status.contains("/rich auto"));
+        assert!(status.contains("/rich on"));
+        assert!(status.contains("/rich safe"));
+        assert!(status.contains("/rich full"));
+        assert!(status.contains("/rich rtl on|off"));
+        assert!(status.contains("/rich draft on|off"));
+    }
+
+    #[test]
+    fn rich_message_prompt_guidance_tracks_delivery_state() {
+        let off = format_rich_message_prompt_guidance(
+            RichMessageMode::Off,
+            RichMessageProfile::Safe,
+            false,
+        );
+        let on = format_rich_message_prompt_guidance(
+            RichMessageMode::On,
+            RichMessageProfile::Safe,
+            false,
+        );
+        let full_rtl = format_rich_message_prompt_guidance(
+            RichMessageMode::Auto,
+            RichMessageProfile::Full,
+            true,
+        );
+
+        assert!(off.contains("delivery for this chat is OFF"));
+        assert!(off.contains("classic Telegram path"));
+        assert!(on.contains("delivery for this chat is ON"));
+        assert!(on.contains("RICH MESSAGE RESPONSE FORMAT RULES"));
+        assert!(on.contains("Treat your final answer as the rendered message body"));
+        assert!(on.contains("If the user asks for a table/table-like Markdown"));
+        assert!(on.contains("| 항목 | 설명 | 상태 |"));
+        assert!(on.contains("Never wrap the whole final answer"));
+        assert!(on.contains("literal Markdown/HTML source"));
+        assert!(full_rtl.contains("Profile is FULL"));
+        assert!(full_rtl.contains("right-to-left"));
+    }
+
+    #[test]
+    fn system_prompt_includes_rich_message_guidance() {
+        let guidance = format_rich_message_prompt_guidance(
+            RichMessageMode::On,
+            RichMessageProfile::Safe,
+            false,
+        );
+        let prompt = build_system_prompt(
+            "You are chatting with a user through Telegram.",
+            "/tmp",
+            123,
+            "bot_key",
+            "",
+            None,
+            "",
+            "",
+            None,
+            12,
+            "Telegram",
+            &guidance,
+        );
+
+        assert!(prompt.contains("Telegram Rich Message delivery for this chat is ON"));
+        assert!(prompt.contains("RICH MESSAGE RESPONSE FORMAT RULES"));
+        assert!(prompt.contains("Treat your final answer as the rendered message body"));
+        assert!(prompt.contains("Never wrap Markdown tables"));
+    }
+
+    #[test]
+    fn rich_message_auto_tries_for_long_content_but_not_plain_short_text() {
+        let short = "hello";
+        let long = "x".repeat(TELEGRAM_MSG_LIMIT + 1);
+
+        assert!(!should_try_rich_message(RichMessageMode::Auto, short));
+        assert!(should_try_rich_message(RichMessageMode::Auto, &long));
+        assert!(should_try_rich_message(RichMessageMode::On, short));
+        assert!(!should_try_rich_message(RichMessageMode::Off, &long));
+    }
+
+    #[test]
+    fn rich_message_auto_tries_for_markdown_tables() {
+        let table = "| 항목 | 설명 |\n|---|---|\n| 기획 | 요구사항 정리 |";
+        let fenced_table = "```md\n| 항목 | 설명 |\n|---|---|\n| 기획 | 요구사항 정리 |\n```";
+
+        assert!(should_try_rich_message(RichMessageMode::Auto, table));
+        assert!(!should_try_rich_message(
+            RichMessageMode::Auto,
+            fenced_table
+        ));
+    }
+
+    #[test]
+    fn rich_message_auto_tries_for_rich_html_blocks() {
+        let html_table =
+            "<table><tr><th>항목</th><th>상태</th></tr><tr><td>기획</td><td>완료</td></tr></table>";
+        let rich_tag = "<tg-math-block>E = mc^2</tg-math-block>";
+        let fenced_html_table = format!("```html\n{html_table}\n```");
+
+        assert!(should_try_rich_message(RichMessageMode::Auto, html_table));
+        assert!(should_try_rich_message(RichMessageMode::Auto, rich_tag));
+        assert!(!should_try_rich_message(
+            RichMessageMode::Auto,
+            &fenced_html_table
+        ));
+    }
+
+    #[test]
+    fn rich_message_limits_are_conservative() {
+        let too_many_lines = (0..501)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let too_long = "가".repeat(32_769);
+
+        assert!(!rich_message_content_is_within_limits(&too_many_lines));
+        assert!(!rich_message_content_is_within_limits(&too_long));
+        assert!(rich_message_content_is_within_limits("normal text"));
+    }
+
+    #[test]
+    fn rich_message_retry_after_is_parsed_from_raw_api_body() {
+        let body = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":7}}"#;
+
+        assert_eq!(telegram_retry_after_seconds(body), Some(7));
+        assert_eq!(telegram_retry_after_seconds(r#"{"ok":true}"#), None);
+        assert_eq!(telegram_retry_after_seconds("not json"), None);
+    }
+
+    #[test]
+    fn rich_markdown_sanitizer_preserves_advanced_text_blocks() {
+        let markdown = concat!(
+            "# Report\n\n",
+            "| A | B |\n",
+            "|---|---|\n",
+            "| 1 | 2 |\n\n",
+            "- [x] done\n",
+            "- [ ] next\n\n",
+            "$$E=mc^2$$\n\n",
+            "[^1]: footnote\n\n",
+            "<details open><summary>More</summary>\n",
+            "Body\n",
+            "</details>\n"
+        );
+
+        let sanitized = sanitize_rich_markdown(markdown, RichMessageProfile::Safe);
+
+        assert!(sanitized.contains("| A | B |"));
+        assert!(sanitized.contains("- [x] done"));
+        assert!(sanitized.contains("$$E=mc^2$$"));
+        assert!(sanitized.contains("[^1]: footnote"));
+        assert!(sanitized.contains("<details open>"));
+        assert!(sanitized.contains("<summary>More</summary>"));
+    }
+
+    #[test]
+    fn rich_markdown_sanitizer_escapes_media_and_unsafe_html() {
+        let sanitized = sanitize_rich_markdown(
+            "![](https://example.com/a.png)\n<tg-map lat=\"1\" long=\"2\"/>",
+            RichMessageProfile::Safe,
+        );
+
+        assert!(sanitized.contains("\\![](https://example.com/a.png)"));
+        assert!(sanitized.contains("&lt;tg-map"));
+    }
+
+    #[test]
+    fn rich_markdown_sanitizer_preserves_code_fences_verbatim() {
+        let markdown = "```md\n![](https://example.com/a.png)\n<tg-map/>\n```";
+
+        let sanitized = sanitize_rich_markdown(markdown, RichMessageProfile::Safe);
+
+        assert!(sanitized.contains("![](https://example.com/a.png)"));
+        assert!(sanitized.contains("<tg-map/>"));
+    }
+
+    #[test]
+    fn rich_markdown_full_profile_passes_official_full_surface_verbatim() {
+        let markdown = concat!(
+            "![](https://example.com/photo.jpg \"Photo caption\")\n",
+            "<tg-map lat=\"41.9\" long=\"12.5\" zoom=\"14\"/>\n",
+            "<tg-collage><img src=\"https://example.com/photo.jpg\"/><video src=\"https://example.com/video.mp4\"/></tg-collage>\n",
+            "<tg-slideshow><img src=\"https://example.com/photo.jpg\"/><video src=\"https://example.com/video.mp4\"/></tg-slideshow>\n",
+            "<a name=\"chapter-1\"></a><a href=\"#chapter-1\">Jump</a>\n",
+            "<tg-reference name=\"note-1\">Referenced text</tg-reference>\n",
+            "<tg-time unix=\"1647531900\" format=\"wDT\">22:45 tomorrow</tg-time>\n",
+            "<tg-math-block>E = mc^2</tg-math-block>\n",
+            "<tg-thinking>Thinking...</tg-thinking>\n"
+        );
+
+        let sanitized = sanitize_rich_markdown(markdown, RichMessageProfile::Full);
+
+        assert_eq!(sanitized, markdown);
+        assert!(sanitized.contains("![](https://example.com/photo.jpg"));
+        assert!(sanitized.contains("<tg-map"));
+        assert!(sanitized.contains("<tg-collage>"));
+        assert!(sanitized.contains("<tg-slideshow>"));
+        assert!(sanitized.contains("<tg-thinking>"));
+    }
 }
 
 /// Get the configured Codex reasoning effort for a specific chat_id.
@@ -2323,53 +2965,6 @@ mod live_schedule_tests {
     }
 }
 
-/// Delete a schedule's run-history file. Called from `--cron-remove` so that
-/// removing a schedule also clears its accumulated history (consistent with how
-/// `delete_schedule_entry` already removes the schedule's `.result` companion).
-fn delete_schedule_history(id: &str) {
-    let Some(dir) = schedule_history_dir() else {
-        return;
-    };
-    let path = dir.join(format!("{}.log", id));
-    if path.exists() {
-        match fs::remove_file(&path) {
-            Ok(_) => sched_debug(&format!(
-                "[delete_schedule_history] removed: {}",
-                path.display()
-            )),
-            Err(e) => sched_debug(&format!(
-                "[delete_schedule_history] remove failed: {}, path={}",
-                e,
-                path.display()
-            )),
-        }
-    }
-    let marker = schedule_history_redaction_marker_path(&path);
-    if marker.exists() {
-        let _ = fs::remove_file(marker);
-    }
-    // Lock sentinel created by lock_schedule_history_file. Removing it keeps the
-    // schedule_history dir tidy when a schedule (and its history) goes away.
-    let lock_path = path.with_extension("log.lock");
-    if lock_path.exists() {
-        let _ = fs::remove_file(lock_path);
-    }
-}
-
-/// Public wrapper for `delete_schedule_history` (used by `--cron-remove` in main.rs).
-/// Refuses ids that don't match the generator format — see
-/// `is_valid_schedule_id` for the path-traversal rationale.
-pub fn delete_schedule_history_pub(id: &str) {
-    if !is_valid_schedule_id(id) {
-        sched_debug(&format!(
-            "[delete_schedule_history_pub] rejected id={:?} (must match [0-9A-F]{{8}})",
-            id
-        ));
-        return;
-    }
-    delete_schedule_history(id);
-}
-
 /// Parse a relative time string (e.g. "4h", "30m", "1d") into a future DateTime
 fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
     sched_debug(&format!("[parse_relative_time] input: {:?}", s));
@@ -2967,6 +3562,7 @@ fn build_system_prompt(
     user_message: Option<&str>,
     context_count: usize,
     platform: &str,
+    rich_message_prompt_guidance: &str,
 ) -> String {
     msg_debug(&format!("[build_system_prompt] chat_id={}, bot_username={:?}, bot_display_name={:?}, session_id={:?}, disabled_notice_len={}, role_len={}",
         chat_id, bot_username, bot_display_name, session_id, disabled_notice.len(), role.len()));
@@ -3244,7 +3840,8 @@ fn build_system_prompt(
          IMPORTANT: The user is on {platform} and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
          Never use tools that expect user interaction. If you need clarification, just ask in plain text.\n\n\
-         Response format: Use Markdown by default, but do NOT use Markdown tables.\n\n\
+         Response format: Use Markdown by default. Avoid Markdown tables unless the user explicitly asks for a table or tabular Markdown.\n\n\
+         {rich_message_prompt_guidance}\
          If the user asks about how to use cokacdir, refer to the documentation files in ~/.cokacdir/docs/ for accurate guidance.\n\n\
          ═══════════════════════════════════════\n\
          COKACDIR COMMAND REFERENCE\n\
@@ -3788,8 +4385,27 @@ fn should_attach_response_as_file(response_len: usize, provider_str: &str) -> bo
 const MAX_QUEUE_SIZE: usize = 20;
 /// Default queue mode state for chats without explicit setting
 const QUEUE_MODE_DEFAULT: bool = true;
-/// Default silent mode state for chats without explicit setting
-const SILENT_MODE_DEFAULT: bool = true;
+/// Default output mode for chats without explicit setting
+const OUTPUT_MODE_DEFAULT: OutputMode = OutputMode::Compact;
+/// Default Rich Message behavior for chats without explicit setting. Auto keeps
+/// short plain responses on the classic path and tries Rich Messages when it
+/// materially reduces Telegram splitting/file attachment or preserves rich-only
+/// blocks such as Markdown tables in final output.
+const RICH_MESSAGE_MODE_DEFAULT: RichMessageMode = RichMessageMode::Auto;
+/// Default Rich Message formatting profile for chats without explicit setting.
+/// Safe preserves the previous no-surprise behavior for existing users.
+const RICH_MESSAGE_PROFILE_DEFAULT: RichMessageProfile = RichMessageProfile::Safe;
+/// Default Rich Message direction. Telegram supports `is_rtl`, but most chats
+/// should remain left-to-right unless explicitly configured.
+const RICH_MESSAGE_RTL_DEFAULT: bool = false;
+/// Default Rich Message draft streaming. Drafts are visible ephemeral previews,
+/// so keep them opt-in to preserve `/silent final` semantics for existing users.
+const RICH_MESSAGE_DRAFT_DEFAULT: bool = false;
+/// Telegram Bot API 10.1 Rich Message text limit.
+const RICH_MESSAGE_CHAR_LIMIT: usize = 32_768;
+/// Telegram Bot API 10.1 Rich Message block limit. The current rich path uses a
+/// conservative non-empty-line estimate before falling back to the classic path.
+const RICH_MESSAGE_BLOCK_LIMIT: usize = 500;
 /// Default direct mode state for chats without explicit setting
 const DIRECT_MODE_DEFAULT: bool = false;
 /// Default public access state for group chats without explicit setting
@@ -3938,6 +4554,68 @@ fn load_bot_settings(token: &str) -> BotSettings {
         })
         .unwrap_or_default();
 
+    let output_mode: HashMap<String, String> = entry
+        .get("output_mode")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str()
+                        .and_then(parse_output_mode)
+                        .map(|mode| (k.clone(), mode.as_str().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rich_message_mode: HashMap<String, String> = entry
+        .get("rich_message_mode")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str()
+                        .and_then(parse_rich_message_mode)
+                        .map(|mode| (k.clone(), mode.as_str().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rich_message_profile: HashMap<String, String> = entry
+        .get("rich_message_profile")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str()
+                        .and_then(parse_rich_message_profile)
+                        .map(|profile| (k.clone(), profile.as_str().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rich_message_rtl: HashMap<String, bool> = entry
+        .get("rich_message_rtl")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rich_message_draft: HashMap<String, bool> = entry
+        .get("rich_message_draft")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let direct: HashMap<String, bool> = entry
         .get("direct")
         .and_then(|v| v.as_object())
@@ -4063,6 +4741,11 @@ fn load_bot_settings(token: &str) -> BotSettings {
         models,
         debug,
         silent,
+        output_mode,
+        rich_message_mode,
+        rich_message_profile,
+        rich_message_rtl,
+        rich_message_draft,
         direct,
         context,
         instructions,
@@ -4122,6 +4805,11 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "models": settings.models,
         "debug": settings.debug,
         "silent": settings.silent,
+        "output_mode": settings.output_mode,
+        "rich_message_mode": settings.rich_message_mode,
+        "rich_message_profile": settings.rich_message_profile,
+        "rich_message_rtl": settings.rich_message_rtl,
+        "rich_message_draft": settings.rich_message_draft,
         "direct": settings.direct,
         "context": settings.context,
         "instructions": settings.instructions,
@@ -4385,6 +5073,7 @@ fn is_owner_only_command(text: &str) -> bool {
             | "envvars"
             | "usechrome"
             | "silent"
+            | "rich"
             | "queue"
             | "direct"
             | "contextlevel"
@@ -5139,7 +5828,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("fast", "Toggle Codex fast service tier"),
         teloxide::types::BotCommand::new("debug", "Toggle debug logging"),
         teloxide::types::BotCommand::new("envvars", "Show all environment variables"),
-        teloxide::types::BotCommand::new("silent", "Toggle silent mode (hide tool calls)"),
+        teloxide::types::BotCommand::new("silent", "View/set output mode (compact/final/verbose)"),
+        teloxide::types::BotCommand::new("rich", "View/set Rich Message mode/profile"),
         teloxide::types::BotCommand::new("direct", "Toggle direct mode (group only)"),
         teloxide::types::BotCommand::new("contextlevel", "Set group chat log context count"),
         teloxide::types::BotCommand::new("query", "Send message to AI (/query@bot for groups)"),
@@ -9319,7 +10009,11 @@ async fn handle_message(
     } else if is_cmd(&text, "silent") {
         msg_debug("[handle_message] routing → /silent");
         println!("  [{timestamp}] ◀ [{user_name}] /silent");
-        handle_silent_command(&bot, chat_id, &state, token).await?;
+        handle_silent_command(&bot, chat_id, &text, &state, token).await?;
+    } else if is_cmd(&text, "rich") {
+        msg_debug("[handle_message] routing → /rich");
+        println!("  [{timestamp}] ◀ [{user_name}] /rich");
+        handle_rich_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "queue") {
         msg_debug("[handle_message] routing → /queue");
         println!("  [{timestamp}] ◀ [{user_name}] /queue");
@@ -9592,7 +10286,13 @@ Ask in natural language to manage schedules.
   Minimum 2500ms, recommended 3000ms+.
 <code>/debug</code> — Toggle debug logging
 <code>/envvars</code> — Show all environment variables and their current values
-<code>/silent</code> — Toggle silent mode (hide tool calls)
+<code>/silent</code> — Show current output mode and available options
+<code>/silent final|compact|verbose</code> — Set output mode explicitly
+<code>/rich</code> — Show current Rich Message settings and available options
+<code>/rich off|auto|on</code> — Set Rich Message delivery for eligible final responses
+<code>/rich safe|full</code> — Set Rich rendering profile
+<code>/rich rtl on|off</code> — Set Rich Message direction
+<code>/rich draft on|off</code> — Stream Rich drafts in final-only private chats
 <code>/usechrome</code> — Toggle Chrome browser for Claude (--chrome)
 <code>/instruction &lt;text&gt;</code> — Set system instruction for AI
 <code>/instruction</code> — View current instruction
@@ -13890,31 +14590,214 @@ async fn handle_setendhook_clear_command(
     Ok(())
 }
 
-/// Handle /silent command - toggle silent mode per chat (hide tool calls)
+fn format_output_mode_status(mode: OutputMode, updated: bool) -> String {
+    let heading = if updated {
+        "Output mode updated"
+    } else {
+        "Current output mode"
+    };
+    format!(
+        "{heading}: {}\n{}\n\nAvailable modes:\n/silent compact — {}\n/silent final — {}\n/silent verbose — {}",
+        mode.label(),
+        mode.description(),
+        OutputMode::Compact.description(),
+        OutputMode::FinalOnly.description(),
+        OutputMode::Verbose.description()
+    )
+}
+
+fn format_rich_message_mode_status(
+    mode: RichMessageMode,
+    profile: RichMessageProfile,
+    is_rtl: bool,
+    draft_enabled: bool,
+    updated: bool,
+) -> String {
+    let heading = if updated {
+        "Rich Message settings updated"
+    } else {
+        "Current Rich Message settings"
+    };
+    format!(
+        "{heading}\nDelivery: {} — {}\nProfile: {} — {}\nRTL: {}\nDraft streaming: {}\n\nAvailable commands:\n/rich off — {}\n/rich auto — {}\n/rich on — {}\n/rich safe — {}\n/rich full — {}\n/rich rtl on|off — set InputRichMessage.is_rtl\n/rich draft on|off — stream sendRichMessageDraft previews in final-only private chats",
+        mode.label(),
+        mode.description(),
+        profile.label(),
+        profile.description(),
+        if is_rtl { "on" } else { "off" },
+        if draft_enabled { "on" } else { "off" },
+        RichMessageMode::Off.description(),
+        RichMessageMode::Auto.description(),
+        RichMessageMode::On.description(),
+        RichMessageProfile::Safe.description(),
+        RichMessageProfile::Full.description()
+    )
+}
+
+/// Handle /silent command - configure per-chat output mode.
+///
+/// Bare `/silent` shows the current mode and available options. Explicit
+/// arguments set a mode:
+/// `/silent on|compact`, `/silent off|verbose`, `/silent final`, `/silent status`.
 async fn handle_silent_command(
     bot: &Bot,
     chat_id: ChatId,
+    text: &str,
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let next = {
+    let arg = command_args(text).to_ascii_lowercase();
+    let result: Result<(OutputMode, bool), String> = {
         let mut data = state.lock().await;
-        let key = chat_id.0.to_string();
-        let prev = data
-            .settings
-            .silent
-            .get(&key)
-            .copied()
-            .unwrap_or(SILENT_MODE_DEFAULT);
-        let next = !prev;
-        data.settings.silent.insert(key, next);
-        save_bot_settings(token, &data.settings);
-        next
+        let current = get_output_mode(&data.settings, chat_id);
+        let requested = match arg.as_str() {
+            "" | "status" | "show" => Ok((current, false)),
+            "on" | "compact" | "silent" => Ok((OutputMode::Compact, true)),
+            "off" | "verbose" | "full" | "details" | "detail" => Ok((OutputMode::Verbose, true)),
+            "final" | "final_only" | "final-only" | "quiet" | "quietest" => {
+                Ok((OutputMode::FinalOnly, true))
+            }
+            _ => Err(format!(
+                "Unknown /silent mode: {}\n\nUsage:\n/silent\n/silent status\n/silent on|compact\n/silent off|verbose\n/silent final",
+                arg
+            )),
+        };
+        if let Ok((mode, should_update)) = requested {
+            if should_update {
+                set_output_mode(&mut data.settings, chat_id, mode);
+                save_bot_settings(token, &data.settings);
+            }
+        }
+        requested
     };
-    let status = if next {
-        "🔇 Silent mode: ON"
-    } else {
-        "🔊 Silent mode: OFF"
+    let status = match result {
+        Ok((mode, updated)) => format_output_mode_status(mode, updated),
+        Err(msg) => msg,
+    };
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, status).await)?;
+    Ok(())
+}
+
+/// Handle /rich command - configure Rich Message delivery for final responses.
+///
+/// Bare `/rich` shows the current mode and available options. Explicit
+/// arguments set delivery, formatting profile, direction, or draft streaming:
+/// `/rich off|auto|on`, `/rich safe|full`, `/rich rtl on|off`,
+/// `/rich draft on|off`.
+async fn handle_rich_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg_original = command_args(text);
+    let arg = arg_original.to_ascii_lowercase();
+    let result: Result<(RichMessageMode, RichMessageProfile, bool, bool, bool), String> = {
+        let mut data = state.lock().await;
+        let current = get_rich_message_mode(&data.settings, chat_id);
+        let current_profile = get_rich_message_profile(&data.settings, chat_id);
+        let current_rtl = get_rich_message_rtl(&data.settings, chat_id);
+        let current_draft = get_rich_message_draft(&data.settings, chat_id);
+        let parts = arg.split_whitespace().collect::<Vec<_>>();
+        let requested = match parts.as_slice() {
+            [] | ["status"] | ["show"] => Ok((
+                current,
+                current_profile,
+                current_rtl,
+                current_draft,
+                false,
+            )),
+            ["off"] | ["false"] | ["disabled"] | ["disable"] => Ok((
+                RichMessageMode::Off,
+                current_profile,
+                current_rtl,
+                current_draft,
+                true,
+            )),
+            ["auto"] | ["default"] => Ok((
+                RichMessageMode::Auto,
+                current_profile,
+                current_rtl,
+                current_draft,
+                true,
+            )),
+            ["on"] | ["true"] | ["enabled"] | ["enable"] | ["rich"] => Ok((
+                RichMessageMode::On,
+                current_profile,
+                current_rtl,
+                current_draft,
+                true,
+            )),
+            ["safe"] | ["secure"] | ["text"] | ["text-only"] | ["text_only"] => Ok((
+                current,
+                RichMessageProfile::Safe,
+                current_rtl,
+                current_draft,
+                true,
+            )),
+            ["full"] | ["all"] | ["complete"] | ["100"] | ["100%"] => Ok((
+                RichMessageMode::On,
+                RichMessageProfile::Full,
+                current_rtl,
+                current_draft,
+                true,
+            )),
+            ["profile", value] => match parse_rich_message_profile(value) {
+                Some(profile) => Ok((current, profile, current_rtl, current_draft, true)),
+                None => Err(format!(
+                    "Unknown /rich profile: {}\n\nUsage: /rich profile safe|full",
+                    value
+                )),
+            },
+            ["rtl", value] | ["direction", value] => match *value {
+                "on" | "true" | "yes" | "rtl" => {
+                    Ok((current, current_profile, true, current_draft, true))
+                }
+                "off" | "false" | "no" | "ltr" => {
+                    Ok((current, current_profile, false, current_draft, true))
+                }
+                _ => Err(format!(
+                    "Unknown /rich rtl value: {}\n\nUsage: /rich rtl on|off",
+                    value
+                )),
+            },
+            ["draft", value] | ["drafts", value] | ["stream", value] | ["streaming", value] => {
+                match *value {
+                    "on" | "true" | "yes" | "enable" | "enabled" => {
+                        Ok((current, current_profile, current_rtl, true, true))
+                    }
+                    "off" | "false" | "no" | "disable" | "disabled" => {
+                        Ok((current, current_profile, current_rtl, false, true))
+                    }
+                    _ => Err(format!(
+                        "Unknown /rich draft value: {}\n\nUsage: /rich draft on|off",
+                        value
+                    )),
+                }
+            }
+            _ => Err(format!(
+                "Unknown /rich option: {}\n\nUsage:\n/rich\n/rich status\n/rich off|auto|on\n/rich safe|full\n/rich rtl on|off\n/rich draft on|off",
+                arg_original
+            )),
+        };
+        if let Ok((mode, profile, is_rtl, draft_enabled, should_update)) = requested {
+            if should_update {
+                set_rich_message_mode(&mut data.settings, chat_id, mode);
+                set_rich_message_profile(&mut data.settings, chat_id, profile);
+                set_rich_message_rtl(&mut data.settings, chat_id, is_rtl);
+                set_rich_message_draft(&mut data.settings, chat_id, draft_enabled);
+                save_bot_settings(token, &data.settings);
+            }
+        }
+        requested
+    };
+    let status = match result {
+        Ok((mode, profile, is_rtl, draft_enabled, updated)) => {
+            format_rich_message_mode_status(mode, profile, is_rtl, draft_enabled, updated)
+        }
+        Err(msg) => msg,
     };
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
@@ -15413,6 +16296,7 @@ async fn handle_text_message(
         context_count,
         bot_username_for_prompt,
         bot_display_name_for_prompt,
+        rich_message_prompt_guidance,
         chrome_enabled,
         effort,
         codex_fast_enabled,
@@ -15452,6 +16336,11 @@ async fn handle_text_message(
             .unwrap_or(12);
         let buname = data.bot_username.clone();
         let bdname = data.bot_display_name.clone();
+        let rich_prompt_guidance = format_rich_message_prompt_guidance(
+            get_rich_message_mode(&data.settings, chat_id),
+            get_rich_message_profile(&data.settings, chat_id),
+            get_rich_message_rtl(&data.settings, chat_id),
+        );
         let chrome = data
             .settings
             .use_chrome
@@ -15464,7 +16353,18 @@ async fn handle_text_message(
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
         (
-            info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome, effort,
+            info,
+            tools,
+            uploads,
+            mdl,
+            hist,
+            instr,
+            ctx_count,
+            buname,
+            bdname,
+            rich_prompt_guidance,
+            chrome,
+            effort,
             codex_fast,
         )
     };
@@ -15497,11 +16397,11 @@ async fn handle_text_message(
     // It will be added together with the assistant response in the spawned task,
     // only on successful completion. On cancel, nothing is recorded.
 
-    // Placeholder send is deferred into the spawned polling task — it happens
-    // after the group_lock is acquired there, matching the prior ordering
-    // (placeholder appears once cross-bot serialization permits this bot to
-    // start). This also avoids leaving an orphan placeholder if `/stop`
-    // arrives during lock wait.
+    // User-visible start notification is deferred into the spawned polling
+    // task. In verbose/compact modes this is a placeholder sent after the
+    // group_lock is acquired; in final-only mode it is intentionally skipped.
+    // This preserves cross-bot serialization and avoids leaving an orphan
+    // placeholder if `/stop` arrives during lock wait.
 
     // Sanitize input
     let sanitized_input = ai_screen::sanitize_user_input(user_text);
@@ -15565,6 +16465,7 @@ async fn handle_text_message(
         Some(user_text),
         context_count,
         &platform,
+        &rich_message_prompt_guidance,
     );
 
     // Create channel for streaming
@@ -15618,13 +16519,14 @@ async fn handle_text_message(
         // which head-of-line-blocked the per-chat FIFO worker — see
         // `run_chat_worker`). The cancel_token reservation in the inline
         // section already guards this bot's per-chat slot, so doing the wait
-        // here only delays the placeholder send, not subsequent messages.
+        // here only delays the start notification/final-only execution, not
+        // subsequent messages.
         let group_lock = acquire_group_chat_lock(chat_id.0).await;
 
         // /stop arriving while we waited for the group lock sets cancelled=true.
         // AI has not been spawned yet (we spawn it below, after the lock is
-        // acquired and the placeholder is sent), so cleanup is just state +
-        // queue processing; no child to SIGKILL, no API calls billed.
+        // acquired and the output-mode gate has run), so cleanup is just state
+        // + queue processing; no child to SIGKILL, no API calls billed.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
             msg_debug(&format!(
                 "[queue:trigger] chat_id={}, source=text_cancelled_during_lock",
@@ -15640,28 +16542,50 @@ async fn handle_text_message(
         }
         let _group_lock = group_lock; // hold group chat lock until task ends
 
-        // Send placeholder message (was previously inline before this spawn).
-        // AI is spawned only after the placeholder succeeds, so a network
-        // error here means no AI subprocess to clean up.
-        shared_rate_limit_wait(&state_owned, chat_id).await;
-        let placeholder = match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
-            Ok(m) => m,
-            Err(e) => {
-                msg_debug(&format!(
-                    "[queue:trigger] chat_id={}, source=text_placeholder_error: {}",
-                    chat_id.0, e
-                ));
-                {
-                    let mut data = state_owned.lock().await;
-                    remove_cancel_token_locked(&mut data, chat_id);
-                }
-                process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
-                return;
-            }
+        let (polling_time_ms, output_mode, rich_draft_enabled) = {
+            let data = state_owned.lock().await;
+            (
+                data.polling_time_ms,
+                get_output_mode(&data.settings, chat_id),
+                get_rich_message_draft(&data.settings, chat_id),
+            )
         };
-        let mut placeholder_msg_id = placeholder.id;
+        let final_only_mode = output_mode.is_final_only();
 
-        // Now that the lock is held and the placeholder is up, spawn the AI
+        // Send placeholder message unless the chat is in final-only mode.
+        //
+        // AI is spawned only after this decision. In normal/compact modes, a
+        // placeholder failure still aborts before any AI subprocess/API call.
+        // In final-only mode there is intentionally no visible "safe point":
+        // the user asked for only the terminal message.
+        let mut placeholder_msg_id = if final_only_mode {
+            msg_debug(&format!(
+                "[handle_text_message] final-only mode: skipping placeholder for chat_id={}",
+                chat_id.0
+            ));
+            None
+        } else {
+            shared_rate_limit_wait(&state_owned, chat_id).await;
+            let placeholder =
+                match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        msg_debug(&format!(
+                            "[queue:trigger] chat_id={}, source=text_placeholder_error: {}",
+                            chat_id.0, e
+                        ));
+                        {
+                            let mut data = state_owned.lock().await;
+                            remove_cancel_token_locked(&mut data, chat_id);
+                        }
+                        process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+                        return;
+                    }
+                };
+            Some(placeholder.id)
+        };
+
+        // Now that the lock is held and the output-mode gate has run, spawn the AI
         // backend. This was previously inline in `handle_text_message`, but
         // running it before the lock was held meant that two bots in the
         // same group chat could both have their AI subprocesses running
@@ -15835,11 +16759,11 @@ async fn handle_text_message(
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut last_confirmed_len: usize = 0;
+        let rich_draft_id = (chrono::Utc::now().timestamp_millis() % 2_147_483_647).max(1);
+        let mut last_rich_draft_len: usize = 0;
+        let mut sent_empty_rich_draft = false;
 
-        let (polling_time_ms, silent_mode) = {
-            let data = state_owned.lock().await;
-            (data.polling_time_ms, is_silent(&data.settings, chat_id))
-        };
+        let silent_mode = !output_mode.is_verbose();
         let mut queue_done = false;
         let mut response_rendered = false;
         while !done || !queue_done {
@@ -15900,8 +16824,8 @@ async fn handle_text_message(
                                 let summary = format_tool_input(&name, &input);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 println!("  [{ts}]   ⚙ {name}: {summary}");
-                                msg_debug(&format!("[polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent_mode={}, response_len={}, ends_with_nl={}",
-                                        name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
+                                msg_debug(&format!("[polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, output_mode={}, response_len={}, ends_with_nl={}",
+                                        name, truncate_str(&input, 200), pending_cokacdir, output_mode.as_str(), full_response.len(), full_response.ends_with('\n')));
                                 raw_entries.push(RawPayloadEntry {
                                     tag: "ToolUse".into(),
                                     content: format!("{}: {}", name, input),
@@ -15955,6 +16879,9 @@ async fn handle_text_message(
                                     if std::mem::take(&mut suppress_tool_display) {
                                         println!("  [{ts}]   ↩ cokacdir (chat_log, suppressed)");
                                         msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
+                                    } else if final_only_mode {
+                                        println!("  [{ts}]   ↩ cokacdir: {content}");
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir/final_only: skipped, total={}", chat_id.0, full_response.len()));
                                     } else {
                                         println!("  [{ts}]   ↩ cokacdir: {content}");
                                         let formatted = format_cokacdir_result(&content);
@@ -16010,10 +16937,15 @@ async fn handle_text_message(
                                         tag: "TaskNotification".into(),
                                         content: summary.clone(),
                                     });
-                                    let _fr_before = full_response.len();
-                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                    msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
-                                            chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    if !final_only_mode {
+                                        let _fr_before = full_response.len();
+                                        full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    } else {
+                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification/final_only: skipped, summary={:?}, total={}",
+                                                chat_id.0, truncate_str(&summary, 200), full_response.len()));
+                                    }
                                 }
                             }
                             StreamMessage::Done {
@@ -16102,8 +17034,57 @@ async fn handle_text_message(
                     }
                 }
 
-                if !done {
+                if !done && final_only_mode && rich_draft_enabled && chat_id.0 > 0 {
+                    let (rich_mode, rich_profile, is_rtl) = {
+                        let data = state_owned.lock().await;
+                        (
+                            get_rich_message_mode(&data.settings, chat_id),
+                            get_rich_message_profile(&data.settings, chat_id),
+                            get_rich_message_rtl(&data.settings, chat_id),
+                        )
+                    };
+                    if rich_mode != RichMessageMode::Off {
+                        let draft_markdown = if full_response.trim().is_empty() {
+                            if rich_profile == RichMessageProfile::Full && !sent_empty_rich_draft {
+                                sent_empty_rich_draft = true;
+                                Some("<tg-thinking>Thinking...</tg-thinking>".to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            let draft_end = floor_char_boundary(
+                                &full_response,
+                                full_response.len().min(RICH_MESSAGE_CHAR_LIMIT),
+                            );
+                            if draft_end > last_rich_draft_len {
+                                last_rich_draft_len = draft_end;
+                                Some(sanitize_rich_markdown(
+                                    &normalize_empty_lines(&full_response[..draft_end]),
+                                    rich_profile,
+                                ))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(markdown) = draft_markdown {
+                            let _ = send_rich_message_draft_markdown(
+                                &bot_owned,
+                                chat_id,
+                                rich_draft_id,
+                                &markdown,
+                                is_rtl,
+                                &state_owned,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if !done && !final_only_mode {
                     // ── Rolling placeholder pattern (unified for all chats) ──
+                    let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                        continue;
+                    };
                     let threshold = file_attach_threshold();
                     let delta_end =
                         floor_char_boundary(&full_response, full_response.len().min(threshold));
@@ -16116,17 +17097,21 @@ async fn handle_text_message(
                         if html_delta.trim().is_empty() {
                             // Delta is whitespace-only after normalization — skip edit, just update position
                             msg_debug(&format!("[rolling_ph] SKIP empty delta: placeholder_msg_id={}, delta_bytes={}, confirmed={}→{}",
-                                placeholder_msg_id, delta.len(), last_confirmed_len, delta_end));
+                                current_placeholder_msg_id, delta.len(), last_confirmed_len, delta_end));
                             last_confirmed_len = delta_end;
                         } else {
                             msg_debug(&format!("[rolling_ph] EDIT delta: placeholder_msg_id={}, delta_len={}, html_len={}, confirmed={}→{}",
-                                placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, full_response.len()));
+                                current_placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, full_response.len()));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             if html_delta.len() <= TELEGRAM_MSG_LIMIT {
                                 let _ = tg!(
                                     "edit_message",
                                     bot_owned
-                                        .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                        .edit_message_text(
+                                            chat_id,
+                                            current_placeholder_msg_id,
+                                            &html_delta
+                                        )
                                         .parse_mode(ParseMode::Html)
                                         .await
                                 );
@@ -16145,7 +17130,9 @@ async fn handle_text_message(
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let _ = tg!(
                                         "delete_message",
-                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                        bot_owned
+                                            .delete_message(chat_id, current_placeholder_msg_id)
+                                            .await
                                     );
                                 } else {
                                     let truncated_delta =
@@ -16155,7 +17142,7 @@ async fn handle_text_message(
                                         bot_owned
                                             .edit_message_text(
                                                 chat_id,
-                                                placeholder_msg_id,
+                                                current_placeholder_msg_id,
                                                 &truncated_delta
                                             )
                                             .await
@@ -16164,13 +17151,13 @@ async fn handle_text_message(
                             }
                             last_confirmed_len = delta_end;
                             // Create new placeholder for next cycle
-                            let old_ph_id = placeholder_msg_id;
+                            let old_ph_id = current_placeholder_msg_id;
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             match tg!("send_message", bot_owned.send_message(chat_id, "...").await)
                             {
                                 Ok(new_ph) => {
-                                    placeholder_msg_id = new_ph.id;
-                                    msg_debug(&format!("[rolling_ph] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, placeholder_msg_id));
+                                    placeholder_msg_id = Some(new_ph.id);
+                                    msg_debug(&format!("[rolling_ph] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, new_ph.id));
                                 }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -16178,7 +17165,7 @@ async fn handle_text_message(
                                         "  [{ts}]   ⚠ new placeholder failed: {}",
                                         redact_err(&e)
                                     );
-                                    msg_debug(&format!("[rolling_ph] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
+                                    msg_debug(&format!("[rolling_ph] NEW placeholder FAILED: keeping msg_id={}, err={}", current_placeholder_msg_id, e));
                                 }
                             }
                             last_edit_text.clear();
@@ -16197,7 +17184,11 @@ async fn handle_text_message(
                                 &state_owned,
                                 chat_id,
                                 bot_owned
-                                    .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                    .edit_message_text(
+                                        chat_id,
+                                        current_placeholder_msg_id,
+                                        &html_text
+                                    )
                                     .parse_mode(ParseMode::Html)
                                     .await
                             ) {
@@ -16265,132 +17256,179 @@ async fn handle_text_message(
                     last_confirmed_len = 0;
                 }
                 let remaining = &full_response[last_confirmed_len..];
-                msg_debug(&format!("[rolling_ph] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                    placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-                if was_originally_empty || remaining.trim().is_empty() {
-                    // No new content — delete the spinner placeholder
-                    msg_debug(&format!(
-                        "[rolling_ph] FINAL DELETE placeholder: msg_id={}",
-                        placeholder_msg_id
-                    ));
-                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!(
-                        "delete_message",
-                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                    );
-                } else if should_attach_response_as_file(full_response.len(), provider_str) {
-                    // Response too large — send as file attachment
-                    msg_debug(&format!(
-                        "[rolling_ph] FINAL FILE ATTACH: total={}",
-                        full_response.len()
-                    ));
-                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!(
-                        "edit_message",
-                        bot_owned
-                            .edit_message_text(
-                                chat_id,
-                                placeholder_msg_id,
-                                "\u{1f4c4} Response attached as file"
-                            )
-                            .await
-                    );
-                    send_response_as_file(
-                        &bot_owned,
-                        chat_id,
-                        &final_response,
-                        &state_owned,
-                        "response",
-                    )
-                    .await;
-                } else {
-                    let normalized_remaining = normalize_empty_lines(remaining);
-                    let html_remaining = markdown_to_telegram_html(&normalized_remaining);
-                    msg_debug(&format!(
-                        "[rolling_ph] FINAL EDIT placeholder: msg_id={}, html_len={}",
-                        placeholder_msg_id,
-                        html_remaining.len()
-                    ));
-                    if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
-                        if let Err(e) = tg!(
+                if let Some(current_placeholder_msg_id) = placeholder_msg_id {
+                    msg_debug(&format!("[rolling_ph] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
+                        current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                    if was_originally_empty || remaining.trim().is_empty() {
+                        // No new content — delete the spinner placeholder
+                        msg_debug(&format!(
+                            "[rolling_ph] FINAL DELETE placeholder: msg_id={}",
+                            current_placeholder_msg_id
+                        ));
+                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                        let _ = tg!(
+                            "delete_message",
+                            bot_owned
+                                .delete_message(chat_id, current_placeholder_msg_id)
+                                .await
+                        );
+                    } else if should_attach_response_as_file(full_response.len(), provider_str) {
+                        // Response too large — send as file attachment
+                        msg_debug(&format!(
+                            "[rolling_ph] FINAL FILE ATTACH: total={}",
+                            full_response.len()
+                        ));
+                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                        let _ = tg!(
                             "edit_message",
                             bot_owned
-                                .edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
-                                .parse_mode(ParseMode::Html)
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    "\u{1f4c4} Response attached as file",
+                                )
                                 .await
-                        ) {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!(
-                                "  [{ts}]   ⚠ edit_message failed (final HTML): {}",
-                                redact_err(&e)
-                            );
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!(
+                        );
+                        send_response_as_file(
+                            &bot_owned,
+                            chat_id,
+                            &final_response,
+                            &state_owned,
+                            "response",
+                        )
+                        .await;
+                    } else {
+                        let normalized_remaining = normalize_empty_lines(remaining);
+                        let html_remaining = markdown_to_telegram_html(&normalized_remaining);
+                        let rich_profile = {
+                            let data = state_owned.lock().await;
+                            get_rich_message_profile(&data.settings, chat_id)
+                        };
+                        let rich_markdown_remaining =
+                            sanitize_rich_markdown(&normalized_remaining, rich_profile);
+                        msg_debug(&format!(
+                            "[rolling_ph] FINAL EDIT placeholder: msg_id={}, html_len={}, rich_markdown_len={}",
+                            current_placeholder_msg_id,
+                            html_remaining.len(),
+                            rich_markdown_remaining.len()
+                        ));
+                        if try_edit_rich_message_markdown_if_enabled(
+                            &bot_owned,
+                            chat_id,
+                            current_placeholder_msg_id,
+                            &rich_markdown_remaining,
+                            &state_owned,
+                        )
+                        .await
+                        {
+                            // Rich edit succeeded; no classic fallback needed.
+                        } else if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
+                            if let Err(e) = tg!(
                                 "edit_message",
                                 bot_owned
                                     .edit_message_text(
                                         chat_id,
-                                        placeholder_msg_id,
-                                        &normalized_remaining
+                                        current_placeholder_msg_id,
+                                        &html_remaining
                                     )
+                                    .parse_mode(ParseMode::Html)
                                     .await
-                            );
-                        }
-                    } else {
-                        let send_result = send_long_message(
-                            &bot_owned,
-                            chat_id,
-                            &html_remaining,
-                            Some(ParseMode::Html),
-                            &state_owned,
-                        )
-                        .await;
-                        match send_result {
-                            Ok(_) => {
+                            ) {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!(
+                                    "  [{ts}]   ⚠ edit_message failed (final HTML): {}",
+                                    redact_err(&e)
+                                );
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
                                 let _ = tg!(
-                                    "delete_message",
-                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(
+                                            chat_id,
+                                            current_placeholder_msg_id,
+                                            &normalized_remaining
+                                        )
+                                        .await
                                 );
                             }
-                            Err(_) => {
-                                let fallback = send_long_message(
-                                    &bot_owned,
-                                    chat_id,
-                                    &normalized_remaining,
-                                    None,
-                                    &state_owned,
-                                )
-                                .await;
-                                match fallback {
-                                    Ok(_) => {
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!(
-                                            "delete_message",
-                                            bot_owned
-                                                .delete_message(chat_id, placeholder_msg_id)
-                                                .await
-                                        );
-                                    }
-                                    Err(_) => {
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let truncated =
-                                            truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
-                                        let _ = tg!(
-                                            "edit_message",
-                                            bot_owned
-                                                .edit_message_text(
-                                                    chat_id,
-                                                    placeholder_msg_id,
-                                                    &truncated
-                                                )
-                                                .await
-                                        );
+                        } else {
+                            let send_result = send_long_message(
+                                &bot_owned,
+                                chat_id,
+                                &html_remaining,
+                                Some(ParseMode::Html),
+                                &state_owned,
+                            )
+                            .await;
+                            match send_result {
+                                Ok(_) => {
+                                    shared_rate_limit_wait(&state_owned, chat_id).await;
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned
+                                            .delete_message(chat_id, current_placeholder_msg_id)
+                                            .await
+                                    );
+                                }
+                                Err(_) => {
+                                    let fallback = send_long_message(
+                                        &bot_owned,
+                                        chat_id,
+                                        &normalized_remaining,
+                                        None,
+                                        &state_owned,
+                                    )
+                                    .await;
+                                    match fallback {
+                                        Ok(_) => {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let _ = tg!(
+                                                "delete_message",
+                                                bot_owned
+                                                    .delete_message(
+                                                        chat_id,
+                                                        current_placeholder_msg_id,
+                                                    )
+                                                    .await
+                                            );
+                                        }
+                                        Err(_) => {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let truncated = truncate_str(
+                                                &normalized_remaining,
+                                                TELEGRAM_MSG_LIMIT,
+                                            );
+                                            let _ = tg!(
+                                                "edit_message",
+                                                bot_owned
+                                                    .edit_message_text(
+                                                        chat_id,
+                                                        current_placeholder_msg_id,
+                                                        &truncated
+                                                    )
+                                                    .await
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                } else if !was_originally_empty && !remaining.trim().is_empty() {
+                    let normalized_remaining = normalize_empty_lines(remaining);
+                    msg_debug(&format!(
+                        "[rolling_ph] FINAL SEND without placeholder: len={}",
+                        normalized_remaining.len()
+                    ));
+                    send_final_response_without_placeholder(
+                        &bot_owned,
+                        chat_id,
+                        &normalized_remaining,
+                        &state_owned,
+                        provider_str,
+                        "response",
+                    )
+                    .await;
                 }
 
                 // Clean up leftover "Stopping..." message if /stop raced with normal completion
@@ -16959,37 +17997,136 @@ async fn handle_text_message(
                 last_confirmed_len = 0;
             }
             let remaining = &full_response[last_confirmed_len..];
-            msg_debug(&format!(
-                "[rolling_ph] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
-                placeholder_msg_id,
-                last_confirmed_len,
-                remaining.trim().len()
-            ));
-            if should_attach_response_as_file(full_response.len(), provider_str) {
-                // Large stopped response — send as file
+            if let Some(current_placeholder_msg_id) = placeholder_msg_id {
                 msg_debug(&format!(
-                    "[rolling_ph] STOPPED FILE ATTACH: total={}",
-                    full_response.len()
+                    "[rolling_ph] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
+                    current_placeholder_msg_id,
+                    last_confirmed_len,
+                    remaining.trim().len()
                 ));
-                shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!(
-                    "edit_message",
-                    bot_owned
-                        .edit_message_text(
+                if should_attach_response_as_file(full_response.len(), provider_str) {
+                    // Large stopped response — send as file
+                    msg_debug(&format!(
+                        "[rolling_ph] STOPPED FILE ATTACH: total={}",
+                        full_response.len()
+                    ));
+                    shared_rate_limit_wait(&state_owned, chat_id).await;
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                current_placeholder_msg_id,
+                                "\u{1f4c4} Response attached as file [Stopped]",
+                            )
+                            .await
+                    );
+                    send_response_as_file(
+                        &bot_owned,
+                        chat_id,
+                        &stopped_response,
+                        &state_owned,
+                        "response",
+                    )
+                    .await;
+                } else {
+                    let display_stopped = if remaining.trim().is_empty() {
+                        "[Stopped]".to_string()
+                    } else {
+                        let normalized = normalize_empty_lines(remaining);
+                        format!("{}\n\n[Stopped]", normalized)
+                    };
+                    let html_stopped = markdown_to_telegram_html(&display_stopped);
+                    if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
+                        if let Err(e) = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    &html_stopped
+                                )
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        ) {
+                            let ts_err = chrono::Local::now().format("%H:%M:%S");
+                            println!(
+                                "  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {}",
+                                redact_err(&e)
+                            );
+                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                            let _ = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(
+                                        chat_id,
+                                        current_placeholder_msg_id,
+                                        &display_stopped
+                                    )
+                                    .await
+                            );
+                        }
+                    } else {
+                        let send_result = send_long_message(
+                            &bot_owned,
                             chat_id,
-                            placeholder_msg_id,
-                            "\u{1f4c4} Response attached as file [Stopped]"
+                            &html_stopped,
+                            Some(ParseMode::Html),
+                            &state_owned,
                         )
-                        .await
-                );
-                send_response_as_file(
-                    &bot_owned,
-                    chat_id,
-                    &stopped_response,
-                    &state_owned,
-                    "response",
-                )
-                .await;
+                        .await;
+                        match send_result {
+                            Ok(_) => {
+                                shared_rate_limit_wait(&state_owned, chat_id).await;
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned
+                                        .delete_message(chat_id, current_placeholder_msg_id)
+                                        .await
+                                );
+                            }
+                            Err(_) => {
+                                let fallback = send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &display_stopped,
+                                    None,
+                                    &state_owned,
+                                )
+                                .await;
+                                match fallback {
+                                    Ok(_) => {
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let _ = tg!(
+                                            "delete_message",
+                                            bot_owned
+                                                .delete_message(
+                                                    chat_id,
+                                                    current_placeholder_msg_id,
+                                                )
+                                                .await
+                                        );
+                                    }
+                                    Err(_) => {
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let truncated =
+                                            truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT);
+                                        let _ = tg!(
+                                            "edit_message",
+                                            bot_owned
+                                                .edit_message_text(
+                                                    chat_id,
+                                                    current_placeholder_msg_id,
+                                                    &truncated
+                                                )
+                                                .await
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     "[Stopped]".to_string()
@@ -16997,81 +18134,21 @@ async fn handle_text_message(
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n[Stopped]", normalized)
                 };
-                let html_stopped = markdown_to_telegram_html(&display_stopped);
-                if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(e) = tg!(
-                        "edit_message",
-                        bot_owned
-                            .edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                    ) {
-                        let ts_err = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {}",
-                            redact_err(&e)
-                        );
-                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!(
-                            "edit_message",
-                            bot_owned
-                                .edit_message_text(chat_id, placeholder_msg_id, &display_stopped)
-                                .await
-                        );
-                    }
-                } else {
-                    let send_result = send_long_message(
-                        &bot_owned,
-                        chat_id,
-                        &html_stopped,
-                        Some(ParseMode::Html),
-                        &state_owned,
-                    )
-                    .await;
-                    match send_result {
-                        Ok(_) => {
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!(
-                                "delete_message",
-                                bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                            );
-                        }
-                        Err(_) => {
-                            let fallback = send_long_message(
-                                &bot_owned,
-                                chat_id,
-                                &display_stopped,
-                                None,
-                                &state_owned,
-                            )
-                            .await;
-                            match fallback {
-                                Ok(_) => {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!(
-                                        "delete_message",
-                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                                    );
-                                }
-                                Err(_) => {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let truncated =
-                                        truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!(
-                                        "edit_message",
-                                        bot_owned
-                                            .edit_message_text(
-                                                chat_id,
-                                                placeholder_msg_id,
-                                                &truncated
-                                            )
-                                            .await
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                let stopped_without_placeholder =
+                    if should_attach_response_as_file(full_response.len(), provider_str) {
+                        &stopped_response
+                    } else {
+                        &display_stopped
+                    };
+                send_final_response_without_placeholder(
+                    &bot_owned,
+                    chat_id,
+                    stopped_without_placeholder,
+                    &state_owned,
+                    provider_str,
+                    "response",
+                )
+                .await;
             }
 
             let stop_msg_id = {
@@ -17600,6 +18677,15 @@ async fn honor_telegram_retry_after<T>(
     }
 }
 
+async fn honor_telegram_retry_after_secs(state: &SharedState, chat_id: ChatId, seconds: u64) {
+    let until = tokio::time::Instant::now() + tokio::time::Duration::from_secs(seconds);
+    let mut data = state.lock().await;
+    let entry = data.api_timestamps.entry(chat_id).or_insert(until);
+    if *entry < until {
+        *entry = until;
+    }
+}
+
 /// Send a message that may exceed Telegram's 4096 character limit
 /// by splitting it into multiple messages, handling UTF-8 boundaries
 /// and unclosed HTML tags (e.g. <pre>) across split points
@@ -17719,6 +18805,655 @@ async fn send_response_as_file(
     );
     let _ = std::fs::remove_file(&tmp_path);
     result.is_ok()
+}
+
+fn rich_message_block_estimate(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .max(1)
+}
+
+fn rich_message_content_is_within_limits(content: &str) -> bool {
+    if content.trim().is_empty() {
+        return false;
+    }
+    if content.chars().count() > RICH_MESSAGE_CHAR_LIMIT {
+        return false;
+    }
+    rich_message_block_estimate(content) <= RICH_MESSAGE_BLOCK_LIMIT
+}
+
+fn should_try_rich_message(mode: RichMessageMode, content: &str) -> bool {
+    if !rich_message_content_is_within_limits(content) {
+        return false;
+    }
+    match mode {
+        RichMessageMode::Off => false,
+        RichMessageMode::Auto => {
+            content.len() > TELEGRAM_MSG_LIMIT || rich_message_content_has_advanced_blocks(content)
+        }
+        RichMessageMode::On => true,
+    }
+}
+
+fn rich_message_content_has_advanced_blocks(content: &str) -> bool {
+    let mut previous_non_code_line: Option<&str> = None;
+    let mut in_code_fence = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            previous_non_code_line = None;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+
+        if let Some(previous) = previous_non_code_line {
+            if rich_markdown_table_header_like(previous)
+                && rich_markdown_table_separator_like(trimmed)
+            {
+                return true;
+            }
+        }
+        if rich_markdown_advanced_line_like(trimmed) {
+            return true;
+        }
+
+        previous_non_code_line = Some(trimmed);
+    }
+
+    false
+}
+
+fn rich_markdown_table_header_like(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return false;
+    }
+
+    let cells = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    cells.len() >= 2 && cells.iter().any(|cell| !cell.is_empty())
+}
+
+fn rich_markdown_table_separator_like(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return false;
+    }
+
+    let cells = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            !cell.is_empty()
+                && cell.chars().all(|ch| ch == '-' || ch == ':')
+                && cell.chars().filter(|ch| *ch == '-').count() >= 3
+        })
+}
+
+fn rich_markdown_advanced_line_like(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("- [ ] ")
+        || lower.starts_with("- [x] ")
+        || lower.starts_with("* [ ] ")
+        || lower.starts_with("* [x] ")
+        || trimmed.starts_with("$$")
+        || (trimmed.starts_with("[^") && trimmed.contains("]:"))
+        || lower.starts_with("<details")
+        || lower.starts_with("<summary")
+        || lower.starts_with("<table")
+        || lower.starts_with("<thead")
+        || lower.starts_with("<tbody")
+        || lower.starts_with("<tfoot")
+        || lower.starts_with("<caption")
+        || lower.starts_with("<tr")
+        || lower.starts_with("<th")
+        || lower.starts_with("<td")
+        || lower.starts_with("<tg-")
+}
+
+fn sanitize_rich_markdown(markdown: &str, profile: RichMessageProfile) -> String {
+    if profile == RichMessageProfile::Full {
+        // Full profile intentionally passes Telegram Rich Markdown through
+        // verbatim. The Bot API's Rich Markdown mode supports the whole
+        // Markdown surface plus arbitrary HTML, and the official rich HTML tags
+        // cover media, maps, collages, slideshows, anchors, references,
+        // captions, tables, math blocks, and draft-only thinking blocks. The
+        // surrounding Rich API call remains best-effort and falls back to the
+        // classic sendMessage/split/file path on API rejection.
+        return markdown.to_string();
+    }
+
+    let mut result = String::with_capacity(markdown.len());
+    let mut in_code_fence = false;
+    for (idx, line) in markdown.split('\n').enumerate() {
+        if idx > 0 {
+            result.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            result.push_str(line);
+            continue;
+        }
+        if in_code_fence {
+            result.push_str(line);
+            continue;
+        }
+        let without_media = escape_rich_markdown_media_syntax(line);
+        result.push_str(&sanitize_rich_markdown_html_tags(&without_media, profile));
+    }
+    result
+}
+
+fn escape_rich_markdown_media_syntax(line: &str) -> String {
+    // Telegram Rich Markdown treats image-style blocks as media attachments.
+    // Safe profile stays text-focused by escaping them; inline Markdown links
+    // remain supported and Telegram will show its normal link-opening
+    // confirmation. Full profile bypasses this sanitizer and passes media
+    // syntax through verbatim.
+    line.replace("![", "\\![")
+}
+
+fn sanitize_rich_markdown_html_tags(s: &str, profile: RichMessageProfile) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    while let Some(rel_start) = s[cursor..].find('<') {
+        let start = cursor + rel_start;
+        out.push_str(&s[cursor..start]);
+        let Some(rel_end) = s[start..].find('>') else {
+            out.push_str(&s[start..]);
+            return out;
+        };
+        let end = start + rel_end;
+        let tag = &s[start..=end];
+        if rich_markdown_html_tag_allowed(tag, profile) {
+            out.push_str(tag);
+        } else {
+            out.push_str("&lt;");
+            out.push_str(&tag[1..tag.len() - 1].replace('&', "&amp;"));
+            out.push_str("&gt;");
+        }
+        cursor = end + 1;
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+fn rich_markdown_html_tag_allowed(tag: &str, profile: RichMessageProfile) -> bool {
+    let normalized = tag.trim().to_ascii_lowercase();
+    if profile == RichMessageProfile::Full {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        "<u>"
+            | "</u>"
+            | "<ins>"
+            | "</ins>"
+            | "<s>"
+            | "</s>"
+            | "<strike>"
+            | "</strike>"
+            | "<del>"
+            | "</del>"
+            | "<tg-spoiler>"
+            | "</tg-spoiler>"
+            | "<sub>"
+            | "</sub>"
+            | "<sup>"
+            | "</sup>"
+            | "<code>"
+            | "</code>"
+            | "<pre>"
+            | "</pre>"
+            | "<details>"
+            | "<details open>"
+            | "</details>"
+            | "<summary>"
+            | "</summary>"
+            | "<aside>"
+            | "</aside>"
+            | "<cite>"
+            | "</cite>"
+            | "<br>"
+            | "<br/>"
+            | "<br />"
+    )
+}
+
+fn telegram_retry_after_seconds(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("parameters")
+                .and_then(|p| p.get("retry_after"))
+                .and_then(|s| s.as_u64())
+        })
+}
+
+/// Send a final response using Bot API 10.1 Rich Markdown.
+///
+/// This is intentionally a raw reqwest call instead of teloxide because the
+/// current teloxide dependency does not expose `sendRichMessage`. The helper is
+/// best-effort: it returns false on any API/client/format failure so callers can
+/// fall back to the long-standing sendMessage/file path.
+async fn send_rich_message_markdown(
+    bot: &Bot,
+    chat_id: ChatId,
+    markdown: &str,
+    is_rtl: bool,
+    state: &SharedState,
+) -> bool {
+    if !rich_message_content_is_within_limits(markdown) {
+        return false;
+    }
+
+    let api_base_url = {
+        let data = state.lock().await;
+        data.api_base_url.clone()
+    };
+    let token = bot.token().to_string();
+    let url = format!(
+        "{}/bot{}/sendRichMessage",
+        api_base_url.trim_end_matches('/'),
+        token
+    );
+    let payload = serde_json::json!({
+        "chat_id": chat_id.0,
+        "rich_message": {
+            "markdown": markdown,
+            "is_rtl": is_rtl,
+            "skip_entity_detection": true
+        }
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessage", &debug_result);
+            msg_debug(&format!("[rich_message] client build failed: {err}"));
+            return false;
+        }
+    };
+
+    shared_rate_limit_wait(state, chat_id).await;
+    let response = match client.post(&url).json(&payload).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessage", &debug_result);
+            msg_debug(&format!("[rich_message] sendRichMessage failed: {err}"));
+            return false;
+        }
+    };
+
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessage", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] sendRichMessage response read failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    if let Some(seconds) = telegram_retry_after_seconds(&body) {
+        honor_telegram_retry_after_secs(state, chat_id, seconds).await;
+    }
+
+    let ok = status.is_success()
+        && serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|ok| ok.as_bool()))
+            .unwrap_or(false);
+    if ok {
+        let debug_result: Result<(), String> = Ok(());
+        tg_debug("sendRichMessage", &debug_result);
+        return true;
+    }
+
+    let err = redact_known_tokens(&format!(
+        "HTTP {}: {}",
+        status,
+        body.replace(&token, "<bot_token_redacted>")
+    ));
+    let debug_result: Result<(), String> = Err(err.clone());
+    tg_debug("sendRichMessage", &debug_result);
+    msg_debug(&format!("[rich_message] sendRichMessage rejected: {err}"));
+    false
+}
+
+/// Stream a temporary Rich Message draft using Bot API 10.1.
+///
+/// Drafts are ephemeral 30-second previews and do not persist in chat history.
+/// Callers must still send the complete final response with `sendRichMessage`.
+async fn send_rich_message_draft_markdown(
+    bot: &Bot,
+    chat_id: ChatId,
+    draft_id: i64,
+    markdown: &str,
+    is_rtl: bool,
+    state: &SharedState,
+) -> bool {
+    if chat_id.0 <= 0 || draft_id == 0 || !rich_message_content_is_within_limits(markdown) {
+        return false;
+    }
+
+    let api_base_url = {
+        let data = state.lock().await;
+        data.api_base_url.clone()
+    };
+    let token = bot.token().to_string();
+    let url = format!(
+        "{}/bot{}/sendRichMessageDraft",
+        api_base_url.trim_end_matches('/'),
+        token
+    );
+    let payload = serde_json::json!({
+        "chat_id": chat_id.0,
+        "draft_id": draft_id,
+        "rich_message": {
+            "markdown": markdown,
+            "is_rtl": is_rtl,
+            "skip_entity_detection": true
+        }
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessageDraft", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] sendRichMessageDraft client build failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    shared_rate_limit_wait(state, chat_id).await;
+    let response = match client.post(&url).json(&payload).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessageDraft", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] sendRichMessageDraft failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("sendRichMessageDraft", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] sendRichMessageDraft response read failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    if let Some(seconds) = telegram_retry_after_seconds(&body) {
+        honor_telegram_retry_after_secs(state, chat_id, seconds).await;
+    }
+
+    let ok = status.is_success()
+        && serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|ok| ok.as_bool()))
+            .unwrap_or(false);
+    if ok {
+        let debug_result: Result<(), String> = Ok(());
+        tg_debug("sendRichMessageDraft", &debug_result);
+        return true;
+    }
+
+    let err = redact_known_tokens(&format!(
+        "HTTP {}: {}",
+        status,
+        body.replace(&token, "<bot_token_redacted>")
+    ));
+    let debug_result: Result<(), String> = Err(err.clone());
+    tg_debug("sendRichMessageDraft", &debug_result);
+    msg_debug(&format!(
+        "[rich_message] sendRichMessageDraft rejected: {err}"
+    ));
+    false
+}
+
+/// Edit an existing bot message using Bot API 10.1 Rich Markdown.
+///
+/// This mirrors `send_rich_message_markdown` but targets `editMessageText` with
+/// the `rich_message` parameter. It is used only as a best-effort upgrade for
+/// existing placeholder messages; callers keep the classic edit/split fallback.
+async fn edit_rich_message_markdown(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: teloxide::types::MessageId,
+    markdown: &str,
+    is_rtl: bool,
+    state: &SharedState,
+) -> bool {
+    if !rich_message_content_is_within_limits(markdown) {
+        return false;
+    }
+
+    let api_base_url = {
+        let data = state.lock().await;
+        data.api_base_url.clone()
+    };
+    let token = bot.token().to_string();
+    let url = format!(
+        "{}/bot{}/editMessageText",
+        api_base_url.trim_end_matches('/'),
+        token
+    );
+    let payload = serde_json::json!({
+        "chat_id": chat_id.0,
+        "message_id": message_id.0,
+        "rich_message": {
+            "markdown": markdown,
+            "is_rtl": is_rtl,
+            "skip_entity_detection": true
+        }
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("editMessageText.richMessage", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] editMessageText client build failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    shared_rate_limit_wait(state, chat_id).await;
+    let response = match client.post(&url).json(&payload).send().await {
+        Ok(response) => response,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("editMessageText.richMessage", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] editMessageText rich_message failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            let err = redact_known_tokens(&e.to_string().replace(&token, "<bot_token_redacted>"));
+            let debug_result: Result<(), String> = Err(err.clone());
+            tg_debug("editMessageText.richMessage", &debug_result);
+            msg_debug(&format!(
+                "[rich_message] editMessageText response read failed: {err}"
+            ));
+            return false;
+        }
+    };
+
+    if let Some(seconds) = telegram_retry_after_seconds(&body) {
+        honor_telegram_retry_after_secs(state, chat_id, seconds).await;
+    }
+
+    let ok = status.is_success()
+        && serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|ok| ok.as_bool()))
+            .unwrap_or(false);
+    if ok {
+        let debug_result: Result<(), String> = Ok(());
+        tg_debug("editMessageText.richMessage", &debug_result);
+        return true;
+    }
+
+    let err = redact_known_tokens(&format!(
+        "HTTP {}: {}",
+        status,
+        body.replace(&token, "<bot_token_redacted>")
+    ));
+    let debug_result: Result<(), String> = Err(err.clone());
+    tg_debug("editMessageText.richMessage", &debug_result);
+    msg_debug(&format!(
+        "[rich_message] editMessageText rich_message rejected: {err}"
+    ));
+    false
+}
+
+async fn try_edit_rich_message_markdown_if_enabled(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: teloxide::types::MessageId,
+    markdown: &str,
+    state: &SharedState,
+) -> bool {
+    let (rich_mode, is_rtl) = {
+        let data = state.lock().await;
+        (
+            get_rich_message_mode(&data.settings, chat_id),
+            get_rich_message_rtl(&data.settings, chat_id),
+        )
+    };
+    should_try_rich_message(rich_mode, markdown)
+        && edit_rich_message_markdown(bot, chat_id, message_id, markdown, is_rtl, state).await
+}
+
+/// Send the final AI response without a pre-existing placeholder.
+///
+/// This is used by the quietest output mode. It deliberately avoids sending a
+/// spinner/progress placeholder, so the chat receives only the terminal result.
+async fn send_final_response_without_placeholder(
+    bot: &Bot,
+    chat_id: ChatId,
+    response: &str,
+    state: &SharedState,
+    provider: &str,
+    label: &str,
+) {
+    if response.trim().is_empty() {
+        return;
+    }
+
+    let html_response = markdown_to_telegram_html(response);
+    let (rich_mode, rich_profile, is_rtl) = {
+        let data = state.lock().await;
+        (
+            get_rich_message_mode(&data.settings, chat_id),
+            get_rich_message_profile(&data.settings, chat_id),
+            get_rich_message_rtl(&data.settings, chat_id),
+        )
+    };
+    let rich_markdown_response = sanitize_rich_markdown(response, rich_profile);
+    if should_try_rich_message(rich_mode, &rich_markdown_response)
+        && send_rich_message_markdown(bot, chat_id, &rich_markdown_response, is_rtl, state).await
+    {
+        return;
+    }
+
+    if should_attach_response_as_file(response.len(), provider) {
+        if send_response_as_file(bot, chat_id, response, state, label).await {
+            return;
+        }
+    }
+
+    if html_response.len() <= TELEGRAM_MSG_LIMIT {
+        shared_rate_limit_wait(state, chat_id).await;
+        if tg!(
+            "send_message",
+            bot.send_message(chat_id, &html_response)
+                .parse_mode(ParseMode::Html)
+                .await
+        )
+        .is_ok()
+        {
+            return;
+        }
+
+        shared_rate_limit_wait(state, chat_id).await;
+        let _ = tg!("send_message", bot.send_message(chat_id, response).await);
+        return;
+    }
+
+    if send_long_message(bot, chat_id, &html_response, Some(ParseMode::Html), state)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    if send_long_message(bot, chat_id, response, None, state)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    let truncated = truncate_str(response, TELEGRAM_MSG_LIMIT);
+    shared_rate_limit_wait(state, chat_id).await;
+    let _ = tg!("send_message", bot.send_message(chat_id, &truncated).await);
 }
 
 /// Normalize consecutive empty lines to maximum of one
@@ -18037,6 +19772,7 @@ fn format_cokacdir_result(content: &str) -> String {
     };
 
     let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    let result_kind = v.get("kind").and_then(|s| s.as_str());
 
     if status == "error" {
         let msg = v
@@ -18046,11 +19782,21 @@ fn format_cokacdir_result(content: &str) -> String {
         return format!("Error: {}", msg);
     }
 
-    // Auto-detect subcommand from result JSON fields
+    // Prefer explicit result kind when the CLI provides it. This avoids
+    // inferring destructive operations from shared fields like `id`.
     if v.get("time").is_some() {
         // --currenttime → {"status":"ok","time":"..."}
         let time = v["time"].as_str().unwrap_or("?");
         format!("🕐 {}", time)
+    } else if result_kind == Some("cron_history") {
+        // --cron-history → {"status":"ok","kind":"cron_history","id":"...","count":N,"history":[...]}
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let count = v.get("count").and_then(|n| n.as_u64()).unwrap_or(0);
+        format!("📜 History\n🔖 {}\n🧾 {} record(s)", id, count)
+    } else if result_kind == Some("cron_remove") {
+        // --cron-remove → {"status":"ok","kind":"cron_remove","id":"..."}
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        format!("✅ Removed\n🔖 {}", id)
     } else if v.get("schedules").is_some() {
         // --cron-list → {"status":"ok","schedules":[...]}
         let schedules = v["schedules"].as_array();
@@ -18097,6 +19843,16 @@ fn format_cokacdir_result(content: &str) -> String {
             }
             None => content.to_string(),
         }
+    } else if v.get("status").and_then(|s| s.as_str()) == Some("ok")
+        && v.get("id").and_then(|s| s.as_str()).is_some()
+        && v.get("count").and_then(|n| n.as_u64()).is_some()
+        && v.get("history").and_then(|h| h.as_array()).is_some()
+    {
+        // Compatibility fallback for older --cron-history output without `kind`.
+        // New output should use the explicit `cron_history` branch above.
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
+        let count = v.get("count").and_then(|n| n.as_u64()).unwrap_or(0);
+        format!("📜 History\n🔖 {}\n🧾 {} record(s)", id, count)
     } else if v.get("path").is_some() {
         // --sendfile → {"status":"ok","path":"..."}
         let path = v["path"].as_str().unwrap_or("?");
@@ -18134,15 +19890,88 @@ fn format_cokacdir_result(content: &str) -> String {
         format!("✅ Updated\n🕐 `{}`\n🔖 {}", schedule, id)
     } else if v.get("id").is_some() {
         let id = v["id"].as_str().unwrap_or("?");
+        let minimal_id_result = v
+            .as_object()
+            .map(|obj| {
+                obj.len() == 2
+                    && obj.get("status").and_then(|s| s.as_str()) == Some("ok")
+                    && obj.get("id").and_then(|s| s.as_str()).is_some()
+            })
+            .unwrap_or(false);
         if id.starts_with("msg_") {
             // --message result: not useful to show to user
             String::new()
-        } else {
-            // --cron-remove → {"status":"ok","id":"..."}
+        } else if minimal_id_result {
+            // Compatibility fallback for older --cron-remove output without
+            // `kind`. New output should use the explicit `cron_remove` branch above.
             format!("✅ Removed\n🔖 {}", id)
+        } else {
+            // Unknown result carrying an id. Returning the raw JSON is safer
+            // than falsely saying something was removed.
+            content.to_string()
         }
     } else {
         content.to_string()
+    }
+}
+
+#[cfg(test)]
+mod cokacdir_result_format_tests {
+    use super::format_cokacdir_result;
+
+    #[test]
+    fn cron_history_result_is_not_formatted_as_removed() {
+        let formatted =
+            format_cokacdir_result(r#"{"status":"ok","id":"CD52CBA0","count":5,"history":[]}"#);
+
+        assert!(
+            formatted.contains("History"),
+            "history result should be labeled as history: {formatted}"
+        );
+        assert!(
+            !formatted.contains("Removed"),
+            "history result must not look like a removal: {formatted}"
+        );
+    }
+
+    #[test]
+    fn cron_history_kind_result_is_formatted_as_history() {
+        let formatted = format_cokacdir_result(
+            r#"{"status":"ok","kind":"cron_history","id":"CD52CBA0","count":5,"history":[]}"#,
+        );
+
+        assert_eq!(formatted, "📜 History\n🔖 CD52CBA0\n🧾 5 record(s)");
+    }
+
+    #[test]
+    fn minimal_id_result_is_formatted_as_removed() {
+        let formatted = format_cokacdir_result(r#"{"status":"ok","id":"CD52CBA0"}"#);
+
+        assert_eq!(formatted, "✅ Removed\n🔖 CD52CBA0");
+    }
+
+    #[test]
+    fn cron_remove_kind_result_is_formatted_as_removed() {
+        let formatted =
+            format_cokacdir_result(r#"{"status":"ok","kind":"cron_remove","id":"CD52CBA0"}"#);
+
+        assert_eq!(formatted, "✅ Removed\n🔖 CD52CBA0");
+    }
+
+    #[test]
+    fn unknown_id_result_with_extra_fields_is_left_raw() {
+        let raw = r#"{"status":"ok","id":"ABCDEF12","extra":true}"#;
+        let formatted = format_cokacdir_result(raw);
+
+        assert_eq!(formatted, raw);
+    }
+
+    #[test]
+    fn id_only_result_is_left_raw() {
+        let raw = r#"{"id":"ABCDEF12"}"#;
+        let formatted = format_cokacdir_result(raw);
+
+        assert_eq!(formatted, raw);
     }
 }
 
@@ -18715,45 +20544,64 @@ async fn execute_schedule(
     // from old schedule files are deliberately ignored.
     let prompt = user_prompt.clone();
 
-    // Send placeholder with only the user's original prompt.
-    shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!(
-        "send_message",
-        bot.send_message(chat_id, format!("⏰ {user_prompt}")).await
-    ) {
-        Ok(msg) => msg,
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}",
-                redact_err(&e)
-            );
-            // Clean up pending + cancel_token, restore session.
-            {
-                let mut data = state.lock().await;
-                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                    set.remove(&schedule_id);
-                }
-                remove_cancel_token_locked(&mut data, chat_id);
-                // Inline mode never replaced the session, so leave it untouched.
-                if !inline_mode {
-                    if let Some(prev) = prev_session {
-                        data.sessions.insert(chat_id, prev);
-                    } else {
-                        data.sessions.remove(&chat_id);
+    let (polling_time_ms, output_mode) = {
+        let data = state.lock().await;
+        (
+            data.polling_time_ms,
+            get_output_mode(&data.settings, chat_id),
+        )
+    };
+    let final_only_mode = output_mode.is_final_only();
+
+    // Send placeholder with only the user's original prompt unless final-only
+    // mode is active. Final-only mode is intentionally silent until the
+    // terminal response.
+    let placeholder_msg_id = if final_only_mode {
+        sched_debug(&format!(
+            "[execute_schedule] id={}, final-only mode → skipping placeholder",
+            schedule_id
+        ));
+        None
+    } else {
+        shared_rate_limit_wait(state, chat_id).await;
+        let placeholder = match tg!(
+            "send_message",
+            bot.send_message(chat_id, format!("⏰ {user_prompt}")).await
+        ) {
+            Ok(msg) => msg,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}",
+                    redact_err(&e)
+                );
+                // Clean up pending + cancel_token, restore session.
+                {
+                    let mut data = state.lock().await;
+                    if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                        set.remove(&schedule_id);
+                    }
+                    remove_cancel_token_locked(&mut data, chat_id);
+                    // Inline mode never replaced the session, so leave it untouched.
+                    if !inline_mode {
+                        if let Some(prev) = prev_session {
+                            data.sessions.insert(chat_id, prev);
+                        } else {
+                            data.sessions.remove(&chat_id);
+                        }
                     }
                 }
+                msg_debug(&format!(
+                    "[queue:trigger] chat_id={}, source=schedule_placeholder_error",
+                    chat_id.0
+                ));
+                drop(group_lock); // release before queue processing to avoid deadlock
+                process_next_queued_message(bot, chat_id, state).await;
+                return;
             }
-            msg_debug(&format!(
-                "[queue:trigger] chat_id={}, source=schedule_placeholder_error",
-                chat_id.0
-            ));
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return;
-        }
+        };
+        Some(placeholder.id)
     };
-    let placeholder_msg_id = placeholder.id;
 
     // Build disabled tools notice
     let default_tools: std::collections::HashSet<&str> =
@@ -18779,7 +20627,13 @@ async fn execute_schedule(
     };
 
     let bot_key = token_hash(token);
-    let (sched_instruction, sched_context_count, sched_bot_username, sched_bot_display_name) = {
+    let (
+        sched_instruction,
+        sched_context_count,
+        sched_bot_username,
+        sched_bot_display_name,
+        sched_rich_message_prompt_guidance,
+    ) = {
         let data = state.lock().await;
         let ctx = data
             .settings
@@ -18795,6 +20649,11 @@ async fn execute_schedule(
             ctx,
             data.bot_username.clone(),
             data.bot_display_name.clone(),
+            format_rich_message_prompt_guidance(
+                get_rich_message_mode(&data.settings, chat_id),
+                get_rich_message_profile(&data.settings, chat_id),
+                get_rich_message_rtl(&data.settings, chat_id),
+            ),
         )
     };
     let platform = capitalize_platform(detect_platform(token));
@@ -18842,6 +20701,7 @@ async fn execute_schedule(
         None, // scheduled tasks: no user message dedup
         sched_context_count,
         &platform,
+        &sched_rich_message_prompt_guidance,
     );
 
     // Retrieve pre-inserted cancel token (from scheduler_loop), or create a new one
@@ -19076,9 +20936,8 @@ async fn execute_schedule(
     let inline_clear_epoch_for_guard = inline_clear_epoch;
     let provider_str = provider_owned.clone();
     // Captured for schedule_history append at the end of this run.
-    // Wall-clock duration is measured from this point (just after placeholder send +
-    // pre-execution setup) to the polling loop's completion — close to the user-visible
-    // "task is running" window.
+    // Wall-clock duration is measured from this point (just after the output
+    // mode gate + pre-execution setup) to the polling loop's completion.
     let history_start = std::time::Instant::now();
     let history_bot_key = bot_key.clone();
     let request_tasks = {
@@ -19115,10 +20974,7 @@ async fn execute_schedule(
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
-        let (polling_time_ms, silent_mode) = {
-            let data = state_owned.lock().await;
-            (data.polling_time_ms, is_silent(&data.settings, chat_id))
-        };
+        let silent_mode = !output_mode.is_verbose();
 
         let mut queue_done = false;
         while !done || !queue_done {
@@ -19168,8 +21024,8 @@ async fn execute_schedule(
                                 let summary = format_tool_input(&name, &input);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 println!("  [{ts}]   ⚙ [Schedule] {name}: {summary}");
-                                sched_debug(&format!("[schedule_polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent_mode={}, response_len={}, ends_with_nl={}",
-                                    name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
+                                sched_debug(&format!("[schedule_polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, output_mode={}, response_len={}, ends_with_nl={}",
+                                    name, truncate_str(&input, 200), pending_cokacdir, output_mode.as_str(), full_response.len(), full_response.ends_with('\n')));
                                 raw_entries.push(RawPayloadEntry {
                                     tag: "ToolUse".into(),
                                     content: format!("{}: {}", name, input),
@@ -19220,6 +21076,9 @@ async fn execute_schedule(
                                     if std::mem::take(&mut suppress_tool_display) {
                                         println!("  [{ts}]   ↩ [Schedule] cokacdir (chat_log, suppressed)");
                                         sched_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
+                                    } else if final_only_mode {
+                                        println!("  [{ts}]   ↩ [Schedule] cokacdir: {content}");
+                                        sched_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir/final_only: skipped, total={}", chat_id.0, full_response.len()));
                                     } else {
                                         println!("  [{ts}]   ↩ [Schedule] cokacdir: {content}");
                                         let formatted = format_cokacdir_result(&content);
@@ -19273,10 +21132,15 @@ async fn execute_schedule(
                                         tag: "TaskNotification".into(),
                                         content: summary.clone(),
                                     });
-                                    let _fr_before = full_response.len();
-                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                    sched_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
-                                        chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    if !final_only_mode {
+                                        let _fr_before = full_response.len();
+                                        full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                        sched_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
+                                            chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    } else {
+                                        sched_debug(&format!("[fr_trace][{}] +TaskNotification/final_only: skipped, summary={:?}, total={}",
+                                            chat_id.0, truncate_str(&summary, 200), full_response.len()));
+                                    }
                                 }
                             }
                             StreamMessage::Done { result, session_id } => {
@@ -19363,8 +21227,11 @@ async fn execute_schedule(
             }
 
             // Update placeholder with progress
-            if !done {
+            if !done && !final_only_mode {
                 // ── Rolling placeholder pattern (unified for all chats) ──
+                let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                    continue;
+                };
                 let threshold = file_attach_threshold();
                 let delta_end =
                     floor_char_boundary(&full_response, full_response.len().min(threshold));
@@ -19374,17 +21241,21 @@ async fn execute_schedule(
                     let html_delta = markdown_to_telegram_html(&normalized_delta);
                     if html_delta.trim().is_empty() {
                         msg_debug(&format!("[rolling_ph/sched] SKIP empty delta: placeholder_msg_id={}, delta_bytes={}, confirmed={}→{}",
-                            placeholder_msg_id, delta.len(), last_confirmed_len, delta_end));
+                            current_placeholder_msg_id, delta.len(), last_confirmed_len, delta_end));
                         last_confirmed_len = delta_end;
                     } else {
                         msg_debug(&format!("[rolling_ph/sched] EDIT delta: placeholder_msg_id={}, delta_len={}, html_len={}, confirmed={}→{}",
-                            placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, delta_end));
+                            current_placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, delta_end));
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         if html_delta.len() <= TELEGRAM_MSG_LIMIT {
                             let _ = tg!(
                                 "edit_message",
                                 bot_owned
-                                    .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                    .edit_message_text(
+                                        chat_id,
+                                        current_placeholder_msg_id,
+                                        &html_delta
+                                    )
                                     .parse_mode(ParseMode::Html)
                                     .await
                             );
@@ -19402,7 +21273,9 @@ async fn execute_schedule(
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
                                 let _ = tg!(
                                     "delete_message",
-                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    bot_owned
+                                        .delete_message(chat_id, current_placeholder_msg_id)
+                                        .await
                                 );
                             } else {
                                 let truncated_delta =
@@ -19412,7 +21285,7 @@ async fn execute_schedule(
                                     bot_owned
                                         .edit_message_text(
                                             chat_id,
-                                            placeholder_msg_id,
+                                            current_placeholder_msg_id,
                                             &truncated_delta
                                         )
                                         .await
@@ -19420,12 +21293,12 @@ async fn execute_schedule(
                             }
                         }
                         last_confirmed_len = delta_end;
-                        let old_ph_id = placeholder_msg_id;
+                        let old_ph_id = current_placeholder_msg_id;
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
                             Ok(new_ph) => {
-                                placeholder_msg_id = new_ph.id;
-                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, placeholder_msg_id));
+                                placeholder_msg_id = Some(new_ph.id);
+                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, new_ph.id));
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -19433,7 +21306,7 @@ async fn execute_schedule(
                                     "  [{ts}]   ⚠ new placeholder failed (schedule): {}",
                                     redact_err(&e)
                                 );
-                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
+                                msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={}, err={}", current_placeholder_msg_id, e));
                             }
                         }
                         last_edit_text.clear();
@@ -19451,7 +21324,7 @@ async fn execute_schedule(
                             &state_owned,
                             chat_id,
                             bot_owned
-                                .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                .edit_message_text(chat_id, current_placeholder_msg_id, &html_text)
                                 .parse_mode(ParseMode::Html)
                                 .await
                         );
@@ -19509,40 +21382,70 @@ async fn execute_schedule(
                 last_confirmed_len = 0;
             }
             let remaining = &full_response[last_confirmed_len..];
-            if should_attach_response_as_file(full_response.len(), &provider_str) {
-                let notice = format!(
-                    "\u{1f4c4} Response attached as file [Stopped]{}",
-                    continue_hint
-                );
-                let _ = tg!(
-                    "edit_message",
-                    bot_owned
-                        .edit_message_text(chat_id, placeholder_msg_id, &notice)
-                        .await
-                );
+            if let Some(current_placeholder_msg_id) = placeholder_msg_id {
+                if should_attach_response_as_file(full_response.len(), &provider_str) {
+                    let notice = format!(
+                        "\u{1f4c4} Response attached as file [Stopped]{}",
+                        continue_hint
+                    );
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(chat_id, current_placeholder_msg_id, &notice)
+                            .await
+                    );
+                    let stopped_content =
+                        format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
+                    send_response_as_file(
+                        &bot_owned,
+                        chat_id,
+                        &stopped_content,
+                        &state_owned,
+                        "schedule",
+                    )
+                    .await;
+                } else {
+                    let display_stopped = if remaining.trim().is_empty() {
+                        format!("⛔ Stopped{}", continue_hint)
+                    } else {
+                        let normalized = normalize_empty_lines(remaining);
+                        format!("{}\n\n⛔ Stopped{}", normalized, continue_hint)
+                    };
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                current_placeholder_msg_id,
+                                &display_stopped
+                            )
+                            .await
+                    );
+                }
+            } else {
                 let stopped_content =
                     format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
-                send_response_as_file(
-                    &bot_owned,
-                    chat_id,
-                    &stopped_content,
-                    &state_owned,
-                    "schedule",
-                )
-                .await;
-            } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     format!("⛔ Stopped{}", continue_hint)
                 } else {
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n⛔ Stopped{}", normalized, continue_hint)
                 };
-                let _ = tg!(
-                    "edit_message",
-                    bot_owned
-                        .edit_message_text(chat_id, placeholder_msg_id, &display_stopped)
-                        .await
-                );
+                let stopped_without_placeholder =
+                    if should_attach_response_as_file(full_response.len(), &provider_str) {
+                        &stopped_content
+                    } else {
+                        &display_stopped
+                    };
+                send_final_response_without_placeholder(
+                    &bot_owned,
+                    chat_id,
+                    stopped_without_placeholder,
+                    &state_owned,
+                    &provider_str,
+                    "schedule",
+                )
+                .await;
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -19550,9 +21453,10 @@ async fn execute_schedule(
         } else {
             // had_real_response (captured above before this branch ran) is the
             // pre-replacement emptiness signal. When the AI produced no output
-            // at all, delete the placeholder silently rather than editing it to
-            // the "(No response)" sentinel — that string was confusing users
-            // and is also gated out of session history below.
+            // at all, delete any placeholder silently (or send nothing in
+            // final-only mode) rather than surfacing the "(No response)"
+            // sentinel — that string was confusing users and is also gated out
+            // of session history below.
             if full_response.is_empty() {
                 full_response = "(No response)".to_string();
                 sched_debug(&format!(
@@ -19570,110 +21474,168 @@ async fn execute_schedule(
                 last_confirmed_len = 0;
             }
             let remaining = &full_response[last_confirmed_len..];
-            msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-            if !had_real_response || remaining.trim().is_empty() {
-                msg_debug(&format!(
-                    "[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}",
-                    placeholder_msg_id
-                ));
-                let _ = tg!(
-                    "delete_message",
-                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                );
-            } else if should_attach_response_as_file(full_response.len(), &provider_str) {
-                msg_debug(&format!(
-                    "[rolling_ph/sched] FINAL FILE ATTACH: total={}",
-                    full_response.len()
-                ));
-                let notice = format!("\u{1f4c4} Response attached as file{}", continue_hint);
-                let _ = tg!(
-                    "edit_message",
-                    bot_owned
-                        .edit_message_text(chat_id, placeholder_msg_id, &notice)
-                        .await
-                );
-                let final_text =
-                    format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
-                send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule")
-                    .await;
-            } else {
-                let normalized_remaining = normalize_empty_lines(remaining);
-                let final_text = format!("{}{}", normalized_remaining, continue_hint);
-                let html_response = markdown_to_telegram_html(&final_text);
-                msg_debug(&format!(
-                    "[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}",
-                    placeholder_msg_id,
-                    html_response.len()
-                ));
-                if html_response.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(_) = tg!(
+            if let Some(current_placeholder_msg_id) = placeholder_msg_id {
+                msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
+                    current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                if !had_real_response || remaining.trim().is_empty() {
+                    msg_debug(&format!(
+                        "[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}",
+                        current_placeholder_msg_id
+                    ));
+                    let _ = tg!(
+                        "delete_message",
+                        bot_owned
+                            .delete_message(chat_id, current_placeholder_msg_id)
+                            .await
+                    );
+                } else if should_attach_response_as_file(full_response.len(), &provider_str) {
+                    msg_debug(&format!(
+                        "[rolling_ph/sched] FINAL FILE ATTACH: total={}",
+                        full_response.len()
+                    ));
+                    let notice = format!("\u{1f4c4} Response attached as file{}", continue_hint);
+                    let _ = tg!(
                         "edit_message",
                         bot_owned
-                            .edit_message_text(chat_id, placeholder_msg_id, &html_response)
-                            .parse_mode(ParseMode::Html)
+                            .edit_message_text(chat_id, current_placeholder_msg_id, &notice)
                             .await
-                    ) {
-                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!(
-                            "edit_message",
-                            bot_owned
-                                .edit_message_text(chat_id, placeholder_msg_id, &final_text)
-                                .await
-                        );
-                    }
-                } else {
-                    let send_result = send_long_message(
+                    );
+                    let final_text =
+                        format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                    send_response_as_file(
                         &bot_owned,
                         chat_id,
-                        &html_response,
-                        Some(ParseMode::Html),
+                        &final_text,
                         &state_owned,
+                        "schedule",
                     )
                     .await;
-                    match send_result {
-                        Ok(_) => {
+                } else {
+                    let normalized_remaining = normalize_empty_lines(remaining);
+                    let final_text = format!("{}{}", normalized_remaining, continue_hint);
+                    let html_response = markdown_to_telegram_html(&final_text);
+                    let rich_profile = {
+                        let data = state_owned.lock().await;
+                        get_rich_message_profile(&data.settings, chat_id)
+                    };
+                    let rich_markdown_response = sanitize_rich_markdown(&final_text, rich_profile);
+                    msg_debug(&format!(
+                        "[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}, rich_markdown_len={}",
+                        current_placeholder_msg_id,
+                        html_response.len(),
+                        rich_markdown_response.len()
+                    ));
+                    if try_edit_rich_message_markdown_if_enabled(
+                        &bot_owned,
+                        chat_id,
+                        current_placeholder_msg_id,
+                        &rich_markdown_response,
+                        &state_owned,
+                    )
+                    .await
+                    {
+                        // Rich edit succeeded; no classic fallback needed.
+                    } else if html_response.len() <= TELEGRAM_MSG_LIMIT {
+                        if let Err(_) = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    &html_response
+                                )
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        ) {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let _ = tg!(
-                                "delete_message",
-                                bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(
+                                        chat_id,
+                                        current_placeholder_msg_id,
+                                        &final_text
+                                    )
+                                    .await
                             );
                         }
-                        Err(_) => {
-                            let fallback = send_long_message(
-                                &bot_owned,
-                                chat_id,
-                                &final_text,
-                                None,
-                                &state_owned,
-                            )
-                            .await;
-                            match fallback {
-                                Ok(_) => {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!(
-                                        "delete_message",
-                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                                    );
-                                }
-                                Err(_) => {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let truncated = truncate_str(&final_text, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!(
-                                        "edit_message",
-                                        bot_owned
-                                            .edit_message_text(
-                                                chat_id,
-                                                placeholder_msg_id,
-                                                &truncated
-                                            )
-                                            .await
-                                    );
+                    } else {
+                        let send_result = send_long_message(
+                            &bot_owned,
+                            chat_id,
+                            &html_response,
+                            Some(ParseMode::Html),
+                            &state_owned,
+                        )
+                        .await;
+                        match send_result {
+                            Ok(_) => {
+                                shared_rate_limit_wait(&state_owned, chat_id).await;
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned
+                                        .delete_message(chat_id, current_placeholder_msg_id)
+                                        .await
+                                );
+                            }
+                            Err(_) => {
+                                let fallback = send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &final_text,
+                                    None,
+                                    &state_owned,
+                                )
+                                .await;
+                                match fallback {
+                                    Ok(_) => {
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let _ = tg!(
+                                            "delete_message",
+                                            bot_owned
+                                                .delete_message(
+                                                    chat_id,
+                                                    current_placeholder_msg_id,
+                                                )
+                                                .await
+                                        );
+                                    }
+                                    Err(_) => {
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let truncated =
+                                            truncate_str(&final_text, TELEGRAM_MSG_LIMIT);
+                                        let _ = tg!(
+                                            "edit_message",
+                                            bot_owned
+                                                .edit_message_text(
+                                                    chat_id,
+                                                    current_placeholder_msg_id,
+                                                    &truncated
+                                                )
+                                                .await
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
+            } else if had_real_response && !remaining.trim().is_empty() {
+                let final_text =
+                    format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                msg_debug(&format!(
+                    "[rolling_ph/sched] FINAL SEND without placeholder: len={}",
+                    final_text.len()
+                ));
+                send_final_response_without_placeholder(
+                    &bot_owned,
+                    chat_id,
+                    &final_text,
+                    &state_owned,
+                    &provider_str,
+                    "schedule",
+                )
+                .await;
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -19917,11 +21879,11 @@ async fn process_bot_message(
         insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
     }
 
-    // File deletion is deferred until the placeholder send succeeds (see the
-    // delete site after `placeholder_msg_id`). Deleting here would lose the
-    // message on every failure path between claim and placeholder —
-    // cancellation during lock wait, panic in session lookup, placeholder
-    // network error — because none of those branches have a re-queue path.
+    // File deletion is deferred until this task is committed to execution.
+    // Deleting here would lose the message on every failure path between claim
+    // and the output-mode gate — cancellation during lock wait, panic in
+    // session lookup, or placeholder network error — because none of those
+    // branches have a re-queue path.
     // The cancel_token holds the per-chat slot until removed, so the
     // scheduler's busy-check still skips this file on subsequent ticks
     // (preventing the original TOCTOU where a sibling claim left a deleted
@@ -19969,6 +21931,7 @@ async fn process_bot_message(
         history,
         instruction,
         context_count,
+        botmsg_rich_message_prompt_guidance,
         botmsg_chrome_enabled,
         effort,
         codex_fast_enabled,
@@ -20009,9 +21972,25 @@ async fn process_bot_message(
         let provider = detect_provider(mdl.as_deref());
         let eff = get_effort_for_provider(&data.settings, chat_id, provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
+        let rich_prompt_guidance = format_rich_message_prompt_guidance(
+            get_rich_message_mode(&data.settings, chat_id),
+            get_rich_message_profile(&data.settings, chat_id),
+            get_rich_message_rtl(&data.settings, chat_id),
+        );
         msg_debug(&format!("[process_bot_message] session_info={}, tools={}, model={:?}, history_len={}, instruction={}",
-            info.is_some(), tools.len(), mdl, hist.len(), instr.is_some()));
-        (info, tools, mdl, hist, instr, ctx, chrome, eff, codex_fast)
+	        info.is_some(), tools.len(), mdl, hist.len(), instr.is_some()));
+        (
+            info,
+            tools,
+            mdl,
+            hist,
+            instr,
+            ctx,
+            rich_prompt_guidance,
+            chrome,
+            eff,
+            codex_fast,
+        )
     };
 
     let (session_id, current_path) = match session_info {
@@ -20067,67 +22046,85 @@ async fn process_bot_message(
         }
     };
 
-    // Send placeholder
-    msg_debug("[process_bot_message] sending placeholder");
-    shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
-        Ok(m) => {
-            msg_debug(&format!(
-                "[process_bot_message] placeholder sent: msg_id={}",
-                m.id
-            ));
-            m
-        }
-        Err(e) => {
-            msg_debug(&format!(
-                "[process_bot_message] failed to send placeholder: {}, aborting",
-                e
-            ));
-            msg_debug(&format!(
-                "[queue:trigger] chat_id={}, source=botmsg_placeholder_error",
-                chat_id.0
-            ));
-            {
-                let mut data = state.lock().await;
-                remove_cancel_token_locked(&mut data, chat_id);
-            }
-            // Discard the on-disk file: leaving it would let the scheduler
-            // re-attempt every 5s, which for a permanent failure (bot kicked,
-            // chat closed, token revoked) becomes log spam with the same
-            // error class. A transient failure forces the user to manually
-            // re-send, but that matches the "Please try again" notice below.
-            let remove_result = fs::remove_file(&msg.file_path);
-            msg_debug(&format!(
-                "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
-                msg.id,
-                remove_result.is_ok()
-            ));
-            // Best-effort surface the dropped bot-to-bot message. The notice
-            // itself may also fail (the original placeholder error was likely
-            // a network / rate-limit / permissions issue affecting all
-            // outbound messages in this chat) — that's why this is `let _ =`.
-            shared_rate_limit_wait(state, chat_id).await;
-            let _ =
-                tg!("send_message", bot.send_message(chat_id,
-                format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
-                    msg.from, truncate_str(&msg.content, 200), e)).await);
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return;
-        }
+    let (polling_time_ms, output_mode) = {
+        let data = state.lock().await;
+        (
+            data.polling_time_ms,
+            get_output_mode(&data.settings, chat_id),
+        )
     };
-    let placeholder_msg_id = placeholder.id;
+    let final_only_mode = output_mode.is_final_only();
 
-    // Placeholder is visible to the user — processing has visibly started.
-    // This is the safe point to delete the on-disk message file:
-    //   • Earlier (at claim) lost the message on cancel-during-lock-wait,
-    //     no-session, or placeholder-send failure paths.
-    //   • Later (after AI completes) would risk replay if the bot restarts
-    //     mid-turn — the user has already seen "..." and would receive the
-    //     same prompt again on next startup.
+    // Send placeholder unless final-only mode is active.
+    msg_debug(&format!(
+        "[process_bot_message] output_mode={}, final_only={}",
+        output_mode.as_str(),
+        final_only_mode
+    ));
+    let placeholder_msg_id = if final_only_mode {
+        msg_debug("[process_bot_message] final-only mode: skipping placeholder");
+        None
+    } else {
+        msg_debug("[process_bot_message] sending placeholder");
+        shared_rate_limit_wait(state, chat_id).await;
+        let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
+            Ok(m) => {
+                msg_debug(&format!(
+                    "[process_bot_message] placeholder sent: msg_id={}",
+                    m.id
+                ));
+                m
+            }
+            Err(e) => {
+                msg_debug(&format!(
+                    "[process_bot_message] failed to send placeholder: {}, aborting",
+                    e
+                ));
+                msg_debug(&format!(
+                    "[queue:trigger] chat_id={}, source=botmsg_placeholder_error",
+                    chat_id.0
+                ));
+                {
+                    let mut data = state.lock().await;
+                    remove_cancel_token_locked(&mut data, chat_id);
+                }
+                // Discard the on-disk file: leaving it would let the scheduler
+                // re-attempt every 5s, which for a permanent failure (bot kicked,
+                // chat closed, token revoked) becomes log spam with the same
+                // error class. A transient failure forces the user to manually
+                // re-send, but that matches the "Please try again" notice below.
+                let remove_result = fs::remove_file(&msg.file_path);
+                msg_debug(&format!(
+                    "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
+                    msg.id,
+                    remove_result.is_ok()
+                ));
+                // Best-effort surface the dropped bot-to-bot message. The notice
+                // itself may also fail (the original placeholder error was likely
+                // a network / rate-limit / permissions issue affecting all
+                // outbound messages in this chat) — that's why this is `let _ =`.
+                shared_rate_limit_wait(state, chat_id).await;
+                let _ =
+                    tg!("send_message", bot.send_message(chat_id,
+                    format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
+                        msg.from, truncate_str(&msg.content, 200), e)).await);
+                drop(group_lock); // release before queue processing to avoid deadlock
+                process_next_queued_message(bot, chat_id, state).await;
+                return;
+            }
+        };
+        Some(placeholder.id)
+    };
+
+    // Delete the on-disk message once the task is committed to execution.
+    //
+    // In verbose/compact modes, the placeholder is the visible safe point. In
+    // final-only mode there is no visible safe point by design; deleting here
+    // avoids replaying a bot-to-bot message and duplicating side effects after
+    // a restart.
     let remove_result = fs::remove_file(&msg.file_path);
     msg_debug(&format!(
-        "[process_bot_message] deleted message file post-placeholder: id={}, path={}, ok={}",
+        "[process_bot_message] deleted message file after output-mode gate: id={}, path={}, ok={}",
         msg.id,
         msg.file_path.display(),
         remove_result.is_ok()
@@ -20195,6 +22192,7 @@ async fn process_bot_message(
         None, // bot-to-bot messages: no user message dedup
         context_count,
         &platform,
+        &botmsg_rich_message_prompt_guidance,
     );
     msg_debug(&format!(
         "[process_bot_message] system_prompt built, len={}",
@@ -20354,7 +22352,6 @@ async fn process_bot_message(
     // Polling loop (spawned as async task to avoid blocking scheduler)
     let bot_owned = bot.clone();
     let state_owned = state.clone();
-    let msg_clone = msg.clone();
     let provider_str: &'static str = detect_provider(model.as_deref());
     let current_path_owned = current_path.clone();
     // Captured at spawn so the post-completion guard catches /clear and /start
@@ -20369,7 +22366,7 @@ async fn process_bot_message(
     let bot_username_for_log = bot_username.to_string();
     let bot_display_name_for_log = bot_display_name.to_string();
     let from_bot_for_log = msg.from.clone();
-    msg_debug(&format!("[process_bot_message] spawning polling loop: provider={}, msg_id={}, placeholder_msg_id={}",
+    msg_debug(&format!("[process_bot_message] spawning polling loop: provider={}, msg_id={}, placeholder_msg_id={:?}",
         provider_str, bmsg_id_for_log, placeholder_msg_id));
     let request_tasks = {
         let data = state.lock().await;
@@ -20404,13 +22401,12 @@ async fn process_bot_message(
         let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
-        let (polling_time_ms, silent_mode) = {
-            let data = state_owned.lock().await;
-            (data.polling_time_ms, is_silent(&data.settings, chat_id))
-        };
+        let silent_mode = !output_mode.is_verbose();
         msg_debug(&format!(
-            "[botmsg_poll:{}] started: polling_time_ms={}, silent_mode={}",
-            bmsg_id_for_log, polling_time_ms, silent_mode
+            "[botmsg_poll:{}] started: polling_time_ms={}, output_mode={}",
+            bmsg_id_for_log,
+            polling_time_ms,
+            output_mode.as_str()
         ));
 
         let mut queue_done = false;
@@ -20471,8 +22467,8 @@ async fn process_bot_message(
                                 let summary = format_tool_input(&name, &input);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 println!("  [{ts}]   ⚙ [BotMsg] {name}: {summary}");
-                                msg_debug(&format!("[botmsg_poll:{}] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent={}, response_len={}, ends_nl={}",
-                                        bmsg_id_for_log, name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
+                                msg_debug(&format!("[botmsg_poll:{}] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, output_mode={}, response_len={}, ends_nl={}",
+                                        bmsg_id_for_log, name, truncate_str(&input, 200), pending_cokacdir, output_mode.as_str(), full_response.len(), full_response.ends_with('\n')));
                                 raw_entries.push(RawPayloadEntry {
                                     tag: "ToolUse".into(),
                                     content: format!("{}: {}", name, input),
@@ -20523,6 +22519,9 @@ async fn process_bot_message(
                                             "  [{ts}]   ↩ [BotMsg] cokacdir (chat_log, suppressed)"
                                         );
                                         msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
+                                    } else if final_only_mode {
+                                        println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir/final_only: skipped, total={}", chat_id.0, full_response.len()));
                                     } else {
                                         println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
                                         let formatted = format_cokacdir_result(&content);
@@ -20591,10 +22590,15 @@ async fn process_bot_message(
                                         tag: "TaskNotification".into(),
                                         content: summary.clone(),
                                     });
-                                    let _fr_before = full_response.len();
-                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                    msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
-                                            chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    if !final_only_mode {
+                                        let _fr_before = full_response.len();
+                                        full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
+                                    } else {
+                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification/final_only: skipped, summary={:?}, total={}",
+                                                chat_id.0, truncate_str(&summary, 200), full_response.len()));
+                                    }
                                 }
                             }
                             StreamMessage::Done {
@@ -20678,8 +22682,11 @@ async fn process_bot_message(
                     }
                 }
 
-                if !done {
+                if !done && !final_only_mode {
                     // ── Rolling placeholder pattern (unified for all chats) ──
+                    let Some(current_placeholder_msg_id) = placeholder_msg_id else {
+                        continue;
+                    };
                     let threshold = file_attach_threshold();
                     let delta_end =
                         floor_char_boundary(&full_response, full_response.len().min(threshold));
@@ -20700,7 +22707,11 @@ async fn process_bot_message(
                                 let _ = tg!(
                                     "edit_message",
                                     bot_owned
-                                        .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                        .edit_message_text(
+                                            chat_id,
+                                            current_placeholder_msg_id,
+                                            &html_delta
+                                        )
                                         .parse_mode(ParseMode::Html)
                                         .await
                                 );
@@ -20718,7 +22729,9 @@ async fn process_bot_message(
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let _ = tg!(
                                         "delete_message",
-                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                        bot_owned
+                                            .delete_message(chat_id, current_placeholder_msg_id)
+                                            .await
                                     );
                                 } else {
                                     let truncated_delta =
@@ -20728,7 +22741,7 @@ async fn process_bot_message(
                                         bot_owned
                                             .edit_message_text(
                                                 chat_id,
-                                                placeholder_msg_id,
+                                                current_placeholder_msg_id,
                                                 &truncated_delta
                                             )
                                             .await
@@ -20740,7 +22753,7 @@ async fn process_bot_message(
                             match tg!("send_message", bot_owned.send_message(chat_id, "...").await)
                             {
                                 Ok(new_ph) => {
-                                    placeholder_msg_id = new_ph.id;
+                                    placeholder_msg_id = Some(new_ph.id);
                                 }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -20769,7 +22782,11 @@ async fn process_bot_message(
                                 &state_owned,
                                 chat_id,
                                 bot_owned
-                                    .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                    .edit_message_text(
+                                        chat_id,
+                                        current_placeholder_msg_id,
+                                        &html_text
+                                    )
                                     .parse_mode(ParseMode::Html)
                                     .await
                             );
@@ -20799,9 +22816,9 @@ async fn process_bot_message(
                 shared_rate_limit_wait(&state_owned, chat_id).await;
 
                 // Capture pre-replacement emptiness so the UI silently deletes
-                // the placeholder when the AI produced nothing, and the session
-                // writeback below skips the assistant push — see handle_text_message
-                // for the same pattern.
+                // any placeholder (or sends nothing in final-only mode) when the
+                // AI produced nothing, and the session writeback below skips the
+                // assistant push — see handle_text_message for the same pattern.
                 let was_originally_empty = full_response.is_empty();
                 if was_originally_empty {
                     msg_debug(&format!(
@@ -20830,130 +22847,177 @@ async fn process_bot_message(
                     last_confirmed_len = 0;
                 }
                 let remaining = &full_response[last_confirmed_len..];
-                msg_debug(&format!("[rolling_ph/botmsg] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
-                    placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-                if was_originally_empty || remaining.trim().is_empty() {
-                    msg_debug(&format!(
-                        "[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}",
-                        placeholder_msg_id
-                    ));
-                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!(
-                        "delete_message",
-                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
-                    );
-                } else if should_attach_response_as_file(full_response.len(), provider_str) {
-                    msg_debug(&format!(
-                        "[rolling_ph/botmsg] FINAL FILE ATTACH: total={}",
-                        full_response.len()
-                    ));
-                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!(
-                        "edit_message",
-                        bot_owned
-                            .edit_message_text(
-                                chat_id,
-                                placeholder_msg_id,
-                                "\u{1f4c4} Response attached as file"
-                            )
-                            .await
-                    );
-                    send_response_as_file(
-                        &bot_owned,
-                        chat_id,
-                        &final_response,
-                        &state_owned,
-                        "botmsg",
-                    )
-                    .await;
-                } else {
-                    let normalized_remaining = normalize_empty_lines(remaining);
-                    let html_remaining = markdown_to_telegram_html(&normalized_remaining);
-                    msg_debug(&format!(
-                        "[botmsg_poll:{}] final delta_len={}, html_len={}",
-                        bmsg_id_for_log,
-                        normalized_remaining.len(),
-                        html_remaining.len()
-                    ));
-                    if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
-                        if let Err(e) = tg!(
+                if let Some(current_placeholder_msg_id) = placeholder_msg_id {
+                    msg_debug(&format!("[rolling_ph/botmsg] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
+                        current_placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
+                    if was_originally_empty || remaining.trim().is_empty() {
+                        msg_debug(&format!(
+                            "[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}",
+                            current_placeholder_msg_id
+                        ));
+                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                        let _ = tg!(
+                            "delete_message",
+                            bot_owned
+                                .delete_message(chat_id, current_placeholder_msg_id)
+                                .await
+                        );
+                    } else if should_attach_response_as_file(full_response.len(), provider_str) {
+                        msg_debug(&format!(
+                            "[rolling_ph/botmsg] FINAL FILE ATTACH: total={}",
+                            full_response.len()
+                        ));
+                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                        let _ = tg!(
                             "edit_message",
                             bot_owned
-                                .edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
-                                .parse_mode(ParseMode::Html)
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    "\u{1f4c4} Response attached as file",
+                                )
                                 .await
-                        ) {
-                            msg_debug(&format!(
-                                "[botmsg_poll:{}] HTML edit failed: {}",
-                                bmsg_id_for_log, e
-                            ));
-                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!(
+                        );
+                        send_response_as_file(
+                            &bot_owned,
+                            chat_id,
+                            &final_response,
+                            &state_owned,
+                            "botmsg",
+                        )
+                        .await;
+                    } else {
+                        let normalized_remaining = normalize_empty_lines(remaining);
+                        let html_remaining = markdown_to_telegram_html(&normalized_remaining);
+                        let rich_profile = {
+                            let data = state_owned.lock().await;
+                            get_rich_message_profile(&data.settings, chat_id)
+                        };
+                        let rich_markdown_remaining =
+                            sanitize_rich_markdown(&normalized_remaining, rich_profile);
+                        msg_debug(&format!(
+                            "[botmsg_poll:{}] final delta_len={}, html_len={}, rich_markdown_len={}",
+                            bmsg_id_for_log,
+                            normalized_remaining.len(),
+                            html_remaining.len(),
+                            rich_markdown_remaining.len()
+                        ));
+                        if try_edit_rich_message_markdown_if_enabled(
+                            &bot_owned,
+                            chat_id,
+                            current_placeholder_msg_id,
+                            &rich_markdown_remaining,
+                            &state_owned,
+                        )
+                        .await
+                        {
+                            // Rich edit succeeded; no classic fallback needed.
+                        } else if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
+                            if let Err(e) = tg!(
                                 "edit_message",
                                 bot_owned
                                     .edit_message_text(
                                         chat_id,
-                                        placeholder_msg_id,
-                                        &normalized_remaining
+                                        current_placeholder_msg_id,
+                                        &html_remaining
                                     )
+                                    .parse_mode(ParseMode::Html)
                                     .await
-                            );
-                        }
-                    } else {
-                        let send_result = send_long_message(
-                            &bot_owned,
-                            chat_id,
-                            &html_remaining,
-                            Some(ParseMode::Html),
-                            &state_owned,
-                        )
-                        .await;
-                        match send_result {
-                            Ok(_) => {
+                            ) {
+                                msg_debug(&format!(
+                                    "[botmsg_poll:{}] HTML edit failed: {}",
+                                    bmsg_id_for_log, e
+                                ));
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
                                 let _ = tg!(
-                                    "delete_message",
-                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(
+                                            chat_id,
+                                            current_placeholder_msg_id,
+                                            &normalized_remaining
+                                        )
+                                        .await
                                 );
                             }
-                            Err(_) => {
-                                let fallback = send_long_message(
-                                    &bot_owned,
-                                    chat_id,
-                                    &normalized_remaining,
-                                    None,
-                                    &state_owned,
-                                )
-                                .await;
-                                match fallback {
-                                    Ok(_) => {
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!(
-                                            "delete_message",
-                                            bot_owned
-                                                .delete_message(chat_id, placeholder_msg_id)
-                                                .await
-                                        );
-                                    }
-                                    Err(_) => {
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let truncated =
-                                            truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
-                                        let _ = tg!(
-                                            "edit_message",
-                                            bot_owned
-                                                .edit_message_text(
-                                                    chat_id,
-                                                    placeholder_msg_id,
-                                                    &truncated
-                                                )
-                                                .await
-                                        );
+                        } else {
+                            let send_result = send_long_message(
+                                &bot_owned,
+                                chat_id,
+                                &html_remaining,
+                                Some(ParseMode::Html),
+                                &state_owned,
+                            )
+                            .await;
+                            match send_result {
+                                Ok(_) => {
+                                    shared_rate_limit_wait(&state_owned, chat_id).await;
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned
+                                            .delete_message(chat_id, current_placeholder_msg_id)
+                                            .await
+                                    );
+                                }
+                                Err(_) => {
+                                    let fallback = send_long_message(
+                                        &bot_owned,
+                                        chat_id,
+                                        &normalized_remaining,
+                                        None,
+                                        &state_owned,
+                                    )
+                                    .await;
+                                    match fallback {
+                                        Ok(_) => {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let _ = tg!(
+                                                "delete_message",
+                                                bot_owned
+                                                    .delete_message(
+                                                        chat_id,
+                                                        current_placeholder_msg_id,
+                                                    )
+                                                    .await
+                                            );
+                                        }
+                                        Err(_) => {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let truncated = truncate_str(
+                                                &normalized_remaining,
+                                                TELEGRAM_MSG_LIMIT,
+                                            );
+                                            let _ = tg!(
+                                                "edit_message",
+                                                bot_owned
+                                                    .edit_message_text(
+                                                        chat_id,
+                                                        current_placeholder_msg_id,
+                                                        &truncated
+                                                    )
+                                                    .await
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                } else if !was_originally_empty && !remaining.trim().is_empty() {
+                    let normalized_remaining = normalize_empty_lines(remaining);
+                    msg_debug(&format!(
+                        "[rolling_ph/botmsg] FINAL SEND without placeholder: len={}",
+                        normalized_remaining.len()
+                    ));
+                    send_final_response_without_placeholder(
+                        &bot_owned,
+                        chat_id,
+                        &normalized_remaining,
+                        &state_owned,
+                        provider_str,
+                        "botmsg",
+                    )
+                    .await;
                 }
 
                 // Update session state
@@ -21147,32 +23211,66 @@ async fn process_bot_message(
                 last_confirmed_len = 0;
             }
             let remaining = &full_response[last_confirmed_len..];
-            msg_debug(&format!("[rolling_ph/botmsg] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
-                placeholder_msg_id, last_confirmed_len, remaining.trim().len()));
-            if should_attach_response_as_file(full_response.len(), provider_str) {
-                msg_debug(&format!(
-                    "[rolling_ph/botmsg] STOPPED FILE ATTACH: total={}",
-                    full_response.len()
-                ));
-                shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!(
-                    "edit_message",
-                    bot_owned
-                        .edit_message_text(
-                            chat_id,
-                            placeholder_msg_id,
-                            "\u{1f4c4} Response attached as file [Stopped]"
-                        )
-                        .await
-                );
-                send_response_as_file(
-                    &bot_owned,
-                    chat_id,
-                    &stopped_response,
-                    &state_owned,
-                    "botmsg",
-                )
-                .await;
+            if let Some(current_placeholder_msg_id) = placeholder_msg_id {
+                msg_debug(&format!("[rolling_ph/botmsg] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
+                    current_placeholder_msg_id, last_confirmed_len, remaining.trim().len()));
+                if should_attach_response_as_file(full_response.len(), provider_str) {
+                    msg_debug(&format!(
+                        "[rolling_ph/botmsg] STOPPED FILE ATTACH: total={}",
+                        full_response.len()
+                    ));
+                    shared_rate_limit_wait(&state_owned, chat_id).await;
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                current_placeholder_msg_id,
+                                "\u{1f4c4} Response attached as file [Stopped]",
+                            )
+                            .await
+                    );
+                    send_response_as_file(
+                        &bot_owned,
+                        chat_id,
+                        &stopped_response,
+                        &state_owned,
+                        "botmsg",
+                    )
+                    .await;
+                } else {
+                    let display_stopped = if remaining.trim().is_empty() {
+                        "[Stopped]".to_string()
+                    } else {
+                        let normalized = normalize_empty_lines(remaining);
+                        format!("{}\n\n[Stopped]", normalized)
+                    };
+                    let html_stopped = markdown_to_telegram_html(&display_stopped);
+                    if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
+                        let _ = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    &html_stopped
+                                )
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        );
+                    } else {
+                        let _ = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(
+                                    chat_id,
+                                    current_placeholder_msg_id,
+                                    &truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT)
+                                )
+                                .await
+                        );
+                    }
+                }
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     "[Stopped]".to_string()
@@ -21180,27 +23278,21 @@ async fn process_bot_message(
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n[Stopped]", normalized)
                 };
-                let html_stopped = markdown_to_telegram_html(&display_stopped);
-                if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                    let _ = tg!(
-                        "edit_message",
-                        bot_owned
-                            .edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                    );
-                } else {
-                    let _ = tg!(
-                        "edit_message",
-                        bot_owned
-                            .edit_message_text(
-                                chat_id,
-                                placeholder_msg_id,
-                                &truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT)
-                            )
-                            .await
-                    );
-                }
+                let stopped_without_placeholder =
+                    if should_attach_response_as_file(full_response.len(), provider_str) {
+                        &stopped_response
+                    } else {
+                        &display_stopped
+                    };
+                send_final_response_without_placeholder(
+                    &bot_owned,
+                    chat_id,
+                    stopped_without_placeholder,
+                    &state_owned,
+                    provider_str,
+                    "botmsg",
+                )
+                .await;
             }
 
             // Do NOT create response file on cancel → chain broken
@@ -21732,10 +23824,11 @@ async fn scheduler_cycle(
             }
 
             // Note: file deletion happens inside `process_bot_message` only
-            // after the placeholder send succeeds. Deleting here (or at claim
-            // time) lost the message on every interim failure path
-            // (cancel-during-lock-wait, no-session, placeholder send error)
-            // because none of those branches re-queue the file.
+            // after the task is committed to execution (placeholder sent in
+            // verbose/compact modes, output-mode gate passed in final-only
+            // mode). Deleting here (or at claim time) lost the message on every
+            // interim failure path because none of those branches re-queue the
+            // file.
             msg_debug(&format!(
                 "[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})",
                 msg.id, msg.from, msg.to, chat_id_num

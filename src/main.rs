@@ -314,7 +314,10 @@ fn handle_cron_register(
         schedule_type, schedule_value
     ));
 
-    // Generate 8-char uppercase hex ID (0-9, A-F), unique among existing schedule files
+    // Generate 8-char uppercase hex ID (0-9, A-F), unique among existing live
+    // schedule files and retained history files. History is intentionally kept
+    // after manual removal so follow-up questions can inspect what happened; do
+    // not reuse a schedule ID that still has history.
     cron_debug("  Generating unique ID...");
     let id = {
         use std::collections::HashSet;
@@ -322,11 +325,17 @@ fn handle_cron_register(
         cron_debug(&format!("  Existing schedule IDs: {:?}", existing));
         loop {
             let candidate = format!("{:08X}", rand::random::<u32>());
-            if !existing.contains(&candidate) {
+            let history_exists = telegram::schedule_history_path_pub(&candidate)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            if !existing.contains(&candidate) && !history_exists {
                 cron_debug(&format!("  Generated ID: {}", candidate));
                 break candidate;
             }
-            cron_debug(&format!("  ID collision: {}, retrying...", candidate));
+            cron_debug(&format!(
+                "  ID collision/reserved by history: {}, retrying...",
+                candidate
+            ));
         }
     };
 
@@ -386,6 +395,7 @@ fn handle_cron_register(
 
     let mut output = serde_json::json!({
         "status": "ok",
+        "kind": "cron_register",
         "id": id,
         "prompt": prompt,
         "schedule": schedule_value,
@@ -487,7 +497,10 @@ fn handle_cron_list(chat_id: i64, hash_key: &str) {
             obj
         })
         .collect();
-    println!("{}", serde_json::json!({"status":"ok","schedules":items}));
+    println!(
+        "{}",
+        serde_json::json!({"status":"ok","kind":"cron_list","schedules":items})
+    );
 }
 
 fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
@@ -512,15 +525,18 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
     }
 
     if telegram::delete_schedule_entry_pub(id) {
-        // Also clear the run-history file for this schedule. If we kept it around, a
-        // future schedule that happened to receive the same 8-char ID (collision-checked
-        // but theoretically reusable) would inherit the prior schedule's run history.
-        telegram::delete_schedule_history_pub(id);
+        // Keep run history after manual removal. Follow-up turns often need to
+        // inspect why a schedule fired or was removed, and `--cron-history`
+        // authorizes against retained history records when the live entry is gone.
+        // ID generation avoids reusing IDs with existing history files.
         cron_debug(&format!(
             "[handle_cron_remove] id={}, deleted successfully",
             id
         ));
-        println!("{}", serde_json::json!({"status":"ok","id":id}));
+        println!(
+            "{}",
+            serde_json::json!({"status":"ok","kind":"cron_remove","id":id})
+        );
     } else {
         cron_debug(&format!("[handle_cron_remove] id={}, delete failed", id));
         eprintln!(
@@ -536,8 +552,9 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
 /// Authorization: prefers the live schedule entry's (chat_id, key) match. If the
 /// entry is gone (one-time schedule already executed and auto-deleted), falls back to
 /// the first record in the history file — both `chat_id` and the key verifier must match.
-/// Output: `{"status":"ok","id":"...","count":N,"history":[{...}, ...]}`. An entry that
-/// exists but has never run yields `count:0, history:[]`.
+/// Output:
+/// `{"status":"ok","kind":"cron_history","id":"...","count":N,"history":[{...}, ...]}`.
+/// An entry that exists but has never run yields `count:0, history:[]`.
 fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
@@ -640,6 +657,7 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
 
     let output = serde_json::json!({
         "status": "ok",
+        "kind": "cron_history",
         "id": id,
         "count": history.len(),
         "history": history,
@@ -754,7 +772,7 @@ fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
     ));
     println!(
         "{}",
-        serde_json::json!({"status":"ok","id":id,"schedule":schedule_value})
+        serde_json::json!({"status":"ok","kind":"cron_update","id":id,"schedule":schedule_value})
     );
 }
 

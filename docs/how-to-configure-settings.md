@@ -2,12 +2,54 @@
 
 ## /silent
 
-Toggles silent mode for the current chat. Default: **ON**.
+Configures output verbosity for the current chat. Default: **compact**.
 
-- **ON** — Tool calls (Bash, Read, Edit, etc.) are hidden from the response. Only the AI's text output and errors are shown.
-- **OFF** — Full tool call details are displayed, including commands run and file contents read.
+```
+/silent
+/silent status
+/silent compact
+/silent final
+/silent verbose
+```
 
-Silent mode reduces message noise, especially in group chats.
+- **compact** — Tool calls and normal tool results are hidden, while normal AI text/progress remains visible. This is the default and matches the old silent-on behavior.
+- **final** — Tool calls, tool results, task notifications, cokacdir tool summaries, placeholders, and progress edits are hidden. The chat receives only the final response.
+- **verbose** — Full tool call details are displayed, including commands run, tool summaries, tool results, and tool errors.
+
+Running `/silent` with no argument does not change the setting. It shows the current mode and the available `/silent compact`, `/silent final`, and `/silent verbose` options.
+
+Legacy settings are migrated safely: old `silent=true` maps to `compact`, old `silent=false` maps to `verbose`, and missing settings default to `compact`.
+
+---
+
+## /rich
+
+Configures Telegram Bot API 10.1 Rich Message delivery for eligible final responses. Defaults: delivery **auto**, profile **safe**, RTL **off**, draft streaming **off**.
+
+```
+/rich
+/rich status
+/rich off
+/rich auto
+/rich on
+/rich safe
+/rich full
+/rich profile safe|full
+/rich rtl on|off
+/rich draft on|off
+```
+
+- **off** — Always use the classic `sendMessage` / split-message / file-attachment path.
+- **auto** — Use Rich Messages for eligible final responses when the classic path would otherwise split/attach the message, or when the response contains rich-only Markdown blocks such as tables.
+- **on** — Prefer Rich Messages for all eligible final responses.
+- **safe** — Text-focused Rich Markdown. Media blocks and unsupported raw HTML are escaped.
+- **full** — Full Telegram Rich Markdown/HTML surface. Markdown media blocks, maps, collages, slideshows, anchors, references, date-time entities, custom emoji syntax, official HTML tags, and `sendRichMessageDraft`'s `<tg-thinking>` tag are passed through. `/rich full` also switches delivery to **on**.
+- **rtl on|off** — Sets `InputRichMessage.is_rtl`.
+- **draft on|off** — Opt-in streaming of `sendRichMessageDraft` previews while a final-only private-chat response is being generated. Drafts are ephemeral and the complete response is still sent normally when generation finishes.
+
+Rich delivery applies to eligible final-response sends, including `final` output mode and final edits of existing rolling placeholders. In safe profile it uses sanitized Telegram Rich Markdown so supported advanced text blocks such as headings, tables, task lists, LaTeX formulas, footnotes, and details sections can render natively while media attachment blocks and unsupported raw HTML are escaped. In full profile it passes Telegram Rich Markdown through verbatim to expose the complete Bot API 10.1 formatting surface. Automatic entity detection is disabled, and the bot falls back to the classic path if Telegram rejects the rich message or the response exceeds conservative Rich Message limits.
+
+When Rich delivery is `auto` or `on`, cokacdir also injects explicit response-format guidance into the AI system prompt. The guidance tells the model that the final answer is the rendered message body, not a source-code example; to produce renderable Telegram Rich Markdown/HTML; to output requested Markdown tables directly; and not to wrap rich-renderable markup in a code block unless the user explicitly asks to see literal Markdown/HTML source.
 
 ---
 
