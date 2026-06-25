@@ -11,6 +11,7 @@ use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde_json::Value;
 
 use crate::services::claude::{
@@ -358,30 +359,63 @@ fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String>
         .ok_or_else(|| format!("Invalid Agy conversation path: {}", source.display()))?;
     let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("db");
     let target = dir.join(format!("{}.{}", target_id, ext));
-    std::fs::copy(source, &target).map_err(|e| {
-        format!(
-            "Failed to copy Agy conversation {} -> {}: {}",
-            source.display(),
-            target.display(),
-            e
-        )
-    })?;
 
     if ext == "db" {
-        for suffix in ["db-wal", "db-shm"] {
-            let sidecar = source.with_extension(suffix);
-            if sidecar.is_file() {
-                let target_sidecar = dir.join(format!("{}.{}", target_id, suffix));
-                std::fs::copy(&sidecar, &target_sidecar).map_err(|e| {
+        for path in [
+            target.clone(),
+            dir.join(format!("{}.db-wal", target_id)),
+            dir.join(format!("{}.db-shm", target_id)),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|e| {
                     format!(
-                        "Failed to copy Agy conversation sidecar {} -> {}: {}",
-                        sidecar.display(),
-                        target_sidecar.display(),
+                        "Failed to remove stale Agy clone target {}: {}",
+                        path.display(),
                         e
                     )
                 })?;
             }
         }
+
+        let source_conn = Connection::open_with_flags(
+            source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to open Agy conversation for backup {}: {}",
+                source.display(),
+                e
+            )
+        })?;
+        source_conn
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| {
+                format!(
+                    "Failed to configure Agy conversation backup timeout {}: {}",
+                    source.display(),
+                    e
+                )
+            })?;
+        source_conn
+            .backup(DatabaseName::Main, &target, None)
+            .map_err(|e| {
+                format!(
+                    "Failed to backup Agy conversation {} -> {}: {}",
+                    source.display(),
+                    target.display(),
+                    e
+                )
+            })?;
+    } else {
+        std::fs::copy(source, &target).map_err(|e| {
+            format!(
+                "Failed to copy Agy conversation {} -> {}: {}",
+                source.display(),
+                target.display(),
+                e
+            )
+        })?;
     }
 
     Ok(())

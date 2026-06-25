@@ -355,8 +355,44 @@ fn handle_cron_register(
     // later, but the captured session_id belongs to the provider active at
     // registration time.
     cron_debug("  Resolving current model/provider...");
-    let current_model = telegram::resolve_model_for_chat(chat_id, hash_key);
-    let provider = telegram::detect_provider_pub(current_model.as_deref()).to_string();
+    let mut current_model = telegram::resolve_model_for_chat(chat_id, hash_key);
+    let mut provider = telegram::detect_provider_pub(current_model.as_deref()).to_string();
+    if let Some(source_sid) = session_id {
+        match telegram::resolve_session_provider_pub(source_sid, Some(&provider)) {
+            Some(resolved_provider) => {
+                if resolved_provider != provider {
+                    cron_debug(&format!(
+                        "  provider adjusted from model setting: {} -> {}",
+                        provider, resolved_provider
+                    ));
+                    provider = resolved_provider;
+                }
+                if matches!(
+                    current_model
+                        .as_deref()
+                        .map(|model| telegram::detect_provider_pub(Some(model))),
+                    Some(model_provider) if model_provider != provider.as_str()
+                ) {
+                    cron_debug(&format!(
+                        "  model {:?} belongs to a different provider; clearing stored model for schedule",
+                        current_model
+                    ));
+                    current_model = None;
+                }
+            }
+            None => {
+                cron_debug(&format!(
+                    "  ERROR: --session could not be resolved to a provider: {}",
+                    source_sid
+                ));
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"status":"error","message":format!("--session could not be resolved to a provider: {}", source_sid)})
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     cron_debug(&format!("  current_model: {:?}", current_model));
     cron_debug(&format!("  provider: {}", provider));
 

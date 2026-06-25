@@ -1,7 +1,7 @@
 # Telegram Rich Message 고급 렌더링 참고 문서
 
 작성일: 2026-06-24  
-대상 구현: cokacdir `0.6.37`의 Telegram `/rich` 및 고급 렌더링 경로
+대상 구현: cokacdir `0.6.38`의 Telegram `/rich` 및 고급 렌더링 경로
 
 이 문서는 cokacdir에 Telegram Bot API 10.1 Rich Message 기반 고급 렌더링을 적용할 때 참고한 외부 공식 문서와 내부 구현 판단을 한곳에 정리한 것이다. 원문 문서를 그대로 복제하기보다, 구현에 필요한 요건·제약·설계 결정을 추적 가능한 형태로 요약한다.
 

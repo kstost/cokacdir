@@ -1348,7 +1348,8 @@ fn format_rich_message_prompt_guidance(
 #[cfg(test)]
 mod output_mode_tests {
     use super::{
-        format_output_mode_status, get_output_mode, set_output_mode, BotSettings, OutputMode,
+        detect_cokacdir_sendfile_command, format_output_mode_status, get_output_mode,
+        set_output_mode, should_reset_final_only_for_task_notification, BotSettings, OutputMode,
     };
     use teloxide::types::ChatId;
 
@@ -1407,6 +1408,52 @@ mod output_mode_tests {
         assert!(status.contains("/silent final"));
         assert!(status.contains("/silent verbose"));
         assert!(!status.contains("Cycle:"));
+    }
+
+    #[test]
+    fn final_only_keeps_candidate_after_completed_todo_notification() {
+        let summary = "[x] inspect code\n[x] summarize result";
+
+        assert!(!should_reset_final_only_for_task_notification(
+            summary, "updated"
+        ));
+    }
+
+    #[test]
+    fn final_only_resets_candidate_for_in_progress_todo_notification() {
+        let summary = "[x] inspect code\n[ ] summarize result";
+
+        assert!(should_reset_final_only_for_task_notification(
+            summary, "updated"
+        ));
+    }
+
+    #[test]
+    fn final_only_keeps_candidate_for_completed_status_notification() {
+        assert!(!should_reset_final_only_for_task_notification(
+            "task finished",
+            "completed"
+        ));
+    }
+
+    #[test]
+    fn final_only_detects_cokacdir_sendfile_tool_use() {
+        let input = serde_json::json!({
+            "command": format!("{} --sendfile /tmp/out.png --chat 1 --key xxx", crate::bin_path())
+        })
+        .to_string();
+
+        assert!(detect_cokacdir_sendfile_command("Bash", &input));
+    }
+
+    #[test]
+    fn final_only_does_not_preserve_other_cokacdir_tool_use() {
+        let input = serde_json::json!({
+            "command": format!("{} --currenttime", crate::bin_path())
+        })
+        .to_string();
+
+        assert!(!detect_cokacdir_sendfile_command("Bash", &input));
     }
 }
 
@@ -4457,6 +4504,34 @@ fn reset_final_only_text_candidate(final_only_mode: bool, candidate: &mut String
     if final_only_mode {
         candidate.clear();
     }
+}
+
+fn should_reset_final_only_for_task_notification(summary: &str, status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "complete" | "completed" | "done" | "finished" | "success" | "succeeded"
+    ) {
+        return false;
+    }
+
+    let mut saw_todo_line = false;
+    for line in summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        saw_todo_line = true;
+        if !(line.starts_with("[x]")
+            || line.starts_with("[X]")
+            || line.starts_with("[✓]")
+            || line.starts_with("[✔]"))
+        {
+            return true;
+        }
+    }
+
+    !saw_todo_line
 }
 
 fn maybe_use_done_result_for_final_only(
@@ -11177,6 +11252,44 @@ pub fn detect_provider_pub(model: Option<&str>) -> &'static str {
     detect_provider(model)
 }
 
+/// Resolve the provider that owns a session id/name. This is used by CLI
+/// schedule registration so an explicit `--session` is not blindly paired with
+/// a provider inferred from the current model setting.
+pub fn resolve_session_provider_pub(
+    query: &str,
+    preferred_provider: Option<&str>,
+) -> Option<String> {
+    let mut providers = Vec::new();
+    if let Some(provider) = preferred_provider {
+        match provider {
+            "claude" => providers.push(SessionProvider::Claude),
+            "codex" => providers.push(SessionProvider::Codex),
+            "agy" | "gemini" => providers.push(SessionProvider::Agy),
+            "opencode" => providers.push(SessionProvider::OpenCode),
+            _ => {}
+        }
+    }
+
+    for provider in [
+        SessionProvider::Claude,
+        SessionProvider::Codex,
+        SessionProvider::Agy,
+        SessionProvider::OpenCode,
+    ] {
+        if !providers.contains(&provider) {
+            providers.push(provider);
+        }
+    }
+
+    for provider in providers {
+        if resolve_session(query, provider).is_some() {
+            return Some(session_provider_str(provider).to_string());
+        }
+    }
+
+    None
+}
+
 /// Convert provider name to SessionProvider enum.
 fn provider_to_session(provider: &str) -> SessionProvider {
     match provider {
@@ -16860,6 +16973,7 @@ async fn handle_text_message(
         let mut new_session_id: Option<String> = None;
         let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
+        let mut pending_cokacdir_preserves_final = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut last_confirmed_len: usize = 0;
@@ -16928,11 +17042,17 @@ async fn handle_text_message(
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
-                                pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                let is_cokacdir = detect_cokacdir_command(&name, &input);
+                                let preserves_final = final_only_mode
+                                    && detect_cokacdir_sendfile_command(&name, &input);
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir = is_cokacdir;
+                                pending_cokacdir_preserves_final = preserves_final;
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
                                 let summary = format_tool_input(&name, &input);
@@ -16979,10 +17099,15 @@ async fn handle_text_message(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                                let preserves_final =
+                                    final_only_mode && pending_cokacdir_preserves_final;
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir_preserves_final = false;
                                 msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
                                     msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -17049,11 +17174,16 @@ async fn handle_text_message(
                                     msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
                                 }
                             }
-                            StreamMessage::TaskNotification { summary, .. } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                            StreamMessage::TaskNotification {
+                                status, summary, ..
+                            } => {
+                                if should_reset_final_only_for_task_notification(&summary, &status)
+                                {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
                                 if !summary.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "TaskNotification".into(),
@@ -19834,14 +19964,27 @@ fn find_closing_single(chars: &[char], start: usize, marker: char) -> Option<usi
 /// Handles quoted paths, shell wrappers (bash -lc "..."), chained commands (cd && ...), etc.
 /// NOTE: Returns bool (not subcommand name), so console logs show "cokacdir: ..." without
 /// the specific --flag. format_cokacdir_result() auto-detects subcommand from JSON fields instead.
-fn detect_cokacdir_command(name: &str, input: &str) -> bool {
+fn bash_tool_command(name: &str, input: &str) -> Option<String> {
     if name != "Bash" {
-        return false;
+        return None;
     }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+    let v = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    v.get("command")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn command_contains_shell_token(cmd: &str, token: &str) -> bool {
+    cmd.split_whitespace().any(|tok| {
+        let unquoted = tok.trim_matches(|c| c == '"' || c == '\'');
+        unquoted == token
+    })
+}
+
+fn detect_cokacdir_command(name: &str, input: &str) -> bool {
+    let Some(cmd) = bash_tool_command(name, input) else {
         return false;
     };
-    let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let expected = crate::bin_path().rsplit(['/', '\\']).next().unwrap_or("");
     if expected.is_empty() {
         return false;
@@ -19854,15 +19997,21 @@ fn detect_cokacdir_command(name: &str, input: &str) -> bool {
     })
 }
 
-/// Check if a Bash tool call contains --read_chat_log (result should be suppressed from display).
-fn detect_chat_log_read(name: &str, input: &str) -> bool {
-    if name != "Bash" {
+fn detect_cokacdir_sendfile_command(name: &str, input: &str) -> bool {
+    if !detect_cokacdir_command(name, input) {
         return false;
     }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+    let Some(cmd) = bash_tool_command(name, input) else {
         return false;
     };
-    let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    command_contains_shell_token(&cmd, "--sendfile")
+}
+
+/// Check if a Bash tool call contains --read_chat_log (result should be suppressed from display).
+fn detect_chat_log_read(name: &str, input: &str) -> bool {
+    let Some(cmd) = bash_tool_command(name, input) else {
+        return false;
+    };
     cmd.contains("--read_chat_log")
 }
 
@@ -21112,6 +21261,7 @@ async fn execute_schedule(
         let mut had_error = false;
         let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
+        let mut pending_cokacdir_preserves_final = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut exec_session_id: Option<String> = None;
@@ -21168,11 +21318,17 @@ async fn execute_schedule(
                                     chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
-                                pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                let is_cokacdir = detect_cokacdir_command(&name, &input);
+                                let preserves_final = final_only_mode
+                                    && detect_cokacdir_sendfile_command(&name, &input);
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir = is_cokacdir;
+                                pending_cokacdir_preserves_final = preserves_final;
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
                                 let summary = format_tool_input(&name, &input);
@@ -21216,10 +21372,15 @@ async fn execute_schedule(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                                let preserves_final =
+                                    final_only_mode && pending_cokacdir_preserves_final;
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir_preserves_final = false;
                                 sched_debug(&format!("[schedule_polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
                                     sched_debug(&format!("[schedule_polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
@@ -21284,11 +21445,16 @@ async fn execute_schedule(
                                     sched_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
                                 }
                             }
-                            StreamMessage::TaskNotification { summary, .. } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                            StreamMessage::TaskNotification {
+                                status, summary, ..
+                            } => {
+                                if should_reset_final_only_for_task_notification(&summary, &status)
+                                {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
                                 if !summary.is_empty() {
                                     raw_entries.push(RawPayloadEntry {
                                         tag: "TaskNotification".into(),
@@ -22615,6 +22781,7 @@ async fn process_bot_message(
         let mut new_session_id: Option<String> = None;
         let mut spin_idx: usize = if final_only_mode { 1 } else { 0 };
         let mut pending_cokacdir = false;
+        let mut pending_cokacdir_preserves_final = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut placeholder_msg_id = placeholder_msg_id;
@@ -22686,11 +22853,17 @@ async fn process_bot_message(
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
                             }
                             StreamMessage::ToolUse { name, input } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
-                                pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                let is_cokacdir = detect_cokacdir_command(&name, &input);
+                                let preserves_final = final_only_mode
+                                    && detect_cokacdir_sendfile_command(&name, &input);
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir = is_cokacdir;
+                                pending_cokacdir_preserves_final = preserves_final;
                                 suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
                                 let summary = format_tool_input(&name, &input);
@@ -22731,10 +22904,15 @@ async fn process_bot_message(
                                 }
                             }
                             StreamMessage::ToolResult { content, is_error } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                                let preserves_final =
+                                    final_only_mode && pending_cokacdir_preserves_final;
+                                if !preserves_final {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
+                                pending_cokacdir_preserves_final = false;
                                 msg_debug(&format!("[botmsg_poll:{}] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}",
                                         bmsg_id_for_log, is_error, content.len(), pending_cokacdir, last_tool_name));
                                 if is_error {
@@ -22812,11 +22990,16 @@ async fn process_bot_message(
                                     msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
                                 }
                             }
-                            StreamMessage::TaskNotification { summary, .. } => {
-                                reset_final_only_text_candidate(
-                                    final_only_mode,
-                                    &mut final_only_response,
-                                );
+                            StreamMessage::TaskNotification {
+                                status, summary, ..
+                            } => {
+                                if should_reset_final_only_for_task_notification(&summary, &status)
+                                {
+                                    reset_final_only_text_candidate(
+                                        final_only_mode,
+                                        &mut final_only_response,
+                                    );
+                                }
                                 msg_debug(&format!(
                                     "[botmsg_poll:{}] TaskNotification: summary_len={}",
                                     bmsg_id_for_log,

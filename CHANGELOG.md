@@ -1,5 +1,17 @@
 # Changelog — cokacdir
 
+## 0.6.40 — 2026-06-25
+
+- **`/silent final` no longer drops the final answer after completed Codex todo updates.** Codex can emit the terminal assistant text, then a completed `todo_list` task notification, then `turn.completed` with an empty result. Final-only mode now preserves the assistant-answer candidate when the task notification is already complete or every todo line is checked, while still clearing interim text for in-progress task updates. This fixes the “processing placeholder disappears with no response” failure seen when all work completed successfully but the final answer was cleared just before rendering.
+
+- **Final-only mode preserves terminal answers across `cokacdir --sendfile` delivery events.** Codex image/file auto-delivery and model-issued sendfile commands are represented as `Bash` ToolUse/ToolResult events after the answer may already have been produced. `/silent final` now detects `cokacdir --sendfile` specifically and keeps the final answer candidate through that internal delivery pair, without changing the reset behavior for normal tools or other cokacdir commands.
+
+- **Scheduled session registration now resolves the provider from the source session id.** `--cron ... --session <SID>` validates that the session can actually be found and adjusts the stored provider to the resolved session provider instead of blindly trusting the chat's current model setting. If the session cannot be resolved, registration fails early with a JSON error.
+
+- **Agy scheduled-session cloning now uses SQLite online backup for `.db` conversations.** Cloning removes stale target sidecars and backs up the source database through `rusqlite` instead of copying `.db/.db-wal/.db-shm` files directly, reducing the risk of inconsistent Agy conversation clones.
+
+---
+
 ## 0.6.38 — 2026-06-24
 
 - **`/silent final` now shows the existing animated processing placeholder before the terminal response.** Final mode still hides tool calls, tool results, task notifications, and intermediate AI text, but normal chat, scheduled tasks, and bot-to-bot processing now show the clock/typing `Processing` animation and replace that message with the final response when the run completes. Final mode now renders the final assistant answer candidate after the latest tool/tool-result/task boundary instead of dumping every streamed assistant text chunk accumulated during the run, cancelled final-only runs no longer reveal partial accumulated text, and Codex todo-list updates are treated as task notifications so they cannot leak into the final-only response.
