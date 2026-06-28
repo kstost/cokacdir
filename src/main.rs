@@ -2374,10 +2374,14 @@ fn main() -> io::Result<()> {
         app.save_settings();
     }
 
-    // Save last directory for shell cd (skip remote paths)
+    // Save last directory for shell cd (skip remote paths). When launched via
+    // the shell wrapper, write to a per-run file so non-TUI commands cannot
+    // accidentally reuse a stale ~/.cokacdir/lastdir value.
     if !app.active_panel().is_remote() {
         let last_dir = app.active_panel().path.display().to_string();
-        if let Some(config_dir) = config::Settings::config_dir() {
+        if let Some(path) = shell_lastdir_output_path() {
+            let _ = write_shell_lastdir_output(&path, &last_dir);
+        } else if let Some(config_dir) = config::Settings::config_dir() {
             let lastdir_path = config_dir.join("lastdir");
             let _ = std::fs::write(&lastdir_path, &last_dir);
         }
@@ -2591,6 +2595,49 @@ fn completed_file_operation_succeeded(progress: &crate::ui::app::FileOperationPr
         .as_ref()
         .map(|result| result.failure_count == 0 && result.success_count > 0)
         .unwrap_or(false)
+}
+
+fn shell_lastdir_output_path() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var_os("COKACDIR_LASTDIR_FILE")?);
+    let config_dir = config::Settings::config_dir()?;
+    if is_valid_shell_lastdir_output_path(&path, &config_dir) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn is_valid_shell_lastdir_output_path(
+    path: &std::path::Path,
+    config_dir: &std::path::Path,
+) -> bool {
+    let expected_dir = config_dir.join("_lastdir");
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent != expected_dir {
+        return false;
+    }
+
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("cokacdir-lastdir."))
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn write_shell_lastdir_output(path: &std::path::Path, last_dir: &str) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(last_dir.as_bytes())
 }
 
 fn new_tar_error_dialog(message: String) -> crate::ui::app::Dialog {
@@ -3258,6 +3305,55 @@ mod cli_token_tests {
         assert!(is_slack_token("xoxb-bot-token,xapp-app-token"));
         assert!(is_slack_token("slack:xoxb-bot-token,xapp-app-token"));
         assert!(!is_slack_token("123456789:telegram-token"));
+    }
+}
+
+#[cfg(test)]
+mod shell_lastdir_tests {
+    use super::is_valid_shell_lastdir_output_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn accepts_wrapper_temp_file_inside_lastdir_dir() {
+        let config_dir = PathBuf::from("home").join("user").join(".cokacdir");
+        let path = config_dir.join("_lastdir").join("cokacdir-lastdir.A1b2C3");
+
+        assert!(is_valid_shell_lastdir_output_path(&path, &config_dir));
+    }
+
+    #[test]
+    fn rejects_output_path_outside_lastdir_dir() {
+        let config_dir = PathBuf::from("home").join("user").join(".cokacdir");
+        let path = config_dir.join("settings.json");
+
+        assert!(!is_valid_shell_lastdir_output_path(&path, &config_dir));
+    }
+
+    #[test]
+    fn rejects_wrong_temp_file_prefix() {
+        let config_dir = PathBuf::from("home").join("user").join(".cokacdir");
+        let path = config_dir.join("_lastdir").join("other-file");
+
+        assert!(!is_valid_shell_lastdir_output_path(&path, &config_dir));
+    }
+
+    #[test]
+    fn rejects_empty_temp_file_suffix() {
+        let config_dir = PathBuf::from("home").join("user").join(".cokacdir");
+        let path = config_dir.join("_lastdir").join("cokacdir-lastdir.");
+
+        assert!(!is_valid_shell_lastdir_output_path(&path, &config_dir));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_path() {
+        let config_dir = PathBuf::from("home").join("user").join(".cokacdir");
+        let path = config_dir
+            .join("_lastdir")
+            .join("..")
+            .join("cokacdir-lastdir.A1b2C3");
+
+        assert!(!is_valid_shell_lastdir_output_path(&path, &config_dir));
     }
 }
 

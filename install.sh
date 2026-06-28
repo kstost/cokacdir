@@ -86,8 +86,30 @@ download() {
     fi
 }
 
-# Shell wrapper function to add
-SHELL_FUNC='cokacdir() { command cokacdir "$@" && cd "$(cat ~/.cokacdir/lastdir 2>/dev/null || pwd)"; }'
+# Shell wrapper function to add. The binary writes COKACDIR_LASTDIR_FILE only
+# after an interactive TUI run, so non-interactive commands never cd.
+SHELL_FUNC='cokacdir() {
+    local cokacdir_lastdir_dir="$HOME/.cokacdir/_lastdir"
+    local cokacdir_lastdir_file
+    mkdir -p "$cokacdir_lastdir_dir" || return $?
+    chmod 700 "$cokacdir_lastdir_dir" 2>/dev/null || true
+    cokacdir_lastdir_file="$(mktemp "$cokacdir_lastdir_dir/cokacdir-lastdir.XXXXXX")" || return $?
+
+    COKACDIR_LASTDIR_FILE="$cokacdir_lastdir_file" command cokacdir "$@"
+    local cokacdir_status=$?
+
+    if [ "$cokacdir_status" -eq 0 ] && [ -s "$cokacdir_lastdir_file" ]; then
+        local cokacdir_lastdir
+        cokacdir_lastdir="$(cat "$cokacdir_lastdir_file" 2>/dev/null)" || cokacdir_lastdir=""
+        if [ -n "$cokacdir_lastdir" ]; then
+            cd "$cokacdir_lastdir"
+        fi
+    fi
+
+    rm -f "$cokacdir_lastdir_file"
+
+    return "$cokacdir_status"
+}'
 
 # Get shell config file
 get_shell_config() {
@@ -122,8 +144,19 @@ setup_shell() {
         return
     fi
 
-    # Check if already configured
+    # Check if already configured. Older installers added wrappers that changed
+    # directory after commands like `cokacdir --version`; append the fixed wrapper
+    # after those old definitions so re-running the installer corrects them.
     if [ -f "$config_file" ] && grep -q "cokacdir()" "$config_file"; then
+        if grep -Fq "COKACDIR_LASTDIR_FILE=" "$config_file"; then
+            return
+        fi
+        if grep -Fq 'command cokacdir "$@" && cd "$(cat ~/.cokacdir/lastdir' "$config_file" || \
+           grep -Fq "local cokacdir_should_cd=1" "$config_file"; then
+            echo "" >> "$config_file"
+            echo "# cokacdir - cd to last directory on interactive exit" >> "$config_file"
+            echo "$SHELL_FUNC" >> "$config_file"
+        fi
         return
     fi
 
@@ -134,7 +167,7 @@ setup_shell() {
 
     # Add function
     echo "" >> "$config_file"
-    echo "# cokacdir - cd to last directory on exit" >> "$config_file"
+    echo "# cokacdir - cd to last directory on interactive exit" >> "$config_file"
     echo "$SHELL_FUNC" >> "$config_file"
 }
 
