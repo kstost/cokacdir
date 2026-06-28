@@ -120,9 +120,29 @@ COKACDIR_SHELL_WRAPPER
 }
 
 # Get shell config file
+fallback_shell_config() {
+    if [ -f "$HOME/.zshrc" ]; then
+        echo "$HOME/.zshrc"
+    elif [ -f "$HOME/.bashrc" ]; then
+        echo "$HOME/.bashrc"
+    elif [ -f "$HOME/.bash_profile" ]; then
+        echo "$HOME/.bash_profile"
+    elif [ -z "${SHELL:-}" ]; then
+        case "$(uname -s)" in
+            Darwin*) echo "$HOME/.zshrc" ;;
+            *)       echo "$HOME/.bashrc" ;;
+        esac
+    else
+        echo ""
+    fi
+}
+
 get_shell_config() {
     local shell_name
-    shell_name="$(basename "$SHELL")"
+    shell_name=""
+    if [ -n "${SHELL:-}" ]; then
+        shell_name="$(basename "$SHELL")"
+    fi
 
     case "$shell_name" in
         bash)
@@ -138,7 +158,7 @@ get_shell_config() {
             echo "$HOME/.zshrc"
             ;;
         *)
-            echo ""
+            fallback_shell_config
             ;;
     esac
 }
