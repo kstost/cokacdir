@@ -86,9 +86,14 @@ download() {
     fi
 }
 
-# Shell wrapper function to add. The binary writes COKACDIR_LASTDIR_FILE only
-# after an interactive TUI run, so non-interactive commands never cd.
-SHELL_FUNC='cokacdir() {
+# Canonical shell wrapper. cokacctl extracts this marked block from install.sh
+# so this file remains the source of truth for the user-facing cokacdir() shell
+# function.
+write_shell_wrapper() {
+    cat <<'COKACDIR_SHELL_WRAPPER'
+# BEGIN COKACDIR SHELL WRAPPER
+# cokacdir - cd to last directory on interactive exit
+cokacdir() {
     local cokacdir_lastdir_dir="$HOME/.cokacdir/_lastdir"
     local cokacdir_lastdir_file
     mkdir -p "$cokacdir_lastdir_dir" || return $?
@@ -109,7 +114,10 @@ SHELL_FUNC='cokacdir() {
     rm -f "$cokacdir_lastdir_file"
 
     return "$cokacdir_status"
-}'
+}
+# END COKACDIR SHELL WRAPPER
+COKACDIR_SHELL_WRAPPER
+}
 
 # Get shell config file
 get_shell_config() {
@@ -154,8 +162,7 @@ setup_shell() {
         if grep -Fq 'command cokacdir "$@" && cd "$(cat ~/.cokacdir/lastdir' "$config_file" || \
            grep -Fq "local cokacdir_should_cd=1" "$config_file"; then
             echo "" >> "$config_file"
-            echo "# cokacdir - cd to last directory on interactive exit" >> "$config_file"
-            echo "$SHELL_FUNC" >> "$config_file"
+            write_shell_wrapper >> "$config_file"
         fi
         return
     fi
@@ -167,8 +174,7 @@ setup_shell() {
 
     # Add function
     echo "" >> "$config_file"
-    echo "# cokacdir - cd to last directory on interactive exit" >> "$config_file"
-    echo "$SHELL_FUNC" >> "$config_file"
+    write_shell_wrapper >> "$config_file"
 }
 
 main() {
