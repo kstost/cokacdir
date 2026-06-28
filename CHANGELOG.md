@@ -1,5 +1,13 @@
 # Changelog — cokacdir
 
+## 0.6.41 — 2026-06-28
+
+- **Go to Path autocomplete now prioritizes what the user actually typed.** Path suggestions are ranked as exact, case-insensitive exact, prefix, substring, then subsequence matches, so inputs such as `/Users/kst/de` surface `Desktop/`, `develop/`, and `devnoda/` ahead of unrelated fuzzy matches, and `/V` surfaces `/Volumes/` before lower-quality root entries. Hidden entries are still available, but they are pushed behind visible entries unless the prefix itself starts with `.`.
+
+- **Tab completion now uses high-confidence prefix matches before fuzzy matches.** When exact/prefix candidates exist, common-prefix expansion and single-candidate completion operate on that stronger group first, preventing fuzzy/subsequence matches from blocking obvious completions such as `/V` → `/Volumes/`.
+
+---
+
 ## 0.6.40 — 2026-06-25
 
 - **`/silent final` no longer drops the final answer after completed Codex todo updates.** Codex can emit the terminal assistant text, then a completed `todo_list` task notification, then `turn.completed` with an empty result. Final-only mode now preserves the assistant-answer candidate when the task notification is already complete or every todo line is checked, while still clearing interim text for in-progress task updates. This fixes the “processing placeholder disappears with no response” failure seen when all work completed successfully but the final answer was cleared just before rendering.

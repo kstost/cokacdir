@@ -152,27 +152,79 @@ fn parse_path_for_completion(input: &str) -> (PathBuf, String) {
 }
 
 /// 순차 매칭 (subsequence matching)
-/// pattern의 문자들이 text에 순서대로 존재하는지 확인 (연속일 필요 없음)
+/// pattern의 문자들이 text에 순서대로 존재하는지 확인하고 첫 매칭 위치를 반환
 /// 예: "lade"는 "cLAuDE"에 매칭 (l-a-d-e 순서로 존재)
-fn matches_subsequence(text: &str, pattern: &str) -> bool {
+fn subsequence_match_start(text: &str, pattern: &str) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(0);
+    }
+
     let mut pattern_chars = pattern.chars().peekable();
-    for text_char in text.chars() {
+    let mut start = None;
+
+    for (index, text_char) in text.chars().enumerate() {
         if let Some(&pattern_char) = pattern_chars.peek() {
             if text_char == pattern_char {
+                if start.is_none() {
+                    start = Some(index);
+                }
                 pattern_chars.next();
             }
         } else {
             break;
         }
     }
-    pattern_chars.peek().is_none()
+
+    if pattern_chars.peek().is_none() {
+        start
+    } else {
+        None
+    }
 }
 
-/// 디렉토리 읽기 및 순차 매칭
-/// 대소문자 무시 검색, 디렉토리 우선 정렬
+#[derive(Debug)]
+struct PathSuggestionCandidate {
+    display_name: String,
+    is_dir: bool,
+    match_rank: u8,
+    hidden_penalty: u8,
+    match_start: usize,
+    name_len: usize,
+    sort_name: String,
+    original_name: String,
+}
+
+fn path_match_score(name: &str, prefix: &str, lower_prefix: &str) -> Option<(u8, usize)> {
+    if prefix.is_empty() {
+        return Some((0, 0));
+    }
+
+    let lower_name = name.to_lowercase();
+
+    if name == prefix {
+        return Some((0, 0));
+    }
+
+    if lower_name == lower_prefix {
+        return Some((1, 0));
+    }
+
+    if lower_name.starts_with(lower_prefix) {
+        return Some((2, 0));
+    }
+
+    if let Some(byte_index) = lower_name.find(lower_prefix) {
+        return Some((3, lower_name[..byte_index].chars().count()));
+    }
+
+    subsequence_match_start(&lower_name, lower_prefix).map(|index| (4, index))
+}
+
+/// 디렉토리 읽기 및 랭킹 기반 경로 매칭
+/// exact/prefix/substring/subsequence 순으로 우선하고, 숨김 항목은 명시 입력 전까지 뒤로 정렬
 /// Security: Filters out . and .. entries to prevent path traversal
-fn get_path_suggestions(base_dir: &PathBuf, prefix: &str) -> Vec<String> {
-    let mut suggestions: Vec<(String, bool)> = Vec::new();
+fn get_ranked_path_suggestions(base_dir: &Path, prefix: &str) -> Vec<PathSuggestionCandidate> {
+    let mut suggestions: Vec<PathSuggestionCandidate> = Vec::new();
     let lower_prefix = prefix.to_lowercase();
 
     if let Ok(entries) = fs::read_dir(base_dir) {
@@ -186,26 +238,53 @@ fn get_path_suggestions(base_dir: &PathBuf, prefix: &str) -> Vec<String> {
 
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-            // 순차 매칭 (대소문자 무시)
-            if prefix.is_empty() || matches_subsequence(&name.to_lowercase(), &lower_prefix) {
+            if let Some((match_rank, match_start)) = path_match_score(&name, prefix, &lower_prefix)
+            {
                 let display_name = if is_dir {
                     format!("{}{}", name, std::path::MAIN_SEPARATOR)
                 } else {
-                    name
+                    name.clone()
                 };
-                suggestions.push((display_name, is_dir));
+                let sort_name = name.to_lowercase();
+                suggestions.push(PathSuggestionCandidate {
+                    display_name,
+                    is_dir,
+                    match_rank,
+                    hidden_penalty: if name.starts_with('.') && !prefix.starts_with('.') {
+                        1
+                    } else {
+                        0
+                    },
+                    match_start,
+                    name_len: name.chars().count(),
+                    sort_name,
+                    original_name: name,
+                });
             }
         }
     }
 
-    // 디렉토리 우선, 그 다음 이름순 정렬
-    suggestions.sort_by(|a, b| match (a.1, b.1) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
+    suggestions.sort_by(|a, b| {
+        a.match_rank
+            .cmp(&b.match_rank)
+            .then_with(|| a.hidden_penalty.cmp(&b.hidden_penalty))
+            .then_with(|| b.is_dir.cmp(&a.is_dir))
+            .then_with(|| a.match_start.cmp(&b.match_start))
+            .then_with(|| a.name_len.cmp(&b.name_len))
+            .then_with(|| a.sort_name.cmp(&b.sort_name))
+            .then_with(|| a.original_name.cmp(&b.original_name))
     });
 
-    suggestions.into_iter().map(|(name, _)| name).collect()
+    suggestions
+}
+
+fn get_path_suggestions(base_dir: &Path, prefix: &str) -> Vec<String> {
+    let suggestions = get_ranked_path_suggestions(base_dir, prefix);
+
+    suggestions
+        .into_iter()
+        .map(|candidate| candidate.display_name)
+        .collect()
 }
 
 /// 자동완성 목록 업데이트 (입력할 때마다 호출)
@@ -230,7 +309,11 @@ fn update_path_suggestions(dialog: &mut Dialog) {
 /// 유일 매칭: 바로 적용, 복수 매칭: 공통 접두어 적용
 fn trigger_path_completion(dialog: &mut Dialog) {
     let (base_dir, prefix) = parse_path_for_completion(&dialog.input);
-    let suggestions = get_path_suggestions(&base_dir, &prefix);
+    let ranked_suggestions = get_ranked_path_suggestions(&base_dir, &prefix);
+    let suggestions: Vec<String> = ranked_suggestions
+        .iter()
+        .map(|candidate| candidate.display_name.clone())
+        .collect();
 
     if let Some(ref mut completion) = dialog.completion {
         if suggestions.is_empty() {
@@ -242,9 +325,31 @@ fn trigger_path_completion(dialog: &mut Dialog) {
             // 적용 후 새로운 suggestions 업데이트
             update_path_suggestions(dialog);
         } else {
+            // 복수 매칭 - 낮은 점수의 fuzzy 후보가 prefix 자동완성을 막지 않도록
+            // exact/prefix 후보가 있으면 그 그룹 안에서만 자동 확장한다.
+            let completion_candidates: Vec<String> = if prefix.is_empty() {
+                suggestions.clone()
+            } else {
+                let prefix_matches: Vec<String> = ranked_suggestions
+                    .iter()
+                    .filter(|candidate| candidate.match_rank <= 2)
+                    .map(|candidate| candidate.display_name.clone())
+                    .collect();
+                if prefix_matches.is_empty() {
+                    suggestions.clone()
+                } else {
+                    prefix_matches
+                }
+            };
+
+            if completion_candidates.len() == 1 {
+                apply_completion(dialog, &base_dir, &completion_candidates[0]);
+                update_path_suggestions(dialog);
+                return;
+            }
+
             // 복수 매칭 - 공통 접두어 적용 후 목록 표시
-            let common = find_common_prefix(&suggestions);
-            if common.len() > prefix.len() {
+            if let Some(common) = completion_prefix_for_input(&completion_candidates, &prefix) {
                 let new_path = base_dir.join(&common);
                 dialog.input = new_path.display().to_string();
             }
@@ -278,6 +383,24 @@ fn find_common_prefix(suggestions: &[String]) -> String {
     // 디렉토리 접미사 `/` 또는 `\` 제외
     let common: String = first.chars().take(common_chars).collect();
     common.trim_end_matches(['/', '\\']).to_string()
+}
+
+fn completion_prefix_for_input(suggestions: &[String], typed_prefix: &str) -> Option<String> {
+    let common = find_common_prefix(suggestions);
+    let typed_len = typed_prefix.chars().count();
+
+    if common.chars().count() <= typed_len {
+        return None;
+    }
+
+    let lower_common = common.to_lowercase();
+    let lower_typed = typed_prefix.to_lowercase();
+    if !lower_common.starts_with(&lower_typed) {
+        return None;
+    }
+
+    let suffix: String = common.chars().skip(typed_len).collect();
+    Some(format!("{}{}", typed_prefix, suffix))
 }
 
 /// 선택된 자동완성 항목 적용
@@ -5197,6 +5320,127 @@ mod tests {
         cleanup_temp_test_dir(&temp_dir);
     }
 
+    #[test]
+    fn test_path_suggestions_prioritize_prefix_over_subsequence() {
+        let temp_dir = create_temp_test_dir();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        fs::create_dir(temp_dir.join(".claude")).unwrap();
+        fs::create_dir(temp_dir.join(".codex")).unwrap();
+        fs::create_dir(temp_dir.join("Desktop")).unwrap();
+        fs::create_dir(temp_dir.join("develop")).unwrap();
+        fs::create_dir(temp_dir.join("devnoda")).unwrap();
+
+        let suggestions = get_path_suggestions(&temp_dir, "de");
+
+        assert_eq!(suggestions[0], format!("Desktop{}", sep));
+        assert_eq!(suggestions[1], format!("develop{}", sep));
+        assert_eq!(suggestions[2], format!("devnoda{}", sep));
+        assert!(
+            suggestions
+                .iter()
+                .position(|s| s == &format!(".claude{}", sep))
+                .unwrap()
+                > 2
+        );
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_path_suggestions_prioritize_prefix_at_root_style_input() {
+        let temp_dir = create_temp_test_dir();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        fs::create_dir(temp_dir.join(".resolve")).unwrap();
+        fs::create_dir(temp_dir.join(".vol")).unwrap();
+        fs::create_dir(temp_dir.join("dev")).unwrap();
+        fs::create_dir(temp_dir.join("private")).unwrap();
+        fs::create_dir(temp_dir.join("Volumes")).unwrap();
+
+        let suggestions = get_path_suggestions(&temp_dir, "V");
+
+        assert_eq!(suggestions[0], format!("Volumes{}", sep));
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_trigger_path_completion_uses_unique_prefix_before_fuzzy_matches() {
+        let temp_dir = create_temp_test_dir();
+
+        fs::create_dir(temp_dir.join(".resolve")).unwrap();
+        fs::create_dir(temp_dir.join(".vol")).unwrap();
+        fs::create_dir(temp_dir.join("dev")).unwrap();
+        fs::create_dir(temp_dir.join("private")).unwrap();
+        fs::create_dir(temp_dir.join("Volumes")).unwrap();
+
+        let input = temp_dir.join("V").display().to_string();
+        let mut dialog = Dialog {
+            dialog_type: DialogType::Goto,
+            cursor_pos: input.chars().count(),
+            input,
+            message: String::new(),
+            completion: Some(PathCompletion::default()),
+            selected_button: 0,
+            selection: None,
+            use_md5: false,
+        };
+
+        trigger_path_completion(&mut dialog);
+
+        let mut expected = temp_dir.join("Volumes").display().to_string();
+        if !ends_with_separator(&expected) {
+            expected.push(std::path::MAIN_SEPARATOR);
+        }
+        assert_eq!(dialog.input, expected);
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_trigger_path_completion_preserves_typed_prefix_case() {
+        let temp_dir = create_temp_test_dir();
+
+        fs::create_dir(temp_dir.join("Desktop")).unwrap();
+        fs::create_dir(temp_dir.join("develop")).unwrap();
+
+        let input = temp_dir.join("d").display().to_string();
+        let mut dialog = Dialog {
+            dialog_type: DialogType::Goto,
+            cursor_pos: input.chars().count(),
+            input,
+            message: String::new(),
+            completion: Some(PathCompletion::default()),
+            selected_button: 0,
+            selection: None,
+            use_md5: false,
+        };
+
+        trigger_path_completion(&mut dialog);
+
+        assert_eq!(dialog.input, temp_dir.join("de").display().to_string());
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_path_suggestions_keep_hidden_entries_back_until_dot_prefix() {
+        let temp_dir = create_temp_test_dir();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        fs::create_dir(temp_dir.join(".hidden")).unwrap();
+        fs::create_dir(temp_dir.join("visible")).unwrap();
+
+        let suggestions = get_path_suggestions(&temp_dir, "");
+        assert_eq!(suggestions[0], format!("visible{}", sep));
+
+        let hidden_suggestions = get_path_suggestions(&temp_dir, ".h");
+        assert_eq!(hidden_suggestions, vec![format!(".hidden{}", sep)]);
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
     // ========== find_common_prefix tests ==========
 
     #[test]
@@ -5243,6 +5487,21 @@ mod tests {
         let suggestions = vec!["dir/".to_string(), "dir2/".to_string()];
         let common = find_common_prefix(&suggestions);
         assert_eq!(common, "dir");
+    }
+
+    #[test]
+    fn test_completion_prefix_ignores_non_prefix_fuzzy_common_prefix() {
+        let suggestions = vec!["foobar".to_string(), "foobaz".to_string()];
+        assert_eq!(completion_prefix_for_input(&suggestions, "fb"), None);
+    }
+
+    #[test]
+    fn test_completion_prefix_preserves_typed_prefix_case() {
+        let suggestions = vec!["Desktop/".to_string(), "develop/".to_string()];
+        assert_eq!(
+            completion_prefix_for_input(&suggestions, "d"),
+            Some("de".to_string())
+        );
     }
 
     // ========== PathCompletion tests ==========
