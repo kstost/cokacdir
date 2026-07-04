@@ -155,6 +155,9 @@ pub trait MessengerBackend: Send + Sync {
     /// Delete a message
     async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<bool, String>;
 
+    /// Send a chat action such as "typing".
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<bool, String>;
+
     /// Send a file/document
     async fn send_document(
         &self,
@@ -621,7 +624,7 @@ async fn handle_api_method(state: &ProxyState, method: &str, body: &Value) -> Va
         "DeleteMessage" | "deleteMessage" => handle_delete_message(state, body).await,
         "SendDocument" | "sendDocument" => handle_send_document(state, body).await,
         "GetFile" | "getFile" => handle_get_file(state, body).await,
-        "SendChatAction" | "sendChatAction" => json!({"ok": true, "result": true}),
+        "SendChatAction" | "sendChatAction" => handle_send_chat_action(state, body).await,
         "GetWebhookInfo" | "getWebhookInfo" => {
             json!({"ok": true, "result": {"url": "", "has_custom_certificate": false, "pending_update_count": 0}})
         }
@@ -736,6 +739,16 @@ async fn handle_delete_message(state: &ProxyState, body: &Value) -> Value {
     let message_id = body.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
     match state.backend.delete_message(chat_id, message_id).await {
+        Ok(_) => json!({"ok": true, "result": true}),
+        Err(e) => json!({"ok": false, "description": e}),
+    }
+}
+
+async fn handle_send_chat_action(state: &ProxyState, body: &Value) -> Value {
+    let chat_id = body.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    match state.backend.send_chat_action(chat_id, action).await {
         Ok(_) => json!({"ok": true, "result": true}),
         Err(e) => json!({"ok": false, "description": e}),
     }
@@ -1037,6 +1050,10 @@ impl MessengerBackend for ConsoleBackend {
     }
 
     async fn delete_message(&self, _chat_id: i64, _message_id: i32) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    async fn send_chat_action(&self, _chat_id: i64, _action: &str) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -1615,6 +1632,26 @@ impl MessengerBackend for DiscordBackend {
             .await
             .map_err(|e| format!("Discord delete: {}", e))?;
         Ok(true)
+    }
+
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<bool, String> {
+        let _ = self.http()?;
+        if !action.eq_ignore_ascii_case("typing") {
+            return Ok(true);
+        }
+        let channel_id = chat_id_to_channel_u64(chat_id);
+        let url = format!("https://discord.com/api/v10/channels/{}/typing", channel_id);
+        let response = reqwest::Client::new()
+            .post(url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .send()
+            .await
+            .map_err(|e| format!("Discord typing: {}", e))?;
+        if response.status().is_success() {
+            Ok(true)
+        } else {
+            Err(format!("Discord typing failed: {}", response.status()))
+        }
     }
 
     async fn send_document(
@@ -2794,6 +2831,11 @@ impl MessengerBackend for SlackBackend {
             .await
             .map_err(|e| format!("Slack chat.delete: {}", e))?;
 
+        Ok(true)
+    }
+
+    async fn send_chat_action(&self, _chat_id: i64, _action: &str) -> Result<bool, String> {
+        // Slack Socket Mode/Web API does not expose the RTM `typing` action.
         Ok(true)
     }
 

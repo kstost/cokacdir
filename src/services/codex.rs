@@ -9,14 +9,16 @@ use std::sync::OnceLock;
 
 use crate::services::claude::{debug_log_to, kill_child_tree, CancelToken, StreamMessage};
 
-/// Context required to auto-deliver images that Codex's built-in `image_gen`
-/// tool drops into `~/.codex/generated_images/<session_id>/` without surfacing
-/// any JSON event in `codex exec --json`. Without this fallback the bot has no
-/// way to know an image was produced and the user sees nothing.
+/// Context required to detect images that Codex's built-in `image_gen` tool
+/// drops into `~/.codex/generated_images/<session_id>/` without surfacing any
+/// JSON event in `codex exec --json`. Most callers auto-deliver them; companion
+/// visible pings record the generated path so Telegram can attach it with a
+/// caption and persist a visual reference.
 pub struct CodexAutoSendCtx {
     pub cokacdir_bin: String,
     pub chat_id: i64,
     pub bot_key: String,
+    pub send_files: bool,
 }
 
 /// Short (12-hex-char) SHA-256 of the input, used for /loop verification
@@ -834,8 +836,9 @@ pub fn clone_session_for_schedule(
 /// Execute a command using Codex CLI with streaming output.
 ///
 /// Parameters mirror `claude::execute_command_streaming` for consistency,
-/// but some are ignored (allowed_tools, no_session_persistence)
-/// because Codex exec has no tool restriction support.
+/// but `allowed_tools` is ignored because Codex exec has no tool restriction
+/// support. `no_session_persistence` maps to `codex exec --ephemeral` for
+/// one-shot calls.
 ///
 /// When `session_id` is Some, uses `codex exec resume` to continue an existing
 /// session (Codex manages conversation history natively). When None, starts a
@@ -849,8 +852,8 @@ pub fn execute_command_streaming(
     _allowed_tools: Option<&[String]>, // ignored — Codex has no tool restriction
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,                  // "codex:" prefix already stripped
-    _no_session_persistence: bool,        // ignored — Codex exec handles persistence internally
-    auto_send: Option<&CodexAutoSendCtx>, // when Some, deliver image_gen outputs that the model forgot to sendfile
+    no_session_persistence: bool,         // true = pass `--ephemeral` on new sessions
+    auto_send: Option<&CodexAutoSendCtx>, // when Some, detect image_gen outputs that the model forgot to sendfile
     reasoning_effort: Option<&str>,       // None = use Codex CLI default (~/.codex/config.toml)
     fast_mode: bool,                      // true = pass `-c service_tier="fast"`
 ) -> Result<(), String> {
@@ -864,6 +867,13 @@ pub fn execute_command_streaming(
     codex_debug_log(&format!("fast_mode: {}", fast_mode));
     let is_resume = session_id.is_some();
     codex_debug_log(&format!("is_resume: {}", is_resume));
+    codex_debug_log(&format!(
+        "no_session_persistence: {}",
+        no_session_persistence
+    ));
+    if is_resume && no_session_persistence {
+        return Err("Codex ephemeral execution cannot resume an existing session".to_string());
+    }
     codex_debug_log(&format!(
         "system_prompt: is_some={}, len={}",
         system_prompt.is_some(),
@@ -913,15 +923,19 @@ pub fn execute_command_streaming(
             "Building NEW SESSION args, working_dir={}",
             working_dir
         ));
-        // codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -
-        vec![
+        // codex exec --json [--ephemeral] --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -
+        let mut args = vec![
             "exec".to_string(),
             "--json".to_string(),
             "--dangerously-bypass-approvals-and-sandbox".to_string(),
             "--skip-git-repo-check".to_string(),
             "-C".to_string(),
             working_dir.to_string(),
-        ]
+        ];
+        if no_session_persistence {
+            args.insert(2, "--ephemeral".to_string());
+        }
+        args
     };
 
     // Write system prompt to temp file and pass via -c model_instructions_file
@@ -1504,6 +1518,39 @@ fn auto_deliver_new_images(
 
     for (path, _) in candidates {
         let path_str = path.to_string_lossy().to_string();
+        if !ctx.send_files {
+            codex_debug_log(&format!(
+                "[auto-send] recording generated image {}",
+                path_str
+            ));
+            let tool_input = serde_json::json!({
+                "path": path_str,
+                "delivered": false,
+            })
+            .to_string();
+            if sender
+                .send(StreamMessage::ToolUse {
+                    name: "GeneratedImage".to_string(),
+                    input: tool_input.clone(),
+                })
+                .is_err()
+            {
+                codex_debug_log("[auto-send] channel closed, aborting generated-image records");
+                return;
+            }
+            if sender
+                .send(StreamMessage::ToolResult {
+                    content: tool_input,
+                    is_error: false,
+                })
+                .is_err()
+            {
+                codex_debug_log("[auto-send] channel closed after generated-image record");
+                return;
+            }
+            continue;
+        }
+
         codex_debug_log(&format!(
             "[auto-send] invoking cokacdir --sendfile {}",
             path_str

@@ -22,6 +22,43 @@ Legacy settings are migrated safely: old `silent=true` maps to `compact`, old `s
 
 ---
 
+## /companion
+
+Toggles companion mode for the current chat. It takes no arguments; every `/companion` call flips the setting.
+
+```
+/companion
+/companion_profile
+/companion_profile <text>
+/companion_profile_clear
+/companion_visible
+/companion_visible status
+/companion_visible on
+/companion_visible off
+/companion_ping <min> <max>
+/companion_ping status
+/companion_ping on
+/companion_ping off
+```
+
+When enabled, AI runs stay quiet while work is in progress and send only the final response. The system prompt also strongly biases the agent toward short, casual, friend-like replies instead of formal progress narration or long explanations. In normal conversation, the default personality uses a person-like companion persona instead of foregrounding an AI-assistant identity. In casual or emotional conversation, it responds to the user's feelings first and may ask one short natural follow-up question so the user feels accompanied rather than managed.
+
+Companion ping is enabled by default only in the owner's 1:1 chat when companion mode is ON, using a random interval between 5 and 60 minutes. If the owner has been quiet for that interval, the bot generates one short companion message, then waits silently until the owner speaks again. Any real owner message resets the timer. `/companion_ping <min> <max>` overrides the interval for the owner's 1:1 chat. `min` must be at least 1 minute, `min` must not exceed `max`, and `max` has no upper limit. `/companion_ping off` disables even the default ping for that chat; `/companion_ping on`, `/companion_ping default`, or `/companion_ping reset` restores the 5-60 minute default. Group chats and non-owner chats are not supported for companion ping.
+
+`/companion_visible` is OFF by default and only works for companion pings in the owner's 1:1 chat when the current provider is Codex and that chat has a separate `/companion_profile <text>` override. If no chat-specific companion profile is set, no image generation request is made and pings stay text-only. When enabled with a profile, the companion ping first generates the short text message in the normal chat session, then image generation runs in a separate ephemeral Codex session with only the companion profile, the generated message, current time context, reference path/status, and visible image directory. That ephemeral worker uses the `$imagegen` skill to create one PNG image whose visible form matches the companion profile identity. On Telegram, the app sends it as a photo with the short ping message; bridge platforms such as Discord and Slack keep the existing file upload behavior. The image generation session id is not stored back into the chat session. The first generated image seeds the stable reference at `~/.cokacdir/companion/visible/<chat_id>/reference.png`; later images are prompted to use that reference for visual consistency. Changing or clearing `/companion_profile` clears the visible reference so a new identity can seed a new appearance. Non-Codex providers keep companion pings text-only.
+
+Companion personality can be customized globally by editing:
+
+```
+~/.cokacdir/prompt/companion.md
+```
+
+This file is auto-generated with a default profile on first use. Use `/companion_profile <text>` to override the personality for the current chat only, and `/companion_profile_clear` to return that chat to the global file. Priority: chat override > global `companion.md` > built-in default.
+
+Telegram shows typing indicators while the agent works. Discord receives typing indicators through the bridge. Slack's current Socket Mode/Web API path has no supported typing indicator, so Slack stays quiet until the final response.
+
+---
+
 ## /rich
 
 Configures Telegram Bot API 10.1 Rich Message delivery for eligible final responses. Defaults: delivery **auto**, profile **safe**, RTL **off**, draft streaming **off**.
