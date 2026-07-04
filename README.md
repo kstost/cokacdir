@@ -43,7 +43,7 @@ That’s it — open your chat app and start chatting with your bot.
 * **Remote SSH/SFTP**: Explore remote servers over SSH/SFTP with saved profiles
 * **File encryption**: AES-256 encryption with configurable chunk splitting
 * **Duplicate file detection**: Detect and manage duplicate files using hash-based comparison
-* **Chat bots**: Remotely control AI coding sessions through Telegram, Discord, or Slack with streaming output
+* **Chat bots**: Remotely control AI coding sessions through Telegram, Discord, or Slack with streaming output, queued requests, scheduled tasks, rich Telegram responses, and companion mode
 * **Customizable themes**: Light and dark themes with full JSON-based color customization
 
 ## Community
@@ -65,15 +65,18 @@ For the measured Antigravity CLI integration contract, see [How cokacdir Uses An
 * Multi-provider support (Claude, Codex, Agy, OpenCode) with real-time streaming
 * Session persistence and cross-provider session interpretation
 * Scheduled tasks using cron expressions or absolute time
+* Request queue and cancellation controls (`/queue`, `/stop`, `/stopall`, `/stop_<id>`)
 * Group chat support where multiple bots share context
 * Bot-to-bot messaging for multi-agent workflows
+* Output controls including `/silent`, Telegram Rich Messages, Codex fast tier, and Claude Chrome mode
+* Companion mode with optional owner-only proactive pings and Codex-generated visible companion images
 * File upload/download, tool management, debug logging
 
-**Commands:** `/start`, `/stop`, `/clear`, `/help`, `/session`, `/pwd`, `/model`, `/stt_model`, `/effort`, `/down`, `/instruction`, `/instruction_clear`, `/allowed`, `/allowedtools`, `/availabletools`, `/contextlevel`, `/query`, `/loop`, `/setendhook`, `/setendhook_clear`, `/public`, `/direct`, `/setpollingtime`, `/debug`, `/silent`, `/rich`, `/companion`, `/companion_profile`, `/companion_profile_clear`, `/companion_visible`, `/companion_ping`, `/envvars`
+**Commands:** `/start`, `/stop`, `/stopall`, `/clear`, `/help`, `/session`, `/pwd`, `/model`, `/stt_model`, `/effort`, `/fast`, `/down`, `/instruction`, `/instruction_clear`, `/allowed`, `/allowedtools`, `/availabletools`, `/queue`, `/contextlevel`, `/query`, `/loop`, `/setendhook`, `/setendhook_clear`, `/public`, `/direct`, `/setpollingtime`, `/debug`, `/envvars`, `/silent`, `/rich`, `/companion`, `/companion_profile`, `/companion_profile_clear`, `/companion_visible`, `/companion_ping`, `/usechrome`
 
 ## Configuration
 
-cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
+cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), switch schedules into inline chat-session mode (`COKAC_SCHEDULE_INLINE=1`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
 
 ## Supported Platforms
 
