@@ -2155,13 +2155,14 @@ mod output_mode_tests {
 #[cfg(test)]
 mod rich_message_mode_tests {
     use super::{
-        build_system_prompt, format_rich_message_mode_status, format_rich_message_prompt_guidance,
-        get_rich_message_draft, get_rich_message_mode, get_rich_message_profile,
-        get_rich_message_rtl, parse_rich_message_mode, parse_rich_message_profile,
-        rich_message_content_is_within_limits, sanitize_rich_markdown, set_rich_message_draft,
-        set_rich_message_mode, set_rich_message_profile, set_rich_message_rtl,
-        should_try_rich_message, telegram_retry_after_seconds, BotSettings, RichMessageMode,
-        RichMessageProfile, TELEGRAM_MSG_LIMIT,
+        build_system_prompt, format_companion_prompt_guidance, format_rich_message_mode_status,
+        format_rich_message_prompt_guidance, get_rich_message_draft, get_rich_message_mode,
+        get_rich_message_profile, get_rich_message_rtl, is_owner_private_chat,
+        parse_rich_message_mode, parse_rich_message_profile, rich_message_content_is_within_limits,
+        sanitize_rich_markdown, set_rich_message_draft, set_rich_message_mode,
+        set_rich_message_profile, set_rich_message_rtl, should_try_rich_message,
+        telegram_retry_after_seconds, BotSettings, RichMessageMode, RichMessageProfile,
+        TELEGRAM_MSG_LIMIT,
     };
     use teloxide::types::ChatId;
 
