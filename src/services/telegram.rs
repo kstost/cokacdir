@@ -2211,15 +2211,17 @@ mod output_mode_tests {
 mod rich_message_mode_tests {
     use super::{
         build_companion_visible_reference_prompt, build_companion_visible_scene_prompt,
-        build_system_prompt, format_companion_prompt_guidance, format_rich_message_mode_status,
-        format_rich_message_prompt_guidance, get_rich_message_draft, get_rich_message_mode,
-        get_rich_message_profile, get_rich_message_rtl, is_owner_only_command,
-        is_owner_private_chat, parse_rich_message_mode, parse_rich_message_profile,
-        rich_message_content_is_within_limits, sanitize_rich_markdown, set_rich_message_draft,
+        build_system_prompt, companion_visible_dir, format_companion_prompt_guidance,
+        format_rich_message_mode_status, format_rich_message_prompt_guidance,
+        get_rich_message_draft, get_rich_message_mode, get_rich_message_profile,
+        get_rich_message_rtl, is_owner_only_command, is_owner_private_chat,
+        parse_rich_message_mode, parse_rich_message_profile, rich_message_content_is_within_limits,
+        sanitize_rich_markdown, select_companion_visible_image_path, set_rich_message_draft,
         set_rich_message_mode, set_rich_message_profile, set_rich_message_rtl,
         should_try_rich_message, telegram_retry_after_seconds, BotSettings, RichMessageMode,
         RichMessageProfile, TELEGRAM_MSG_LIMIT,
     };
+    use std::fs;
     use teloxide::types::ChatId;
 
     #[test]
@@ -2418,6 +2420,13 @@ mod rich_message_mode_tests {
     }
 
     #[test]
+    fn companion_prompt_guidance_is_empty_when_companion_mode_is_off() {
+        let prompt = format_companion_prompt_guidance(false, "A dry, understated old friend.");
+
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
     fn companion_ping_owner_private_guard_allows_only_owner_private_chat() {
         let mut settings = BotSettings::default();
         settings.owner_user_id = Some(42);
@@ -2474,6 +2483,59 @@ mod rich_message_mode_tests {
         assert!(prompt.contains("new moment with the same companion"));
         assert!(prompt.contains("Let the companion message and current time drive"));
         assert!(prompt.contains("<companion_visible_image>"));
+    }
+
+    #[test]
+    fn companion_visible_image_selection_uses_tool_fallback_when_tagged_path_is_invalid() {
+        let chat_id = ChatId(9_876_543_210_001);
+        let dir = companion_visible_dir(chat_id).expect("home dir is required for this test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create companion visible test dir");
+
+        let fallback = dir.join("tool-fallback.png");
+        fs::write(&fallback, b"png").expect("write fallback image");
+        let missing_tagged_path = dir.join("missing-tagged.png");
+        let response = format!(
+            "<companion_visible_image>{}</companion_visible_image>",
+            missing_tagged_path.display()
+        );
+
+        let selected = select_companion_visible_image_path(
+            chat_id,
+            &response,
+            "companion_visible_image",
+            &[fallback.clone()],
+        );
+
+        assert_eq!(selected.as_deref(), Some(fallback.as_path()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn companion_visible_image_selection_prefers_valid_tagged_path() {
+        let chat_id = ChatId(9_876_543_210_002);
+        let dir = companion_visible_dir(chat_id).expect("home dir is required for this test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create companion visible test dir");
+
+        let tagged = dir.join("tagged.png");
+        let fallback = dir.join("tool-fallback.png");
+        fs::write(&tagged, b"png").expect("write tagged image");
+        fs::write(&fallback, b"png").expect("write fallback image");
+        let response = format!(
+            "<companion_visible_reference_image>{}</companion_visible_reference_image>",
+            tagged.display()
+        );
+
+        let selected = select_companion_visible_image_path(
+            chat_id,
+            &response,
+            "companion_visible_reference_image",
+            &[fallback.clone()],
+        );
+
+        assert_eq!(selected.as_deref(), Some(tagged.as_path()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -16048,20 +16110,29 @@ async fn handle_companion_prompt_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let override_profile = {
+    let (override_profile, companion_mode) = {
         let data = state.lock().await;
-        get_companion_profile_override(&data.settings, chat_id)
+        (
+            get_companion_profile_override(&data.settings, chat_id),
+            get_companion_mode(&data.settings, chat_id),
+        )
     };
     let (profile, source) = resolve_companion_profile(override_profile.as_deref());
-    let guidance = format_companion_prompt_guidance(true, &profile);
+    let guidance = format_companion_prompt_guidance(companion_mode, &profile);
+    let mode_label = if companion_mode { "ON" } else { "OFF" };
+    let display_guidance = if companion_mode {
+        guidance.clone()
+    } else {
+        "(none; companion mode is OFF)".to_string()
+    };
     let plain_status = format!(
-        "Effective companion system prompt ({source}):\n{}\n\nGlobal default file:\n{}\n\nCommands:\n/companion_prompt\n/companion_profile\n/companion_profile <text>\n/companion_profile_clear",
-        guidance,
+        "Effective companion system prompt (companion mode: {mode_label}, {source}):\n{}\n\nGlobal default file:\n{}\n\nCommands:\n/companion_prompt\n/companion_profile\n/companion_profile <text>\n/companion_profile_clear",
+        display_guidance,
         companion_profile_path_display()
     );
     let rich_status = format!(
-        "<b>Effective companion system prompt ({source}):</b>\n<pre>{}</pre>\n\n<b>Global default file:</b>\n<code>{}</code>\n\n<b>Commands:</b>\n<code>/companion_prompt</code>\n<code>/companion_profile</code>\n<code>/companion_profile &lt;text&gt;</code>\n<code>/companion_profile_clear</code>",
-        html_escape(&guidance),
+        "<b>Effective companion system prompt (companion mode: {mode_label}, {source}):</b>\n<pre>{}</pre>\n\n<b>Global default file:</b>\n<code>{}</code>\n\n<b>Commands:</b>\n<code>/companion_prompt</code>\n<code>/companion_profile</code>\n<code>/companion_profile &lt;text&gt;</code>\n<code>/companion_profile_clear</code>",
+        html_escape(&display_guidance),
         html_escape(&companion_profile_path_display())
     );
     send_rich_html_or_long_message(bot, chat_id, &plain_status, &rich_status, state).await
@@ -21502,6 +21573,30 @@ fn parse_companion_visible_image_tag_response(response: &str, tag: &str) -> Opti
         .map(PathBuf::from)
 }
 
+fn select_companion_visible_image_path(
+    chat_id: ChatId,
+    response: &str,
+    response_tag: &str,
+    visible_image_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(path) = parse_companion_visible_image_tag_response(response, response_tag) {
+        if companion_visible_image_source_allowed(chat_id, &path) {
+            return Some(path);
+        }
+        msg_debug(&format!(
+            "[companion_visible] rejected tagged {} path: {}",
+            response_tag,
+            path.display()
+        ));
+    }
+
+    visible_image_paths
+        .iter()
+        .rev()
+        .find(|path| companion_visible_image_source_allowed(chat_id, path))
+        .cloned()
+}
+
 fn companion_visible_image_path_from_tool_use(name: &str, input: &str) -> Option<PathBuf> {
     if name == "GeneratedImage" {
         let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
@@ -21867,15 +21962,7 @@ async fn run_companion_visible_image_generation_ephemeral(
     } else {
         final_only_response.trim()
     };
-    let tagged_visible_image_path =
-        parse_companion_visible_image_tag_response(render_source, response_tag);
-    tagged_visible_image_path.or_else(|| {
-        visible_image_paths
-            .iter()
-            .rev()
-            .find(|path| companion_visible_image_source_allowed(chat_id, path))
-            .cloned()
-    })
+    select_companion_visible_image_path(chat_id, render_source, response_tag, &visible_image_paths)
 }
 
 async fn ensure_companion_visible_reference_ephemeral(
