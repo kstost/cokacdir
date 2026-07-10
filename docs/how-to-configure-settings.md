@@ -119,9 +119,21 @@ Sets the effort level for the current chat's active Claude or Codex provider.
 ```
 
 - **Claude**: `low`, `medium`, `high`, `xhigh`, `max`
-- **Codex**: `minimal`, `low`, `medium`, `high`, `xhigh`
+- **Other/default Codex models**: `minimal`, `low`, `medium`, `high`, `xhigh`
+- **Codex `gpt-5.6-sol`**: `low` (default), `medium`, `high`, `xhigh`, `max`, `ultra`
+- **Codex `gpt-5.6-terra`**: `low`, `medium` (default), `high`, `xhigh`, `max`, `ultra`
+- **Codex `gpt-5.6-luna`**: `low`, `medium` (default), `high`, `xhigh`, `max`
+- **Codex `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini`**: `low`, `medium` (default), `high`, `xhigh`
+- **Codex `gpt-5.3-codex-spark`**: `low`, `medium`, `high` (default), `xhigh`
 - Without arguments, shows the current provider's value and accepted levels.
 - `reset`, `clear`, or `default` removes the override for the current provider.
+
+For every explicitly listed model, `xhigh` selects extra-high reasoning.
+`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` additionally support `max`
+for maximum reasoning depth; Sol and Terra alone support `ultra` for automatic
+task delegation at the maximum reasoning level. Effort values that are not
+supported by the active Codex model are retained for later model switches but
+are not passed to the CLI.
 
 This setting is stored per chat by cokacdir. The underlying Claude CLI receives it as `--effort <level>` for each session invocation; Codex receives it as `-c model_reasoning_effort=<level>`.
 

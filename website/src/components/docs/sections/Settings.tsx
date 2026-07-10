@@ -111,8 +111,17 @@ export default function Settings() {
         )}</P>
         <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
           <li>{t(<>Claude: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>, <>Claude: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>)}</li>
-          <li>{t(<>Codex: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>, <>Codex: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>)}</li>
+          <li>{t(<>Other/default Codex models: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>, <>기타/기본 Codex 모델: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>)}</li>
+          <li>{t(<>Codex <IC>gpt-5.6-sol</IC>: <IC>low</IC> (default), <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC>, <IC>ultra</IC></>, <>Codex <IC>gpt-5.6-sol</IC>: <IC>low</IC> (기본값), <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC>, <IC>ultra</IC></>)}</li>
+          <li>{t(<>Codex <IC>gpt-5.6-terra</IC>: <IC>low</IC>, <IC>medium</IC> (default), <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC>, <IC>ultra</IC></>, <>Codex <IC>gpt-5.6-terra</IC>: <IC>low</IC>, <IC>medium</IC> (기본값), <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC>, <IC>ultra</IC></>)}</li>
+          <li>{t(<>Codex <IC>gpt-5.6-luna</IC>: <IC>low</IC>, <IC>medium</IC> (default), <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>, <>Codex <IC>gpt-5.6-luna</IC>: <IC>low</IC>, <IC>medium</IC> (기본값), <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>)}</li>
+          <li>{t(<>Codex <IC>gpt-5.5</IC> / <IC>gpt-5.4</IC> / <IC>gpt-5.4-mini</IC>: <IC>low</IC>, <IC>medium</IC> (default), <IC>high</IC>, <IC>xhigh</IC></>, <>Codex <IC>gpt-5.5</IC> / <IC>gpt-5.4</IC> / <IC>gpt-5.4-mini</IC>: <IC>low</IC>, <IC>medium</IC> (기본값), <IC>high</IC>, <IC>xhigh</IC></>)}</li>
+          <li>{t(<>Codex <IC>gpt-5.3-codex-spark</IC>: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC> (default), <IC>xhigh</IC></>, <>Codex <IC>gpt-5.3-codex-spark</IC>: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC> (기본값), <IC>xhigh</IC></>)}</li>
         </ul>
+        <P>{t(
+          <><IC>xhigh</IC> provides extra-high reasoning on every listed model. <IC>max</IC> is available on Sol, Terra, and Luna, while <IC>ultra</IC> additionally enables automatic task delegation on Sol and Terra.</>,
+          <>목록의 모든 모델에서 <IC>xhigh</IC>는 extra-high reasoning을 적용합니다. <IC>max</IC>는 Sol, Terra, Luna에서 사용할 수 있고, <IC>ultra</IC>는 Sol과 Terra에서만 automatic task delegation을 추가로 활성화합니다.</>
+        )}</P>
         <P>{t(
           <><IC>/effort reset</IC> clears the override for the current provider.</>,
           <><IC>/effort reset</IC>은 현재 provider의 override를 해제합니다.</>

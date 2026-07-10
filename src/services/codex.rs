@@ -169,6 +169,7 @@ fn codex_debug_log(msg: &str) {
 pub fn verify_completion_codex(
     session_id: &str,
     working_dir: &str,
+    model: Option<&str>,
     reasoning_effort: Option<&str>,
     fast_mode: bool,
 ) -> Result<crate::services::claude::VerifyResult, String> {
@@ -257,6 +258,10 @@ pub fn verify_completion_codex(
         "--output-last-message".to_string(),
         out_path_str,
     ];
+    if let Some(model) = model {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
     if let Some(effort) = reasoning_effort {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort={}", effort));
@@ -1000,7 +1005,8 @@ pub fn execute_command_streaming(
         args.push(m.to_string());
     }
 
-    // Reasoning effort override (minimal/low/medium/high/xhigh).
+    // Reasoning effort override. Accepted values are model-dependent and are
+    // validated by the caller before they reach this CLI argument builder.
     // Caller must already have validated the value; codex parses `-c key=value`
     // as JSON when possible, otherwise as a literal string — these enum
     // values are safe bare identifiers.

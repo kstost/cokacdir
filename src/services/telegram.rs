@@ -2672,8 +2672,16 @@ mod rich_message_mode_tests {
 
 /// Get the configured Codex reasoning effort for a specific chat_id.
 /// Returns None when unset, so the Codex CLI / config.toml default applies.
-fn get_codex_effort(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
-    settings.effort.get(&chat_id.0.to_string()).cloned()
+fn get_codex_effort(
+    settings: &BotSettings,
+    chat_id: ChatId,
+    model: Option<&str>,
+) -> Option<String> {
+    settings
+        .effort
+        .get(&chat_id.0.to_string())
+        .filter(|effort| is_valid_codex_effort(model, effort))
+        .cloned()
 }
 
 /// Get the configured Claude effort for a specific chat_id.
@@ -2686,10 +2694,11 @@ fn get_effort_for_provider(
     settings: &BotSettings,
     chat_id: ChatId,
     provider: &str,
+    model: Option<&str>,
 ) -> Option<String> {
     match provider {
         "claude" => get_claude_effort(settings, chat_id),
-        "codex" => get_codex_effort(settings, chat_id),
+        "codex" => get_codex_effort(settings, chat_id, model),
         _ => None,
     }
 }
@@ -2763,9 +2772,55 @@ fn expand_user_path(path: &str) -> String {
     path.to_string()
 }
 
-/// Validate a Codex reasoning_effort value.
-fn is_valid_codex_effort(v: &str) -> bool {
-    matches!(v, "minimal" | "low" | "medium" | "high" | "xhigh")
+fn is_codex_sol_or_terra(model: Option<&str>) -> bool {
+    matches!(
+        model,
+        Some("codex:gpt-5.6-sol") | Some("codex:gpt-5.6-terra")
+    )
+}
+
+fn is_codex_luna(model: Option<&str>) -> bool {
+    matches!(model, Some("codex:gpt-5.6-luna"))
+}
+
+fn is_codex_low_to_xhigh_model(model: Option<&str>) -> bool {
+    matches!(
+        model,
+        Some("codex:gpt-5.5")
+            | Some("codex:gpt-5.4")
+            | Some("codex:gpt-5.4-mini")
+            | Some("codex:gpt-5.3-codex-spark")
+    )
+}
+
+fn is_codex_max_effort_model(model: Option<&str>) -> bool {
+    is_codex_sol_or_terra(model) || is_codex_luna(model)
+}
+
+fn codex_default_effort(model: Option<&str>) -> Option<&'static str> {
+    match model {
+        Some("codex:gpt-5.6-sol") => Some("low"),
+        Some("codex:gpt-5.6-terra")
+        | Some("codex:gpt-5.6-luna")
+        | Some("codex:gpt-5.5")
+        | Some("codex:gpt-5.4")
+        | Some("codex:gpt-5.4-mini") => Some("medium"),
+        Some("codex:gpt-5.3-codex-spark") => Some("high"),
+        _ => None,
+    }
+}
+
+/// Validate a Codex reasoning_effort value for the selected model.
+fn is_valid_codex_effort(model: Option<&str>, v: &str) -> bool {
+    if is_codex_sol_or_terra(model) {
+        matches!(v, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
+    } else if is_codex_luna(model) {
+        matches!(v, "low" | "medium" | "high" | "xhigh" | "max")
+    } else if is_codex_low_to_xhigh_model(model) {
+        matches!(v, "low" | "medium" | "high" | "xhigh")
+    } else {
+        matches!(v, "minimal" | "low" | "medium" | "high" | "xhigh")
+    }
 }
 
 /// Validate a Claude Code --effort value.
@@ -2773,19 +2828,98 @@ fn is_valid_claude_effort(v: &str) -> bool {
     matches!(v, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
-fn valid_effort_values(provider: &str) -> &'static str {
+fn valid_effort_values(provider: &str, model: Option<&str>) -> &'static str {
     match provider {
         "claude" => "low, medium, high, xhigh, max",
+        "codex" if is_codex_sol_or_terra(model) => "low, medium, high, xhigh, max, ultra",
+        "codex" if is_codex_luna(model) => "low, medium, high, xhigh, max",
+        "codex" if is_codex_low_to_xhigh_model(model) => "low, medium, high, xhigh",
         "codex" => "minimal, low, medium, high, xhigh",
-        _ => "Claude: low, medium, high, xhigh, max; Codex: minimal, low, medium, high, xhigh",
+        _ => "Claude: low, medium, high, xhigh, max; Codex: model-dependent",
     }
 }
 
-fn is_valid_effort_for_provider(provider: &str, v: &str) -> bool {
+fn is_valid_effort_for_provider(provider: &str, model: Option<&str>, v: &str) -> bool {
     match provider {
         "claude" => is_valid_claude_effort(v),
-        "codex" => is_valid_codex_effort(v),
+        "codex" => is_valid_codex_effort(model, v),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod effort_validation_tests {
+    use super::{codex_default_effort, is_valid_codex_effort, valid_effort_values};
+
+    #[test]
+    fn sol_and_terra_accept_extended_effort_values() {
+        for model in ["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"] {
+            for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+                assert!(is_valid_codex_effort(Some(model), effort));
+            }
+            assert!(!is_valid_codex_effort(Some(model), "minimal"));
+            assert_eq!(
+                valid_effort_values("codex", Some(model)),
+                "low, medium, high, xhigh, max, ultra"
+            );
+        }
+        assert_eq!(codex_default_effort(Some("codex:gpt-5.6-sol")), Some("low"));
+        assert_eq!(
+            codex_default_effort(Some("codex:gpt-5.6-terra")),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn luna_accepts_max_but_not_minimal_or_ultra() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(is_valid_codex_effort(Some("codex:gpt-5.6-luna"), effort));
+        }
+        assert!(!is_valid_codex_effort(
+            Some("codex:gpt-5.6-luna"),
+            "minimal"
+        ));
+        assert!(!is_valid_codex_effort(Some("codex:gpt-5.6-luna"), "ultra"));
+        assert_eq!(
+            valid_effort_values("codex", Some("codex:gpt-5.6-luna")),
+            "low, medium, high, xhigh, max"
+        );
+        assert_eq!(
+            codex_default_effort(Some("codex:gpt-5.6-luna")),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn listed_non_5_6_models_accept_only_low_through_xhigh() {
+        for (model, default_effort) in [
+            ("codex:gpt-5.5", "medium"),
+            ("codex:gpt-5.4", "medium"),
+            ("codex:gpt-5.4-mini", "medium"),
+            ("codex:gpt-5.3-codex-spark", "high"),
+        ] {
+            for effort in ["low", "medium", "high", "xhigh"] {
+                assert!(is_valid_codex_effort(Some(model), effort));
+            }
+            for effort in ["minimal", "max", "ultra"] {
+                assert!(!is_valid_codex_effort(Some(model), effort));
+            }
+            assert_eq!(
+                valid_effort_values("codex", Some(model)),
+                "low, medium, high, xhigh"
+            );
+            assert_eq!(codex_default_effort(Some(model)), Some(default_effort));
+        }
+    }
+
+    #[test]
+    fn other_codex_models_keep_standard_effort_values() {
+        for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+            assert!(is_valid_codex_effort(Some("codex:other-model"), effort));
+        }
+        assert!(!is_valid_codex_effort(Some("codex:other-model"), "max"));
+        assert!(!is_valid_codex_effort(Some("codex:other-model"), "ultra"));
+        assert_eq!(codex_default_effort(Some("codex:other-model")), None);
     }
 }
 
@@ -11642,7 +11776,7 @@ Ask in natural language to manage schedules.
 <code>/stt_model</code> — Show current speech recognition model
 <code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
-<code>/effort &lt;level&gt;</code> — Set effort (Claude: low/medium/high/xhigh/max, Codex: minimal/low/medium/high/xhigh, or reset)
+<code>/effort &lt;level&gt;</code> — Set effort (Codex gpt-5.6 models have model-specific levels)
 <code>/fast</code> — Toggle Codex fast service tier
 <code>/setpollingtime &lt;ms&gt;</code> — Set API polling interval
   Too low may cause API rate limits.
@@ -17009,7 +17143,7 @@ async fn handle_effort_command(
     if arg.is_empty() {
         let current = {
             let data = state.lock().await;
-            get_effort_for_provider(&data.settings, chat_id, provider)
+            get_effort_for_provider(&data.settings, chat_id, provider, current_model.as_deref())
         };
         let mut msg = if provider == "claude" || provider == "codex" {
             match &current {
@@ -17018,7 +17152,13 @@ async fn handle_effort_command(
                     provider_label,
                     html_escape(v)
                 ),
-                None => format!("Current {} effort: <b>default</b>\n", provider_label),
+                None => match (provider, codex_default_effort(current_model.as_deref())) {
+                    ("codex", Some(default_effort)) => format!(
+                        "Current Codex effort: <b>default ({})</b>\n",
+                        html_escape(default_effort)
+                    ),
+                    _ => format!("Current {} effort: <b>default</b>\n", provider_label),
+                },
             }
         } else {
             format!("Effort is supported only for Claude and Codex.\nCurrent model provider: <b>{}</b>\n", html_escape(provider_label))
@@ -17027,13 +17167,54 @@ async fn handle_effort_command(
             msg.push_str(&format!(
                 "\nAccepted for {}: <code>{}</code>\n",
                 provider_label,
-                valid_effort_values(provider)
+                valid_effort_values(provider, current_model.as_deref())
             ));
         }
         msg.push_str("\n<b>Usage:</b>\n");
-        msg.push_str("<code>/effort low</code>, <code>/effort medium</code>, <code>/effort high</code>, <code>/effort xhigh</code>\n");
-        msg.push_str("<code>/effort max</code> — Claude only\n");
-        msg.push_str("<code>/effort minimal</code> — Codex only\n");
+        let listed_codex_default = if provider == "codex" {
+            codex_default_effort(current_model.as_deref())
+        } else {
+            None
+        };
+        if let Some(default_effort) = listed_codex_default {
+            let default_marker = |effort| {
+                if effort == default_effort {
+                    " (default)"
+                } else {
+                    ""
+                }
+            };
+            msg.push_str(&format!(
+                "<code>/effort low</code>{} — fast responses with lighter reasoning\n",
+                default_marker("low")
+            ));
+            msg.push_str(&format!(
+                "<code>/effort medium</code>{} — balances speed and reasoning depth for everyday tasks\n",
+                default_marker("medium")
+            ));
+            msg.push_str(&format!(
+                "<code>/effort high</code>{} — greater reasoning depth for complex problems\n",
+                default_marker("high")
+            ));
+            msg.push_str(
+                "<code>/effort xhigh</code> — extra high reasoning depth for complex problems\n",
+            );
+            if is_codex_max_effort_model(current_model.as_deref()) {
+                msg.push_str(&format!(
+                    "<code>/effort max</code>{} — maximum reasoning depth for the hardest problems\n",
+                    default_marker("max")
+                ));
+            }
+            if is_codex_sol_or_terra(current_model.as_deref()) {
+                msg.push_str(
+                    "<code>/effort ultra</code> — maximum reasoning with automatic task delegation\n",
+                );
+            }
+        } else {
+            msg.push_str("<code>/effort low</code>, <code>/effort medium</code>, <code>/effort high</code>, <code>/effort xhigh</code>\n");
+            msg.push_str("<code>/effort max</code> — Claude only\n");
+            msg.push_str("<code>/effort minimal</code> — Codex only\n");
+        }
         msg.push_str("<code>/effort reset</code> — clear current provider override\n");
         shared_rate_limit_wait(state, chat_id).await;
         tg!(
@@ -17086,7 +17267,7 @@ async fn handle_effort_command(
         return Ok(());
     }
 
-    if !is_valid_effort_for_provider(provider, &arg) {
+    if !is_valid_effort_for_provider(provider, current_model.as_deref(), &arg) {
         shared_rate_limit_wait(state, chat_id).await;
         tg!(
             "send_message",
@@ -17096,7 +17277,7 @@ async fn handle_effort_command(
                     "Invalid {} effort value: '{}'. Accepted: {}, reset.",
                     provider_label,
                     arg,
-                    valid_effort_values(provider)
+                    valid_effort_values(provider, current_model.as_deref())
                 ),
             )
             .await
@@ -17371,19 +17552,20 @@ async fn handle_model_command(
             msg.push_str("\n<b>Codex:</b>\n");
             msg.push_str("<code>/model codex</code> — default\n");
             msg.push_str(
-                "<code>/model codex:gpt-5.5</code> — Latest frontier agentic coding model\n",
+                "<code>/model codex:gpt-5.6-sol</code> — Latest frontier agentic coding model\n",
             );
-            msg.push_str("<code>/model codex:gpt-5.4</code> — Frontier agentic coding model\n");
-            msg.push_str("<code>/model codex:gpt-5.3-codex</code> — Frontier Codex-optimized agentic coding model\n");
+            msg.push_str(
+                "<code>/model codex:gpt-5.6-terra</code> — Balanced agentic coding model for everyday work\n",
+            );
+            msg.push_str(
+                "<code>/model codex:gpt-5.6-luna</code> — Fast and affordable agentic coding model\n",
+            );
+            msg.push_str("<code>/model codex:gpt-5.5</code> — Frontier model for complex coding, research, and real-world work\n");
+            msg.push_str("<code>/model codex:gpt-5.4</code> — Strong model for everyday coding\n");
+            msg.push_str("<code>/model codex:gpt-5.4-mini</code> — Small, fast, and cost-efficient model for simpler coding tasks\n");
             msg.push_str(
                 "<code>/model codex:gpt-5.3-codex-spark</code> — Ultra-fast coding model\n",
             );
-            msg.push_str(
-                "<code>/model codex:gpt-5.2-codex</code> — Frontier agentic coding model\n",
-            );
-            msg.push_str("<code>/model codex:gpt-5.2</code> — Optimized for professional work and long-running agents\n");
-            msg.push_str("<code>/model codex:gpt-5.1-codex-max</code> — Codex-optimized model for deep and fast reasoning\n");
-            msg.push_str("<code>/model codex:gpt-5.1-codex-mini</code> — Optimized for codex. Cheaper, faster, but less capable\n");
         }
         if has_agy {
             msg.push_str("\n<b>Agy (Antigravity):</b>\n");
@@ -18204,7 +18386,7 @@ async fn handle_text_message(
             .copied()
             .unwrap_or(false);
         let provider = detect_provider(mdl.as_deref());
-        let effort = get_effort_for_provider(&data.settings, chat_id, &provider);
+        let effort = get_effort_for_provider(&data.settings, chat_id, &provider, mdl.as_deref());
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         let output_mode = get_output_mode(&data.settings, chat_id);
         let companion_mode = get_companion_mode(&data.settings, chat_id);
@@ -19523,8 +19705,13 @@ async fn handle_text_message(
                                 .get(&chat_id)
                                 .and_then(|s| s.current_path.clone())
                                 .unwrap_or_default();
-                            let effort =
-                                get_effort_for_provider(&data.settings, chat_id, provider_str);
+                            let model = get_model(&data.settings, chat_id);
+                            let effort = get_effort_for_provider(
+                                &data.settings,
+                                chat_id,
+                                provider_str,
+                                model.as_deref(),
+                            );
                             let codex_fast = is_codex_fast(&data.settings, chat_id);
                             (
                                 ls.remaining,
@@ -19532,6 +19719,7 @@ async fn handle_text_message(
                                 ls.original_request.clone(),
                                 sid,
                                 cwd,
+                                model,
                                 effort,
                                 codex_fast,
                             )
@@ -19543,6 +19731,7 @@ async fn handle_text_message(
                         original_request,
                         sid,
                         cwd,
+                        model_for_verify,
                         effort_for_verify,
                         codex_fast_for_verify,
                     )) = loop_info
@@ -19684,6 +19873,9 @@ async fn handle_text_message(
                                         "codex" => crate::services::codex::verify_completion_codex(
                                             &sid_clone,
                                             &cwd_clone,
+                                            model_for_verify
+                                                .as_deref()
+                                                .and_then(codex::strip_codex_prefix),
                                             effort_for_verify.as_deref(),
                                             codex_fast_for_verify,
                                         ),
@@ -23146,7 +23338,7 @@ async fn execute_schedule(
                 .clone()
                 .unwrap_or_else(|| detect_provider(model.as_deref()).to_string())
         };
-        let effort = get_effort_for_provider(&data.settings, chat_id, &provider);
+        let effort = get_effort_for_provider(&data.settings, chat_id, &provider, model.as_deref());
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         (
             get_allowed_tools(&data.settings, chat_id),
@@ -24691,7 +24883,7 @@ async fn process_bot_message(
             .copied()
             .unwrap_or(false);
         let provider = detect_provider(mdl.as_deref());
-        let eff = get_effort_for_provider(&data.settings, chat_id, provider);
+        let eff = get_effort_for_provider(&data.settings, chat_id, provider, mdl.as_deref());
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         let rich_prompt_guidance = format_rich_message_prompt_guidance(
             get_rich_message_mode(&data.settings, chat_id),
@@ -26441,6 +26633,7 @@ async fn execute_companion_ping(
             .unwrap_or_else(|| ".".to_string());
         let model = get_model(&data.settings, chat_id);
         let provider = detect_provider(model.as_deref());
+        let effort = get_effort_for_provider(&data.settings, chat_id, provider, model.as_deref());
         let companion_profile_override = get_companion_profile_override(&data.settings, chat_id);
         let has_companion_profile_override = companion_profile_override
             .as_deref()
@@ -26472,7 +26665,7 @@ async fn execute_companion_ping(
                     get_rich_message_rtl(&data.settings, chat_id),
                 ),
                 chrome_enabled: data.settings.use_chrome.get(&key).copied().unwrap_or(false),
-                effort: get_effort_for_provider(&data.settings, chat_id, provider),
+                effort,
                 codex_fast_enabled: is_codex_fast(&data.settings, chat_id),
                 companion_profile: String::new(),
                 companion_visible_enabled,
