@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -740,23 +740,39 @@ impl DiffState {
 
     /// Recursively lazy-load all descendants of a directory
     fn lazy_load_all_descendants(&mut self, all_entry_idx: usize) {
-        if self.all_entries[all_entry_idx].children_not_loaded {
-            self.lazy_load_children(all_entry_idx);
+        if all_entry_idx >= self.all_entries.len() {
+            return;
         }
-        // Now iterate over children and recursively load their descendants
-        let parent_path = self.all_entries[all_entry_idx].relative_path.clone();
-        let parent_depth = self.all_entries[all_entry_idx].depth;
-        let prefix = format!("{}/", parent_path);
-        // Find direct children that are directories (depth == parent_depth + 1)
-        let mut i = all_entry_idx + 1;
-        while i < self.all_entries.len() {
-            if !self.all_entries[i].relative_path.starts_with(&prefix) {
-                break;
+
+        // Process higher-index siblings first. Inserting descendants after a
+        // higher index cannot invalidate the lower sibling indices still on the
+        // stack, avoiding both recursive stack growth and index-shift bugs.
+        let mut pending = vec![all_entry_idx];
+        while let Some(index) = pending.pop() {
+            if index >= self.all_entries.len() {
+                continue;
             }
-            if self.all_entries[i].is_directory && self.all_entries[i].depth == parent_depth + 1 {
-                self.lazy_load_all_descendants(i);
+            if self.all_entries[index].children_not_loaded {
+                self.lazy_load_children(index);
             }
-            i += 1;
+
+            let parent_path = self.all_entries[index].relative_path.clone();
+            let parent_depth = self.all_entries[index].depth;
+            let prefix = format!("{}/", parent_path);
+            let mut child_directories = Vec::new();
+            let mut i = index + 1;
+            while i < self.all_entries.len() {
+                if !self.all_entries[i].relative_path.starts_with(&prefix) {
+                    break;
+                }
+                if self.all_entries[i].is_directory && self.all_entries[i].depth == parent_depth + 1
+                {
+                    child_directories.push(i);
+                }
+                i += 1;
+            }
+            // Ascending push means the highest index is popped first.
+            pending.extend(child_directories);
         }
     }
 
@@ -822,14 +838,7 @@ impl DiffState {
         if self.all_entries.is_empty() {
             return;
         }
-        let sorted = resort_level(
-            &self.all_entries,
-            0,
-            0,
-            self.all_entries.len(),
-            self.sort_by,
-            self.sort_order,
-        );
+        let sorted = resort_flat_tree(&self.all_entries, self.sort_by, self.sort_order);
         self.all_entries = sorted;
         self.apply_filter();
     }
@@ -839,130 +848,192 @@ impl DiffState {
 // Recursive diff tree builder
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn build_recursive(
+struct BuildFrame {
+    relative_path: String,
+    left_dir: PathBuf,
+    right_dir: PathBuf,
+    names: Vec<String>,
+    left_names: HashSet<String>,
+    right_names: HashSet<String>,
+    next_name: usize,
+    depth: usize,
+    owner_index: Option<usize>,
+    has_difference: bool,
+}
+
+struct BuildProgress<'a> {
+    cancel_flag: &'a AtomicBool,
+    progress_tx: &'a Sender<DiffProgressMsg>,
+    total: usize,
+    counter: &'a std::sync::atomic::AtomicUsize,
+}
+
+fn make_build_frame(
     left_root: &Path,
     right_root: &Path,
-    relative_path: &str,
+    relative_path: String,
     depth: usize,
-    compare_method: CompareMethod,
+    owner_index: Option<usize>,
     sort_by: SortBy,
     sort_order: SortOrder,
-    entries: &mut Vec<DiffEntry>,
-) {
+) -> BuildFrame {
     let left_dir = if relative_path.is_empty() {
         left_root.to_path_buf()
     } else {
-        left_root.join(relative_path)
+        left_root.join(&relative_path)
     };
     let right_dir = if relative_path.is_empty() {
         right_root.to_path_buf()
     } else {
-        right_root.join(relative_path)
+        right_root.join(&relative_path)
     };
-
-    // Read entries from both sides
-    let left_names = read_dir_names(&left_dir);
-    let right_names = read_dir_names(&right_dir);
-
-    // Merge into union of names
-    let mut all_names: Vec<String> = {
-        let mut set: HashSet<String> = HashSet::new();
-        for name in &left_names {
-            set.insert(name.clone());
-        }
-        for name in &right_names {
-            set.insert(name.clone());
-        }
-        set.into_iter().collect()
-    };
-
-    let left_set: HashSet<&str> = left_names.iter().map(|s| s.as_str()).collect();
-    let right_set: HashSet<&str> = right_names.iter().map(|s| s.as_str()).collect();
-
-    // Sort names: directories first, then by sort criteria
+    let left_names_vec = read_dir_names(&left_dir);
+    let right_names_vec = read_dir_names(&right_dir);
+    let left_refs: HashSet<&str> = left_names_vec.iter().map(String::as_str).collect();
+    let right_refs: HashSet<&str> = right_names_vec.iter().map(String::as_str).collect();
+    let mut names: Vec<String> = left_names_vec
+        .iter()
+        .chain(&right_names_vec)
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     sort_names(
-        &mut all_names,
+        &mut names,
         &left_dir,
         &right_dir,
-        &left_set,
-        &right_set,
+        &left_refs,
+        &right_refs,
         sort_by,
         sort_order,
     );
 
-    for name in &all_names {
-        let child_relative = if relative_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", relative_path, name)
-        };
+    BuildFrame {
+        relative_path,
+        left_dir,
+        right_dir,
+        names,
+        left_names: left_names_vec.into_iter().collect(),
+        right_names: right_names_vec.into_iter().collect(),
+        next_name: 0,
+        depth,
+        owner_index,
+        has_difference: false,
+    }
+}
 
-        let left_path = left_dir.join(name);
-        let right_path = right_dir.join(name);
+fn build_iterative(
+    left_root: &Path,
+    right_root: &Path,
+    compare_method: CompareMethod,
+    sort_by: SortBy,
+    sort_order: SortOrder,
+    entries: &mut Vec<DiffEntry>,
+    progress: Option<BuildProgress<'_>>,
+) {
+    let mut frames = vec![make_build_frame(
+        left_root,
+        right_root,
+        String::new(),
+        0,
+        None,
+        sort_by,
+        sort_order,
+    )];
 
-        let left_info = make_file_info(&left_path, name);
-        let right_info = make_file_info(&right_path, name);
+    while !frames.is_empty() {
+        if progress
+            .as_ref()
+            .is_some_and(|p| p.cancel_flag.load(Ordering::Relaxed))
+        {
+            return;
+        }
 
-        let left_exists = left_set.contains(name.as_str());
-        let right_exists = right_set.contains(name.as_str());
-
-        let left_is_dir = left_info.as_ref().map_or(false, |i| i.is_directory);
-        let right_is_dir = right_info.as_ref().map_or(false, |i| i.is_directory);
-        let is_directory = left_is_dir || right_is_dir;
-
-        if left_exists && right_exists {
-            // Both sides exist
-            if left_is_dir && right_is_dir {
-                // Both are directories - recurse and check children
-                let child_start = entries.len();
-
-                // Placeholder index for this directory entry
-                let dir_index = entries.len();
-                entries.push(DiffEntry {
-                    relative_path: child_relative.clone(),
-                    left: left_info,
-                    right: right_info,
-                    status: DiffStatus::DirSame, // Temporary, will be updated
-                    is_directory: true,
-                    depth,
-                    children_not_loaded: false,
-                });
-
-                build_recursive(
-                    left_root,
-                    right_root,
-                    &child_relative,
-                    depth + 1,
-                    compare_method,
-                    sort_by,
-                    sort_order,
-                    entries,
-                );
-
-                // Check if any children differ
-                let has_diff = entries[dir_index + 1..].iter().any(|e| {
-                    matches!(
-                        e.status,
-                        DiffStatus::Modified
-                            | DiffStatus::LeftOnly
-                            | DiffStatus::RightOnly
-                            | DiffStatus::DirModified
-                    )
-                });
-
-                entries[dir_index].status = if has_diff {
+        let finished = frames
+            .last()
+            .map(|frame| frame.next_name >= frame.names.len())
+            .unwrap_or(true);
+        if finished {
+            let finished_frame = frames.pop().expect("non-empty frame stack");
+            let owner_index = finished_frame.owner_index;
+            if let Some(dir_index) = owner_index {
+                entries[dir_index].status = if finished_frame.has_difference {
                     DiffStatus::DirModified
                 } else {
                     DiffStatus::DirSame
                 };
+                if finished_frame.has_difference {
+                    if let Some(parent) = frames.last_mut() {
+                        parent.has_difference = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let (name, relative_path, left_dir, right_dir, depth, left_exists, right_exists) = {
+            let frame = frames.last_mut().expect("non-empty frame stack");
+            let name = frame.names[frame.next_name].clone();
+            frame.next_name += 1;
+            let relative_path = if frame.relative_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", frame.relative_path, name)
+            };
+            (
+                name.clone(),
+                relative_path,
+                frame.left_dir.clone(),
+                frame.right_dir.clone(),
+                frame.depth,
+                frame.left_names.contains(&name),
+                frame.right_names.contains(&name),
+            )
+        };
+
+        if let Some(progress) = progress.as_ref() {
+            let count = progress.counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = progress.progress_tx.send(DiffProgressMsg::Comparing(
+                relative_path.clone(),
+                count,
+                progress.total,
+            ));
+        }
+
+        let left_info = make_file_info(&left_dir.join(&name), &name);
+        let right_info = make_file_info(&right_dir.join(&name), &name);
+        let left_is_dir = left_info.as_ref().is_some_and(|info| info.is_directory);
+        let right_is_dir = right_info.as_ref().is_some_and(|info| info.is_directory);
+        let is_directory = left_is_dir || right_is_dir;
+
+        if left_exists && right_exists {
+            if left_is_dir && right_is_dir {
+                let dir_index = entries.len();
+                entries.push(DiffEntry {
+                    relative_path: relative_path.clone(),
+                    left: left_info,
+                    right: right_info,
+                    status: DiffStatus::DirSame,
+                    is_directory: true,
+                    depth,
+                    children_not_loaded: false,
+                });
+                frames.push(make_build_frame(
+                    left_root,
+                    right_root,
+                    relative_path,
+                    depth + 1,
+                    Some(dir_index),
+                    sort_by,
+                    sort_order,
+                ));
             } else if !left_is_dir && !right_is_dir {
-                // Both are files - compare
                 let same = match (left_info.as_ref(), right_info.as_ref()) {
-                    (Some(l), Some(r)) => compare_files(l, r, compare_method),
-                    _ => false, // If either info is None (stat failed), treat as different
+                    (Some(left), Some(right)) => compare_files(left, right, compare_method),
+                    _ => false,
                 };
                 entries.push(DiffEntry {
-                    relative_path: child_relative,
+                    relative_path,
                     left: left_info,
                     right: right_info,
                     status: if same {
@@ -974,10 +1045,15 @@ fn build_recursive(
                     depth,
                     children_not_loaded: false,
                 });
+                if !same {
+                    frames
+                        .last_mut()
+                        .expect("current directory frame")
+                        .has_difference = true;
+                }
             } else {
-                // One is dir, one is file - treat as modified (type mismatch)
                 entries.push(DiffEntry {
-                    relative_path: child_relative,
+                    relative_path,
                     left: left_info,
                     right: right_info,
                     status: DiffStatus::Modified,
@@ -985,29 +1061,70 @@ fn build_recursive(
                     depth,
                     children_not_loaded: false,
                 });
+                frames
+                    .last_mut()
+                    .expect("current directory frame")
+                    .has_difference = true;
             }
-        } else if left_exists {
-            // Left only - skip recursion, children loaded lazily on expand
-            entries.push(DiffEntry {
-                relative_path: child_relative,
-                left: left_info,
-                right: None,
-                status: DiffStatus::LeftOnly,
-                is_directory,
-                depth,
-                children_not_loaded: is_directory,
-            });
         } else {
-            // Right only - skip recursion, children loaded lazily on expand
+            let status = if left_exists {
+                DiffStatus::LeftOnly
+            } else {
+                DiffStatus::RightOnly
+            };
             entries.push(DiffEntry {
-                relative_path: child_relative,
-                left: None,
-                right: right_info,
-                status: DiffStatus::RightOnly,
+                relative_path,
+                left: if left_exists { left_info } else { None },
+                right: if right_exists { right_info } else { None },
+                status,
                 is_directory,
                 depth,
                 children_not_loaded: is_directory,
             });
+            frames
+                .last_mut()
+                .expect("current directory frame")
+                .has_difference = true;
+        }
+    }
+}
+
+fn build_recursive(
+    left_root: &Path,
+    right_root: &Path,
+    relative_path: &str,
+    depth: usize,
+    compare_method: CompareMethod,
+    sort_by: SortBy,
+    sort_order: SortOrder,
+    entries: &mut Vec<DiffEntry>,
+) {
+    // Kept as the synchronous entry point, but implemented with an explicit
+    // frame stack so deeply nested directory trees cannot overflow the thread
+    // stack. Callers currently invoke this only for the root.
+    let left = if relative_path.is_empty() {
+        left_root.to_path_buf()
+    } else {
+        left_root.join(relative_path)
+    };
+    let right = if relative_path.is_empty() {
+        right_root.to_path_buf()
+    } else {
+        right_root.join(relative_path)
+    };
+    build_iterative(
+        &left,
+        &right,
+        compare_method,
+        sort_by,
+        sort_order,
+        entries,
+        None,
+    );
+
+    if depth != 0 {
+        for entry in entries.iter_mut() {
+            entry.depth = entry.depth.saturating_add(depth);
         }
     }
 }
@@ -1031,72 +1148,52 @@ fn count_entries_recursive(
     progress_tx: &Sender<DiffProgressMsg>,
     running_count: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> usize {
-    if cancel_flag.load(Ordering::Relaxed) {
-        return 0;
-    }
+    let mut pending = vec![relative_path.to_string()];
 
-    let left_dir = if relative_path.is_empty() {
-        left_root.to_path_buf()
-    } else {
-        left_root.join(relative_path)
-    };
-    let right_dir = if relative_path.is_empty() {
-        right_root.to_path_buf()
-    } else {
-        right_root.join(relative_path)
-    };
-
-    let left_names = read_dir_names(&left_dir);
-    let right_names = read_dir_names(&right_dir);
-
-    let mut all_names: HashSet<String> = HashSet::new();
-    for name in &left_names {
-        all_names.insert(name.clone());
-    }
-    for name in &right_names {
-        all_names.insert(name.clone());
-    }
-
-    let left_set: HashSet<&str> = left_names.iter().map(|s| s.as_str()).collect();
-    let right_set: HashSet<&str> = right_names.iter().map(|s| s.as_str()).collect();
-
-    let added = all_names.len();
-    let new_total = running_count.fetch_add(added, Ordering::Relaxed) + added;
-    let _ = progress_tx.send(DiffProgressMsg::Counting(new_total));
-
-    let mut count = added;
-
-    for name in &all_names {
+    while let Some(relative) = pending.pop() {
         if cancel_flag.load(Ordering::Relaxed) {
-            return count;
+            break;
         }
-        let left_exists = left_set.contains(name.as_str());
-        let right_exists = right_set.contains(name.as_str());
-
-        let child_relative = if relative_path.is_empty() {
-            name.clone()
+        let left_dir = if relative.is_empty() {
+            left_root.to_path_buf()
         } else {
-            format!("{}/{}", relative_path, name)
+            left_root.join(&relative)
         };
+        let right_dir = if relative.is_empty() {
+            right_root.to_path_buf()
+        } else {
+            right_root.join(&relative)
+        };
+        let left_names = read_dir_names(&left_dir);
+        let right_names = read_dir_names(&right_dir);
+        let left_set: HashSet<&str> = left_names.iter().map(String::as_str).collect();
+        let right_set: HashSet<&str> = right_names.iter().map(String::as_str).collect();
+        let all_names: HashSet<String> = left_names.iter().chain(&right_names).cloned().collect();
 
-        if left_exists && right_exists {
-            let left_is_dir = is_dir_via_info(&left_dir.join(name));
-            let right_is_dir = is_dir_via_info(&right_dir.join(name));
-            if left_is_dir && right_is_dir {
-                count += count_entries_recursive(
-                    left_root,
-                    right_root,
-                    &child_relative,
-                    cancel_flag,
-                    progress_tx,
-                    running_count,
-                );
+        let added = all_names.len();
+        let previous = running_count.fetch_add(added, Ordering::Relaxed);
+        let new_total = previous.saturating_add(added);
+        let _ = progress_tx.send(DiffProgressMsg::Counting(new_total));
+
+        for name in all_names {
+            if cancel_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            if left_set.contains(name.as_str())
+                && right_set.contains(name.as_str())
+                && is_dir_via_info(&left_dir.join(&name))
+                && is_dir_via_info(&right_dir.join(&name))
+            {
+                pending.push(if relative.is_empty() {
+                    name
+                } else {
+                    format!("{}/{}", relative, name)
+                });
             }
         }
-        // One-side-only directories: no recursion needed, just count the directory itself
     }
 
-    count
+    running_count.load(Ordering::Relaxed)
 }
 
 /// Threaded version of build_recursive with cancel_flag and progress reporting
@@ -1114,174 +1211,33 @@ fn build_recursive_threaded(
     total: usize,
     counter: &Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    if cancel_flag.load(Ordering::Relaxed) {
-        return;
-    }
-
-    let left_dir = if relative_path.is_empty() {
+    let left = if relative_path.is_empty() {
         left_root.to_path_buf()
     } else {
         left_root.join(relative_path)
     };
-    let right_dir = if relative_path.is_empty() {
+    let right = if relative_path.is_empty() {
         right_root.to_path_buf()
     } else {
         right_root.join(relative_path)
     };
-
-    let left_names = read_dir_names(&left_dir);
-    let right_names = read_dir_names(&right_dir);
-
-    let mut all_names: Vec<String> = {
-        let mut set: HashSet<String> = HashSet::new();
-        for name in &left_names {
-            set.insert(name.clone());
-        }
-        for name in &right_names {
-            set.insert(name.clone());
-        }
-        set.into_iter().collect()
-    };
-
-    let left_set: HashSet<&str> = left_names.iter().map(|s| s.as_str()).collect();
-    let right_set: HashSet<&str> = right_names.iter().map(|s| s.as_str()).collect();
-
-    sort_names(
-        &mut all_names,
-        &left_dir,
-        &right_dir,
-        &left_set,
-        &right_set,
+    build_iterative(
+        &left,
+        &right,
+        compare_method,
         sort_by,
         sort_order,
-    );
-
-    for name in &all_names {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let child_relative = if relative_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", relative_path, name)
-        };
-
-        // Send progress
-        let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = progress_tx.send(DiffProgressMsg::Comparing(
-            child_relative.clone(),
-            count,
+        entries,
+        Some(BuildProgress {
+            cancel_flag,
+            progress_tx,
             total,
-        ));
-
-        let left_path = left_dir.join(name);
-        let right_path = right_dir.join(name);
-
-        let left_info = make_file_info(&left_path, name);
-        let right_info = make_file_info(&right_path, name);
-
-        let left_exists = left_set.contains(name.as_str());
-        let right_exists = right_set.contains(name.as_str());
-
-        let left_is_dir = left_info.as_ref().map_or(false, |i| i.is_directory);
-        let right_is_dir = right_info.as_ref().map_or(false, |i| i.is_directory);
-        let is_directory = left_is_dir || right_is_dir;
-
-        if left_exists && right_exists {
-            if left_is_dir && right_is_dir {
-                let dir_index = entries.len();
-                entries.push(DiffEntry {
-                    relative_path: child_relative.clone(),
-                    left: left_info,
-                    right: right_info,
-                    status: DiffStatus::DirSame,
-                    is_directory: true,
-                    depth,
-                    children_not_loaded: false,
-                });
-
-                build_recursive_threaded(
-                    left_root,
-                    right_root,
-                    &child_relative,
-                    depth + 1,
-                    compare_method,
-                    sort_by,
-                    sort_order,
-                    entries,
-                    cancel_flag,
-                    progress_tx,
-                    total,
-                    counter,
-                );
-
-                let has_diff = entries[dir_index + 1..].iter().any(|e| {
-                    matches!(
-                        e.status,
-                        DiffStatus::Modified
-                            | DiffStatus::LeftOnly
-                            | DiffStatus::RightOnly
-                            | DiffStatus::DirModified
-                    )
-                });
-
-                entries[dir_index].status = if has_diff {
-                    DiffStatus::DirModified
-                } else {
-                    DiffStatus::DirSame
-                };
-            } else if !left_is_dir && !right_is_dir {
-                let same = match (left_info.as_ref(), right_info.as_ref()) {
-                    (Some(l), Some(r)) => compare_files(l, r, compare_method),
-                    _ => false,
-                };
-                entries.push(DiffEntry {
-                    relative_path: child_relative,
-                    left: left_info,
-                    right: right_info,
-                    status: if same {
-                        DiffStatus::Same
-                    } else {
-                        DiffStatus::Modified
-                    },
-                    is_directory: false,
-                    depth,
-                    children_not_loaded: false,
-                });
-            } else {
-                entries.push(DiffEntry {
-                    relative_path: child_relative,
-                    left: left_info,
-                    right: right_info,
-                    status: DiffStatus::Modified,
-                    is_directory,
-                    depth,
-                    children_not_loaded: false,
-                });
-            }
-        } else if left_exists {
-            // Left only - skip recursion, children loaded lazily on expand
-            entries.push(DiffEntry {
-                relative_path: child_relative,
-                left: left_info,
-                right: None,
-                status: DiffStatus::LeftOnly,
-                is_directory,
-                depth,
-                children_not_loaded: is_directory,
-            });
-        } else {
-            // Right only - skip recursion, children loaded lazily on expand
-            entries.push(DiffEntry {
-                relative_path: child_relative,
-                left: None,
-                right: right_info,
-                status: DiffStatus::RightOnly,
-                is_directory,
-                depth,
-                children_not_loaded: is_directory,
-            });
+            counter,
+        }),
+    );
+    if depth != 0 {
+        for entry in entries.iter_mut() {
+            entry.depth = entry.depth.saturating_add(depth);
         }
     }
 }
@@ -1477,56 +1433,51 @@ fn get_extension(name: &str) -> String {
 // In-memory re-sort (preserving DFS tree structure)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Recursively re-sort entries at a given depth level within [start, end).
-/// Each directory entry "owns" a contiguous block: itself + all deeper descendants.
-/// Returns a new Vec with entries sorted at every level.
-fn resort_level(
+/// Re-sort every sibling list while preserving DFS tree structure, using only
+/// index stacks. A directory chain can be much deeper than the process stack.
+fn resort_flat_tree(
     entries: &[DiffEntry],
-    target_depth: usize,
-    start: usize,
-    end: usize,
     sort_by: SortBy,
     sort_order: SortOrder,
 ) -> Vec<DiffEntry> {
-    // Identify blocks: each entry at target_depth owns itself + subsequent deeper entries
-    let mut blocks: Vec<(usize, usize)> = Vec::new();
-    let mut i = start;
-    while i < end {
-        if entries[i].depth == target_depth {
-            let block_start = i;
-            let mut block_end = i + 1;
-            while block_end < end && entries[block_end].depth > target_depth {
-                block_end += 1;
-            }
-            blocks.push((block_start, block_end));
-            i = block_end;
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    let mut children = vec![Vec::<usize>::new(); entries.len()];
+    let mut ancestor_stack: Vec<usize> = Vec::new();
+
+    for (index, entry) in entries.iter().enumerate() {
+        ancestor_stack.truncate(entry.depth);
+        if entry.depth == 0 {
+            roots.push(index);
+        } else if let Some(&parent) = ancestor_stack.get(entry.depth - 1) {
+            children[parent].push(index);
         } else {
-            i += 1;
+            // Keep malformed/incomplete input visible rather than dropping it.
+            roots.push(index);
+        }
+        if entry.is_directory {
+            ancestor_stack.push(index);
         }
     }
 
-    // Sort blocks by their head entry
-    blocks.sort_by(|a, b| {
-        compare_entries_for_sort(&entries[a.0], &entries[b.0], sort_by, sort_order)
-    });
-
-    // Rebuild: for each block, emit the head entry, then recursively sort children
-    let mut result = Vec::new();
-    for (block_start, block_end) in blocks {
-        result.push(entries[block_start].clone());
-        if entries[block_start].is_directory && block_end > block_start + 1 {
-            let children = resort_level(
-                entries,
-                target_depth + 1,
-                block_start + 1,
-                block_end,
-                sort_by,
-                sort_order,
-            );
-            result.extend(children);
-        }
+    let compare = |a: &usize, b: &usize| {
+        compare_entries_for_sort(&entries[*a], &entries[*b], sort_by, sort_order)
+            .then_with(|| entries[*a].relative_path.cmp(&entries[*b].relative_path))
+    };
+    roots.sort_by(compare);
+    for siblings in &mut children {
+        siblings.sort_by(compare);
     }
 
+    let mut result = Vec::with_capacity(entries.len());
+    let mut pending: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(index) = pending.pop() {
+        result.push(entries[index].clone());
+        pending.extend(children[index].iter().rev().copied());
+    }
     result
 }
 
@@ -1586,6 +1537,11 @@ fn compare_entries_for_sort(
 
 /// Compare two files. Returns true if they are considered the same.
 pub fn compare_files(left: &DiffFileInfo, right: &DiffFileInfo, method: CompareMethod) -> bool {
+    // A symbolic link and a regular file are different filesystem objects even
+    // when following the link happens to yield the same bytes.
+    if left.is_symlink != right.is_symlink {
+        return false;
+    }
     // If both are symlinks, compare their target paths
     if left.is_symlink && right.is_symlink {
         return fs::read_link(&left.full_path).ok() == fs::read_link(&right.full_path).ok();
@@ -1629,8 +1585,14 @@ pub fn byte_compare(path_a: &Path, path_b: &Path) -> bool {
     let mut buf_b = [0u8; CHUNK_SIZE];
 
     loop {
-        let n_a = read_exact_or_eof(&mut reader_a, &mut buf_a);
-        let n_b = read_exact_or_eof(&mut reader_b, &mut buf_b);
+        let n_a = match read_exact_or_eof(&mut reader_a, &mut buf_a) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let n_b = match read_exact_or_eof(&mut reader_b, &mut buf_b) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
 
         if n_a != n_b {
             return false;
@@ -1645,16 +1607,17 @@ pub fn byte_compare(path_a: &Path, path_b: &Path) -> bool {
 }
 
 /// Read exactly buf.len() bytes, or fewer only at EOF. Returns bytes read.
-fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> usize {
+fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
             Ok(0) => break, // EOF
             Ok(n) => filled += n,
-            Err(_) => return 0,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    filled
+    Ok(filled)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2536,4 +2499,122 @@ fn handle_enter(app: &mut App) {
 
     // Enter file content diff view
     app.enter_diff_file_view(left_path, right_path, file_name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_error_is_not_reported_as_eof() {
+        struct BrokenReader;
+        impl Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::Other, "broken"))
+            }
+        }
+
+        let mut reader = BrokenReader;
+        let mut buffer = [0u8; 8];
+        assert!(read_exact_or_eof(&mut reader, &mut buffer).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_regular_file_are_not_equal_even_with_same_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let regular = temp_dir.path().join("regular");
+        let link = temp_dir.path().join("link");
+        std::fs::write(&regular, b"same bytes").unwrap();
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let left = make_file_info(&link, "link").unwrap();
+        let right = make_file_info(&regular, "regular").unwrap();
+
+        assert!(!compare_files(&left, &right, CompareMethod::Content));
+    }
+
+    #[test]
+    fn deeply_nested_comparison_uses_an_explicit_stack() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let mut left_cursor = left.path().to_path_buf();
+        let mut right_cursor = right.path().to_path_buf();
+        const DEPTH: usize = 700;
+        for _ in 0..DEPTH {
+            left_cursor.push("d");
+            right_cursor.push("d");
+            std::fs::create_dir(&left_cursor).unwrap();
+            std::fs::create_dir(&right_cursor).unwrap();
+        }
+        std::fs::write(left_cursor.join("leaf"), b"same").unwrap();
+        std::fs::write(right_cursor.join("leaf"), b"same").unwrap();
+
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.build_diff_list();
+
+        assert_eq!(state.all_entries.len(), DEPTH + 1);
+        assert_eq!(state.all_entries.last().unwrap().status, DiffStatus::Same);
+        assert_eq!(state.all_entries.last().unwrap().depth, DEPTH);
+    }
+
+    #[test]
+    fn deeply_nested_resort_uses_an_explicit_stack() {
+        const DEPTH: usize = 20_000;
+        let entries: Vec<DiffEntry> = (0..DEPTH)
+            .map(|depth| DiffEntry {
+                relative_path: depth.to_string(),
+                left: None,
+                right: None,
+                status: DiffStatus::DirSame,
+                is_directory: true,
+                depth,
+                children_not_loaded: false,
+            })
+            .collect();
+
+        let sorted = resort_flat_tree(&entries, SortBy::Name, SortOrder::Asc);
+
+        assert_eq!(sorted.len(), DEPTH);
+        assert_eq!(sorted.last().unwrap().depth, DEPTH - 1);
+    }
+
+    #[test]
+    fn iterative_resort_keeps_children_with_their_parent() {
+        let make_entry = |path: &str, name: &str, depth: usize| DiffEntry {
+            relative_path: path.to_string(),
+            left: Some(DiffFileInfo {
+                name: name.to_string(),
+                size: 0,
+                modified: Local::now(),
+                is_directory: true,
+                is_symlink: false,
+                full_path: PathBuf::from(path),
+            }),
+            right: None,
+            status: DiffStatus::LeftOnly,
+            is_directory: true,
+            depth,
+            children_not_loaded: false,
+        };
+        let entries = vec![
+            make_entry("b", "b", 0),
+            make_entry("b/child", "child-b", 1),
+            make_entry("a", "a", 0),
+            make_entry("a/child", "child-a", 1),
+        ];
+
+        let sorted = resort_flat_tree(&entries, SortBy::Name, SortOrder::Asc);
+        let paths: Vec<&str> = sorted
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+
+        assert_eq!(paths, ["a", "a/child", "b", "b/child"]);
+    }
 }

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 
@@ -68,14 +69,20 @@ fn is_binary(data: &[u8]) -> bool {
 /// Compute LCS (Longest Common Subsequence) of two line sequences.
 /// Returns a list of matched pairs (left_index, right_index).
 ///
-/// For files up to ~10000 lines each, uses standard O(n*m) DP.
-/// For larger files, falls back to a simpler sequential comparison.
+/// Uses standard O(n*m) DP only while the matrix remains reasonably sized.
+/// Larger inputs fall back to a linear-memory greedy matcher.
 fn compute_lcs(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
     let n = left.len();
     let m = right.len();
 
-    // Size limit: if combined lines exceed 20000, use simple sequential matching
-    if n + m > 20000 {
+    // A 10k x 10k input used to allocate roughly 400 MiB even though the
+    // combined-line threshold considered it acceptable.  Bound the actual DP
+    // cell count instead (u32 is four bytes per cell).
+    const MAX_LCS_CELLS: usize = 4_000_000;
+    let cells = n
+        .checked_add(1)
+        .and_then(|rows| m.checked_add(1).and_then(|cols| rows.checked_mul(cols)));
+    if cells.is_none_or(|cells| cells > MAX_LCS_CELLS) {
         return compute_lcs_simple(left, right);
     }
 
@@ -113,19 +120,29 @@ fn compute_lcs(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
     result
 }
 
-/// Simple sequential matching for large files.
-/// Uses a greedy approach: for each left line, find the nearest unmatched right line.
+/// Greedy matching for large files using indexed right-hand positions.
 fn compute_lcs_simple(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     let mut right_pos = 0;
+    let mut right_positions: HashMap<&str, VecDeque<usize>> = HashMap::new();
+
+    for (index, line) in right.iter().enumerate() {
+        right_positions
+            .entry(line.as_str())
+            .or_default()
+            .push_back(index);
+    }
 
     for (li, left_line) in left.iter().enumerate() {
-        for ri in right_pos..right.len() {
-            if left_line == &right[ri] {
-                result.push((li, ri));
-                right_pos = ri + 1;
-                break;
-            }
+        let Some(positions) = right_positions.get_mut(left_line.as_str()) else {
+            continue;
+        };
+        while positions.front().is_some_and(|index| *index < right_pos) {
+            positions.pop_front();
+        }
+        if let Some(ri) = positions.pop_front() {
+            result.push((li, ri));
+            right_pos = ri + 1;
         }
     }
 
@@ -1304,5 +1321,13 @@ mod tests {
         let right: Vec<String> = Vec::new();
         let lcs = compute_lcs(&left, &right);
         assert!(lcs.is_empty());
+    }
+
+    #[test]
+    fn large_adversarial_diff_avoids_quadratic_matrix_and_scan() {
+        let left = vec!["left-only".to_string(); 10_000];
+        let right = vec!["right-only".to_string(); 10_000];
+
+        assert!(compute_lcs(&left, &right).is_empty());
     }
 }

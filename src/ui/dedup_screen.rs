@@ -61,8 +61,12 @@ impl DedupScreenState {
 
     fn push_log(&mut self, line: String) {
         if self.log_lines.len() >= MAX_LOG_LINES {
-            self.log_lines.remove(0);
-            self.log_scroll = self.log_scroll.saturating_sub(1);
+            // Removing index zero shifts every retained String. Drop a chunk so a
+            // large dedup run remains amortized O(n), rather than repeatedly doing
+            // a 10,000-element move for every subsequent log line.
+            let drop_count = (MAX_LOG_LINES / 10).max(1).min(self.log_lines.len());
+            self.log_lines.drain(..drop_count);
+            self.log_scroll = self.log_scroll.saturating_sub(drop_count);
         }
         self.log_lines.push(line);
         let max_scroll = self.log_lines.len().saturating_sub(1);
@@ -71,15 +75,19 @@ impl DedupScreenState {
 
     fn poll(&mut self) {
         // Collect messages first to avoid borrow conflict
-        let messages: Vec<DedupMessage> = if let Some(ref rx) = self.receiver {
-            let mut msgs = Vec::new();
-            while let Ok(msg) = rx.try_recv() {
-                msgs.push(msg);
-            }
-            msgs
-        } else {
-            return;
-        };
+        let (messages, disconnected): (Vec<DedupMessage>, bool) =
+            if let Some(ref rx) = self.receiver {
+                let mut msgs = Vec::new();
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => msgs.push(msg),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break (msgs, false),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break (msgs, true),
+                    }
+                }
+            } else {
+                return;
+            };
 
         for msg in messages {
             match msg {
@@ -112,10 +120,21 @@ impl DedupScreenState {
                     self.push_log(format!("[ERROR] {}", msg));
                 }
                 DedupMessage::Complete => {
+                    self.phase = DedupPhase::Complete;
                     self.is_complete = true;
                     self.receiver = None;
                 }
             }
+        }
+
+        // A panic or other premature worker exit used to leave `receiver` set
+        // forever. Escape would then only request cancellation and the screen
+        // could never be closed because no Complete message could arrive.
+        if disconnected && !self.is_complete {
+            self.push_log("[ERROR] Deduplication worker stopped unexpectedly".to_string());
+            self.phase = DedupPhase::Complete;
+            self.is_complete = true;
+            self.receiver = None;
         }
     }
 }
@@ -376,4 +395,54 @@ pub fn handle_input(state: &mut DedupScreenState, code: KeyCode, modifiers: KeyM
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle_state(receiver: Receiver<DedupMessage>) -> DedupScreenState {
+        DedupScreenState {
+            target_path: PathBuf::from("."),
+            phase: DedupPhase::Scanning,
+            current_file: String::new(),
+            progress: 0,
+            log_lines: Vec::new(),
+            log_scroll: 0,
+            scanned: 0,
+            duplicates: 0,
+            freed: 0,
+            is_complete: false,
+            receiver: Some(receiver),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_trap_the_screen() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let mut state = idle_state(receiver);
+
+        state.poll();
+
+        assert!(state.is_complete);
+        assert_eq!(state.phase, DedupPhase::Complete);
+        assert!(state.receiver.is_none());
+        assert!(state.log_lines.iter().any(|line| line.contains("stopped")));
+        assert!(handle_input(&mut state, KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn log_retention_stays_bounded() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut state = idle_state(receiver);
+
+        for i in 0..(MAX_LOG_LINES * 3) {
+            state.push_log(i.to_string());
+        }
+
+        assert!(state.log_lines.len() <= MAX_LOG_LINES);
+        assert_eq!(state.log_lines.last().map(String::as_str), Some("29999"));
+    }
 }

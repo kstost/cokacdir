@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -80,6 +80,11 @@ pub struct ViewerState {
 
     // 화면 크기 (렌더링 시 업데이트)
     pub visible_height: usize,
+
+    // Word-wrap navigation uses visual rows, not logical source lines.
+    wrapped_line_origins: Vec<usize>,
+    wrap_width: usize,
+    pending_wrap_source_line: Option<usize>,
 }
 
 impl ViewerState {
@@ -114,6 +119,9 @@ impl ViewerState {
             file_size: 0,
             total_lines: 0,
             visible_height: 20, // 기본값, 렌더링 시 업데이트됨
+            wrapped_line_origins: Vec::new(),
+            wrap_width: 0,
+            pending_wrap_source_line: None,
         }
     }
 
@@ -138,6 +146,9 @@ impl ViewerState {
         self.search_term.clear();
         self.match_lines.clear();
         self.match_positions.clear();
+        self.wrapped_line_origins.clear();
+        self.wrap_width = 0;
+        self.pending_wrap_source_line = None;
 
         // Check file size before loading to prevent memory exhaustion
         let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -314,7 +325,7 @@ impl ViewerState {
     pub fn scroll_to_current_match(&mut self) {
         if !self.match_positions.is_empty() && self.current_match < self.match_positions.len() {
             let (line, _, _) = self.match_positions[self.current_match];
-            self.scroll = line.saturating_sub(5);
+            self.scroll_to_source_line(line, 5);
         }
     }
 
@@ -354,18 +365,18 @@ impl ViewerState {
         }
 
         // 현재 화면에 보이는 첫 번째 줄 기준
-        let current_line = self.scroll + 5; // 화면 중앙 근처
+        let current_line = self.source_line_for_visual_row(self.scroll.saturating_add(5));
         let mut sorted: Vec<_> = self.bookmarks.iter().copied().collect();
         sorted.sort();
 
         for &bm in &sorted {
             if bm > current_line {
-                self.scroll = bm.saturating_sub(5);
+                self.scroll_to_source_line(bm, 5);
                 return;
             }
         }
         // 처음 북마크로 순환
-        self.scroll = sorted[0].saturating_sub(5);
+        self.scroll_to_source_line(sorted[0], 5);
     }
 
     /// 이전 북마크로 이동
@@ -375,26 +386,26 @@ impl ViewerState {
         }
 
         // 현재 화면에 보이는 첫 번째 줄 기준
-        let current_line = self.scroll + 5; // 화면 중앙 근처
+        let current_line = self.source_line_for_visual_row(self.scroll.saturating_add(5));
         let mut sorted: Vec<_> = self.bookmarks.iter().copied().collect();
         sorted.sort();
         sorted.reverse();
 
         for &bm in &sorted {
             if bm < current_line {
-                self.scroll = bm.saturating_sub(5);
+                self.scroll_to_source_line(bm, 5);
                 return;
             }
         }
         // 마지막 북마크로 순환
-        self.scroll = sorted[0].saturating_sub(5);
+        self.scroll_to_source_line(sorted[0], 5);
     }
 
     /// 줄 번호로 이동
     pub fn goto_line(&mut self, line_str: &str) {
         if let Ok(line_num) = line_str.parse::<usize>() {
             if line_num > 0 && line_num <= self.lines.len() {
-                self.scroll = (line_num - 1).saturating_sub(5);
+                self.scroll_to_source_line(line_num - 1, 5);
             }
         }
     }
@@ -418,6 +429,69 @@ impl ViewerState {
             }
         }
         self.scroll = 0;
+    }
+
+    fn build_wrapped_lines(&self, content_width: usize) -> Vec<(usize, String, bool)> {
+        let mut wrapped_lines = Vec::new();
+        for (orig_idx, original_line) in self.lines.iter().enumerate() {
+            let line = original_line.replace('\t', "    ");
+            if line.is_empty() {
+                wrapped_lines.push((orig_idx, String::new(), true));
+            } else if content_width > 0 {
+                for (segment, wrapped) in textwrap::wrap(&line, content_width).iter().enumerate() {
+                    wrapped_lines.push((orig_idx, wrapped.to_string(), segment == 0));
+                }
+            } else {
+                wrapped_lines.push((orig_idx, line, true));
+            }
+        }
+        wrapped_lines
+    }
+
+    fn effective_line_count(&self) -> usize {
+        if self.word_wrap && !self.wrapped_line_origins.is_empty() {
+            self.wrapped_line_origins.len()
+        } else {
+            self.lines.len()
+        }
+    }
+
+    fn source_line_for_visual_row(&self, row: usize) -> usize {
+        if self.word_wrap && !self.wrapped_line_origins.is_empty() {
+            self.wrapped_line_origins
+                .get(row.min(self.wrapped_line_origins.len() - 1))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            row.min(self.lines.len().saturating_sub(1))
+        }
+    }
+
+    fn scroll_to_source_line(&mut self, source_line: usize, leading_rows: usize) {
+        let row = if self.word_wrap && !self.wrapped_line_origins.is_empty() {
+            self.wrapped_line_origins
+                .iter()
+                .position(|line| *line == source_line)
+                .unwrap_or(source_line)
+        } else {
+            source_line
+        };
+        self.scroll = row.saturating_sub(leading_rows);
+    }
+
+    fn toggle_word_wrap(&mut self) {
+        if self.word_wrap {
+            let source_line = self.source_line_for_visual_row(self.scroll);
+            self.word_wrap = false;
+            self.wrapped_line_origins.clear();
+            self.wrap_width = 0;
+            self.pending_wrap_source_line = None;
+            self.scroll = source_line;
+        } else {
+            self.pending_wrap_source_line = Some(self.scroll);
+            self.word_wrap = true;
+            self.horizontal_scroll = 0;
+        }
     }
 }
 
@@ -448,6 +522,50 @@ mod tests {
         assert_eq!(editor.cursor_line, 0);
         assert_eq!(editor.scroll, 0);
     }
+
+    #[test]
+    fn wrapped_viewer_scrolls_visual_rows_of_a_long_logical_line() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut viewer = ViewerState::new();
+        viewer.lines = vec!["abcdefghijklmnopqrstuvwxyz".to_string()];
+        viewer.word_wrap = true;
+        viewer.visible_height = 2;
+        viewer.wrapped_line_origins = viewer
+            .build_wrapped_lines(5)
+            .iter()
+            .map(|row| row.0)
+            .collect();
+        assert!(viewer.effective_line_count() > viewer.lines.len());
+
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.viewer_state = Some(viewer);
+        handle_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        assert_eq!(app.viewer_state.as_ref().unwrap().scroll, 1);
+    }
+
+    #[test]
+    fn bookmark_in_wrapped_view_targets_the_source_line() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut viewer = ViewerState::new();
+        viewer.lines = vec!["abcdefghijklmnopqrstuvwxyz".to_string()];
+        viewer.word_wrap = true;
+        viewer.visible_height = 2;
+        viewer.wrapped_line_origins = viewer
+            .build_wrapped_lines(5)
+            .iter()
+            .map(|row| row.0)
+            .collect();
+        viewer.scroll = 3;
+
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.viewer_state = Some(viewer);
+        handle_input(&mut app, KeyCode::Char('b'), KeyModifiers::NONE);
+
+        let viewer = app.viewer_state.as_ref().unwrap();
+        assert!(viewer.bookmarks.contains(&0));
+        assert!(!viewer.bookmarks.contains(&3));
+    }
 }
 
 pub fn draw(
@@ -472,8 +590,33 @@ pub fn draw(
     let visible_lines = (inner.height - 2) as usize;
     state.visible_height = visible_lines;
 
+    // Content dimensions are also needed to build the visual-row map used by
+    // word-wrap navigation.
+    let content_height = visible_lines;
+    let content_width = inner.width.saturating_sub(5) as usize;
+    let previous_source_line = state.source_line_for_visual_row(state.scroll);
+    let restore_source_line = state.pending_wrap_source_line.take().or_else(|| {
+        (state.word_wrap && state.wrap_width != content_width).then_some(previous_source_line)
+    });
+    let wrapped_lines = if state.word_wrap {
+        state.build_wrapped_lines(content_width)
+    } else {
+        Vec::new()
+    };
+    if state.word_wrap {
+        state.wrapped_line_origins = wrapped_lines.iter().map(|row| row.0).collect();
+        state.wrap_width = content_width;
+        if let Some(source_line) = restore_source_line {
+            state.scroll_to_source_line(source_line, 0);
+        }
+    } else {
+        state.wrapped_line_origins.clear();
+        state.wrap_width = 0;
+    }
+
     // Header
-    let total_lines = state.lines.len();
+    let total_lines = state.effective_line_count();
+    state.scroll = state.scroll.min(total_lines.saturating_sub(content_height));
     let end_line = (state.scroll + visible_lines).min(total_lines);
     let percentage = if total_lines > 0 {
         ((end_line as f32 / total_lines as f32) * 100.0) as u32
@@ -493,7 +636,11 @@ pub fn draw(
                 "[{}] {} | {}-{}/{} ({}%) ",
                 mode_str,
                 state.encoding,
-                state.scroll + 1,
+                if total_lines == 0 {
+                    0
+                } else {
+                    state.scroll + 1
+                },
                 end_line,
                 total_lines,
                 percentage
@@ -517,39 +664,20 @@ pub fn draw(
     );
 
     // Content
-    let content_height = (inner.height - 2) as usize;
-    let content_width = inner.width.saturating_sub(5) as usize; // 줄 번호 공간 제외
-
     // 하이라이터 리셋
     let mut highlighter = state.highlighter.clone();
     if let Some(ref mut hl) = highlighter {
         hl.reset();
         // 스크롤 전까지 상태 업데이트
-        for line in state.lines.iter().take(state.scroll) {
-            hl.tokenize_line(line);
+        if !state.word_wrap {
+            for line in state.lines.iter().take(state.scroll) {
+                hl.tokenize_line(line);
+            }
         }
     }
 
     // Word wrap 모드일 경우 표시할 줄들을 미리 계산
     if state.word_wrap {
-        // wrapped 줄 목록 생성: (원본 줄 번호, 원본 줄 참조, 줄 내용, 첫 줄 여부)
-        let mut wrapped_lines: Vec<(usize, String, bool)> = Vec::new();
-
-        for (orig_idx, original_line) in state.lines.iter().enumerate() {
-            // TAB을 4칸 스페이스로 변환 (잔상 방지)
-            let line = original_line.replace('\t', "    ");
-            if line.is_empty() {
-                wrapped_lines.push((orig_idx, String::new(), true));
-            } else if content_width > 0 {
-                let wrapped = textwrap::wrap(&line, content_width);
-                for (wi, wline) in wrapped.iter().enumerate() {
-                    wrapped_lines.push((orig_idx, wline.to_string(), wi == 0));
-                }
-            } else {
-                wrapped_lines.push((orig_idx, line.clone(), true));
-            }
-        }
-
         // 하이라이터 리셋 for word wrap mode
         let mut hl_for_wrap = state.highlighter.clone();
         if let Some(ref mut hl) = hl_for_wrap {
@@ -1484,6 +1612,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
 
     let visible_lines = state.visible_height;
+    let total_lines = state.effective_line_count();
 
     use crate::keybindings::ViewerAction;
     if let Some(action) = app.keybindings.viewer_action(code, modifiers) {
@@ -1520,7 +1649,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.scroll = state.scroll.saturating_sub(1);
             }
             ViewerAction::ScrollDown => {
-                if state.scroll + visible_lines < state.lines.len() {
+                if state.scroll.saturating_add(visible_lines) < total_lines {
                     state.scroll += 1;
                 }
             }
@@ -1534,14 +1663,14 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.scroll = state.scroll.saturating_sub(visible_lines);
             }
             ViewerAction::PageDown => {
-                let max = state.lines.len().saturating_sub(visible_lines);
-                state.scroll = (state.scroll + visible_lines).min(max);
+                let max = total_lines.saturating_sub(visible_lines);
+                state.scroll = state.scroll.saturating_add(visible_lines).min(max);
             }
             ViewerAction::GoTop => {
                 state.scroll = 0;
             }
             ViewerAction::GoBottom => {
-                state.scroll = state.lines.len().saturating_sub(visible_lines);
+                state.scroll = total_lines.saturating_sub(visible_lines);
             }
             ViewerAction::Find => {
                 state.search_mode = true;
@@ -1549,7 +1678,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.search_cursor_pos = 0;
             }
             ViewerAction::ToggleBookmark => {
-                let current_line = state.scroll;
+                let current_line = state.source_line_for_visual_row(state.scroll);
                 state.toggle_bookmark(current_line);
             }
             ViewerAction::NextBookmark => {
@@ -1559,7 +1688,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.goto_prev_bookmark();
             }
             ViewerAction::ToggleWrap => {
-                state.word_wrap = !state.word_wrap;
+                state.toggle_word_wrap();
             }
             ViewerAction::ToggleHex => {
                 state.toggle_mode();

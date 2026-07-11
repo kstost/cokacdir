@@ -3,10 +3,13 @@ Tool installation and management for cross-compilation.
 Installs Rust, zig, cargo-zigbuild, and macOS SDK into the builder/tools directory.
 """
 import os
+import posixpath
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Optional, Tuple
 import urllib.request
 import ssl
@@ -36,13 +39,27 @@ class ToolInstaller:
         """Create tools directory if it doesn't exist."""
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _is_executable_file(path: Path) -> bool:
+        return path.is_file() and os.access(path, os.X_OK)
+
+    def _remove_managed_path(self, path: Path) -> bool:
+        if not self._is_safe_path_for_deletion(path):
+            self.logger.error(f"Refusing to delete unsafe path: {path}")
+            return False
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+        return True
+
     # ==================== Rust Installation ====================
 
     def get_cargo_path(self) -> Optional[Path]:
         """Get path to cargo executable."""
         # Check local installation first
         local_cargo = self.cargo_home / "bin" / "cargo"
-        if local_cargo.exists():
+        if self._is_executable_file(local_cargo):
             return local_cargo
 
         # Check system PATH with local env
@@ -56,7 +73,7 @@ class ToolInstaller:
             )
             if result.returncode == 0:
                 return Path(result.stdout.strip())
-        except:
+        except OSError:
             pass
 
         # Check system installation
@@ -70,7 +87,7 @@ class ToolInstaller:
         """Get path to rustup executable."""
         # Check local installation first
         local_rustup = self.cargo_home / "bin" / "rustup"
-        if local_rustup.exists():
+        if self._is_executable_file(local_rustup):
             return local_rustup
 
         # Check system installation
@@ -109,16 +126,18 @@ class ToolInstaller:
 
         # Download rustup-init
         rustup_init_url = "https://sh.rustup.rs"
-        rustup_init_path = self.tools_dir / "rustup-init.sh"
+        rustup_init_path = None
 
         try:
-            self.logger.info("Downloading rustup installer...")
-            ctx = ssl.create_default_context()
-
-            with urllib.request.urlopen(rustup_init_url, context=ctx) as response:
-                script_content = response.read()
-                with open(rustup_init_path, "wb") as f:
-                    f.write(script_content)
+            fd, rustup_init_name = tempfile.mkstemp(
+                prefix="rustup-init-", suffix=".sh", dir=self.tools_dir
+            )
+            os.close(fd)
+            rustup_init_path = Path(rustup_init_name)
+            if not self.download_file(
+                rustup_init_url, rustup_init_path, "rustup installer"
+            ):
+                return False
 
             rustup_init_path.chmod(0o755)
 
@@ -144,21 +163,36 @@ class ToolInstaller:
             )
 
             if result.returncode == 0:
-                self.logger.success(f"Rust installed at {self.cargo_home}")
-
-                # Verify installation
                 cargo_path = self.cargo_home / "bin" / "cargo"
-                if cargo_path.exists():
-                    # Get version
-                    version_result = subprocess.run(
-                        [str(cargo_path), "--version"],
-                        capture_output=True,
-                        text=True,
-                        env=env,
+                rustup_path = self.cargo_home / "bin" / "rustup"
+                if not self._is_executable_file(
+                    cargo_path
+                ) or not self._is_executable_file(rustup_path):
+                    self.logger.error(
+                        "Rust installer exited successfully but cargo/rustup was not installed"
                     )
-                    if version_result.returncode == 0:
-                        self.logger.info(f"  {version_result.stdout.strip()}")
+                    return False
 
+                cargo_version = subprocess.run(
+                    [str(cargo_path), "--version"],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                rustup_version = subprocess.run(
+                    [str(rustup_path), "--version"],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                if cargo_version.returncode != 0 or rustup_version.returncode != 0:
+                    self.logger.error(
+                        "Rust installer exited successfully but the installed tools do not run"
+                    )
+                    return False
+
+                self.logger.success(f"Rust installed at {self.cargo_home}")
+                self.logger.info(f"  {cargo_version.stdout.strip()}")
                 return True
             else:
                 self.logger.error(f"Rust installation failed: {result.stderr}")
@@ -170,7 +204,7 @@ class ToolInstaller:
 
         finally:
             # Cleanup installer
-            if rustup_init_path.exists():
+            if rustup_init_path is not None and rustup_init_path.exists():
                 rustup_init_path.unlink()
 
     # ==================== Zig Installation ====================
@@ -178,7 +212,7 @@ class ToolInstaller:
     def get_zig_path(self) -> Optional[Path]:
         """Get path to zig executable."""
         zig_exe = self.zig_dir / "zig"
-        if zig_exe.exists():
+        if self._is_executable_file(zig_exe):
             return zig_exe
 
         # Check if zig is in system PATH
@@ -204,39 +238,51 @@ class ToolInstaller:
         # Download zig
         archive_name = f"zig-{self.config.host_os}-{self.config.host_arch}-{self.config.zig_version}.tar.xz"
         archive_path = self.tools_dir / archive_name
+        extracted_dir = self.tools_dir / f"zig-{self.config.host_os}-{self.config.host_arch}-{self.config.zig_version}"
 
         if not archive_path.exists():
             local_cache = Path.home() / ".rustbuilder" / archive_name
             if local_cache.exists():
                 self.logger.info(f"Using cached {archive_name} from {local_cache.parent}")
-                shutil.copy2(local_cache, archive_path)
+                if not self._copy_file_atomically(local_cache, archive_path):
+                    return False
             elif not self.download_file(self.config.zig_url, archive_path, "Zig compiler"):
                 return False
 
-        # Extract to tools directory
-        if not self.extract_tar_xz(archive_path, self.tools_dir):
+        # A process can stop after extraction but before the final rename. Reuse
+        # a complete staged tree; replace an incomplete managed tree and retry.
+        if extracted_dir.exists() or extracted_dir.is_symlink():
+            staged_zig = extracted_dir / "zig"
+            if not self._is_executable_file(staged_zig):
+                if not self._remove_managed_path(extracted_dir):
+                    return False
+                if not self.extract_tar_xz(archive_path, self.tools_dir):
+                    return False
+        elif not self.extract_tar_xz(archive_path, self.tools_dir):
             return False
 
         # Rename to standard directory name
-        extracted_dir = self.tools_dir / f"zig-{self.config.host_os}-{self.config.host_arch}-{self.config.zig_version}"
         if extracted_dir.exists() and extracted_dir != self.zig_dir:
-            if self.zig_dir.exists():
-                # Security: Verify the path is within tools_dir before deletion
-                if not self._is_safe_path_for_deletion(self.zig_dir):
-                    self.logger.error(f"Refusing to delete unsafe path: {self.zig_dir}")
+            if self.zig_dir.exists() or self.zig_dir.is_symlink():
+                if not self._remove_managed_path(self.zig_dir):
                     return False
-                shutil.rmtree(self.zig_dir)
             extracted_dir.rename(self.zig_dir)
 
         # Verify installation
         zig_exe = self.zig_dir / "zig"
-        if zig_exe.exists():
-            zig_exe.chmod(0o755)
-            self.logger.success(f"Zig installed at {self.zig_dir}")
-            return True
-        else:
-            self.logger.error("Zig installation failed - executable not found")
-            return False
+        if zig_exe.is_file():
+            try:
+                zig_exe.chmod(0o755)
+                version = subprocess.run(
+                    [str(zig_exe), "version"], capture_output=True, text=True
+                )
+                if version.returncode == 0:
+                    self.logger.success(f"Zig installed at {self.zig_dir}")
+                    return True
+            except OSError:
+                pass
+        self.logger.error("Zig installation failed - executable is missing or unusable")
+        return False
 
     # ==================== cargo-zigbuild Installation ====================
 
@@ -244,7 +290,7 @@ class ToolInstaller:
         """Check if cargo-zigbuild is installed."""
         # Check if cargo-zigbuild binary exists in cargo bin
         cargo_zigbuild = self.cargo_home / "bin" / "cargo-zigbuild"
-        if cargo_zigbuild.exists():
+        if self._is_executable_file(cargo_zigbuild):
             return True
 
         # Fallback: check if it's in PATH
@@ -311,11 +357,14 @@ class ToolInstaller:
                 env=env,
             )
 
-            if result.returncode == 0:
+            if result.returncode == 0 and self.is_cargo_zigbuild_installed():
                 self.logger.success("cargo-zigbuild installed successfully")
                 return True
             else:
-                self.logger.error(f"Failed to install cargo-zigbuild: {result.stderr}")
+                self.logger.error(
+                    "Failed to install cargo-zigbuild or verify its executable: "
+                    f"{result.stderr}"
+                )
                 return False
 
         except FileNotFoundError:
@@ -328,7 +377,7 @@ class ToolInstaller:
         """Check if cargo-xwin is installed."""
         # Check if cargo-xwin binary exists in cargo bin
         cargo_xwin = self.cargo_home / "bin" / "cargo-xwin"
-        if cargo_xwin.exists():
+        if self._is_executable_file(cargo_xwin):
             return True
 
         # Fallback: check if it's in PATH
@@ -369,11 +418,14 @@ class ToolInstaller:
                 env=env,
             )
 
-            if result.returncode == 0:
+            if result.returncode == 0 and self.is_cargo_xwin_installed():
                 self.logger.success("cargo-xwin installed successfully")
                 return True
             else:
-                self.logger.error(f"Failed to install cargo-xwin: {result.stderr}")
+                self.logger.error(
+                    "Failed to install cargo-xwin or verify its executable: "
+                    f"{result.stderr}"
+                )
                 return False
 
         except FileNotFoundError:
@@ -438,7 +490,7 @@ class ToolInstaller:
 
     def is_macos_sdk_installed(self) -> bool:
         """Check if macOS SDK is installed."""
-        return self.sdk_dir.exists() and self.sdk_dir.is_dir()
+        return self.sdk_dir.is_dir() and (self.sdk_dir / "usr").is_dir()
 
     def install_macos_sdk(self) -> bool:
         """Install macOS SDK for cross-compilation."""
@@ -461,17 +513,22 @@ class ToolInstaller:
             local_cache = Path.home() / ".rustbuilder" / archive_name
             if local_cache.exists():
                 self.logger.info(f"Using cached {archive_name} from {local_cache.parent}")
-                shutil.copy2(local_cache, archive_path)
+                if not self._copy_file_atomically(local_cache, archive_path):
+                    return False
             elif not self.download_file(
                 self.config.macos_sdk_url, archive_path, "macOS SDK"
             ):
+                return False
+
+        if self.sdk_dir.exists() or self.sdk_dir.is_symlink():
+            if not self._remove_managed_path(self.sdk_dir):
                 return False
 
         # Extract SDK
         if not self.extract_tar_xz(archive_path, self.tools_dir):
             return False
 
-        if self.sdk_dir.exists():
+        if self.is_macos_sdk_installed():
             self.logger.success(f"macOS SDK installed at {self.sdk_dir}")
             return True
         else:
@@ -480,20 +537,55 @@ class ToolInstaller:
 
     # ==================== Utility Methods ====================
 
+    def _copy_file_atomically(self, source: Path, dest: Path) -> bool:
+        """Copy a cached file without exposing a partial final path."""
+        temp_path = None
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{dest.name}.", suffix=".part", dir=dest.parent
+            )
+            temp_path = Path(temp_name)
+            with os.fdopen(fd, "wb") as output:
+                with source.open("rb") as input_file:
+                    shutil.copyfileobj(input_file, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+            os.replace(temp_path, dest)
+            temp_path = None
+            return True
+        except Exception as error:
+            self.logger.error(f"Failed to copy cached file {source}: {error}")
+            return False
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+
     def download_file(self, url: str, dest: Path, desc: str = "file") -> bool:
         """Download a file with progress indication."""
         self.logger.info(f"Downloading {desc}...")
         self.logger.info(f"  URL: {url}")
 
+        temp_path = None
+        temp_fd = None
         try:
             ctx = ssl.create_default_context()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix=f".{dest.name}.", suffix=".part", dir=dest.parent
+            )
+            temp_path = Path(temp_name)
 
-            with urllib.request.urlopen(url, context=ctx) as response:
+            with urllib.request.urlopen(url, context=ctx, timeout=120) as response:
                 total_size = int(response.headers.get("content-length", 0))
                 downloaded = 0
                 chunk_size = 8192
 
-                with open(dest, "wb") as f:
+                with os.fdopen(temp_fd, "wb") as f:
+                    temp_fd = None
                     while True:
                         chunk = response.read(chunk_size)
                         if not chunk:
@@ -511,15 +603,34 @@ class ToolInstaller:
                                 flush=True,
                             )
 
-                print()  # New line after progress
-                self.logger.success(f"Downloaded {desc}")
-                return True
+                    if downloaded == 0:
+                        raise OSError("downloaded file is empty")
+                    if total_size > 0 and downloaded != total_size:
+                        raise OSError(
+                            f"incomplete download: expected {total_size} bytes, "
+                            f"received {downloaded}"
+                        )
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            os.replace(temp_path, dest)
+            temp_path = None
+
+            print()  # New line after progress
+            self.logger.success(f"Downloaded {desc}")
+            return True
 
         except Exception as e:
             self.logger.error(f"Failed to download {desc}: {e}")
-            if dest.exists():
-                dest.unlink()
             return False
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _is_safe_path_for_deletion(self, path: Path) -> bool:
         """Check if a path is safe to delete (within tools_dir and not a symlink escape)."""
@@ -568,30 +679,121 @@ class ToolInstaller:
         except (ValueError, OSError):
             return False
 
+    @staticmethod
+    def _archive_parts(name: str):
+        # Tar names are POSIX paths. Backslashes become separators on Windows
+        # and drive/ADS colons have Windows-specific path semantics, so they
+        # cannot safely be passed to the host Path implementation.
+        if "\0" in name or "\\" in name:
+            return None
+        path = PurePosixPath(name)
+        if path.is_absolute() or not path.parts or any(part == ".." for part in path.parts):
+            return None
+        if os.name == "nt" and any(":" in part for part in path.parts):
+            return None
+        return path.parts
+
+    def _extract_members_safely(self, tar: tarfile.TarFile, stage_dir: Path) -> None:
+        """Extract without ever writing through an archive-created symlink."""
+        members = tar.getmembers()
+        validated = []
+        for member in members:
+            parts = self._archive_parts(member.name)
+            if parts is None:
+                raise ValueError(f"unsafe archive path: {member.name}")
+            if not (member.isdir() or member.isreg() or member.issym() or member.islnk()):
+                raise ValueError(f"special archive entry is not allowed: {member.name}")
+
+            if member.issym():
+                if "\0" in member.linkname or "\\" in member.linkname:
+                    raise ValueError(f"unsafe symlink target: {member.linkname}")
+                if PurePosixPath(member.linkname).is_absolute():
+                    raise ValueError(f"unsafe symlink target: {member.linkname}")
+                combined = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(member.name), member.linkname)
+                )
+                if self._archive_parts(combined) is None:
+                    raise ValueError(f"unsafe symlink target: {member.linkname}")
+            elif member.islnk():
+                if "\0" in member.linkname or "\\" in member.linkname:
+                    raise ValueError(f"unsafe hardlink target: {member.linkname}")
+                if self._archive_parts(posixpath.normpath(member.linkname)) is None:
+                    raise ValueError(f"unsafe hardlink target: {member.linkname}")
+            validated.append((member, parts))
+
+        directory_modes = []
+        links = []
+        for member, parts in validated:
+            target = stage_dir.joinpath(*parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                directory_modes.append((target, member.mode & 0o777))
+            elif member.isreg():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None:
+                    raise ValueError(f"could not read archive file: {member.name}")
+                with source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(member.mode & 0o777)
+            else:
+                links.append((member, target))
+
+        # Links are created only after every regular file, so a later member can
+        # never make extraction write through an earlier symlink.
+        for member, target in links:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                raise ValueError(f"duplicate archive path: {member.name}")
+            if member.issym():
+                os.symlink(member.linkname, target)
+            else:
+                link_target = stage_dir.joinpath(*PurePosixPath(member.linkname).parts)
+                resolved_target = link_target.resolve(strict=True)
+                if stage_dir.resolve() not in (resolved_target, *resolved_target.parents):
+                    raise ValueError(f"unsafe hardlink target: {member.linkname}")
+                if not resolved_target.is_file() or link_target.is_symlink():
+                    raise ValueError(f"invalid hardlink target: {member.linkname}")
+                os.link(resolved_target, target)
+
+        for directory, mode in sorted(
+            directory_modes, key=lambda item: len(item[0].parts), reverse=True
+        ):
+            directory.chmod(mode)
+
     def extract_tar_xz(self, archive: Path, dest_dir: Path) -> bool:
         """Extract a .tar.xz archive with path traversal protection."""
         self.logger.info(f"Extracting {archive.name}...")
+        stage_dir = None
         try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            stage_dir = Path(tempfile.mkdtemp(prefix=".extract-", dir=dest_dir))
             with tarfile.open(archive, "r:xz") as tar:
-                # Validate all members before extraction
-                for member in tar.getmembers():
-                    if not self._is_safe_tar_member(member, dest_dir):
-                        self.logger.error(f"Unsafe path in archive: {member.name}")
-                        return False
-                    # Also reject symbolic links pointing outside
-                    if member.issym() or member.islnk():
-                        link_target = member.linkname
-                        if link_target.startswith('/') or '..' in link_target.split('/'):
-                            self.logger.error(f"Unsafe symlink in archive: {member.name} -> {link_target}")
-                            return False
+                self._extract_members_safely(tar, stage_dir)
 
-                # Safe to extract
-                tar.extractall(path=dest_dir)
+            children = list(stage_dir.iterdir())
+            for child in children:
+                destination = dest_dir / child.name
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError(f"extraction destination exists: {destination}")
+            moved = []
+            try:
+                for child in children:
+                    destination = dest_dir / child.name
+                    child.rename(destination)
+                    moved.append((destination, child))
+            except Exception:
+                for destination, original in reversed(moved):
+                    destination.rename(original)
+                raise
             self.logger.success("Extraction complete")
             return True
         except Exception as e:
             self.logger.error(f"Failed to extract archive: {e}")
             return False
+        finally:
+            if stage_dir is not None:
+                shutil.rmtree(stage_dir, ignore_errors=True)
 
     # ==================== Setup Methods ====================
 

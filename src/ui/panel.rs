@@ -233,7 +233,7 @@ pub fn draw(
         .iter()
         .filter(|f| !f.is_directory)
         .map(|f| f.size)
-        .sum();
+        .fold(0, u64::saturating_add);
 
     // 선택된 파일 정보 계산
     let selected_count = panel.selected_files.len();
@@ -242,7 +242,7 @@ pub fn draw(
         .iter()
         .filter(|f| panel.selected_files.contains(&f.name))
         .map(|f| f.size)
-        .sum();
+        .fold(0, u64::saturating_add);
 
     let number_style = Style::default().fg(theme.panel.directory_text);
     let label_style = theme.dim_style();

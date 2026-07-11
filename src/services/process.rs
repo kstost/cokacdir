@@ -12,6 +12,9 @@ pub enum SortField {
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: i32,
+    /// Linux `/proc/<pid>/stat` field 22. Captured when the row is listed so
+    /// destructive actions can reject a PID that was reused before confirm.
+    pub start_time_ticks: Option<u64>,
     pub user: String,
     pub cpu: f32,
     pub mem: f32,
@@ -159,9 +162,14 @@ fn parse_process_line(line: &str) -> Option<ProcessInfo> {
     let mem = parts[3].parse::<f32>().ok()?;
     let vsz = parts[4].parse::<u64>().ok()?;
     let rss = parts[5].parse::<u64>().ok()?;
+    #[cfg(target_os = "linux")]
+    let start_time_ticks = get_process_starttime(pid);
+    #[cfg(not(target_os = "linux"))]
+    let start_time_ticks = None;
 
     Some(ProcessInfo {
         pid,
+        start_time_ticks,
         user: parts[0].to_string(),
         cpu,
         mem,
@@ -193,6 +201,7 @@ fn parse_tasklist_csv_line(line: &str) -> Option<ProcessInfo> {
 
     Some(ProcessInfo {
         pid,
+        start_time_ticks: None,
         user: fields[6].to_string(),
         cpu: 0.0, // tasklist doesn't provide CPU%
         mem: 0.0,
@@ -235,13 +244,23 @@ fn get_process_starttime(pid: i32) -> Option<u64> {
     let stat_path = format!("/proc/{}/stat", pid);
     let content = std::fs::read_to_string(stat_path).ok()?;
 
+    parse_process_starttime(&content)
+}
+
+/// Parse field 22 (`starttime`) from Linux `/proc/<pid>/stat`.
+///
+/// The `comm` field is parenthesized but may itself contain spaces and `)`.
+/// Therefore the delimiter is the *last* closing parenthesis, not the first.
+#[cfg(target_os = "linux")]
+fn parse_process_starttime(content: &str) -> Option<u64> {
     // Field 22 (0-indexed: 21) is starttime
     // Format: pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
     //         utime stime cutime cstime priority nice num_threads itrealvalue starttime ...
 
-    // Find the closing parenthesis of comm field (which may contain spaces)
-    let comm_end = content.find(')')?;
-    let after_comm = &content[comm_end + 2..]; // Skip ") "
+    // Find the closing parenthesis of comm field (which may contain spaces or
+    // closing parentheses itself).
+    let comm_end = content.rfind(')')?;
+    let after_comm = content.get(comm_end + 1..)?.trim_start();
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
 
     // starttime is field 20 after comm (0-indexed: 19)
@@ -252,10 +271,11 @@ fn get_process_starttime(pid: i32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn verify_process_identity(pid: i32, saved_starttime: Option<u64>) -> Result<(), String> {
     if let Some(saved) = saved_starttime {
-        if let Some(current) = get_process_starttime(pid) {
-            if saved != current {
-                return Err("Process PID was reused by a different process".to_string());
-            }
+        let current = get_process_starttime(pid).ok_or_else(|| {
+            "Cannot verify process identity; refusing to signal a possibly reused PID".to_string()
+        })?;
+        if saved != current {
+            return Err("Process PID was reused by a different process".to_string());
         }
     }
     Ok(())
@@ -556,6 +576,15 @@ mod tests {
         assert_eq!(info.command, "/usr/bin/program --arg value");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_process_starttime_with_closing_parenthesis_in_command() {
+        // Fields after comm begin at state (field 3); starttime is the 20th
+        // field in that suffix (overall field 22).
+        let stat = "123 (worker) name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+        assert_eq!(parse_process_starttime(stat), Some(424242));
+    }
+
     // ========== SortField tests ==========
 
     #[test]
@@ -573,6 +602,7 @@ mod tests {
     fn test_process_info_clone() {
         let info = ProcessInfo {
             pid: 1234,
+            start_time_ticks: Some(42),
             user: "test".to_string(),
             cpu: 1.5,
             mem: 2.5,
@@ -587,6 +617,7 @@ mod tests {
 
         let cloned = info.clone();
         assert_eq!(cloned.pid, info.pid);
+        assert_eq!(cloned.start_time_ticks, info.start_time_ticks);
         assert_eq!(cloned.user, info.user);
         assert_eq!(cloned.command, info.command);
     }

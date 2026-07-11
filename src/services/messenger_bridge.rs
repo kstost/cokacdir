@@ -11,6 +11,7 @@
 //! Discord and Slack bots are launched via `--ccserver` (auto-detected by token format).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -186,25 +187,113 @@ struct HttpRequest {
 
 /// Maximum request body size (100 MB — covers Telegram's 50 MB file upload limit)
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+/// Inbound files are ultimately consumed by telegram.rs's getFile-compatible
+/// 20 MiB path. Enforce the same bound while reading Discord/Slack responses,
+/// including responses without Content-Length, so an unknown-size file cannot
+/// exhaust the bridge process before telegram.rs gets a chance to reject it.
+const BRIDGE_FILE_DOWNLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
+const BRIDGE_FILE_DOWNLOAD_TIMEOUT_SECS: u64 = 120;
+
+fn bridge_api_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        // Certificate verification remains enabled; no danger-accept option
+        // is used when selecting the native TLS backend.
+        .build()
+        .map_err(|e| format!("Failed to create messenger API client: {e}"))
+}
+
+fn bridge_file_download_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // Covers both headers and the streamed response body. This prevents a
+        // stalled or indefinitely trickling CDN peer from pinning a chat
+        // worker forever.
+        .timeout(std::time::Duration::from_secs(
+            BRIDGE_FILE_DOWNLOAD_TIMEOUT_SECS,
+        ))
+        .build()
+        .map_err(|e| format!("Failed to create file download client: {e}"))
+}
+
+async fn read_download_response_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if !response.status().is_success() {
+        return Err(format!("{} failed: HTTP {}", label, response.status()));
+    }
+    if let Some(length) = response.content_length() {
+        if length > max_bytes as u64 {
+            return Err(format!(
+                "{} too large ({} bytes; maximum {} bytes)",
+                label, length, max_bytes
+            ));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("{} read failed: {}", label, e))?
+    {
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{} size overflow", label))?;
+        if next_len > max_bytes {
+            return Err(format!(
+                "{} too large (more than {} bytes)",
+                label, max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_http_line_limited(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    limit: usize,
+) -> Result<Option<String>, ()> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(|_| ())?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map(|index| index + 1).unwrap_or(available.len());
+        if bytes.len().checked_add(take).is_none_or(|len| len > limit) {
+            return Err(());
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| ())
+}
 
 async fn read_http_request(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Option<HttpRequest> {
-    /// Maximum header line size (16 KB — well above any realistic HTTP header)
     const MAX_HEADER_LINE: usize = 16 * 1024;
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-    let mut request_line = String::new();
-    match reader.read_line(&mut request_line).await {
-        Ok(0) => return None,
-        Err(_) => return None,
-        _ => {}
-    }
-    if request_line.len() > MAX_HEADER_LINE {
-        return None;
-    }
+    let request_line = read_http_line_limited(reader, MAX_HEADER_LINE)
+        .await
+        .ok()??;
 
     let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
-    if parts.len() < 2 {
+    if parts.len() != 3 || !parts[2].starts_with("HTTP/1.") {
         return None;
     }
     let path = parts[1].to_string();
@@ -212,14 +301,13 @@ async fn read_http_request(
     let mut content_length: Option<usize> = None;
     let mut content_type = String::new();
     let mut chunked = false;
+    let mut header_bytes = request_line.len();
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => return None,
-            Err(_) => return None,
-            _ => {}
-        }
-        if line.len() > MAX_HEADER_LINE {
+        let line = read_http_line_limited(reader, MAX_HEADER_LINE)
+            .await
+            .ok()??;
+        header_bytes = header_bytes.checked_add(line.len())?;
+        if header_bytes > MAX_HEADER_BYTES {
             return None;
         }
         let trimmed = line.trim();
@@ -228,37 +316,63 @@ async fn read_http_request(
         }
         let lower = trimmed.to_lowercase();
         if let Some(val) = lower.strip_prefix("content-length:") {
-            content_length = val.trim().parse().ok();
+            let parsed = val.trim().parse::<usize>().ok()?;
+            if content_length.is_some_and(|previous| previous != parsed) {
+                return None;
+            }
+            content_length = Some(parsed);
         } else if lower.starts_with("content-type:") {
             content_type = trimmed["content-type:".len()..].trim().to_string();
         } else if lower.starts_with("transfer-encoding:") {
-            if lower.contains("chunked") {
-                chunked = true;
+            let encodings = lower["transfer-encoding:".len()..]
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            if encodings.as_slice() != ["chunked"] {
+                return None;
             }
+            chunked = true;
         }
+    }
+    if chunked && content_length.is_some() {
+        // Reject ambiguous framing instead of choosing one interpretation and
+        // leaving bytes to be parsed as the next request.
+        return None;
     }
 
     let body = if chunked {
         // Read chunked transfer encoding
         let mut body = Vec::new();
         loop {
-            let mut size_line = String::new();
-            match reader.read_line(&mut size_line).await {
-                Ok(0) => break,
-                Err(_) => return None,
-                _ => {}
-            }
-            let chunk_size = match usize::from_str_radix(size_line.trim(), 16) {
+            let size_line = read_http_line_limited(reader, MAX_HEADER_LINE)
+                .await
+                .ok()??;
+            let size_text = size_line.trim().split(';').next().unwrap_or("");
+            let chunk_size = match usize::from_str_radix(size_text, 16) {
                 Ok(s) => s,
                 Err(_) => return None,
             };
             if chunk_size == 0 {
-                // Read trailing \r\n after final chunk
-                let mut trailing = String::new();
-                let _ = reader.read_line(&mut trailing).await;
+                let mut trailer_bytes = 0usize;
+                loop {
+                    let trailer = read_http_line_limited(reader, MAX_HEADER_LINE)
+                        .await
+                        .ok()??;
+                    trailer_bytes = trailer_bytes.checked_add(trailer.len())?;
+                    if trailer_bytes > MAX_HEADER_BYTES {
+                        return None;
+                    }
+                    if trailer.trim().is_empty() {
+                        break;
+                    }
+                }
                 break;
             }
-            if body.len() + chunk_size > MAX_BODY_SIZE {
+            if body
+                .len()
+                .checked_add(chunk_size)
+                .is_none_or(|len| len > MAX_BODY_SIZE)
+            {
                 return None;
             }
             let mut chunk = vec![0u8; chunk_size];
@@ -266,9 +380,10 @@ async fn read_http_request(
                 return None;
             }
             body.extend_from_slice(&chunk);
-            // Read trailing \r\n after chunk data
-            let mut trailing = String::new();
-            let _ = reader.read_line(&mut trailing).await;
+            let trailing = read_http_line_limited(reader, 2).await.ok()??;
+            if trailing != "\r\n" && trailing != "\n" {
+                return None;
+            }
         }
         body
     } else {
@@ -529,7 +644,16 @@ async fn handle_connection(state: Arc<ProxyState>, stream: tokio::net::TcpStream
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    while let Some(req) = read_http_request(&mut reader).await {
+    loop {
+        let req = match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            read_http_request(&mut reader),
+        )
+        .await
+        {
+            Ok(Some(request)) => request,
+            Ok(None) | Err(_) => break,
+        };
         let resp_bytes = route_request(&state, &req).await;
         if write_half.write_all(&resp_bytes).await.is_err() {
             break;
@@ -614,12 +738,22 @@ fn parse_request_body(content_type: &str, body: &[u8]) -> Value {
 // ============================================================
 
 async fn handle_api_method(state: &ProxyState, method: &str, body: &Value) -> Value {
-    // teloxide 0.13 uses PascalCase (GetMe, SendMessage, etc.)
+    // teloxide 0.17 uses the Rust payload type name (PascalCase) as the
+    // endpoint name. Keep the canonical Bot API camelCase aliases too for
+    // compatibility with direct clients.
     match method {
         "GetMe" | "getMe" => handle_get_me(state),
         "SetMyCommands" | "setMyCommands" => json!({"ok": true, "result": true}),
         "GetUpdates" | "getUpdates" => handle_get_updates(state, body).await,
         "SendMessage" | "sendMessage" => handle_send_message(state, body).await,
+        // Telegram Bot API 10.1 Rich Messages are not implemented by the
+        // Discord/Slack backends. Return an explicit API failure so
+        // telegram.rs takes its established classic send/edit fallback. The
+        // previous catch-all success response made callers believe a final
+        // response was delivered when nothing had been sent.
+        "SendRichMessage" | "sendRichMessage" | "SendRichMessageDraft" | "sendRichMessageDraft" => {
+            json!({"ok": false, "description": "Rich Messages are not supported by this bridge"})
+        }
         "EditMessageText" | "editMessageText" => handle_edit_message(state, body).await,
         "DeleteMessage" | "deleteMessage" => handle_delete_message(state, body).await,
         "SendDocument" | "sendDocument" => handle_send_document(state, body).await,
@@ -647,6 +781,8 @@ fn handle_get_me(state: &ProxyState) -> Value {
             "can_join_groups": true,
             "can_read_all_group_messages": true,
             "supports_inline_queries": false,
+            "can_connect_to_business": false,
+            "has_main_web_app": false,
         }
     })
 }
@@ -716,6 +852,16 @@ async fn handle_send_message(state: &ProxyState, body: &Value) -> Value {
 }
 
 async fn handle_edit_message(state: &ProxyState, body: &Value) -> Value {
+    if body.get("rich_message").is_some() {
+        // A raw Rich Message edit has no classic `text` field. Passing it
+        // through would edit the upstream Discord/Slack message to an empty
+        // string and then report success, losing the final response instead
+        // of triggering telegram.rs's classic fallback.
+        return json!({
+            "ok": false,
+            "description": "Rich Message edits are not supported by this bridge"
+        });
+    }
     let chat_id = body.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let message_id = body.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -825,6 +971,207 @@ async fn handle_file_download(state: &ProxyState, file_path: &str) -> Vec<u8> {
             let err = json!({"ok": false, "description": e});
             http_json_response(404, err.to_string().as_bytes())
         }
+    }
+}
+
+#[cfg(test)]
+mod rich_message_fallback_tests {
+    use super::*;
+    use teloxide::payloads::GetUpdatesSetters;
+    use teloxide::prelude::Requester;
+
+    fn proxy_state() -> ProxyState {
+        let (_tx, rx) = mpsc::channel(1);
+        ProxyState {
+            backend: Arc::new(ConsoleBackend::new()),
+            bot_info: BotInfo {
+                id: 1,
+                username: "bridge-test".to_string(),
+                first_name: "Bridge Test".to_string(),
+            },
+            update_rx: Mutex::new(rx),
+            update_id_counter: AtomicI64::new(1),
+            expected_token: "test-token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_rich_send_returns_api_failure_for_classic_fallback() {
+        let state = proxy_state();
+        let result = handle_api_method(
+            &state,
+            "sendRichMessage",
+            &json!({"chat_id": 1, "rich_message": {"markdown": "hello"}}),
+        )
+        .await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn unsupported_rich_edit_does_not_send_an_empty_classic_edit() {
+        let state = proxy_state();
+        let result = handle_api_method(
+            &state,
+            "editMessageText",
+            &json!({
+                "chat_id": 1,
+                "message_id": 2,
+                "rich_message": {"markdown": "final answer"}
+            }),
+        )
+        .await;
+        assert_eq!(result.get("ok").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn teloxide_017_round_trips_through_the_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy test server");
+        let addr = listener.local_addr().expect("proxy test address");
+        let (update_tx, update_rx) = mpsc::channel(1);
+        let state = Arc::new(ProxyState {
+            backend: Arc::new(ConsoleBackend::new()),
+            bot_info: BotInfo {
+                id: 1,
+                username: "bridge-test".to_string(),
+                first_name: "Bridge Test".to_string(),
+            },
+            update_rx: Mutex::new(update_rx),
+            update_id_counter: AtomicI64::new(1),
+            expected_token: "test-token".to_string(),
+        });
+        let server = tokio::spawn(run_proxy_server(state, listener));
+
+        let client = teloxide::net::default_reqwest_settings()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build teloxide proxy client");
+        let api_url = format!("http://{addr}")
+            .parse()
+            .expect("parse proxy API URL");
+        let bot = teloxide::Bot::with_client("test-token", client).set_api_url(api_url);
+
+        // This exercises teloxide's exact endpoint casing and validates that
+        // the proxy's getMe response still satisfies the current Me schema.
+        let me = bot.get_me().await.expect("getMe through proxy");
+        assert_eq!(me.username(), "bridge-test");
+
+        // The sendMessage response must remain deserializable as the current
+        // Message type, not merely return syntactically valid JSON.
+        let sent = bot
+            .send_message(teloxide::types::ChatId(7), "hello")
+            .await
+            .expect("sendMessage through proxy");
+        assert_eq!(sent.id.0, 1);
+        assert_eq!(sent.text(), Some("hello"));
+
+        update_tx
+            .send(IncomingMessage {
+                chat_id: 7,
+                message_id: 2,
+                from_id: 42,
+                from_first_name: "Tester".to_string(),
+                from_username: Some("tester".to_string()),
+                text: Some("incoming".to_string()),
+                is_group: false,
+                group_title: None,
+                document: None,
+                photo: None,
+                caption: None,
+                media_group_id: None,
+            })
+            .await
+            .expect("queue proxy update");
+        let updates = bot
+            .get_updates()
+            .offset(0)
+            .limit(1)
+            .await
+            .expect("getUpdates through proxy");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].id.0, 1);
+        let teloxide::types::UpdateKind::Message(message) = &updates[0].kind else {
+            panic!("proxy update was not a message");
+        };
+        assert_eq!(message.text(), Some("incoming"));
+
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod bounded_download_tests {
+    use super::*;
+
+    async fn parse_raw_proxy_request(raw: Vec<u8>) -> Option<HttpRequest> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind parser test listener");
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&raw).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, _) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        let request = read_http_request(&mut reader).await;
+        client.await.unwrap();
+        request
+    }
+
+    #[tokio::test]
+    async fn unknown_length_download_is_stopped_at_runtime_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nABCD\r\n4\r\nEFGH\r\n0\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let response = reqwest::get(format!("http://{addr}/file"))
+            .await
+            .expect("request test file");
+        let error = read_download_response_limited(response, 6, "test download")
+            .await
+            .expect_err("eight-byte chunked body must exceed six-byte limit");
+        assert!(error.contains("too large"), "unexpected error: {error}");
+        server.await.expect("test server task");
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_an_oversized_unterminated_request_line() {
+        let mut raw = vec![b'G'; 16 * 1024 + 1];
+        raw.extend_from_slice(b"\r\n\r\n");
+
+        assert!(parse_raw_proxy_request(raw).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_ambiguous_content_length_and_chunked_framing() {
+        let raw = b"POST /botx/sendMessage HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec();
+
+        assert!(parse_raw_proxy_request(raw).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_accepts_a_well_framed_chunked_body() {
+        let raw = b"POST /botx/sendMessage HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n4\r\ntest\r\n0\r\n\r\n".to_vec();
+
+        let request = parse_raw_proxy_request(raw).await.expect("valid request");
+        assert_eq!(request.body, b"test");
     }
 }
 
@@ -953,6 +1300,107 @@ impl ConsoleBackend {
     }
 }
 
+fn validate_console_document_filename(filename: &str) -> Result<&std::ffi::OsStr, String> {
+    if filename.is_empty() || filename.contains('\0') || filename.contains('\\') {
+        return Err("Invalid document filename".to_string());
+    }
+    let path = Path::new(filename);
+    let mut components = path.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err("Document filename must be a plain basename".to_string());
+    };
+    if components.next().is_some() || name != path.as_os_str() {
+        return Err("Document filename must be a plain basename".to_string());
+    }
+    Ok(name)
+}
+
+fn persist_console_document_in(dir: &Path, data: &[u8], filename: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    let basename = validate_console_document_filename(filename)?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("Failed to create console document directory: {e}"))?;
+    let (directory, stable_directory, metadata) =
+        crate::services::file_ops::open_directory_for_read(dir)
+            .map_err(|e| format!("Failed to open console document directory: {e}"))?;
+    let directory_identity = crate::services::file_ops::stable_file_identity(&directory)
+        .map_err(|e| format!("Failed to identify console document directory: {e}"))?;
+    if !metadata.file_type().is_dir()
+        || crate::services::file_ops::stable_path_identity(dir)
+            .map_err(|e| format!("Failed to bind console document directory: {e}"))?
+            != directory_identity
+    {
+        return Err("Console document path is not a stable real directory".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure console document directory: {e}"))?;
+    }
+    if crate::services::file_ops::stable_path_identity(dir)
+        .map_err(|e| format!("Failed to rebind console document directory: {e}"))?
+        != directory_identity
+    {
+        return Err("Console document directory changed while it was secured".to_string());
+    }
+
+    for _ in 0..32 {
+        let file_name = format!(
+            "{:032x}-{}",
+            rand::random::<u128>(),
+            basename.to_string_lossy()
+        );
+        let path = dir.join(&file_name);
+        let stable_path = stable_directory.join(&file_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&stable_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Failed to create console document: {e}")),
+        };
+        let identity = match crate::services::file_ops::stable_file_identity(&file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(file);
+                let _ = std::fs::remove_file(&stable_path);
+                return Err(format!("Failed to identify console document: {error}"));
+            }
+        };
+        if let Err(e) = file.write_all(data).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            return Err(format!("Failed to save console document: {e}"));
+        }
+        drop(file);
+        let path_matches = crate::services::file_ops::stable_path_identity(&path)
+            .map(|current| current == identity)
+            .unwrap_or(false);
+        let directory_matches = crate::services::file_ops::stable_path_identity(dir)
+            .map(|current| current == directory_identity)
+            .unwrap_or(false);
+        if !path_matches || !directory_matches {
+            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            return Err("Console document path changed while the file was being saved".to_string());
+        }
+        #[cfg(unix)]
+        directory
+            .sync_all()
+            .map_err(|e| format!("Failed to persist console document: {e}"))?;
+        return Ok(path);
+    }
+
+    Err("Failed to allocate a unique console document path".to_string())
+}
+
 #[async_trait]
 impl MessengerBackend for ConsoleBackend {
     fn name(&self) -> &str {
@@ -1064,10 +1512,10 @@ impl MessengerBackend for ConsoleBackend {
         filename: &str,
         caption: Option<&str>,
     ) -> Result<SentMessage, String> {
-        let dir = std::env::temp_dir().join("cokacdir_bridge");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(filename);
-        let _ = std::fs::write(&path, data);
+        let dir = crate::utils::path::cokacdir_temp_dir()
+            .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {e}"))?
+            .join("cokacdir_bridge");
+        let path = persist_console_document_in(&dir, data, filename)?;
         println!(
             "\n[File: {} ({} bytes) → {}]",
             filename,
@@ -1091,6 +1539,68 @@ impl MessengerBackend for ConsoleBackend {
 
     async fn get_file_data(&self, _file_path: &str) -> Result<Vec<u8>, String> {
         Err("Console backend does not support file downloads".to_string())
+    }
+}
+
+#[cfg(test)]
+mod console_document_tests {
+    use super::{persist_console_document_in, validate_console_document_filename};
+
+    #[test]
+    fn rejects_traversal_and_absolute_document_filenames() {
+        assert!(validate_console_document_filename("../victim").is_err());
+        assert!(validate_console_document_filename("sub/file").is_err());
+        assert!(validate_console_document_filename("sub\\file").is_err());
+        assert!(validate_console_document_filename("/absolute").is_err());
+        assert!(validate_console_document_filename("..").is_err());
+    }
+
+    #[test]
+    fn saves_to_a_private_unique_file_without_touching_existing_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("bridge");
+        std::fs::create_dir(&dir).unwrap();
+        let existing = dir.join("report.txt");
+        std::fs::write(&existing, b"keep me").unwrap();
+
+        let saved = persist_console_document_in(&dir, b"new data", "report.txt").unwrap();
+
+        assert_ne!(saved, existing);
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"new data");
+        assert_eq!(saved.parent(), Some(dir.as_path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(saved).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn console_document_directory_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("bridge");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(persist_console_document_in(&link, b"secret", "report.txt").is_err());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 }
 
@@ -1641,7 +2151,7 @@ impl MessengerBackend for DiscordBackend {
         }
         let channel_id = chat_id_to_channel_u64(chat_id);
         let url = format!("https://discord.com/api/v10/channels/{}/typing", channel_id);
-        let response = reqwest::Client::new()
+        let response = bridge_api_client(30)?
             .post(url)
             .header("Authorization", format!("Bot {}", self.token))
             .send()
@@ -1706,14 +2216,13 @@ impl MessengerBackend for DiscordBackend {
         if !is_allowed_discord_file_url(file_path) {
             return Err(format!("Refused to fetch non-Discord URL: {}", file_path));
         }
-        let resp = reqwest::get(file_path)
+        let resp = bridge_file_download_client()?
+            .get(file_path)
+            .send()
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
-        let bytes = resp
-            .bytes()
+        read_download_response_limited(resp, BRIDGE_FILE_DOWNLOAD_MAX_BYTES, "Discord download")
             .await
-            .map_err(|e| format!("Read failed: {}", e))?;
-        Ok(bytes.to_vec())
     }
 }
 
@@ -1983,22 +2492,22 @@ impl SlackState {
     }
 
     fn register_channel(&self, chat_id: i64, channel: &str) {
-        let snapshot = {
-            let mut map = self
-                .chat_to_channel
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if map
-                .get(&chat_id)
-                .map(|existing| existing == channel)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            map.insert(chat_id, channel.to_string());
-            map.clone()
-        };
-        self.persist_channel_map(&snapshot);
+        let mut map = self
+            .chat_to_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(&chat_id)
+            .map(|existing| existing == channel)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        map.insert(chat_id, channel.to_string());
+        // Keep snapshot mutation and persistence under one ordering lock. If
+        // two event callbacks persist outside this guard, an older snapshot
+        // can finish last and erase the newer channel from disk.
+        self.persist_channel_map(&map);
     }
 
     fn channel_for_chat(&self, chat_id: i64) -> Option<String> {
@@ -2073,12 +2582,10 @@ impl SlackState {
             .iter()
             .map(|(chat_id, channel)| (chat_id.to_string(), serde_json::json!(channel)))
             .collect();
-        let tmp_path = path.with_extension("json.tmp");
         let body = serde_json::Value::Object(json_map).to_string();
         if let Err(e) =
-            std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, path))
+            crate::services::telegram::write_private_file_atomically(path, body.as_bytes())
         {
-            let _ = std::fs::remove_file(&tmp_path);
             eprintln!("  [slack] channel map persist failed: {}", e);
         }
     }
@@ -2160,6 +2667,36 @@ mod slack_tests {
 
         let restored = SlackState::new(Some(path));
         assert_eq!(restored.channel_for_chat(chat_id).as_deref(), Some(channel));
+    }
+
+    #[test]
+    fn concurrent_channel_registrations_all_survive_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slack_map.json");
+        let state = std::sync::Arc::new(SlackState::new(Some(path.clone())));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut workers = Vec::new();
+        for index in 0..16i64 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.register_channel(-(index + 1), &format!("C{index:010}"));
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let reloaded = load_slack_channel_map(&path).expect("load persisted channel map");
+        assert_eq!(reloaded.len(), 16);
+        for index in 0..16i64 {
+            assert_eq!(
+                reloaded.get(&-(index + 1)).map(String::as_str),
+                Some(format!("C{index:010}").as_str())
+            );
+        }
     }
 
     #[test]
@@ -2851,7 +3388,9 @@ impl MessengerBackend for SlackBackend {
             .channel_for_chat(chat_id)
             .ok_or_else(|| format!("Unknown chat_id: {}", chat_id))?;
 
-        let http = reqwest::Client::new();
+        // Includes the potentially large raw upload body, so use the same
+        // bounded 120-second budget as file downloads.
+        let http = bridge_api_client(BRIDGE_FILE_DOWNLOAD_TIMEOUT_SECS)?;
         let auth = format!("Bearer {}", self.bot_token);
 
         // Step 1: Get upload URL
@@ -2996,20 +3535,14 @@ impl MessengerBackend for SlackBackend {
             return Err(format!("Refused to fetch non-Slack URL: {}", file_path));
         }
         let auth = format!("Bearer {}", self.bot_token);
-        let resp = reqwest::Client::new()
+        let resp = bridge_file_download_client()?
             .get(file_path)
             .header("Authorization", auth)
             .send()
             .await
             .map_err(|e| format!("Slack file download: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("Slack file download failed: {}", resp.status()));
-        }
-        let bytes = resp
-            .bytes()
+        read_download_response_limited(resp, BRIDGE_FILE_DOWNLOAD_MAX_BYTES, "Slack file download")
             .await
-            .map_err(|e| format!("Slack file read: {}", e))?;
-        Ok(bytes.to_vec())
     }
 }
 

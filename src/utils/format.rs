@@ -7,11 +7,19 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     if cfg!(windows) {
         let s = path.to_string_lossy();
-        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        if let Some(stripped) = strip_windows_extended_prefix(&s) {
             return PathBuf::from(stripped);
         }
     }
     path
+}
+
+fn strip_windows_extended_prefix(path: &str) -> Option<String> {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{}", unc))
+    } else {
+        path.strip_prefix(r"\\?\").map(str::to_string)
+    }
 }
 
 /// Windows 백슬래시 경로를 슬래시로 정규화 (셸 명령/프롬프트에 삽입할 때 사용)
@@ -268,5 +276,17 @@ mod tests {
         assert_eq!(display_width_suffix("abcdef", 3), "def");
         // CJK: "한글test" → 뒤에서 5칸: "test"(4칸)은 OK, '글'(2칸) 추가 시 6칸 초과 → "test"
         assert_eq!(display_width_suffix("한글test", 5), "test");
+    }
+
+    #[test]
+    fn windows_extended_unc_prefix_remains_an_absolute_unc_path() {
+        assert_eq!(
+            strip_windows_extended_prefix(r"\\?\UNC\server\share\file"),
+            Some(r"\\server\share\file".to_string())
+        );
+        assert_eq!(
+            strip_windows_extended_prefix(r"\\?\C:\Users\name"),
+            Some(r"C:\Users\name".to_string())
+        );
     }
 }

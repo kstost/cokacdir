@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
-use crate::utils::format::safe_suffix;
 
 /// 검색 결과 아이템
 #[derive(Debug, Clone)]
@@ -98,7 +97,7 @@ impl SearchResultState {
     }
 }
 
-/// 재귀적으로 파일 검색
+/// Search a directory tree without consuming the call stack.
 pub fn recursive_search(
     base_path: &PathBuf,
     current_path: &PathBuf,
@@ -106,16 +105,23 @@ pub fn recursive_search(
     results: &mut Vec<SearchResultItem>,
     max_results: usize,
 ) {
-    if results.len() >= max_results {
+    if results.len() >= max_results || max_results == 0 {
         return;
     }
 
     let lower_term = search_term.to_lowercase();
+    let mut pending_dirs = vec![current_path.clone()];
 
-    if let Ok(entries) = fs::read_dir(current_path) {
+    while let Some(directory) = pending_dirs.pop() {
+        if results.len() >= max_results {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
         for entry in entries.filter_map(|e| e.ok()) {
             if results.len() >= max_results {
-                return;
+                break;
             }
 
             let path = entry.path();
@@ -153,9 +159,11 @@ pub fn recursive_search(
                 });
             }
 
-            // 디렉토리인 경우 재귀 검색
+            // Queue real directories only. `symlink_metadata` plus this check
+            // prevents directory symlink cycles and traversal outside the
+            // requested search root.
             if is_directory {
-                recursive_search(base_path, &path, search_term, results, max_results);
+                pending_dirs.push(path);
             }
         }
     }
@@ -411,4 +419,53 @@ pub fn handle_input(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_recursive_search;
+
+    #[test]
+    fn iterative_search_honors_the_result_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            std::fs::write(dir.path().join(format!("match-{index}.txt")), "x").unwrap();
+        }
+
+        let results = execute_recursive_search(&dir.path().to_path_buf(), "match", 3);
+
+        assert_eq!(results.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iterative_search_handles_a_deep_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut current = dir.path().to_path_buf();
+        for _ in 0..1_000 {
+            current.push("d");
+            std::fs::create_dir(&current).unwrap();
+        }
+        std::fs::write(current.join("deep-needle.txt"), "found").unwrap();
+
+        let results = execute_recursive_search(&dir.path().to_path_buf(), "needle", 10);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "deep-needle.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn iterative_search_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret-needle.txt"), "outside").unwrap();
+        symlink(outside.path(), root.path().join("gateway")).unwrap();
+
+        let results = execute_recursive_search(&root.path().to_path_buf(), "needle", 10);
+
+        assert!(results.is_empty());
+    }
 }

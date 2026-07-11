@@ -1,6 +1,6 @@
 [package]
 name = "cokacdir"
-version = "0.7.6"
+version = "0.8.1"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "Telegram/Discord bot that runs Claude Code, Codex, Agy, and Opencode, with a multi-panel terminal file manager"
@@ -34,14 +34,13 @@ hex = "0.4"
 hmac = "0.12"
 md-5 = "0.10"
 thiserror = "1"
-russh = "0.46"
-russh-sftp = "2.0"
-russh-keys = "0.46"
+russh = { version = "0.62.2", default-features = false, features = ["flate2", "ring"] }
+russh-sftp = "2.3.0"
 async-trait = "0.1"
 ratatui-image = { version = "2.0", default-features = false, features = ["rustix", "image-defaults", "crossterm"] }
-teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "http", "model", "builder", "cache", "rustls_backend"] }
+teloxide = { version = "0.17", default-features = false, features = ["native-tls", "ctrlc_handler"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls-vendored", "json"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "http", "model", "builder", "cache", "native_tls_backend"] }
 slack-morphism = { version = "2", features = ["hyper"] }
 fs2 = "0.4"
 filetime = "0.2"

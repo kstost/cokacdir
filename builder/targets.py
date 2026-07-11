@@ -50,7 +50,7 @@ class Target:
         needs_zigbuild = (
             platform != "windows" and (
                 (platform == "macos" and config.host_os == "linux") or
-                (platform == "linux" and config.host_os == "linux")
+                (platform == "linux" and config.host_os in ("linux", "macos"))
             )
         )
 

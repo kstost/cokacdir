@@ -40,7 +40,7 @@ That’s it — open your chat app and start chatting with your bot.
 * **File search**: Recursive file search by name pattern
 * **Diff**: Side-by-side comparison of folders and files
 * **Git integration**: Built-in git status, commit, log, branch management, and diff between commits
-* **Remote SSH/SFTP**: Explore remote servers over SSH/SFTP with saved profiles
+* **Remote SSH/SFTP**: Explore remote servers over SSH/SFTP with saved profiles. Ed25519 and ECDSA private authentication keys are supported. RSA private authentication keys are rejected because the Rust RSA timing issue affects secret-key operations; RSA host-key verification may still be accepted by the SSH backend.
 * **File encryption**: AES-256 encryption with configurable chunk splitting
 * **Duplicate file detection**: Detect and manage duplicate files using hash-based comparison
 * **Chat bots**: Remotely control AI coding sessions through Telegram, Discord, or Slack with streaming output, queued requests, scheduled tasks, rich Telegram responses, and companion mode
@@ -92,9 +92,12 @@ Copyright (c) 2026 cokac.
 
 Telegram STT support downloads and spawns the MIT-licensed `transcriptor`
 binary, which uses OpenAI Whisper model artifacts converted for whisper.cpp.
-Runtime STT dependencies, upstream notices, model limitations, and audio consent
-considerations are summarized in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Linux release binaries also bundle OpenSSL 3.6.3 under the Apache License 2.0.
+Bundled and runtime dependencies, upstream notices, model limitations, and
+audio consent considerations are summarized in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); the exact OpenSSL license text
+is in [LICENSES/OpenSSL-3.6.3.txt](LICENSES/OpenSSL-3.6.3.txt). Installed binaries
+built from this source can print the same material with `cokacdir --licenses`.
 
 ## Author
 

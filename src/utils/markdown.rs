@@ -419,6 +419,10 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
     let mut current_pos = 0;
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
+    // If a malformed opening bracket has already scanned through a closing
+    // bracket (or the rest of the line), do not rescan that same suffix for
+    // every nested `[`. This keeps malformed/untrusted Markdown linear.
+    let mut next_link_attempt = 0usize;
 
     while current_pos < len {
         // Check for bold+italic (***text***)
@@ -496,20 +500,28 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
         }
 
         // Check for link [text](url)
-        if chars[current_pos] == '[' {
-            if let Some((link_text, url, end_pos)) = parse_link(&chars, current_pos) {
-                spans.push(Span::styled(
-                    link_text,
-                    Style::default()
-                        .fg(theme.link)
-                        .add_modifier(Modifier::UNDERLINED),
-                ));
-                spans.push(Span::styled(
-                    format!(" ({})", url),
-                    Style::default().fg(theme.dim),
-                ));
-                current_pos = end_pos;
-                continue;
+        if chars[current_pos] == '[' && current_pos >= next_link_attempt {
+            match parse_link(&chars, current_pos) {
+                LinkParseResult::Match(link_text, url, end_pos) => {
+                    spans.push(Span::styled(
+                        link_text,
+                        Style::default()
+                            .fg(theme.link)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" ({})", url),
+                        Style::default().fg(theme.dim),
+                    ));
+                    current_pos = end_pos;
+                    continue;
+                }
+                LinkParseResult::RetryAfter(position) => {
+                    next_link_attempt = position;
+                }
+                LinkParseResult::NoLaterMatch => {
+                    next_link_attempt = len;
+                }
             }
         }
 
@@ -553,7 +565,13 @@ fn find_closing_marker(chars: &[char], start: usize, marker: &str) -> Option<usi
     None
 }
 
-fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+enum LinkParseResult {
+    Match(String, String, usize),
+    RetryAfter(usize),
+    NoLaterMatch,
+}
+
+fn parse_link(chars: &[char], start: usize) -> LinkParseResult {
     // Find closing bracket
     let mut bracket_end = None;
     for i in start + 1..chars.len() {
@@ -562,11 +580,15 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
             break;
         }
     }
-    let bracket_end = bracket_end?;
+    let Some(bracket_end) = bracket_end else {
+        return LinkParseResult::NoLaterMatch;
+    };
 
     // Check for opening parenthesis
     if bracket_end + 1 >= chars.len() || chars[bracket_end + 1] != '(' {
-        return None;
+        // Every `[` before this first `]` would choose the same invalid closing
+        // bracket under the parser's existing semantics.
+        return LinkParseResult::RetryAfter(bracket_end + 1);
     }
 
     // Find closing parenthesis
@@ -577,12 +599,14 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
             break;
         }
     }
-    let paren_end = paren_end?;
+    let Some(paren_end) = paren_end else {
+        return LinkParseResult::NoLaterMatch;
+    };
 
     let link_text: String = chars[start + 1..bracket_end].iter().collect();
     let url: String = chars[bracket_end + 2..paren_end].iter().collect();
 
-    Some((link_text, url, paren_end + 1))
+    LinkParseResult::Match(link_text, url, paren_end + 1)
 }
 
 /// Parse nested list item and return (indent_level, content)
@@ -708,6 +732,15 @@ mod tests {
         let theme = MarkdownTheme::default();
         let lines = render_markdown("- Item 1\n- Item 2", theme);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn malformed_nested_link_markers_render_without_repeated_suffix_scans() {
+        let input = "[".repeat(20_000);
+        let spans = parse_inline_markdown(&input, &MarkdownTheme::default());
+        let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
+
+        assert_eq!(rendered, input);
     }
 
     #[test]

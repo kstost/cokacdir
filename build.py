@@ -227,13 +227,15 @@ def collect_targets(args: argparse.Namespace) -> list:
             if args.linux_x86_64:
                 targets.append("linux-x86_64")
 
-        if args.windows:
-            targets.append("windows")
-        else:
-            if args.windows_x86_64:
-                targets.append("windows-x86_64")
-            if args.windows_arm64:
-                targets.append("windows-arm64")
+    # ``--all`` intentionally excludes Windows, but the documented
+    # ``--all --windows`` combination must still add the Windows targets.
+    if args.windows:
+        targets.append("windows")
+    else:
+        if args.windows_x86_64:
+            targets.append("windows-x86_64")
+        if args.windows_arm64:
+            targets.append("windows-arm64")
 
     # Positional targets
     targets.extend(args.targets)
@@ -278,18 +280,25 @@ def needs_cross_compilation(targets: list) -> bool:
             return True
         if target in ("linux", "linux-arm64", "linux-x86_64"):
             return True
-        if target in RUST_TARGETS and ("apple-darwin" in RUST_TARGETS[target] or "linux" in RUST_TARGETS[target]):
-            return True
+        rust_target = RUST_TARGETS.get(target, target)
+        if target in RUST_TARGETS or target in RUST_TARGETS.values():
+            if "apple-darwin" in rust_target or "linux" in rust_target:
+                return True
     return False
 
 
 def needs_macos_cross(targets: list) -> bool:
     """Check if any target requires macOS SDK."""
+    # Native macOS toolchains already contain an SDK. The downloaded SDK is
+    # only used by osxcross/zig when producing macOS binaries on Linux.
+    if platform.system().lower() != "linux":
+        return False
     for target in targets:
         target = target.lower()
         if target in ("macos", "macos-arm64", "macos-x86_64", "all"):
             return True
-        if target in RUST_TARGETS and "apple-darwin" in RUST_TARGETS[target]:
+        rust_target = RUST_TARGETS.get(target, target)
+        if (target in RUST_TARGETS or target in RUST_TARGETS.values()) and "apple-darwin" in rust_target:
             return True
     return False
 
@@ -300,7 +309,8 @@ def needs_windows_cross(targets: list) -> bool:
         target = target.lower()
         if target in ("windows", "windows-x86_64", "windows-arm64"):
             return True
-        if target in RUST_TARGETS and "windows" in RUST_TARGETS[target]:
+        rust_target = RUST_TARGETS.get(target, target)
+        if (target in RUST_TARGETS or target in RUST_TARGETS.values()) and "windows" in rust_target:
             return True
     return False
 

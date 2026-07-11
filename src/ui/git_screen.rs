@@ -29,6 +29,9 @@ pub enum GitTab {
 #[derive(Debug, Clone)]
 pub struct GitFileEntry {
     pub path: String,
+    /// Original path for a staged rename/copy.  Both paths are needed when
+    /// unstaging a rename so that one half is not left staged.
+    pub original_path: Option<String>,
     pub index_status: char,
     pub worktree_status: char,
     pub staged: bool,
@@ -101,7 +104,6 @@ pub struct GitScreenState {
 
 impl GitScreenState {
     pub fn new(repo_path: PathBuf) -> Self {
-        stage_all(&repo_path);
         let branch_name = get_current_branch(&repo_path);
         let status_files = get_status(&repo_path);
         let log_entries = get_log(&repo_path, 200);
@@ -261,36 +263,49 @@ fn get_current_branch(path: &Path) -> String {
 }
 
 fn get_status(path: &Path) -> Vec<GitFileEntry> {
-    let output = git_cmd(path).args(["status", "--porcelain=v1"]).output();
+    let output = git_cmd(path)
+        .args(["status", "--porcelain=v1", "-z"])
+        .output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
+    parse_status_porcelain_v1_z(&output.stdout)
+}
 
-    for line in stdout.lines() {
-        if line.len() < 3 {
+/// Parse NUL-delimited porcelain output.  The line-oriented form quotes
+/// non-ASCII names and cannot represent newlines in filenames, so feeding the
+/// displayed path back to `git add/reset/diff` targeted the wrong file.
+fn parse_status_porcelain_v1_z(stdout: &[u8]) -> Vec<GitFileEntry> {
+    let mut entries = Vec::new();
+    let mut records = stdout.split(|byte| *byte == 0);
+
+    while let Some(record) = records.next() {
+        if record.len() < 3 {
             continue;
         }
-        let bytes = line.as_bytes();
-        let index_status = bytes[0] as char;
-        let worktree_status = bytes[1] as char;
-        let file_path = &line[3..];
+        let index_status = record[0] as char;
+        let worktree_status = record[1] as char;
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
 
-        // Handle rename: "R  old -> new"
-        let display_path = if let Some(pos) = file_path.find(" -> ") {
-            file_path[pos + 4..].to_string()
-        } else {
-            file_path.to_string()
-        };
+        // In `-z` mode a rename/copy record contains the destination first,
+        // followed by a second NUL-delimited record with the original path.
+        let original_path =
+            if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+                records
+                    .next()
+                    .map(|original| String::from_utf8_lossy(original).into_owned())
+            } else {
+                None
+            };
 
         let staged = index_status != ' ' && index_status != '?';
 
         entries.push(GitFileEntry {
-            path: display_path,
+            path,
+            original_path,
             index_status,
             worktree_status,
             staged,
@@ -303,7 +318,13 @@ fn get_status(path: &Path) -> Vec<GitFileEntry> {
 fn get_log(path: &Path, count: usize) -> Vec<GitLogEntry> {
     let count_str = count.to_string();
     let output = git_cmd(path)
-        .args(["log", "--format=%h|%s|%an|%ar|%D", "-n", &count_str])
+        .args([
+            "log",
+            "-z",
+            "--format=%h%x00%s%x00%an%x00%ar%x00%D",
+            "-n",
+            &count_str,
+        ])
         .output();
 
     let output = match output {
@@ -311,20 +332,29 @@ fn get_log(path: &Path, count: usize) -> Vec<GitLogEntry> {
         _ => return Vec::new(),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
+    parse_log_z(&output.stdout)
+}
 
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(5, '|').collect();
-        if parts.len() >= 4 {
-            entries.push(GitLogEntry {
-                hash: parts[0].to_string(),
-                message: parts.get(1).unwrap_or(&"").to_string(),
-                author: parts.get(2).unwrap_or(&"").to_string(),
-                date: parts.get(3).unwrap_or(&"").to_string(),
-                refs: parts.get(4).unwrap_or(&"").to_string(),
-            });
+fn parse_log_z(stdout: &[u8]) -> Vec<GitLogEntry> {
+    let mut entries = Vec::new();
+    let mut fields = stdout.split(|byte| *byte == 0);
+
+    loop {
+        let Some(hash) = fields.next() else { break };
+        if hash.is_empty() {
+            break;
         }
+        let Some(message) = fields.next() else { break };
+        let Some(author) = fields.next() else { break };
+        let Some(date) = fields.next() else { break };
+        let Some(refs) = fields.next() else { break };
+        entries.push(GitLogEntry {
+            hash: String::from_utf8_lossy(hash).into_owned(),
+            message: String::from_utf8_lossy(message).into_owned(),
+            author: String::from_utf8_lossy(author).into_owned(),
+            date: String::from_utf8_lossy(date).into_owned(),
+            refs: String::from_utf8_lossy(refs).into_owned(),
+        });
     }
 
     entries
@@ -393,15 +423,14 @@ fn get_branches(path: &Path) -> Vec<GitBranchEntry> {
     entries
 }
 
-fn stage_all(path: &Path) {
-    let _ = git_cmd(path).args(["add", "-A"]).output();
-}
-
-fn stage_file(path: &Path, file: &str) -> Result<(), String> {
-    let output = git_cmd(path)
-        .args(["add", "--", file])
-        .output()
-        .map_err(|e| e.to_string())?;
+fn stage_file(path: &Path, file: &str, original_file: Option<&str>) -> Result<(), String> {
+    let mut command = git_cmd(path);
+    command.args(["add", "--"]);
+    if let Some(original) = original_file {
+        command.arg(original);
+    }
+    command.arg(file);
+    let output = command.output().map_err(|e| e.to_string())?;
 
     if output.status.success() {
         Ok(())
@@ -410,17 +439,36 @@ fn stage_file(path: &Path, file: &str) -> Result<(), String> {
     }
 }
 
-fn unstage_file(path: &Path, file: &str) -> Result<(), String> {
-    let output = git_cmd(path)
-        .args(["reset", "HEAD", "--", file])
+fn unstage_file(path: &Path, file: &str, original_file: Option<&str>) -> Result<(), String> {
+    let has_head = git_cmd(path)
+        .args(["rev-parse", "--verify", "HEAD"])
         .output()
-        .map_err(|e| e.to_string())?;
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    let mut command = git_cmd(path);
+    if has_head {
+        command.args(["reset", "HEAD", "--"]);
+        if let Some(original) = original_file {
+            command.arg(original);
+        }
+        command.arg(file);
+    } else {
+        // `git reset HEAD` is invalid before the first commit.  Removing the
+        // path from the index leaves the working-tree file untouched.
+        command.args(["rm", "--cached", "--", file]);
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
 
     if output.status.success() {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
+}
+
+fn has_unstaged_change(entry: &GitFileEntry) -> bool {
+    entry.index_status == '?' || entry.worktree_status != ' '
 }
 
 fn do_commit(path: &Path, message: &str) -> Result<String, String> {
@@ -1450,15 +1498,32 @@ fn handle_commit_tab_input(state: &mut GitScreenState, code: KeyCode, modifiers:
 
     // Ctrl+A: stage/unstage all
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('a') {
-        let has_unstaged = state.status_files.iter().any(|f| !f.staged);
+        let has_unstaged = state.status_files.iter().any(has_unstaged_change);
+        let mut first_error = None;
         for entry in &state.status_files {
-            if has_unstaged && !entry.staged {
-                let _ = stage_file(&state.repo_path, &entry.path);
+            let result = if has_unstaged && has_unstaged_change(entry) {
+                stage_file(
+                    &state.repo_path,
+                    &entry.path,
+                    entry.original_path.as_deref(),
+                )
             } else if !has_unstaged && entry.staged {
-                let _ = unstage_file(&state.repo_path, &entry.path);
+                unstage_file(
+                    &state.repo_path,
+                    &entry.path,
+                    entry.original_path.as_deref(),
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         state.refresh_status();
+        if let Some(error) = first_error {
+            state.show_msg(error.lines().next().unwrap_or("Git operation failed"));
+        }
         return;
     }
 
@@ -1491,10 +1556,14 @@ fn handle_commit_tab_input(state: &mut GitScreenState, code: KeyCode, modifiers:
             // Stage/unstage toggle
             if let Some(entry) = state.status_files.get(state.commit_selected) {
                 let path = entry.path.clone();
-                if entry.staged {
-                    let _ = unstage_file(&state.repo_path, &path);
+                let original_path = entry.original_path.clone();
+                let result = if entry.staged {
+                    unstage_file(&state.repo_path, &path, original_path.as_deref())
                 } else {
-                    let _ = stage_file(&state.repo_path, &path);
+                    stage_file(&state.repo_path, &path, original_path.as_deref())
+                };
+                if let Err(error) = result {
+                    state.show_msg(error.lines().next().unwrap_or("Git operation failed"));
                 }
                 state.refresh_status();
             }
@@ -1852,5 +1921,114 @@ pub fn handle_paste(state: &mut GitScreenState, text: &str) {
         state.commit_message.push_str(text);
     } else if state.input_mode.is_some() {
         state.input_buffer.push_str(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn run_git(path: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("git must be available for git screen tests")
+    }
+
+    fn init_repo(path: &Path) {
+        let output = run_git(path, &["init", "-q"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(run_git(path, &["config", "user.name", "Test User"])
+            .status
+            .success());
+        assert!(
+            run_git(path, &["config", "user.email", "test@example.invalid"])
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn porcelain_z_parser_preserves_special_paths_and_rename_source() {
+        let mut bytes = b"R  renamed\nfile.txt\0old file.txt\0?? ".to_vec();
+        bytes.extend_from_slice("한글 파일.txt".as_bytes());
+        bytes.push(0);
+
+        let entries = parse_status_porcelain_v1_z(&bytes);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "renamed\nfile.txt");
+        assert_eq!(entries[0].original_path.as_deref(), Some("old file.txt"));
+        assert_eq!(entries[1].path, "한글 파일.txt");
+        assert_eq!(entries[1].original_path, None);
+    }
+
+    #[test]
+    fn nul_delimited_log_parser_preserves_pipes_in_subjects() {
+        let bytes = b"abc123\0subject | with | pipes\0A | User\0now\0HEAD -> main\0";
+        let entries = parse_log_z(bytes);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message, "subject | with | pipes");
+        assert_eq!(entries[0].author, "A | User");
+        assert_eq!(entries[0].refs, "HEAD -> main");
+    }
+
+    #[test]
+    fn staged_file_with_new_worktree_edits_is_still_unstaged_work() {
+        let entries = parse_status_porcelain_v1_z(b"MM file.txt\0");
+        assert!(entries[0].staged);
+        assert!(has_unstaged_change(&entries[0]));
+    }
+
+    #[test]
+    fn opening_git_screen_does_not_modify_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let tracked = dir.path().join("tracked.txt");
+        fs::write(&tracked, "before").unwrap();
+        assert!(run_git(dir.path(), &["add", "tracked.txt"])
+            .status
+            .success());
+        assert!(run_git(dir.path(), &["commit", "-q", "-m", "initial"])
+            .status
+            .success());
+
+        fs::write(&tracked, "after").unwrap();
+        let state = GitScreenState::new(dir.path().to_path_buf());
+
+        assert!(state
+            .status_files
+            .iter()
+            .any(|entry| entry.path == "tracked.txt"));
+        assert!(
+            run_git(dir.path(), &["diff", "--cached", "--quiet"])
+                .status
+                .success(),
+            "opening the screen must not stage working-tree changes"
+        );
+    }
+
+    #[test]
+    fn staged_file_can_be_unstaged_before_the_first_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("first.txt"), "content").unwrap();
+        assert!(run_git(dir.path(), &["add", "first.txt"]).status.success());
+
+        unstage_file(dir.path(), "first.txt", None).unwrap();
+
+        assert!(dir.path().join("first.txt").exists());
+        assert!(run_git(dir.path(), &["diff", "--cached", "--quiet"])
+            .status
+            .success());
+        assert!(get_status(dir.path())
+            .iter()
+            .any(|entry| entry.path == "first.txt" && !entry.staged));
     }
 }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,14 +22,627 @@ use crate::ui::file_viewer::ViewerState;
 use crate::ui::theme::DEFAULT_THEME_NAME;
 use crate::utils::format::strip_unc_prefix;
 
-/// Encode a command as base64 for safe shell execution
-/// This avoids all shell escaping issues by encoding the entire command
-#[cfg(unix)]
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+const HANDLER_FILEPATH_PLACEHOLDER: &str = "{{FILEPATH}}";
+const HANDLER_FILEPATH_ENV: &str = "COKACDIR_HANDLER_FILEPATH";
+
+fn normalized_remote_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn remote_parent_path(path: &Path) -> String {
+    let normalized = normalized_remote_path(path);
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rsplit_once('/') {
+        Some(("", _)) | None => "/".to_string(),
+        Some((parent, _)) => parent.to_string(),
+    }
+}
+
+fn resolve_remote_path(base: &Path, input: &str) -> Result<String, String> {
+    if input.contains('\0') {
+        return Err("Remote path contains a NUL byte".to_string());
+    }
+    let input = input.replace('\\', "/");
+    let combined = if input.starts_with('/') {
+        input
+    } else {
+        format!(
+            "{}/{}",
+            normalized_remote_path(base).trim_end_matches('/'),
+            input
+        )
+    };
+    let mut components = Vec::new();
+    for component in combined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    Ok(format!("/{}", components.join("/")))
+}
+
+fn normalized_remote_child_path(parent: &Path, file_name: &str) -> Result<String, String> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\\'])
+    {
+        return Err("Remote entry has an unsafe or ambiguous name".to_string());
+    }
+    let mut parent = normalized_remote_path(parent);
+    while parent.len() > 1 && parent.ends_with('/') {
+        parent.pop();
+    }
+    Ok(if parent == "/" {
+        format!("/{file_name}")
+    } else {
+        format!("{parent}/{file_name}")
+    })
+}
+
+fn remote_cache_suffix(remote_path: &str) -> String {
+    let extension = remote_path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+    extension
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default()
+}
+
+fn remote_cache_path_for_endpoint(
+    cache_root: &Path,
+    user: &str,
+    host: &str,
+    port: u16,
+    remote_path: &str,
+) -> PathBuf {
+    let host = remote::canonical_remote_host(host).unwrap_or(host);
+    let mut hasher = Sha256::new();
+    hasher.update(b"cokacdir-remote-cache-v1\0");
+    for field in [user.as_bytes(), host.as_bytes(), remote_path.as_bytes()] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.update(port.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(64 + 17);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key.push_str(&remote_cache_suffix(remote_path));
+    cache_root.join(key)
+}
+
+fn remote_cache_path_in(cache_root: &Path, profile: &RemoteProfile, remote_path: &str) -> PathBuf {
+    remote_cache_path_for_endpoint(
+        cache_root,
+        &profile.user,
+        &profile.host,
+        profile.port,
+        remote_path,
+    )
+}
+
+fn prepare_remote_cache_root() -> Result<PathBuf, String> {
+    let temp_root = crate::utils::path::cokacdir_temp_dir()
+        .map_err(|error| format!("Cannot prepare private temporary directory: {error}"))?;
+    let cache_root = temp_root.join("remote-cache");
+    match fs::create_dir(&cache_root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot create private remote cache directory '{}': {}",
+                cache_root.display(),
+                error
+            ));
+        }
+    }
+    let (directory, _, metadata) =
+        file_ops::open_directory_for_read(&cache_root).map_err(|error| {
+            format!(
+                "Cannot securely open remote cache directory '{}': {}",
+                cache_root.display(),
+                error
+            )
+        })?;
+    let identity = file_ops::stable_file_identity(&directory).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || file_ops::stable_path_identity(&cache_root).map_err(|error| error.to_string())?
+            != identity
+    {
+        return Err("Remote cache path is not a stable real directory".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Cannot restrict remote cache directory: {error}"))?;
+    }
+    if file_ops::stable_path_identity(&cache_root).map_err(|error| error.to_string())? != identity {
+        return Err("Remote cache path changed while it was secured".to_string());
+    }
+    Ok(cache_root)
+}
+/// A temporary archive kept in a private same-filesystem directory. `tar`
+/// writes through a cloned handle rather than reopening this visible pathname.
+struct ReservedTarArchive {
+    path: PathBuf,
+    staging_dir: PathBuf,
+    file: Option<fs::File>,
+    file_identity: file_ops::StablePathIdentity,
+    directory_guard: Option<fs::File>,
+    directory_identity: file_ops::StablePathIdentity,
+}
+
+impl ReservedTarArchive {
+    fn create(destination: &Path) -> std::io::Result<Self> {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let staging_dir = file_ops::create_private_quarantine_directory(parent, "tar")?;
+        let path = staging_dir.join("archive.tmp");
+        let result = (|| {
+            let mut options = fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(&path)?;
+            let file_identity = file_ops::stable_file_identity(&file)?;
+            let (directory_guard, _, metadata) = file_ops::open_directory_for_read(&staging_dir)?;
+            if !metadata.is_dir() {
+                return Err(std::io::Error::other(
+                    "temporary archive staging path is not a directory",
+                ));
+            }
+            let directory_identity = file_ops::stable_file_identity(&directory_guard)?;
+            Ok(Self {
+                path: path.clone(),
+                staging_dir: staging_dir.clone(),
+                file: Some(file),
+                file_identity,
+                directory_guard: Some(directory_guard),
+                directory_identity,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&staging_dir);
+        }
+        result
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn writer(&self) -> std::io::Result<fs::File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?
+            .try_clone()
+    }
+
+    fn verify_owned_path(&self) -> std::io::Result<()> {
+        if file_ops::stable_path_identity(&self.staging_dir)? != self.directory_identity
+            || file_ops::stable_path_identity(&self.path)? != self.file_identity
+        {
+            return Err(std::io::Error::other(
+                "temporary archive path was replaced; refusing to publish or remove it",
+            ));
+        }
+        let metadata = self
+            .file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?
+            .metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(
+                "temporary archive handle is not a regular file",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReservedTarArchive {
+    fn drop(&mut self) {
+        let owns_staging_file = file_ops::stable_path_identity(&self.staging_dir).ok()
+            == Some(self.directory_identity)
+            && file_ops::stable_path_identity(&self.path).ok() == Some(self.file_identity);
+        // A Windows disposition delete can be rejected while another handle
+        // to the file remains open. The deletion helper rebinds the pathname
+        // to `file_identity` after this owned writer is closed.
+        drop(self.file.take());
+        if owns_staging_file {
+            let _ = file_ops::remove_file_by_identity(&self.path, self.file_identity);
+        }
+        drop(self.directory_guard.take());
+        if file_ops::stable_path_identity(&self.staging_dir).ok() == Some(self.directory_identity) {
+            let _ = fs::remove_dir(&self.staging_dir);
+        }
+    }
+}
+
+/// Publish a completed archive without ever replacing an existing path.
+fn publish_tar_archive(temp: &ReservedTarArchive, destination: &Path) -> std::io::Result<()> {
+    // Ensure tar's completed bytes reach the filesystem before the archive
+    // name becomes visible.
+    temp.file
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?
+        .sync_all()?;
+    temp.verify_owned_path()?;
+    file_ops::rename_noreplace(temp.path(), destination)?;
+    if file_ops::stable_path_identity(destination)? != temp.file_identity {
+        return Err(std::io::Error::other(format!(
+            "archive publication identity mismatch; inspect '{}' and recovery directory '{}'",
+            destination.display(),
+            temp.staging_dir.display()
+        )));
+    }
+    sync_parent_directory(destination);
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+}
+
+fn create_private_extract_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    enforce_private_extract_directory(path)
+}
+
+fn enforce_private_extract_directory(path: &Path) -> std::io::Result<()> {
+    let (directory, _, metadata) = file_ops::open_directory_for_read(path)?;
+    let identity = file_ops::stable_file_identity(&directory)?;
+    if !metadata.file_type().is_dir() || file_ops::stable_path_identity(path)? != identity {
+        return Err(std::io::Error::other(
+            "private extract directory is not a stable real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    if file_ops::stable_path_identity(path)? != identity {
+        return Err(std::io::Error::other(
+            "private extract directory changed while it was secured",
+        ));
+    }
+    Ok(())
+}
+
+const MAX_TAR_LIST_LINE_BYTES: usize = 256 * 1024;
+const MAX_TAR_ERROR_TAIL_BYTES: usize = 64 * 1024;
+
+fn read_bounded_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    line.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(!line.is_empty());
+        }
+        let chunk_len = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if line.len().saturating_add(chunk_len) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive listing contains an excessively long entry name",
+            ));
+        }
+        line.extend_from_slice(&available[..chunk_len]);
+        let found_newline = available[chunk_len - 1] == b'\n';
+        reader.consume(chunk_len);
+        if found_newline {
+            return Ok(true);
+        }
+    }
+}
+
+fn read_bounded_tail<R: std::io::Read>(mut reader: R, max_bytes: usize) -> String {
+    let mut tail = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        if count >= max_bytes {
+            tail.clear();
+            tail.extend_from_slice(&chunk[count - max_bytes..count]);
+            continue;
+        }
+        let overflow = tail.len().saturating_add(count).saturating_sub(max_bytes);
+        if overflow > 0 {
+            tail.drain(..overflow);
+        }
+        tail.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+fn validate_archive_entry_path(entry: &[u8]) -> Result<(), String> {
+    if entry.is_empty() {
+        return Err("Archive contains an empty entry name".to_string());
+    }
+    if matches!(entry.first(), Some(b'/' | b'\\'))
+        || (entry.len() >= 2 && entry[0].is_ascii_alphabetic() && entry[1] == b':')
+    {
+        return Err(format!(
+            "Archive contains an absolute path: {}",
+            String::from_utf8_lossy(entry)
+        ));
+    }
+    if entry
+        .split(|byte| matches!(*byte, b'/' | b'\\'))
+        .any(|component| component == b"..")
+    {
+        return Err(format!(
+            "Archive contains a parent-directory path: {}",
+            String::from_utf8_lossy(entry)
+        ));
+    }
+    Ok(())
+}
+
+fn tar_supports_safe_extraction_options(tar_cmd: &str) -> bool {
+    std::process::Command::new(tar_cmd)
+        .args([
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--no-overwrite-dir",
+            "--version",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn tar_extraction_options(archive_name: &str) -> &'static str {
+    if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+        "xvfz"
+    } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
+        "xvfj"
+    } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
+        "xvfJ"
+    } else {
+        "xvf"
+    }
+}
 
 #[cfg(unix)]
-fn encode_command_base64(command: &str) -> String {
-    BASE64.encode(command.as_bytes())
+fn strip_special_permission_bits(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let file_type = metadata.file_type();
+        if file_type.is_block_device()
+            || file_type.is_char_device()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive created a special file: {}", path.display()),
+            ));
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o6000 != 0 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(mode & !0o6000);
+            if metadata.is_dir() {
+                let (directory, _, opened) = file_ops::open_directory_for_read(&path)?;
+                if !opened.is_dir()
+                    || file_ops::stable_file_identity(&directory)?
+                        != file_ops::stable_path_identity(&path)?
+                {
+                    return Err(std::io::Error::other(
+                        "archive directory changed before permission cleanup",
+                    ));
+                }
+                directory.set_permissions(permissions)?;
+            } else if metadata.is_file() {
+                let (file, _) = file_ops::open_regular_file_no_follow(&path)?;
+                file.set_permissions(permissions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn strip_special_permission_bits(_root: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Replace handler placeholders with an environment-variable expansion while
+/// preserving the surrounding shell quote context.  The actual path is never
+/// embedded in the command string.
+#[cfg(unix)]
+fn substitute_handler_filepath(template: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
+    }
+
+    let mut output = String::with_capacity(template.len() + 32);
+    let mut quote = Quote::Unquoted;
+    let mut index = 0;
+
+    while index < template.len() {
+        if template[index..].starts_with(HANDLER_FILEPATH_PLACEHOLDER) {
+            match quote {
+                Quote::Unquoted => {
+                    output.push('"');
+                    output.push('$');
+                    output.push_str(HANDLER_FILEPATH_ENV);
+                    output.push('"');
+                }
+                Quote::Double => {
+                    output.push('$');
+                    output.push_str(HANDLER_FILEPATH_ENV);
+                }
+                Quote::Single => {
+                    // Close the single-quoted segment, insert a double-quoted
+                    // expansion, then reopen it.  The original closing quote
+                    // remains in the template.
+                    output.push_str("'\"$");
+                    output.push_str(HANDLER_FILEPATH_ENV);
+                    output.push_str("\"'");
+                }
+            }
+            index += HANDLER_FILEPATH_PLACEHOLDER.len();
+            continue;
+        }
+
+        let ch = template[index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+
+        match quote {
+            Quote::Unquoted => match ch {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => {
+                    // The next character is escaped and cannot alter quoting.
+                    if index < template.len() {
+                        let next = template[index..]
+                            .chars()
+                            .next()
+                            .expect("valid char boundary");
+                        output.push(next);
+                        index += next.len_utf8();
+                    }
+                }
+                _ => {}
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::Unquoted;
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::Unquoted,
+                '\\' => {
+                    if index < template.len() {
+                        let next = template[index..]
+                            .chars()
+                            .next()
+                            .expect("valid char boundary");
+                        output.push(next);
+                        index += next.len_utf8();
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    output
+}
+
+#[cfg(windows)]
+fn substitute_handler_filepath(template: &str) -> String {
+    let mut output = String::with_capacity(template.len() + 32);
+    let mut in_double_quotes = false;
+    let mut index = 0;
+
+    while index < template.len() {
+        if template[index..].starts_with(HANDLER_FILEPATH_PLACEHOLDER) {
+            if in_double_quotes {
+                output.push('%');
+                output.push_str(HANDLER_FILEPATH_ENV);
+                output.push('%');
+            } else {
+                output.push('"');
+                output.push('%');
+                output.push_str(HANDLER_FILEPATH_ENV);
+                output.push('%');
+                output.push('"');
+            }
+            index += HANDLER_FILEPATH_PLACEHOLDER.len();
+            continue;
+        }
+
+        let ch = template[index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+        if ch == '^' && index < template.len() {
+            let next = template[index..]
+                .chars()
+                .next()
+                .expect("valid char boundary");
+            output.push(next);
+            index += next.len_utf8();
+        } else if ch == '"' {
+            in_double_quotes = !in_double_quotes;
+        }
+    }
+
+    output
 }
 
 fn spawn_process_cancel_watchdog(
@@ -414,7 +1028,9 @@ impl RemoteConnectState {
         };
         Self {
             selected_field: RemoteField::Host,
-            host: profile.host.clone(),
+            host: remote::canonical_remote_host(&profile.host)
+                .unwrap_or(&profile.host)
+                .to_string(),
             port: profile.port.to_string(),
             user: profile.user.clone(),
             auth_type,
@@ -436,7 +1052,9 @@ impl RemoteConnectState {
             } else {
                 RemoteField::AuthType
             },
-            host: host.to_string(),
+            host: remote::canonical_remote_host(host)
+                .unwrap_or(host)
+                .to_string(),
             port: port.to_string(),
             user: user.to_string(),
             auth_type: RemoteAuthType::Password,
@@ -537,15 +1155,16 @@ impl RemoteConnectState {
             },
         };
 
+        let host = remote::canonical_remote_host(&self.host).unwrap_or(&self.host);
         let name = if self.profile_name.is_empty() {
-            format!("{}@{}", self.user, self.host)
+            format!("{}@{}", self.user, host)
         } else {
             self.profile_name.clone()
         };
 
         remote::RemoteProfile {
             name,
-            host: self.host.clone(),
+            host: host.to_string(),
             port,
             user: self.user.clone(),
             auth,
@@ -580,24 +1199,30 @@ pub enum ConflictResolution {
 }
 
 /// State for managing file conflict resolution during paste operations
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConflictState {
-    /// List of conflicts: (source path, destination path, display name)
-    pub conflicts: Vec<(PathBuf, PathBuf, String)>,
+    /// List of conflicts. Each entry retains the exact destination identity
+    /// shown to the user until that overwrite choice is resolved.
+    pub conflicts: Vec<(
+        PathBuf,
+        PathBuf,
+        String,
+        Option<file_ops::PathAuthorization>,
+    )>,
     /// Current conflict index being resolved
     pub current_index: usize,
     /// Files that user chose to overwrite
-    pub files_to_overwrite: Vec<PathBuf>,
+    pub files_to_overwrite: HashMap<PathBuf, file_ops::PathAuthorization>,
     /// Files that user chose to skip
     pub files_to_skip: Vec<PathBuf>,
     /// Files that passed pre-conflict validation
     pub valid_files: Vec<String>,
     /// Backup of clipboard for the operation
     pub clipboard_backup: Option<Clipboard>,
-    /// Whether this is a move (cut) operation
-    pub is_move_operation: bool,
     /// Target directory for the operation
     pub target_path: PathBuf,
+    /// Exact target directory shown before the worker is started.
+    pub target_authorization: file_ops::DirectoryAuthorization,
 }
 
 /// State for tar exclude confirmation dialog
@@ -640,6 +1265,79 @@ pub struct Clipboard {
     pub operation: ClipboardOperation,
     /// Remote profile of the source panel (None if local)
     pub source_remote_profile: Option<remote::RemoteProfile>,
+    /// Exact local top-level objects selected when copy/cut was invoked.
+    pub source_authorizations: HashMap<String, file_ops::PathAuthorization>,
+    /// Resolved local source directory object at selection time.
+    pub source_directory_authorization: Option<file_ops::DirectoryAuthorization>,
+}
+
+#[derive(Debug)]
+enum PendingDeleteOperation {
+    Local {
+        entries: Vec<(PathBuf, file_ops::PathAuthorization)>,
+        directory: file_ops::DirectoryAuthorization,
+        close_image_viewer: bool,
+    },
+    Remote {
+        panel_index: usize,
+        paths: Vec<String>,
+    },
+}
+
+#[derive(Debug)]
+enum PendingRenameOperation {
+    Local {
+        panel_index: usize,
+        old_path: PathBuf,
+        source: file_ops::PathAuthorization,
+        directory: file_ops::DirectoryAuthorization,
+    },
+    Remote {
+        panel_index: usize,
+        old_path: String,
+        parent_path: PathBuf,
+    },
+}
+
+fn capture_local_clipboard_authorizations(
+    source_path: &Path,
+    files: &[String],
+    is_remote: bool,
+) -> std::io::Result<(
+    HashMap<String, file_ops::PathAuthorization>,
+    Option<file_ops::DirectoryAuthorization>,
+)> {
+    if is_remote {
+        return Ok((HashMap::new(), None));
+    }
+    let directory = file_ops::capture_directory_authorization(source_path)?;
+    let mut items = HashMap::with_capacity(files.len());
+    for name in files {
+        items.insert(
+            name.clone(),
+            file_ops::capture_path_authorization(&source_path.join(name))?,
+        );
+    }
+    Ok((items, Some(directory)))
+}
+
+fn local_clipboard_source_root(clipboard: &Clipboard) -> &Path {
+    clipboard
+        .source_directory_authorization
+        .as_ref()
+        .map(file_ops::DirectoryAuthorization::resolved_path)
+        .unwrap_or(&clipboard.source_path)
+}
+
+fn local_clipboard_authorization_map(
+    clipboard: &Clipboard,
+) -> HashMap<PathBuf, file_ops::PathAuthorization> {
+    let source_root = local_clipboard_source_root(clipboard);
+    clipboard
+        .source_authorizations
+        .iter()
+        .map(|(name, authorization)| (source_root.join(name), *authorization))
+        .collect()
 }
 
 /// File operation progress state for progress dialog
@@ -661,10 +1359,25 @@ pub struct FileOperationProgress {
     pub total_bytes: u64,
     pub completed_bytes: u64,
 
+    // Top-level items for which the worker emitted FileCompleted. This is
+    // retained until completion so a partially successful cut can discard
+    // names that have actually moved instead of restoring a permanently stale
+    // all-or-nothing clipboard.
+    completed_item_names: HashSet<String>,
+    // Items whose destination may have committed but could not be verified.
+    // They are terminal for automatic cut retry even if the source was safely
+    // restored for manual recovery.
+    terminal_item_names: HashSet<String>,
+    // Cut items deliberately skipped during conflict resolution. A successful
+    // worker result consumes only the items it moved; these names remain on the
+    // clipboard for a later paste.
+    skipped_cut_item_names: HashSet<String>,
+
     pub result: Option<FileOperationResult>,
 
     // Store last error before result is created
     last_error: Option<String>,
+    warnings: Vec<String>,
 
     // Timestamp when the operation started (for display delay)
     pub started_at: Instant,
@@ -689,8 +1402,12 @@ impl FileOperationProgress {
             completed_files: 0,
             total_bytes: 0,
             completed_bytes: 0,
+            completed_item_names: HashSet::new(),
+            terminal_item_names: HashSet::new(),
+            skipped_cut_item_names: HashSet::new(),
             result: None,
             last_error: None,
+            warnings: Vec::new(),
             started_at: Instant::now(),
         }
     }
@@ -729,8 +1446,9 @@ impl FileOperationProgress {
                                     self.current_file_progress = copied as f64 / total as f64;
                                 }
                             }
-                            ProgressMessage::FileCompleted(_) => {
+                            ProgressMessage::FileCompleted(name) => {
                                 self.current_file_progress = 1.0;
+                                self.completed_item_names.insert(name);
                             }
                             ProgressMessage::TotalProgress(
                                 completed_files,
@@ -748,13 +1466,32 @@ impl FileOperationProgress {
                                     success_count: success,
                                     failure_count: failure,
                                     last_error: self.last_error.take(),
+                                    warnings: std::mem::take(&mut self.warnings),
                                 });
                                 self.is_active = false;
                                 return false;
                             }
                             ProgressMessage::Error(_, err) => {
                                 // Store error for later (result is created on Completed)
+                                if err != Self::CANCELLED_ERROR || self.last_error.is_none() {
+                                    self.last_error = Some(err);
+                                }
+                            }
+                            ProgressMessage::TerminalError(name, err) => {
+                                self.terminal_item_names.insert(name.clone());
+                                self.warnings.push(if name.is_empty() {
+                                    format!("Manual recovery required: {err}")
+                                } else {
+                                    format!("{name}: manual recovery required: {err}")
+                                });
                                 self.last_error = Some(err);
+                            }
+                            ProgressMessage::Warning(name, warning) => {
+                                self.warnings.push(if name.is_empty() {
+                                    warning
+                                } else {
+                                    format!("{name}: {warning}")
+                                });
                             }
                         }
                     }
@@ -773,6 +1510,7 @@ impl FileOperationProgress {
                             success_count: 0,
                             failure_count: 1,
                             last_error,
+                            warnings: std::mem::take(&mut self.warnings),
                         });
                         self.is_active = false;
                         return false;
@@ -804,6 +1542,9 @@ pub enum PendingRemoteOpen {
         tmp_path: PathBuf,
         panel_index: usize,
         remote_path: String,
+        endpoint: crate::ui::file_editor::RemoteEditEndpoint,
+        edit_session_id: u64,
+        version: Arc<std::sync::OnceLock<remote::RemoteFileVersion>>,
     },
     /// Open in image viewer
     ImageViewer { tmp_path: PathBuf },
@@ -925,8 +1666,9 @@ pub enum PanelOpOutcome {
     /// Remote editor save upload result. The generation prevents stale uploads
     /// from clearing a newer local save that still needs uploading.
     RemoteSave {
-        message: Result<String, String>,
+        status: RemoteSaveStatus,
         remote_path: String,
+        edit_session_id: u64,
         generation: u64,
         reload: bool,
     },
@@ -939,6 +1681,30 @@ pub enum PanelOpOutcome {
     },
     /// dir_exists result
     DirExists { exists: bool, target_entry: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteSaveStatus {
+    Complete(remote::RemoteFileVersion),
+    CommittedWithWarning {
+        version: remote::RemoteFileVersion,
+        warning: String,
+    },
+    Failed(String),
+}
+
+pub(crate) fn remote_upload_save_status(
+    result: Result<remote::UploadFileOutcome, String>,
+) -> RemoteSaveStatus {
+    match result {
+        Ok(remote::UploadFileOutcome::Complete { version, .. }) => {
+            RemoteSaveStatus::Complete(version)
+        }
+        Ok(remote::UploadFileOutcome::CommittedWithWarning {
+            version, warning, ..
+        }) => RemoteSaveStatus::CommittedWithWarning { version, warning },
+        Err(error) => RemoteSaveStatus::Failed(error),
+    }
 }
 
 /// Successful connection data
@@ -1039,14 +1805,14 @@ impl PanelState {
     /// Get the remote display path (user@host:/path) or local path string
     pub fn display_path(&self) -> String {
         if let Some(ref ctx) = self.remote_ctx {
-            remote::format_remote_display(&ctx.profile, &self.path.display().to_string())
+            remote::format_remote_display(&ctx.profile, &normalized_remote_path(&self.path))
         } else if let Some((ref user, ref host, port)) = self.remote_display {
-            let path = self.path.display().to_string();
-            if port != 22 {
-                format!("{}@{}:{}:{}", user, host, port, path)
-            } else {
-                format!("{}@{}:{}", user, host, path)
-            }
+            remote::format_remote_display_parts(
+                user,
+                host,
+                port,
+                &normalized_remote_path(&self.path),
+            )
         } else {
             self.path.display().to_string()
         }
@@ -1154,7 +1920,7 @@ impl PanelState {
     fn load_files_remote(&mut self) {
         self.files.clear();
 
-        let remote_path = self.path.display().to_string();
+        let remote_path = normalized_remote_path(&self.path);
 
         // Always add parent directory entry for remote paths
         if remote_path != "/" {
@@ -1217,7 +1983,7 @@ impl PanelState {
         self.files.clear();
         self.path = path.to_path_buf();
 
-        let remote_path = path.display().to_string();
+        let remote_path = normalized_remote_path(path);
         // Always add parent directory entry for remote paths
         if remote_path != "/" {
             self.files.push(FileItem {
@@ -1385,7 +2151,7 @@ impl PanelState {
             let mut items: Vec<FileItem> =
                 self.files.drain(..).filter(|f| f.name != "..").collect();
             // Re-add ".." entry
-            let remote_path = self.path.display().to_string();
+            let remote_path = normalized_remote_path(&self.path);
             if remote_path != "/" {
                 self.files.push(FileItem {
                     name: "..".to_string(),
@@ -1405,6 +2171,17 @@ impl PanelState {
             self.load_files();
         }
     }
+}
+
+/// Identity captured when the user opens a process-kill confirmation.
+///
+/// Linux may reuse a PID between displaying the process list and confirming
+/// the action. Keeping the start-time token with the original PID lets the
+/// service refuse to signal a different process that inherited that PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessKillTarget {
+    pub pid: i32,
+    pub start_time_ticks: Option<u64>,
 }
 
 pub struct App {
@@ -1478,7 +2255,7 @@ pub struct App {
     pub process_selected_index: usize,
     pub process_sort_field: crate::services::process::SortField,
     pub process_sort_asc: bool,
-    pub process_confirm_kill: Option<i32>,
+    pub process_confirm_kill: Option<ProcessKillTarget>,
     pub process_force_kill: bool,
 
     // AI screen state
@@ -1515,6 +2292,16 @@ pub struct App {
 
     // Clipboard state for Ctrl+C/X/V operations
     pub clipboard: Option<Clipboard>,
+
+    // Exact objects captured when destructive confirmation dialogs opened.
+    // Execution must never re-read the current cursor selection as authority.
+    pending_delete_operation: Option<PendingDeleteOperation>,
+    pending_rename_operation: Option<PendingRenameOperation>,
+
+    // Cut clipboard retained until the asynchronous move reports success. A
+    // failed or cancelled move must remain retryable instead of silently
+    // consuming the user's selection.
+    pending_cut_clipboard: Option<Clipboard>,
 
     // File operation progress state
     pub file_operation_progress: Option<FileOperationProgress>,
@@ -1623,6 +2410,9 @@ impl App {
             search_result_state: crate::ui::search_result::SearchResultState::default(),
             previous_screen: None,
             clipboard: None,
+            pending_delete_operation: None,
+            pending_rename_operation: None,
+            pending_cut_clipboard: None,
             file_operation_progress: None,
             pending_tar_archive: None,
             pending_extract_dir: None,
@@ -1749,6 +2539,9 @@ impl App {
             search_result_state: crate::ui::search_result::SearchResultState::default(),
             previous_screen: None,
             clipboard: None,
+            pending_delete_operation: None,
+            pending_rename_operation: None,
+            pending_cut_clipboard: None,
             file_operation_progress: None,
             pending_tar_archive: None,
             pending_extract_dir: None,
@@ -1770,14 +2563,19 @@ impl App {
     }
 
     /// Save current settings to config file
-    pub fn save_settings(&mut self) {
+    pub fn save_settings(&mut self) -> std::io::Result<()> {
         use crate::config::PanelSettings;
 
-        // Preserve extension_handler from current file (user may have edited it externally)
-        // Load current file to get the latest extension_handler
-        if let Ok(current_file_settings) = Settings::load_with_error() {
-            self.settings.extension_handler = current_file_settings.extension_handler;
-        }
+        // Exit-time persistence owns only the panel layout. Start from the
+        // latest complete on-disk snapshot so settings changed by another
+        // process while this TUI was open are not overwritten by our stale
+        // in-memory copy.
+        let mut merged_settings = Settings::load_with_error().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("refusing to replace unreadable settings: {error}"),
+            )
+        })?;
 
         // Update settings from current state - save panels array
         let home_path = dirs::home_dir().unwrap_or_else(|| {
@@ -1787,7 +2585,7 @@ impl App {
                 PathBuf::from("/")
             }
         });
-        self.settings.panels = self
+        merged_settings.panels = self
             .panels
             .iter()
             .map(|p| {
@@ -1804,10 +2602,13 @@ impl App {
                 }
             })
             .collect();
-        self.settings.active_panel_index = self.active_panel_index;
+        merged_settings.active_panel_index = self.active_panel_index;
 
-        // Save to file (ignore errors silently)
-        let _ = self.settings.save();
+        let result = merged_settings.save();
+        if result.is_ok() {
+            self.settings = merged_settings;
+        }
+        result
     }
 
     /// Reload settings from config file and apply theme
@@ -1822,6 +2623,14 @@ impl App {
             }
         };
 
+        self.apply_loaded_settings(new_settings);
+        self.show_message("Settings reloaded");
+        true
+    }
+
+    /// Make the runtime's complete Settings snapshot match a value read from
+    /// disk, while applying the fields that also have derived live state.
+    fn apply_loaded_settings(&mut self, new_settings: Settings) {
         // Reload theme if name changed
         if new_settings.theme.name != self.settings.theme.name {
             self.theme = crate::ui::theme::Theme::load(&new_settings.theme.name);
@@ -1842,25 +2651,28 @@ impl App {
             }
         }
 
-        // Update tar_path setting
-        self.settings.tar_path = new_settings.tar_path;
-
-        // Update extension_handler setting
-        self.settings.extension_handler = new_settings.extension_handler;
-
-        // Update diff compare method
-        self.settings.diff_compare_method = new_settings.diff_compare_method;
-
         // Update keybindings
         self.keybindings = crate::keybindings::Keybindings::from_config(&new_settings.keybindings);
-        self.settings.keybindings = new_settings.keybindings;
+        self.settings = new_settings;
+    }
 
-        // Update settings
-        self.settings.theme = new_settings.theme;
-        self.settings.panels = new_settings.panels;
-
-        self.show_message("Settings reloaded");
-        true
+    /// A save can report an error after its atomic rename already committed
+    /// (for example, directory fsync failure). Reload before deciding the
+    /// effective runtime value; blindly rolling back would diverge from disk.
+    pub(crate) fn reconcile_settings_after_save_error(
+        &mut self,
+        previous_settings: Settings,
+    ) -> bool {
+        match Settings::load_with_error() {
+            Ok(persisted) => {
+                self.apply_loaded_settings(persisted);
+                true
+            }
+            Err(_) => {
+                self.apply_loaded_settings(previous_settings);
+                false
+            }
+        }
     }
 
     /// Check if a path is the settings.json file
@@ -1890,6 +2702,7 @@ impl App {
     /// Apply settings from dialog and save
     pub fn apply_settings_from_dialog(&mut self) {
         if let Some(ref state) = self.settings_state {
+            let previous_settings = self.settings.clone();
             let new_theme_name = state.current_theme().to_string();
 
             // Update theme if changed
@@ -1903,9 +2716,23 @@ impl App {
             let new_diff_method = state.current_diff_method().to_string();
             self.settings.diff_compare_method = new_diff_method;
 
-            // Save settings
-            let _ = self.settings.save();
-            self.show_message("Settings saved!");
+            // Do not report success or retain an in-memory configuration that
+            // could not be persisted. The dialog previews themes without
+            // mutating Settings, so the previous value is a reliable rollback.
+            match self.settings.save() {
+                Ok(()) => self.show_message("Settings saved!"),
+                Err(error) => {
+                    let reloaded = self.reconcile_settings_after_save_error(previous_settings);
+                    let detail = if reloaded {
+                        "effective settings were reloaded from disk"
+                    } else {
+                        "disk could not be reread; the last known settings were restored"
+                    };
+                    self.show_message(&format!(
+                        "Could not confirm settings durability ({error}); {detail}"
+                    ));
+                }
+            }
         }
 
         self.settings_state = None;
@@ -2122,29 +2949,34 @@ impl App {
             let panel = &self.panels[self.active_panel_index];
             if let Some(file) = panel.current_file().cloned() {
                 if file.is_directory && panel.is_remote() {
-                    let (new_path, focus) = if file.name == ".." {
-                        let focus = panel
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string());
-                        let parent = panel
-                            .path
-                            .parent()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "/".to_string());
-                        (parent, focus)
+                    if file.name == ".." {
+                        let normalized = normalized_remote_path(&panel.path);
+                        let focus = normalized
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_string);
+                        Ok(Some((remote_parent_path(&panel.path), focus)))
                     } else {
-                        (panel.path.join(&file.name).display().to_string(), None)
-                    };
-                    Some((new_path, focus))
+                        normalized_remote_child_path(&panel.path, &file.name)
+                            .map(|path| Some((path, None)))
+                    }
                 } else {
-                    None
+                    Ok(None)
                 }
             } else {
-                None
+                Ok(None)
             }
         };
 
+        let remote_nav = match remote_nav {
+            Ok(remote_nav) => remote_nav,
+            Err(error) => {
+                self.show_message(&error);
+                return;
+            }
+        };
         if let Some((new_path, focus)) = remote_nav {
             if let Some(focus_name) = focus {
                 self.active_panel_mut().pending_focus = Some(focus_name);
@@ -2182,13 +3014,26 @@ impl App {
                     };
 
                     if is_image {
-                        let tmp_path = match self.remote_tmp_path(&file.name) {
-                            Some(p) => p,
-                            None => return,
+                        let remote_path =
+                            match normalized_remote_child_path(&panel.path, &file.name) {
+                                Ok(path) => path,
+                                Err(error) => {
+                                    self.show_message(&error);
+                                    return;
+                                }
+                            };
+                        let tmp_path = match self.remote_tmp_path(&remote_path) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                self.show_message(&error);
+                                return;
+                            }
                         };
                         self.download_for_remote_open(
                             &file.name,
                             file.size,
+                            remote_path,
+                            tmp_path.clone(),
                             PendingRemoteOpen::ImageViewer { tmp_path },
                         );
                     } else {
@@ -2419,7 +3264,6 @@ impl App {
         // Get the current working directory from active panel
         let cwd = self.active_panel().path.clone();
 
-        let file_path_str = path.to_string_lossy().to_string();
         let mut last_error = String::new();
 
         // Try each handler in order (fallback mechanism)
@@ -2431,12 +3275,15 @@ impl App {
                 (false, handler_template.as_str())
             };
 
-            // Replace {{FILEPATH}} with actual file path (no escaping needed - will use base64)
-            let command = template.replace("{{FILEPATH}}", &file_path_str);
+            // Keep the untrusted path out of the shell program text.  It is
+            // supplied through an environment variable by the execution
+            // helpers, and the placeholder is expanded in its existing quote
+            // context (quoted and unquoted templates are both supported).
+            let command = substitute_handler_filepath(template);
 
             if is_background_mode {
                 // Background mode: spawn and detach (@ prefix)
-                match self.execute_background_command(&command, template, &cwd) {
+                match self.execute_background_command(&command, template, &cwd, path) {
                     Ok(true) => {
                         self.refresh_panels();
                         return Ok(true);
@@ -2452,7 +3299,7 @@ impl App {
                 }
             } else {
                 // Foreground mode: suspend TUI, run command, restore TUI (default)
-                match self.execute_terminal_command(&command, &cwd) {
+                match self.execute_terminal_command(&command, &cwd, path) {
                     Ok(true) => {
                         self.refresh_panels();
                         return Ok(true);
@@ -2479,6 +3326,7 @@ impl App {
         &mut self,
         command: &str,
         cwd: &std::path::Path,
+        file_path: &std::path::Path,
     ) -> Result<bool, String> {
         use crossterm::cursor::{Hide, Show};
         use crossterm::execute;
@@ -2494,28 +3342,24 @@ impl App {
         print!("\x1B[2J\x1B[H");
         let _ = stdout().flush();
 
-        // Execute command with inherited stdio and active panel's directory as CWD
-        // Use base64 encoding to avoid shell escaping issues
+        // Execute the configured shell program with inherited stdio and the
+        // active panel's directory as CWD. The file path is supplied via env.
         #[cfg(unix)]
-        let result = {
-            let encoded = encode_command_base64(command);
-            let wrapped_command =
-                format!("eval \"$('{}' --base64 '{}')\"", crate::bin_path(), encoded);
-
-            std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&wrapped_command)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()
-        };
+        let result = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .env(HANDLER_FILEPATH_ENV, file_path.as_os_str())
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
 
         #[cfg(windows)]
         let result = std::process::Command::new("cmd")
             .args(["/c", command])
             .current_dir(cwd)
+            .env(HANDLER_FILEPATH_ENV, file_path.as_os_str())
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -2540,28 +3384,24 @@ impl App {
         command: &str,
         template: &str,
         cwd: &std::path::Path,
+        file_path: &std::path::Path,
     ) -> Result<bool, String> {
         #[cfg(unix)]
-        let result = {
-            // Use base64 encoding to avoid shell escaping issues
-            let encoded = encode_command_base64(command);
-            let wrapped_command =
-                format!("eval \"$('{}' --base64 '{}')\"", crate::bin_path(), encoded);
-
-            std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&wrapped_command)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-        };
+        let result = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .env(HANDLER_FILEPATH_ENV, file_path.as_os_str())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
 
         #[cfg(windows)]
         let result = std::process::Command::new("cmd")
             .args(["/c", command])
             .current_dir(cwd)
+            .env(HANDLER_FILEPATH_ENV, file_path.as_os_str())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -2936,15 +3776,11 @@ impl App {
     /// Toggle bookmark for the current panel's path
     pub fn toggle_bookmark(&mut self) {
         let current_path = if self.active_panel().is_remote() {
-            let path = self.active_panel().path.display().to_string();
+            let path = normalized_remote_path(&self.active_panel().path);
             if let Some(ref ctx) = self.active_panel().remote_ctx {
                 remote::format_remote_display(&ctx.profile, &path)
             } else if let Some((ref user, ref host, port)) = self.active_panel().remote_display {
-                if port != 22 {
-                    format!("{}@{}:{}:{}", user, host, port, path)
-                } else {
-                    format!("{}@{}:{}", user, host, path)
-                }
+                remote::format_remote_display_parts(user, host, port, &path)
             } else {
                 return;
             }
@@ -2952,20 +3788,34 @@ impl App {
             self.active_panel().path.display().to_string()
         };
 
-        if let Some(pos) = self
+        let previous_settings = self.settings.clone();
+        let success_message = if let Some(pos) = self
             .settings
             .bookmarked_path
             .iter()
             .position(|p| p == &current_path)
         {
             self.settings.bookmarked_path.remove(pos);
-            self.show_message(&format!("Bookmark removed: {}", current_path));
+            format!("Bookmark removed: {}", current_path)
         } else {
             self.settings.bookmarked_path.push(current_path.clone());
-            self.show_message(&format!("Bookmark added: {}", current_path));
-        }
+            format!("Bookmark added: {}", current_path)
+        };
 
-        let _ = self.settings.save();
+        match self.settings.save() {
+            Ok(()) => self.show_message(&success_message),
+            Err(error) => {
+                let reloaded = self.reconcile_settings_after_save_error(previous_settings);
+                let detail = if reloaded {
+                    "effective bookmarks were reloaded from disk"
+                } else {
+                    "disk could not be reread; the last known bookmarks were restored"
+                };
+                self.show_message(&format!(
+                    "Could not confirm bookmark durability ({error}); {detail}"
+                ));
+            }
+        }
     }
 
     pub fn refresh_panels(&mut self) {
@@ -3172,12 +4022,13 @@ impl App {
             return;
         }
         // Clone necessary data first to avoid borrow issues
-        let (file_path, is_directory, is_dotdot) = {
+        let (file_path, is_directory, is_symlink, is_dotdot) = {
             let panel = self.active_panel();
             if let Some(file) = panel.current_file() {
                 (
                     panel.path.join(&file.name),
                     file.is_directory,
+                    file.is_symlink,
                     file.name == "..",
                 )
             } else {
@@ -3193,7 +4044,7 @@ impl App {
         self.info_file_path = file_path.clone();
 
         // For directories, start async size calculation
-        if is_directory {
+        if is_directory && !is_symlink {
             let mut state = FileInfoState::new();
             state.start_calculation(&file_path);
             self.file_info_state = Some(state);
@@ -3283,20 +4134,17 @@ impl App {
         }
     }
 
-    /// 원격 파일의 로컬 tmp 경로 생성
-    fn remote_tmp_path(&self, file_name: &str) -> Option<PathBuf> {
+    /// Return an application-owned cache path derived only from a
+    /// domain-separated hash. Remote profile/path bytes never become local
+    /// path components.
+    fn remote_tmp_path(&self, remote_path: &str) -> Result<PathBuf, String> {
         let panel = self.active_panel();
-        let remote_path = format!("{}/{}", panel.path.display(), file_name);
-        if let Some(ref ctx) = panel.remote_ctx {
-            let home = dirs::home_dir()?;
-            let tmp_base = home
-                .join(".cokacdir")
-                .join("tmp")
-                .join(format!("{}@{}", ctx.profile.user, ctx.profile.host));
-            Some(tmp_base.join(remote_path.trim_start_matches('/')))
-        } else {
-            None
-        }
+        let ctx = panel
+            .remote_ctx
+            .as_ref()
+            .ok_or_else(|| "Remote connection is not available".to_string())?;
+        let cache_root = prepare_remote_cache_root()?;
+        Ok(remote_cache_path_in(&cache_root, &ctx.profile, remote_path))
     }
 
     /// 원격 파일을 tmp로 다운로드 (프로그레스 표시) 후 편집기/뷰어로 열기
@@ -3304,33 +4152,17 @@ impl App {
         &mut self,
         file_name: &str,
         file_size: u64,
+        remote_path: String,
+        tmp_path: PathBuf,
         open_action: PendingRemoteOpen,
     ) {
         let panel_index = self.active_panel_index;
         let panel = &self.panels[panel_index];
-        let remote_path = format!("{}/{}", panel.path.display(), file_name);
-
-        let (profile, tmp_path) = if let Some(ref ctx) = panel.remote_ctx {
-            let Some(home) = dirs::home_dir() else {
-                return;
-            };
-            let tmp_base = home
-                .join(".cokacdir")
-                .join("tmp")
-                .join(format!("{}@{}", ctx.profile.user, ctx.profile.host));
-            let tmp_path = tmp_base.join(remote_path.trim_start_matches('/'));
-            (ctx.profile.clone(), tmp_path)
+        let profile = if let Some(ref ctx) = panel.remote_ctx {
+            ctx.profile.clone()
         } else {
             return;
         };
-
-        // 디렉토리 생성
-        if let Some(parent) = tmp_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                self.show_message(&format!("Cannot create tmp dir: {}", e));
-                return;
-            }
-        }
 
         // 프로그레스 설정
         let mut progress = FileOperationProgress::new(file_ops::FileOperationType::Download);
@@ -3342,6 +4174,10 @@ impl App {
         let tmp_path_clone = tmp_path.clone();
         let remote_path_clone = remote_path.clone();
         let file_name_owned = file_name.to_string();
+        let editor_version = match &open_action {
+            PendingRemoteOpen::Editor { version, .. } => Some(version.clone()),
+            PendingRemoteOpen::ImageViewer { .. } => None,
+        };
 
         thread::spawn(move || {
             let _ = tx.send(file_ops::ProgressMessage::Preparing(format!(
@@ -3370,18 +4206,41 @@ impl App {
 
             // 프로그레스 콜백과 함께 다운로드
             let local_path_str = tmp_path_clone.display().to_string();
-            match session.download_file_with_progress(
-                &remote_path_clone,
-                &local_path_str,
-                file_size,
-                &cancel_flag,
-                |downloaded, total| {
-                    let _ = tx.send(file_ops::ProgressMessage::FileProgress(downloaded, total));
-                    let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
-                        0, 1, downloaded, total,
-                    ));
-                },
-            ) {
+            let download_result = if let Some(version) = editor_version {
+                session
+                    .download_editor_file_with_progress(
+                        &remote_path_clone,
+                        &local_path_str,
+                        &cancel_flag,
+                        |downloaded, total| {
+                            let _ =
+                                tx.send(file_ops::ProgressMessage::FileProgress(downloaded, total));
+                            let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
+                                0, 1, downloaded, total,
+                            ));
+                        },
+                    )
+                    .and_then(|download| {
+                        version.set(download.version).map_err(|_| {
+                            "Remote editor version was already initialized".to_string()
+                        })?;
+                        Ok(download.bytes)
+                    })
+            } else {
+                session.download_file_with_progress(
+                    &remote_path_clone,
+                    &local_path_str,
+                    file_size,
+                    &cancel_flag,
+                    |downloaded, total| {
+                        let _ = tx.send(file_ops::ProgressMessage::FileProgress(downloaded, total));
+                        let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
+                            0, 1, downloaded, total,
+                        ));
+                    },
+                )
+            };
+            match download_result {
                 Ok(_) => {
                     let _ = tx.send(file_ops::ProgressMessage::FileCompleted(file_name_owned));
                     let _ = tx.send(file_ops::ProgressMessage::TotalProgress(
@@ -3421,20 +4280,39 @@ impl App {
                 }
                 None => return,
             };
-            let remote_path = format!("{}/{}", panel.path.display(), file.name);
+            let remote_path = match normalized_remote_child_path(&panel.path, &file.name) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.show_message(&error);
+                    return;
+                }
+            };
             let panel_index = self.active_panel_index;
-            let tmp_path = self.remote_tmp_path(&file.name);
-            let tmp_path = match tmp_path {
-                Some(p) => p,
+            let endpoint = match panel.remote_ctx.as_ref() {
+                Some(ctx) => crate::ui::file_editor::RemoteEditEndpoint::from_profile(&ctx.profile),
                 None => return,
             };
+            let tmp_path = match self.remote_tmp_path(&remote_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.show_message(&error);
+                    return;
+                }
+            };
+            let version = Arc::new(std::sync::OnceLock::new());
+            let edit_session_id = rand::random::<u64>();
             self.download_for_remote_open(
                 &file.name,
                 file.size,
+                remote_path.clone(),
+                tmp_path.clone(),
                 PendingRemoteOpen::Editor {
                     tmp_path,
                     panel_index,
                     remote_path,
+                    endpoint,
+                    edit_session_id,
+                    version,
                 },
             );
         } else {
@@ -3463,11 +4341,112 @@ impl App {
     }
 
     pub fn show_delete_dialog(&mut self) {
+        self.pending_delete_operation = None;
+
+        if self.current_screen == Screen::ImageViewer {
+            let Some(path) = self
+                .image_viewer_state
+                .as_ref()
+                .map(|state| state.path.clone())
+            else {
+                self.show_message("No image is open");
+                return;
+            };
+            let Some(parent) = path.parent() else {
+                self.show_message("Cannot identify the image parent directory");
+                return;
+            };
+            let directory = match file_ops::capture_directory_authorization(parent) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    self.show_message(&format!("Image changed before confirmation: {}", error));
+                    return;
+                }
+            };
+            let resolved_path = directory
+                .resolved_path()
+                .join(path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("")));
+            let source = match file_ops::capture_path_authorization(&resolved_path) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.show_message(&format!("Image changed before confirmation: {}", error));
+                    return;
+                }
+            };
+            let display_name = resolved_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| resolved_path.display().to_string());
+            self.pending_delete_operation = Some(PendingDeleteOperation::Local {
+                entries: vec![(resolved_path, source)],
+                directory,
+                close_image_viewer: true,
+            });
+            self.dialog = Some(Dialog {
+                dialog_type: DialogType::Delete,
+                input: String::new(),
+                cursor_pos: 0,
+                message: format!("Delete {}?", display_name),
+                completion: None,
+                selected_button: 1,
+                selection: None,
+                use_md5: false,
+            });
+            return;
+        }
+
         let files = self.get_operation_files();
         if files.is_empty() {
             self.show_message("No files selected");
             return;
         }
+        let panel_index = self.active_panel_index;
+        let source_path = self.active_panel().path.clone();
+        let pending = if self.active_panel().is_remote() {
+            let paths = match files
+                .iter()
+                .map(|name| normalized_remote_child_path(&source_path, name))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    self.show_message(&error);
+                    return;
+                }
+            };
+            PendingDeleteOperation::Remote { panel_index, paths }
+        } else {
+            let directory = match file_ops::capture_directory_authorization(&source_path) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    self.show_message(&format!(
+                        "Selection changed before deletion confirmation: {}",
+                        error
+                    ));
+                    return;
+                }
+            };
+            let mut entries = Vec::with_capacity(files.len());
+            for name in &files {
+                let path = directory.resolved_path().join(name);
+                let source = match file_ops::capture_path_authorization(&path) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        self.show_message(&format!(
+                            "Selection changed before deletion confirmation: {}",
+                            error
+                        ));
+                        return;
+                    }
+                };
+                entries.push((path, source));
+            }
+            PendingDeleteOperation::Local {
+                entries,
+                directory,
+                close_image_viewer: false,
+            }
+        };
         let file_list = if files.len() <= 3 {
             files.join(", ")
         } else {
@@ -3483,6 +4462,11 @@ impl App {
             selection: None,
             use_md5: false,
         });
+        self.pending_delete_operation = Some(pending);
+    }
+
+    pub(crate) fn cancel_pending_delete(&mut self) {
+        self.pending_delete_operation = None;
     }
 
     pub fn show_encrypt_dialog(&mut self) {
@@ -3522,7 +4506,10 @@ impl App {
             completion: None,
             selected_button: 0,
             selection: None,
-            use_md5: false,
+            // Integrity metadata is opt-out. New encrypted archives should
+            // detect corruption by default; readers remain compatible with
+            // older archives that omitted it.
+            use_md5: true,
         });
     }
 
@@ -3565,8 +4552,8 @@ impl App {
         // Remember split size for next time
         self.settings.encrypt_split_size = split_size_mb;
 
-        let key_path = match crate::enc::ensure_key() {
-            Ok(p) => p,
+        let key = match crate::enc::ensure_key() {
+            Ok(key) => key,
             Err(e) => {
                 self.show_message(&format!("Key error: {}", e));
                 return;
@@ -3585,7 +4572,7 @@ impl App {
         thread::spawn(move || {
             crate::enc::pack_directory_with_progress(
                 &dir,
-                &key_path,
+                &key,
                 tx,
                 cancel_flag,
                 split_size_mb,
@@ -3607,8 +4594,8 @@ impl App {
     }
 
     pub fn execute_decrypt(&mut self) {
-        let key_path = match crate::enc::ensure_key() {
-            Ok(p) => p,
+        let key = match crate::enc::ensure_key() {
+            Ok(key) => key,
             Err(e) => {
                 self.show_message(&format!("Key error: {}", e));
                 return;
@@ -3625,7 +4612,7 @@ impl App {
         progress.receiver = Some(rx);
 
         thread::spawn(move || {
-            crate::enc::unpack_directory_with_progress(&dir, &key_path, tx, cancel_flag);
+            crate::enc::unpack_directory_with_progress(&dir, &key, tx, cancel_flag);
         });
 
         self.file_operation_progress = Some(progress);
@@ -3668,10 +4655,54 @@ impl App {
     }
 
     pub fn show_rename_dialog(&mut self) {
+        self.pending_rename_operation = None;
         let panel = self.active_panel();
         if let Some(file) = panel.current_file() {
             if file.name != ".." {
-                let name = &file.name;
+                let name = file.name.clone();
+                let panel_index = self.active_panel_index;
+                let pending = if panel.is_remote() {
+                    let old_path = match normalized_remote_child_path(&panel.path, &name) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            self.show_message(&error);
+                            return;
+                        }
+                    };
+                    PendingRenameOperation::Remote {
+                        panel_index,
+                        old_path,
+                        parent_path: panel.path.clone(),
+                    }
+                } else {
+                    let directory = match file_ops::capture_directory_authorization(&panel.path) {
+                        Ok(directory) => directory,
+                        Err(error) => {
+                            self.show_message(&format!(
+                                "Rename source changed before the dialog opened: {}",
+                                error
+                            ));
+                            return;
+                        }
+                    };
+                    let old_path = directory.resolved_path().join(&name);
+                    let source = match file_ops::capture_path_authorization(&old_path) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            self.show_message(&format!(
+                                "Rename source changed before the dialog opened: {}",
+                                error
+                            ));
+                            return;
+                        }
+                    };
+                    PendingRenameOperation::Local {
+                        panel_index,
+                        old_path,
+                        source,
+                        directory,
+                    }
+                };
                 let len = name.chars().count();
 
                 // 확장자 제외한 선택 범위 계산
@@ -3694,7 +4725,7 @@ impl App {
 
                 self.dialog = Some(Dialog {
                     dialog_type: DialogType::Rename,
-                    input: file.name.clone(),
+                    input: name,
                     cursor_pos: selection_end,
                     message: String::new(),
                     completion: None,
@@ -3702,10 +4733,15 @@ impl App {
                     selection: Some((0, selection_end)),
                     use_md5: false,
                 });
+                self.pending_rename_operation = Some(pending);
             } else {
                 self.show_message("Select a file to rename");
             }
         }
+    }
+
+    pub(crate) fn cancel_pending_rename(&mut self) {
+        self.pending_rename_operation = None;
     }
 
     pub fn show_tar_dialog(&mut self) {
@@ -4038,134 +5074,149 @@ impl App {
     }
 
     pub fn execute_delete(&mut self) {
-        // 이미지 뷰어에서 삭제 시 현재 보고 있는 이미지 삭제
-        if self.current_screen == Screen::ImageViewer {
-            if let Some(ref state) = self.image_viewer_state {
-                let path = state.path.clone();
-                match file_ops::delete_file(&path) {
-                    Ok(_) => {
-                        self.show_message("Deleted image");
-                        // 이미지 뷰어 닫기
-                        self.current_screen = Screen::FilePanel;
-                        self.image_viewer_state = None;
-                    }
-                    Err(e) => {
-                        self.show_message(&format!("Delete failed: {}", e));
-                    }
-                }
-                self.refresh_panels();
-            }
+        if self.remote_spinner.is_some() {
             return;
         }
-
-        let files = self.get_operation_files();
-        let source_path = self.active_panel().path.clone();
-        let is_remote = self.active_panel().is_remote();
-
-        let mut success_count = 0;
-        let mut last_error = String::new();
-
-        if is_remote {
-            // Remote delete via SFTP (async with spinner)
-            if self.remote_spinner.is_some() {
-                return;
-            }
-            let panel_idx = self.active_panel_index;
-            let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
-                Some(ctx) => ctx,
-                None => return,
-            };
-            let remote_base = source_path.display().to_string();
-            // Collect file info before spawning thread
-            let file_infos: Vec<(String, bool)> = files
-                .iter()
-                .map(|file_name| {
-                    let is_dir = self
-                        .active_panel()
-                        .files
-                        .iter()
-                        .find(|f| f.name == *file_name)
-                        .map(|f| f.is_directory)
-                        .unwrap_or(false);
-                    (file_name.clone(), is_dir)
-                })
-                .collect();
-            let total = file_infos.len();
-            let (tx, rx) = mpsc::channel();
-
-            thread::spawn(move || {
-                let mut success_count = 0;
-                let mut last_error = String::new();
-                for (file_name, is_dir) in &file_infos {
-                    let remote_path =
-                        format!("{}/{}", remote_base.trim_end_matches('/'), file_name);
-                    match ctx.session.remove(&remote_path, *is_dir) {
-                        Ok(_) => success_count += 1,
-                        Err(e) => last_error = e,
-                    }
-                }
-                let msg = if success_count == total {
-                    Ok(format!("Deleted {} file(s)", success_count))
-                } else {
-                    Err(format!(
-                        "Deleted {}/{}. Error: {}",
-                        success_count, total, last_error
-                    ))
-                };
-                let _ = tx.send(RemoteSpinnerResult::PanelOp {
-                    ctx,
-                    panel_idx,
-                    outcome: PanelOpOutcome::Simple {
-                        message: msg,
-                        pending_focus: None,
-                        reload: true,
-                    },
-                });
-            });
-
-            self.remote_spinner = Some(RemoteSpinner {
-                message: "Deleting...".to_string(),
-                started_at: Instant::now(),
-                receiver: rx,
-            });
+        let Some(operation) = self.pending_delete_operation.take() else {
+            self.show_message("Delete confirmation expired; select the item again");
             return;
-        } else {
-            // Local delete in background thread with spinner
-            if self.remote_spinner.is_some() {
-                return;
-            }
-            let files_to_delete: Vec<PathBuf> = files.iter().map(|f| source_path.join(f)).collect();
-            let total = files_to_delete.len();
-            let (tx, rx) = mpsc::channel();
+        };
 
-            thread::spawn(move || {
-                let mut success_count = 0;
-                let mut last_error = String::new();
-                for path in &files_to_delete {
-                    match file_ops::delete_file(path) {
-                        Ok(_) => success_count += 1,
-                        Err(e) => last_error = e.to_string(),
-                    }
-                }
-                let msg = if success_count == total {
-                    Ok(format!("Deleted {} file(s)", success_count))
-                } else {
-                    Err(format!(
-                        "Deleted {}/{}. Error: {}",
-                        success_count, total, last_error
-                    ))
+        match operation {
+            PendingDeleteOperation::Remote { panel_index, paths } => {
+                let Some(ctx) = self.panels[panel_index].remote_ctx.take() else {
+                    self.show_message("Remote delete confirmation expired");
+                    return;
                 };
-                let _ = tx.send(RemoteSpinnerResult::LocalOp {
-                    message: msg,
-                    reload: true,
+                let total = paths.len();
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let mut success_count = 0;
+                    let mut errors = Vec::new();
+                    for remote_path in &paths {
+                        match ctx.session.remove_path(remote_path) {
+                            Ok(_) => success_count += 1,
+                            Err(error) => errors.push(format!("{}: {}", remote_path, error)),
+                        }
+                    }
+                    let message = if success_count == total {
+                        Ok(format!("Deleted {} file(s)", success_count))
+                    } else {
+                        Err(format!(
+                            "Deleted {}/{}. Error: {}",
+                            success_count,
+                            total,
+                            errors.join("; ")
+                        ))
+                    };
+                    let _ = tx.send(RemoteSpinnerResult::PanelOp {
+                        ctx,
+                        panel_idx: panel_index,
+                        outcome: PanelOpOutcome::Simple {
+                            message,
+                            pending_focus: None,
+                            reload: true,
+                        },
+                    });
                 });
-            });
-
-            self.remote_spinner = Some(RemoteSpinner {
-                message: "Deleting...".to_string(),
-                started_at: Instant::now(),
-                receiver: rx,
-            });
+                self.remote_spinner = Some(RemoteSpinner {
+                    message: "Deleting...".to_string(),
+                    started_at: Instant::now(),
+                    receiver: rx,
+                });
+            }
+            PendingDeleteOperation::Local {
+                entries,
+                directory,
+                close_image_viewer,
+            } => {
+                if close_image_viewer {
+                    let Some((path, source)) = entries.first() else {
+                        self.show_message("Image delete confirmation expired");
+                        return;
+                    };
+                    let result = file_ops::verify_directory_authorization(
+                        directory.resolved_path(),
+                        &directory,
+                        "Delete parent directory",
+                    )
+                    .and_then(|()| file_ops::delete_file_detailed_authorized(path, source));
+                    match result {
+                        Ok(warnings) => {
+                            self.current_screen = Screen::FilePanel;
+                            self.image_viewer_state = None;
+                            if warnings.is_empty() {
+                                self.show_message("Deleted image");
+                            } else {
+                                self.show_message(&format!(
+                                    "Deleted image. Warning: {}",
+                                    warnings.join("; ")
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            self.show_message(&format!("Delete failed: {}", error));
+                        }
+                    }
+                    self.refresh_panels();
+                    return;
+                }
+                let total = entries.len();
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let mut success_count = 0;
+                    let mut errors = Vec::new();
+                    let mut warnings = Vec::new();
+                    for (path, source) in &entries {
+                        if let Err(error) = file_ops::verify_directory_authorization(
+                            directory.resolved_path(),
+                            &directory,
+                            "Delete parent directory",
+                        ) {
+                            errors.push(error.to_string());
+                            break;
+                        }
+                        match file_ops::delete_file_detailed_authorized(path, source) {
+                            Ok(item_warnings) => {
+                                success_count += 1;
+                                warnings.extend(
+                                    item_warnings
+                                        .into_iter()
+                                        .map(|warning| format!("{}: {}", path.display(), warning)),
+                                );
+                            }
+                            Err(error) => errors.push(format!("{}: {}", path.display(), error)),
+                        }
+                    }
+                    let mut text = if success_count == total {
+                        format!("Deleted {} file(s)", success_count)
+                    } else {
+                        format!(
+                            "Deleted {}/{}. Error: {}",
+                            success_count,
+                            total,
+                            errors.join("; ")
+                        )
+                    };
+                    if !warnings.is_empty() {
+                        text.push_str(&format!(". Warning: {}", warnings.join("; ")));
+                    }
+                    let message = if success_count == total {
+                        Ok(text)
+                    } else {
+                        Err(text)
+                    };
+                    let _ = tx.send(RemoteSpinnerResult::LocalOp {
+                        message,
+                        reload: true,
+                    });
+                });
+                self.remote_spinner = Some(RemoteSpinner {
+                    message: "Deleting...".to_string(),
+                    started_at: Instant::now(),
+                    receiver: rx,
+                });
+            }
         }
     }
 
@@ -4179,12 +5230,30 @@ impl App {
             return;
         }
 
-        let source_path = self.active_panel().path.clone();
+        let mut source_path = self.active_panel().path.clone();
         let source_remote_profile = self
             .active_panel()
             .remote_ctx
             .as_ref()
             .map(|c| c.profile.clone());
+        let (source_authorizations, source_directory_authorization) =
+            match capture_local_clipboard_authorizations(
+                &source_path,
+                &files,
+                source_remote_profile.is_some(),
+            ) {
+                Ok(authorizations) => authorizations,
+                Err(error) => {
+                    self.show_message(&format!(
+                        "Selection changed before it could be copied: {}",
+                        error
+                    ));
+                    return;
+                }
+            };
+        if let Some(authorization) = source_directory_authorization.as_ref() {
+            source_path = authorization.resolved_path().to_path_buf();
+        }
         let count = files.len();
 
         self.clipboard = Some(Clipboard {
@@ -4192,6 +5261,8 @@ impl App {
             source_path,
             operation: ClipboardOperation::Copy,
             source_remote_profile,
+            source_authorizations,
+            source_directory_authorization,
         });
 
         self.show_message(&format!("{} file(s) copied to clipboard", count));
@@ -4205,12 +5276,30 @@ impl App {
             return;
         }
 
-        let source_path = self.active_panel().path.clone();
+        let mut source_path = self.active_panel().path.clone();
         let source_remote_profile = self
             .active_panel()
             .remote_ctx
             .as_ref()
             .map(|c| c.profile.clone());
+        let (source_authorizations, source_directory_authorization) =
+            match capture_local_clipboard_authorizations(
+                &source_path,
+                &files,
+                source_remote_profile.is_some(),
+            ) {
+                Ok(authorizations) => authorizations,
+                Err(error) => {
+                    self.show_message(&format!(
+                        "Selection changed before it could be cut: {}",
+                        error
+                    ));
+                    return;
+                }
+            };
+        if let Some(authorization) = source_directory_authorization.as_ref() {
+            source_path = authorization.resolved_path().to_path_buf();
+        }
         let count = files.len();
 
         self.clipboard = Some(Clipboard {
@@ -4218,6 +5307,8 @@ impl App {
             source_path,
             operation: ClipboardOperation::Cut,
             source_remote_profile,
+            source_authorizations,
+            source_directory_authorization,
         });
 
         self.show_message(&format!("{} file(s) cut to clipboard", count));
@@ -4243,6 +5334,13 @@ impl App {
 
         // Remote involved — use remote transfer path (no conflict detection for remote)
         if source_is_remote || target_is_remote {
+            if clipboard.operation == ClipboardOperation::Cut {
+                self.clipboard = Some(clipboard);
+                self.show_message(
+                    "Cut involving a remote panel is disabled because the remote source cannot be bound to a race-free snapshot. Copy, verify, then delete the source explicitly.",
+                );
+                return;
+            }
             let is_cut = clipboard.operation == ClipboardOperation::Cut;
             let op_type = if is_cut {
                 FileOperationType::Move
@@ -4271,8 +5369,8 @@ impl App {
 
                 let target_path = self.active_panel().path.clone();
                 let file_paths: Vec<PathBuf> = clipboard.files.iter().map(PathBuf::from).collect();
-                let source_base = clipboard.source_path.display().to_string();
-                let target = target_path.display().to_string();
+                let source_base = normalized_remote_path(&clipboard.source_path);
+                let target = normalized_remote_path(&target_path);
 
                 // Set pending focus to pasted file names
                 if !clipboard.files.is_empty() {
@@ -4311,8 +5409,12 @@ impl App {
                     use_md5: false,
                 });
 
-                // Keep clipboard for copy, consume for cut
-                if !is_cut {
+                // A cut is only consumed after the worker reports complete
+                // success. Keep it separately while the progress dialog owns
+                // the foreground interaction.
+                if is_cut {
+                    self.pending_cut_clipboard = Some(clipboard);
+                } else {
                     self.clipboard = Some(clipboard);
                 }
                 return;
@@ -4348,8 +5450,36 @@ impl App {
             let target_path = self.active_panel().path.clone();
             let valid_files: Vec<String> = clipboard.files.clone();
             let file_paths: Vec<PathBuf> = valid_files.iter().map(PathBuf::from).collect();
-            let source_base = clipboard.source_path.display().to_string();
-            let target = target_path.display().to_string();
+            let source_base = if source_is_remote {
+                normalized_remote_path(&clipboard.source_path)
+            } else {
+                clipboard.source_path.display().to_string()
+            };
+            let local_target_directory_authorization = if target_is_remote {
+                None
+            } else {
+                match file_ops::capture_directory_authorization(&target_path) {
+                    Ok(authorization) => Some(authorization),
+                    Err(error) => {
+                        self.clipboard = Some(clipboard);
+                        self.show_message(&format!(
+                            "Paste target changed before transfer start: {}",
+                            error
+                        ));
+                        return;
+                    }
+                }
+            };
+            let target = if target_is_remote {
+                normalized_remote_path(&target_path)
+            } else {
+                local_target_directory_authorization
+                    .as_ref()
+                    .expect("local target authorization was captured")
+                    .resolved_path()
+                    .display()
+                    .to_string()
+            };
 
             // Set pending focus to pasted file names
             if !valid_files.is_empty() {
@@ -4363,12 +5493,26 @@ impl App {
             let (tx, rx) = mpsc::channel();
             progress.receiver = Some(rx);
 
+            let local_source_authorizations = if source_is_remote {
+                HashMap::new()
+            } else {
+                local_clipboard_authorization_map(&clipboard)
+            };
+            let local_source_directory_authorization = if source_is_remote {
+                None
+            } else {
+                clipboard.source_directory_authorization.clone()
+            };
+
             let config = remote_transfer::TransferConfig {
                 direction,
                 profile,
                 source_files: file_paths,
                 source_base,
                 target_path: target,
+                local_source_authorizations,
+                local_source_directory_authorization,
+                local_target_directory_authorization,
             };
 
             thread::spawn(move || {
@@ -4393,8 +5537,11 @@ impl App {
                 use_md5: false,
             });
 
-            // Keep clipboard for copy, consume for cut
-            if !is_cut {
+            // A cut is only consumed after the worker reports complete
+            // success. Failed/cancelled transfers are restored on completion.
+            if is_cut {
+                self.pending_cut_clipboard = Some(clipboard);
+            } else {
                 self.clipboard = Some(clipboard);
             }
             return;
@@ -4462,28 +5609,50 @@ impl App {
             return;
         }
 
-        // Detect conflicts (files that already exist at destination)
-        let conflicts = self.detect_paste_conflicts(&clipboard, &target_path, &valid_files);
+        let target_authorization = match file_ops::capture_directory_authorization(&target_path) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                self.clipboard = Some(clipboard);
+                self.show_message(&format!(
+                    "Paste target changed before confirmation: {}",
+                    error
+                ));
+                return;
+            }
+        };
+
+        // Detect conflicts and bind each prompt to the exact destination
+        // object that was presented to the user.
+        let conflicts = match self.detect_paste_conflicts(&clipboard, &target_path, &valid_files) {
+            Ok(conflicts) => conflicts,
+            Err(error) => {
+                self.clipboard = Some(clipboard);
+                self.show_message(&format!(
+                    "Could not safely inspect paste conflicts: {}",
+                    error
+                ));
+                return;
+            }
+        };
 
         if !conflicts.is_empty() {
             // Has conflicts - show conflict dialog
-            let is_move = clipboard.operation == ClipboardOperation::Cut;
             self.conflict_state = Some(ConflictState {
                 conflicts,
                 current_index: 0,
-                files_to_overwrite: Vec::new(),
+                files_to_overwrite: HashMap::new(),
                 files_to_skip: Vec::new(),
                 valid_files,
                 clipboard_backup: Some(clipboard),
-                is_move_operation: is_move,
                 target_path: target_path.clone(),
+                target_authorization,
             });
             self.show_duplicate_conflict_dialog();
             return;
         }
 
         // No conflicts - proceed with normal paste
-        self.execute_paste_operation(clipboard, valid_files, target_path);
+        self.execute_paste_operation(clipboard, valid_files, target_path, target_authorization);
     }
 
     /// Detect files that would conflict (already exist) at paste destination
@@ -4492,7 +5661,14 @@ impl App {
         clipboard: &Clipboard,
         target_dir: &Path,
         valid_files: &[String],
-    ) -> Vec<(PathBuf, PathBuf, String)> {
+    ) -> std::io::Result<
+        Vec<(
+            PathBuf,
+            PathBuf,
+            String,
+            Option<file_ops::PathAuthorization>,
+        )>,
+    > {
         let mut conflicts = Vec::new();
 
         for file_name in valid_files {
@@ -4502,11 +5678,12 @@ impl App {
             // Match file_ops: a broken symlink at dest still counts as existing,
             // so the user gets an overwrite prompt instead of a hard failure.
             if std::fs::symlink_metadata(&dest).is_ok() {
-                conflicts.push((src, dest, file_name.clone()));
+                let authorization = file_ops::capture_path_authorization(&dest)?;
+                conflicts.push((src, dest, file_name.clone(), Some(authorization)));
             }
         }
 
-        conflicts
+        Ok(conflicts)
     }
 
     /// Generate a duplicate filename with _dup suffix, checking for existence
@@ -4579,6 +5756,7 @@ impl App {
         clipboard: Clipboard,
         valid_files: Vec<String>,
         target_path: PathBuf,
+        target_authorization: file_ops::DirectoryAuthorization,
     ) {
         // Set pending focus to pasted file names (will find first match in sorted file list)
         if !valid_files.is_empty() {
@@ -4603,6 +5781,8 @@ impl App {
         // Convert files to PathBuf
         let file_paths: Vec<PathBuf> = valid_files.iter().map(PathBuf::from).collect();
         let source_path = clipboard.source_path.clone();
+        let source_authorizations = local_clipboard_authorization_map(&clipboard);
+        let source_directory_authorization = clipboard.source_directory_authorization.clone();
 
         // Start operation in background thread
         let clipboard_operation = clipboard.operation;
@@ -4612,8 +5792,11 @@ impl App {
                     file_paths,
                     &source_path,
                     &target_path,
+                    HashMap::new(),
                     HashSet::new(),
-                    HashSet::new(),
+                    Some(target_authorization),
+                    source_authorizations,
+                    source_directory_authorization,
                     cancel_flag,
                     tx,
                 );
@@ -4623,8 +5806,11 @@ impl App {
                     file_paths,
                     &source_path,
                     &target_path,
+                    HashMap::new(),
                     HashSet::new(),
-                    HashSet::new(),
+                    Some(target_authorization),
+                    source_authorizations,
+                    source_directory_authorization,
                     cancel_flag,
                     tx,
                 );
@@ -4644,9 +5830,12 @@ impl App {
             use_md5: false,
         });
 
-        // Keep clipboard for copy operations (can paste multiple times)
-        // Clear clipboard for cut operations (files are moved)
-        if clipboard.operation == ClipboardOperation::Copy {
+        // Copy remains immediately reusable. Cut remains pending until the
+        // asynchronous result is known, so failure/cancellation cannot erase
+        // the only retry information.
+        if clipboard.operation == ClipboardOperation::Cut {
+            self.pending_cut_clipboard = Some(clipboard);
+        } else {
             self.clipboard = Some(clipboard);
         }
     }
@@ -4659,7 +5848,10 @@ impl App {
         let valid_files: Vec<String> = clipboard
             .files
             .iter()
-            .filter(|f| *f != ".." && source_path.join(f).exists())
+            // `Path::exists` follows links and treats a dangling link as
+            // absent. A file-manager copy must preserve the directory entry
+            // itself, including dangling symlinks.
+            .filter(|f| *f != ".." && std::fs::symlink_metadata(source_path.join(f)).is_ok())
             .cloned()
             .collect();
 
@@ -4679,29 +5871,47 @@ impl App {
         progress.receiver = Some(rx);
 
         // Build rename map: original name -> dup name
-        let mut rename_map: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut rename_map: Vec<(PathBuf, PathBuf, Option<file_ops::PathAuthorization>)> =
+            Vec::new();
         for file_name in &valid_files {
             let dup_name = Self::generate_dup_filename(file_name, &source_path);
             let src = source_path.join(file_name);
             let dest = source_path.join(&dup_name);
-            rename_map.push((src, dest));
+            rename_map.push((
+                src,
+                dest,
+                clipboard.source_authorizations.get(file_name).copied(),
+            ));
         }
 
         // Set pending focus to all dup file names (will find first match in sorted file list)
         let dup_names: Vec<String> = rename_map
             .iter()
-            .filter_map(|(_, dest)| dest.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter_map(|(_, dest, _)| dest.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
         if !dup_names.is_empty() {
             self.pending_paste_focus = Some(dup_names);
         }
 
         // Start operation in background thread
+        let source_directory_authorization = clipboard.source_directory_authorization.clone();
         thread::spawn(move || {
             let mut completed = 0;
             let mut failed = 0;
             let source_paths: Vec<PathBuf> =
-                rename_map.iter().map(|(src, _)| src.clone()).collect();
+                rename_map.iter().map(|(src, _, _)| src.clone()).collect();
+
+            if let Some(authorization) = source_directory_authorization.as_ref() {
+                if let Err(error) = file_ops::verify_directory_authorization(
+                    &source_path,
+                    authorization,
+                    "Clipboard source directory",
+                ) {
+                    let _ = tx.send(ProgressMessage::Error(String::new(), error.to_string()));
+                    let _ = tx.send(ProgressMessage::Completed(0, rename_map.len()));
+                    return;
+                }
+            }
 
             let _ = tx.send(ProgressMessage::Preparing(
                 "Calculating file sizes...".to_string(),
@@ -4737,7 +5947,7 @@ impl App {
             let mut completed_bytes: u64 = 0;
             let mut completed_files: usize = 0;
 
-            for (src, dest) in rename_map {
+            for (src, dest, source_authorization) in rename_map {
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(ProgressMessage::Error(
                         String::new(),
@@ -4745,6 +5955,34 @@ impl App {
                     ));
                     let _ = tx.send(ProgressMessage::Completed(completed, failed + 1));
                     return;
+                }
+
+                if let Some(authorization) = source_directory_authorization.as_ref() {
+                    if let Err(error) = file_ops::verify_directory_authorization(
+                        &source_path,
+                        authorization,
+                        "Clipboard source directory",
+                    ) {
+                        failed += 1;
+                        let file_name = src
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let _ = tx.send(ProgressMessage::Error(file_name, error.to_string()));
+                        break;
+                    }
+                    if source_authorization.is_none() {
+                        failed += 1;
+                        let file_name = src
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let _ = tx.send(ProgressMessage::Error(
+                            file_name,
+                            "Missing clipboard authorization for local source".to_string(),
+                        ));
+                        continue;
+                    }
                 }
 
                 let file_name = src
@@ -4765,33 +6003,97 @@ impl App {
 
                 let _ = tx.send(ProgressMessage::FileStarted(file_name.clone()));
 
-                let result = if src.is_dir() {
-                    file_ops::copy_dir_recursive_with_progress(
-                        &src,
-                        &dest,
-                        &cancel_flag,
-                        &tx,
-                        &mut completed_bytes,
-                        &mut completed_files,
-                        total_bytes,
-                        total_files,
-                    )
-                } else {
-                    let file_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
-                    let file_completed_bytes = completed_bytes;
-                    file_ops::copy_file_with_progress(&src, &dest, &cancel_flag, |copied, total| {
-                        let _ = tx.send(ProgressMessage::FileProgress(copied, total));
-                        let _ = tx.send(ProgressMessage::TotalProgress(
-                            completed_files,
-                            total_files,
-                            file_completed_bytes + copied,
+                let result = match std::fs::symlink_metadata(&src) {
+                    Ok(metadata) if metadata.is_symlink() => {
+                        let result = match source_authorization.as_ref() {
+                            Some(authorization) => {
+                                file_ops::copy_symlink_authorized(&src, &dest, authorization)
+                            }
+                            None => file_ops::copy_file(&src, &dest).map(|_| Vec::new()),
+                        };
+                        result.map(|warnings| {
+                            for warning in warnings {
+                                let _ =
+                                    tx.send(ProgressMessage::Warning(file_name.clone(), warning));
+                            }
+                            completed_files += 1;
+                            let _ = tx.send(ProgressMessage::TotalProgress(
+                                completed_files,
+                                total_files,
+                                completed_bytes,
+                                total_bytes,
+                            ));
+                        })
+                    }
+                    Ok(metadata) if metadata.is_dir() => match source_authorization.as_ref() {
+                        Some(authorization) => {
+                            file_ops::copy_dir_recursive_with_progress_authorized(
+                                &src,
+                                &dest,
+                                authorization,
+                                &cancel_flag,
+                                &tx,
+                                &mut completed_bytes,
+                                &mut completed_files,
+                                total_bytes,
+                                total_files,
+                            )
+                            .map(|warnings| {
+                                for warning in warnings {
+                                    let _ = tx
+                                        .send(ProgressMessage::Warning(file_name.clone(), warning));
+                                }
+                            })
+                        }
+                        None => file_ops::copy_dir_recursive_with_progress(
+                            &src,
+                            &dest,
+                            &cancel_flag,
+                            &tx,
+                            &mut completed_bytes,
+                            &mut completed_files,
                             total_bytes,
-                        ));
-                    })
-                    .map(|_| {
-                        completed_bytes += file_size;
-                        completed_files += 1;
-                    })
+                            total_files,
+                        ),
+                    },
+                    Ok(metadata) => {
+                        let file_size = metadata.len();
+                        let file_completed_bytes = completed_bytes;
+                        let mut progress_callback = |copied, total| {
+                            let _ = tx.send(ProgressMessage::FileProgress(copied, total));
+                            let _ = tx.send(ProgressMessage::TotalProgress(
+                                completed_files,
+                                total_files,
+                                file_completed_bytes + copied,
+                                total_bytes,
+                            ));
+                        };
+                        let result = match source_authorization.as_ref() {
+                            Some(authorization) => file_ops::copy_file_with_progress_authorized(
+                                &src,
+                                &dest,
+                                authorization,
+                                &cancel_flag,
+                                &mut progress_callback,
+                            ),
+                            None => file_ops::copy_file_with_progress(
+                                &src,
+                                &dest,
+                                &cancel_flag,
+                                &mut progress_callback,
+                            )
+                            .map(|copied| (copied, Vec::new())),
+                        };
+                        result.map(|(_, warnings)| {
+                            for warning in warnings {
+                                let _ =
+                                    tx.send(ProgressMessage::Warning(file_name.clone(), warning));
+                            }
+                            completed_bytes += file_size;
+                            completed_files += 1;
+                        })
+                    }
+                    Err(error) => Err(error),
                 };
 
                 match result {
@@ -4801,11 +6103,6 @@ impl App {
                     }
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::Interrupted {
-                            if dest.is_dir() {
-                                let _ = std::fs::remove_dir_all(&dest);
-                            } else {
-                                let _ = std::fs::remove_file(&dest);
-                            }
                             let _ = tx.send(ProgressMessage::Error(
                                 String::new(),
                                 "Cancelled".to_string(),
@@ -4852,13 +6149,13 @@ impl App {
         };
 
         let target_path = conflict_state.target_path;
+        let target_authorization = conflict_state.target_authorization;
 
         // Build all files to process from the pre-conflict validated list.
         let valid_files = conflict_state.valid_files;
 
         // Build overwrite and skip sets from source paths
-        let files_to_overwrite: HashSet<PathBuf> =
-            conflict_state.files_to_overwrite.into_iter().collect();
+        let files_to_overwrite = conflict_state.files_to_overwrite;
         let files_to_skip: HashSet<PathBuf> = conflict_state.files_to_skip.into_iter().collect();
 
         // Check if all files would be skipped
@@ -4877,10 +6174,8 @@ impl App {
         }
 
         if files_to_process.is_empty() {
-            // All files were skipped - show message and restore clipboard if copy
-            if clipboard.operation == ClipboardOperation::Copy {
-                self.clipboard = Some(clipboard);
-            }
+            // Nothing moved, so both copy and cut clipboards remain valid.
+            self.clipboard = Some(clipboard);
             self.show_message("All files skipped");
             self.refresh_panels();
             return;
@@ -4895,6 +6190,14 @@ impl App {
         // Create progress state
         let mut progress = FileOperationProgress::new(operation_type);
         progress.is_active = true;
+        if clipboard.operation == ClipboardOperation::Cut {
+            progress.skipped_cut_item_names.extend(
+                valid_files
+                    .iter()
+                    .filter(|name| files_to_skip.contains(&clipboard.source_path.join(name)))
+                    .cloned(),
+            );
+        }
         let cancel_flag = progress.cancel_flag.clone();
 
         // Create channel for progress messages
@@ -4904,6 +6207,28 @@ impl App {
         // Convert files to PathBuf
         let file_paths: Vec<PathBuf> = valid_files.iter().map(PathBuf::from).collect();
         let source_path = clipboard.source_path.clone();
+        let source_root = local_clipboard_source_root(&clipboard).to_path_buf();
+        let source_authorizations = local_clipboard_authorization_map(&clipboard);
+        let source_directory_authorization = clipboard.source_directory_authorization.clone();
+
+        // Conflict state records source paths using the panel's display path,
+        // which may be a symlink or a non-normalized Windows spelling. The
+        // worker deliberately operates through the directory authorization's
+        // resolved path, so all path-keyed decisions must use that same root.
+        let files_to_overwrite: HashMap<PathBuf, file_ops::PathAuthorization> = valid_files
+            .iter()
+            .filter_map(|name| {
+                files_to_overwrite
+                    .get(&source_path.join(name))
+                    .copied()
+                    .map(|authorization| (source_root.join(name), authorization))
+            })
+            .collect();
+        let files_to_skip: HashSet<PathBuf> = valid_files
+            .iter()
+            .filter(|name| files_to_skip.contains(&source_path.join(name)))
+            .map(|name| source_root.join(name))
+            .collect();
 
         // Start operation in background thread
         let clipboard_operation = clipboard.operation;
@@ -4915,6 +6240,9 @@ impl App {
                     &target_path,
                     files_to_overwrite,
                     files_to_skip,
+                    Some(target_authorization),
+                    source_authorizations,
+                    source_directory_authorization,
                     cancel_flag,
                     tx,
                 );
@@ -4926,6 +6254,9 @@ impl App {
                     &target_path,
                     files_to_overwrite,
                     files_to_skip,
+                    Some(target_authorization),
+                    source_authorizations,
+                    source_directory_authorization,
                     cancel_flag,
                     tx,
                 );
@@ -4945,10 +6276,64 @@ impl App {
             use_md5: false,
         });
 
-        // Keep clipboard for copy operations (can paste multiple times)
-        // Clear clipboard for cut operations (files are moved)
-        if clipboard.operation == ClipboardOperation::Copy {
+        // Consume a cut only after complete success; otherwise the event loop
+        // restores this pending clipboard for retry.
+        if clipboard.operation == ClipboardOperation::Cut {
+            self.pending_cut_clipboard = Some(clipboard);
+        } else {
             self.clipboard = Some(clipboard);
+        }
+    }
+
+    /// Resolve a cut operation after its asynchronous worker completes.
+    /// Complete success consumes the moved items while retaining deliberate
+    /// conflict skips; any failure (including cancellation and partial success)
+    /// restores the remaining sources so the failure is not destructive to UI
+    /// state.
+    pub fn finish_pending_cut_operation(&mut self, succeeded: bool) {
+        if let Some(mut clipboard) = self.pending_cut_clipboard.take() {
+            if succeeded {
+                let skipped = self
+                    .file_operation_progress
+                    .as_ref()
+                    .map(|progress| &progress.skipped_cut_item_names);
+                let source_path = clipboard.source_path.clone();
+                clipboard.files.retain(|name| {
+                    skipped.is_some_and(|names| names.contains(name))
+                        && fs::symlink_metadata(source_path.join(name)).is_ok()
+                });
+                if !clipboard.files.is_empty() {
+                    self.clipboard = Some(clipboard);
+                }
+            } else {
+                if clipboard.source_remote_profile.is_some() {
+                    // The only supported cut with a remote source is a
+                    // same-server no-replace rename, where FileCompleted means
+                    // that exact top-level source name was consumed.
+                    clipboard.files.retain(|name| {
+                        !self
+                            .file_operation_progress
+                            .as_ref()
+                            .is_some_and(|progress| progress.completed_item_names.contains(name))
+                    });
+                } else {
+                    // Local and local→remote moves can fail after moving only
+                    // part of the selection. Keep only names still present at
+                    // the source. symlink_metadata deliberately counts a
+                    // dangling symlink as an entry.
+                    let source_path = clipboard.source_path.clone();
+                    clipboard.files.retain(|name| {
+                        fs::symlink_metadata(source_path.join(name)).is_ok()
+                            && !self
+                                .file_operation_progress
+                                .as_ref()
+                                .is_some_and(|progress| progress.terminal_item_names.contains(name))
+                    });
+                }
+                if !clipboard.files.is_empty() {
+                    self.clipboard = Some(clipboard);
+                }
+            }
         }
     }
 
@@ -5008,8 +6393,14 @@ impl App {
                 Some(ctx) => ctx,
                 None => return,
             };
-            let remote_base = self.active_panel().path.display().to_string();
-            let remote_path = format!("{}/{}", remote_base.trim_end_matches('/'), name);
+            let remote_path = match normalized_remote_child_path(&self.active_panel().path, name) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.panels[panel_idx].remote_ctx = Some(ctx);
+                    self.show_message(&error);
+                    return;
+                }
+            };
             let focus_name = name.to_string();
             let display_name = name.to_string();
             let (tx, rx) = mpsc::channel();
@@ -5088,8 +6479,14 @@ impl App {
                 Some(ctx) => ctx,
                 None => return,
             };
-            let remote_base = self.active_panel().path.display().to_string();
-            let remote_path = format!("{}/{}", remote_base.trim_end_matches('/'), name);
+            let remote_path = match normalized_remote_child_path(&self.active_panel().path, name) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.panels[panel_idx].remote_ctx = Some(ctx);
+                    self.show_message(&error);
+                    return;
+                }
+            };
             let focus_name = name.to_string();
             let display_name = name.to_string();
             let (tx, rx) = mpsc::channel();
@@ -5120,14 +6517,14 @@ impl App {
 
         let path = self.active_panel().path.join(name);
 
-        // Check if file already exists
-        if path.exists() {
-            self.show_message(&format!("'{}' already exists!", name));
-            return;
-        }
-
-        // Create empty file
-        match std::fs::File::create(&path) {
+        // Atomically create a new file.  A separate `exists` check followed by
+        // `File::create` allowed another process to create the path in between,
+        // at which point we would truncate its file.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => {
                 self.active_panel_mut().pending_focus = Some(name.to_string());
                 self.refresh_panels();
@@ -5145,6 +6542,9 @@ impl App {
                     }
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.show_message(&format!("'{}' already exists!", name));
+            }
             Err(e) => self.show_message(&format!("Error: {}", e)),
         }
     }
@@ -5152,85 +6552,88 @@ impl App {
     pub fn execute_rename(&mut self, new_name: &str) {
         // Validate filename to prevent path traversal attacks
         if let Err(e) = file_ops::is_valid_filename(new_name) {
+            self.pending_rename_operation = None;
             self.show_message(&format!("Error: {}", e));
             return;
         }
 
-        if let Some(file) = self.active_panel().current_file() {
-            let old_name = file.name.clone();
-
-            if self.active_panel().is_remote() {
-                // Remote rename via SFTP (async with spinner)
+        let Some(operation) = self.pending_rename_operation.take() else {
+            self.show_message("Rename confirmation expired; select the item again");
+            return;
+        };
+        match operation {
+            PendingRenameOperation::Remote {
+                panel_index,
+                old_path,
+                parent_path,
+            } => {
                 if self.remote_spinner.is_some() {
+                    self.pending_rename_operation = Some(PendingRenameOperation::Remote {
+                        panel_index,
+                        old_path,
+                        parent_path,
+                    });
                     return;
                 }
-                let panel_idx = self.active_panel_index;
-                let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
-                    Some(ctx) => ctx,
-                    None => return,
+                let new_remote = match normalized_remote_child_path(&parent_path, new_name) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.show_message(&error);
+                        return;
+                    }
                 };
-                let remote_base = self.active_panel().path.display().to_string();
-                let old_remote = format!("{}/{}", remote_base.trim_end_matches('/'), old_name);
-                let new_remote = format!("{}/{}", remote_base.trim_end_matches('/'), new_name);
+                let Some(ctx) = self.panels[panel_index].remote_ctx.take() else {
+                    self.show_message("Remote rename confirmation expired");
+                    return;
+                };
                 let focus_name = new_name.to_string();
                 let display_name = new_name.to_string();
                 let (tx, rx) = mpsc::channel();
-
                 thread::spawn(move || {
-                    let msg = match ctx.session.rename(&old_remote, &new_remote) {
+                    let message = match ctx.session.rename_noreplace(&old_path, &new_remote) {
                         Ok(_) => Ok(format!("Renamed to: {}", display_name)),
-                        Err(e) => Err(e),
+                        Err(error) => Err(error),
                     };
                     let _ = tx.send(RemoteSpinnerResult::PanelOp {
                         ctx,
-                        panel_idx,
+                        panel_idx: panel_index,
                         outcome: PanelOpOutcome::Simple {
-                            message: msg,
+                            message,
                             pending_focus: Some(focus_name),
                             reload: true,
                         },
                     });
                 });
-
                 self.remote_spinner = Some(RemoteSpinner {
                     message: "Renaming...".to_string(),
                     started_at: Instant::now(),
                     receiver: rx,
                 });
-                return;
             }
-
-            let old_path = self.active_panel().path.join(&old_name);
-            let new_path = self.active_panel().path.join(new_name);
-
-            // Additional check: ensure the new path stays within the current directory
-            if let Ok(canonical_parent) = self
-                .active_panel()
-                .path
-                .canonicalize()
-                .map(strip_unc_prefix)
-            {
-                // For rename, we verify against parent directory
-                if let Some(new_parent) = new_path.parent() {
-                    if let Ok(canonical_new_parent) =
-                        new_parent.canonicalize().map(strip_unc_prefix)
-                    {
-                        if canonical_new_parent != canonical_parent {
-                            self.show_message("Error: Path traversal attempt detected");
-                            return;
+            PendingRenameOperation::Local {
+                panel_index,
+                old_path,
+                source,
+                directory,
+            } => {
+                let new_path = directory.resolved_path().join(new_name);
+                match file_ops::rename_file_authorized(&old_path, &new_path, &source, &directory) {
+                    Ok(warnings) => {
+                        self.panels[panel_index].pending_focus = Some(new_name.to_string());
+                        if warnings.is_empty() {
+                            self.show_message(&format!("Renamed to: {}", new_name));
+                        } else {
+                            self.show_message(&format!(
+                                "Renamed to: {}. Warning: {}",
+                                new_name,
+                                warnings.join("; ")
+                            ));
                         }
                     }
+                    Err(error) => self.show_message(&format!("Rename failed: {}", error)),
                 }
+                self.refresh_panels();
             }
-
-            match file_ops::rename_file(&old_path, &new_path) {
-                Ok(_) => {
-                    self.active_panel_mut().pending_focus = Some(new_name.to_string());
-                    self.show_message(&format!("Renamed to: {}", new_name));
-                }
-                Err(e) => self.show_message(&format!("Error: {}", e)),
-            }
-            self.refresh_panels();
         }
     }
 
@@ -5307,6 +6710,20 @@ impl App {
         use std::process::{Command, Stdio};
 
         let current_dir = self.active_panel().path.clone();
+        let archive_path = current_dir.join(archive_name);
+
+        // Reserve only a uniquely named file that we own. The final archive
+        // path remains untouched until a successful no-clobber publish.
+        let temp_archive = match ReservedTarArchive::create(&archive_path) {
+            Ok(temp) => temp,
+            Err(error) => {
+                self.show_message(&format!(
+                    "Error: cannot create temporary archive: {}",
+                    error
+                ));
+                return;
+            }
+        };
 
         // Determine compression option based on extension
         let tar_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
@@ -5321,7 +6738,7 @@ impl App {
 
         let tar_options_owned = tar_options.to_string();
         let archive_name_owned = archive_name.to_string();
-        let archive_path_clone = current_dir.join(archive_name);
+        let archive_path_clone = archive_path;
         let files_owned = files.to_vec();
         let excluded_owned = excluded_paths.to_vec();
 
@@ -5370,7 +6787,10 @@ impl App {
 
             // Build tar_args with --exclude options for unsafe symlinks
             // Note: archive name must come right after options (e.g., cvfpz archive.tar.gz)
-            let mut tar_args = vec![tar_options_owned.clone(), archive_name_owned.clone()];
+            // Write the archive to stdout, which is an already-open owned file
+            // handle below. This prevents `tar` from following a pathname that
+            // was replaced after reservation.
+            let mut tar_args = vec![tar_options_owned.clone(), "-".to_string()];
             for excluded in &excluded_owned {
                 tar_args.push(format!("--exclude=./{}", excluded));
             }
@@ -5426,6 +6846,18 @@ impl App {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
 
+            let archive_output = match temp_archive.writer() {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = tx.send(ProgressMessage::Error(
+                        archive_name_owned,
+                        format!("Cannot open the reserved archive output: {}", error),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
+
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(ProgressMessage::Error(
@@ -5474,11 +6906,6 @@ impl App {
                 total_bytes,
             ));
 
-            // Helper function to cleanup partial archive
-            let cleanup_archive = |path: &PathBuf| {
-                let _ = std::fs::remove_file(path);
-            };
-
             // Use stdbuf to disable buffering if available. Each child is
             // placed into its own process group so kill_child_tree's
             // group-targeted SIGKILL stays scoped to tar (and never the
@@ -5489,7 +6916,7 @@ impl App {
                 let mut cmd = Command::new("stdbuf");
                 cmd.current_dir(&current_dir)
                     .args(&args)
-                    .stdout(Stdio::piped())
+                    .stdout(Stdio::from(archive_output))
                     .stderr(Stdio::piped());
                 crate::services::claude::detach_into_own_pgroup(&mut cmd);
                 cmd.spawn()
@@ -5497,7 +6924,7 @@ impl App {
                 let mut cmd = Command::new(&tar_cmd);
                 cmd.current_dir(&current_dir)
                     .args(&tar_args)
-                    .stdout(Stdio::piped())
+                    .stdout(Stdio::from(archive_output))
                     .stderr(Stdio::piped());
                 crate::services::claude::detach_into_own_pgroup(&mut cmd);
                 cmd.spawn()
@@ -5507,28 +6934,18 @@ impl App {
                 Ok(mut child) => {
                     let (cancel_watch_done, cancel_watch) =
                         spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-                    let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let mut completed_files = 0usize;
                     let mut completed_bytes = 0u64;
                     let mut stdout_error_lines: Vec<String> = Vec::new();
 
-                    // Collect stderr in background for error messages
-                    let stderr_handle = stderr.map(|stderr| {
-                        thread::spawn(move || {
-                            use std::io::Read;
-                            let mut err_str = String::new();
-                            let mut stderr = stderr;
-                            let _ = stderr.read_to_string(&mut err_str);
-                            err_str
-                        })
-                    });
-
-                    // Read stdout line by line for progress updates
-                    // (tar outputs verbose listing to stdout on most systems)
-                    if let Some(stdout) = stdout {
+                    // When the archive itself goes to stdout, common tar
+                    // implementations send verbose progress and diagnostics
+                    // to stderr. Consume it continuously so the child cannot
+                    // block on a full pipe.
+                    if let Some(stderr) = stderr {
                         use std::io::BufRead;
-                        let mut reader = BufReader::with_capacity(64, stdout);
+                        let mut reader = BufReader::with_capacity(64, stderr);
                         let mut line = String::new();
 
                         loop {
@@ -5538,8 +6955,6 @@ impl App {
                                 let _ = child.wait();
                                 cancel_watch_done.store(true, Ordering::Relaxed);
                                 let _ = cancel_watch.join();
-                                // Cleanup partial archive on cancellation
-                                cleanup_archive(&archive_path_clone);
                                 let _ = tx.send(ProgressMessage::Error(
                                     archive_name_owned.clone(),
                                     "Cancelled".to_string(),
@@ -5556,7 +6971,10 @@ impl App {
                                     // Check if this looks like an error line (starts with "tar:")
                                     if filename.starts_with("tar:") || filename.starts_with("gtar:")
                                     {
-                                        stdout_error_lines.push(filename.to_string());
+                                        if stdout_error_lines.len() < 16 {
+                                            stdout_error_lines
+                                                .push(filename.chars().take(4096).collect());
+                                        }
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
                                         // Look up file size from the map
@@ -5589,7 +7007,6 @@ impl App {
                     match wait_result {
                         Ok(status) => {
                             if cancel_flag.load(Ordering::Relaxed) {
-                                cleanup_archive(&archive_path_clone);
                                 let _ = tx.send(ProgressMessage::Error(
                                     archive_name_owned.clone(),
                                     "Cancelled".to_string(),
@@ -5598,12 +7015,28 @@ impl App {
                                 return;
                             }
                             if status.success() {
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
+                                match publish_tar_archive(&temp_archive, &archive_path_clone) {
+                                    Ok(()) => {
+                                        let _ =
+                                            tx.send(ProgressMessage::Completed(completed_files, 0));
+                                    }
+                                    Err(error) => {
+                                        let message =
+                                            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                                                format!("{} already exists", archive_name_owned)
+                                            } else {
+                                                format!("Cannot publish archive: {}", error)
+                                            };
+                                        let _ = tx.send(ProgressMessage::Error(
+                                            archive_name_owned,
+                                            message,
+                                        ));
+                                        let _ = tx.send(ProgressMessage::Completed(0, 1));
+                                    }
+                                }
                             } else {
-                                // Cleanup partial archive on failure
-                                cleanup_archive(&archive_path_clone);
                                 let error_msg = Self::process_error_message(
-                                    stderr_handle.and_then(|h| h.join().ok()),
+                                    None,
                                     &stdout_error_lines,
                                     "tar command failed",
                                 );
@@ -5613,8 +7046,6 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            // Cleanup partial archive on error
-                            cleanup_archive(&archive_path_clone);
                             let _ =
                                 tx.send(ProgressMessage::Error(archive_name_owned, e.to_string()));
                             let _ = tx.send(ProgressMessage::Completed(0, 1));
@@ -5640,59 +7071,107 @@ impl App {
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<(usize, u64, std::collections::HashMap<String, u64>), String> {
         use std::collections::HashMap;
+        use std::io::BufReader;
         use std::process::{Command, Stdio};
 
-        // Determine list option based on extension
+        // A non-verbose listing gives one entry name per record across GNU tar,
+        // bsdtar, and common platform tar implementations. Byte totals are
+        // intentionally omitted: retaining every verbose entry in a HashMap
+        // made the preflight itself an OOM vector for hostile archives.
         let list_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-            "tvfz"
+            "tfz"
         } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
-            "tvfj"
+            "tfj"
         } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
-            "tvfJ"
+            "tfJ"
         } else {
-            "tvf"
+            "tf"
         };
 
         let mut total_files = 0usize;
-        let mut total_bytes = 0u64;
-        let mut size_map = HashMap::new();
+        let mut stdout_error_lines = Vec::new();
 
         let archive_path_str = archive_path.to_string_lossy().to_string();
         let mut cmd = Command::new(tar_cmd);
         cmd.arg(list_options)
             .arg(&archive_path_str)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
-        let output = match cmd.spawn() {
-            Ok(child) => {
-                let (cancel_watch_done, cancel_watch) =
-                    spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-                let output = child.wait_with_output();
-                cancel_watch_done.store(true, Ordering::Relaxed);
-                let _ = cancel_watch.join();
-                output
-            }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
             Err(e) => return Err(format!("Failed to list archive contents: {}", e)),
         };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                crate::services::claude::kill_child_tree(&mut child);
+                let _ = child.wait();
+                return Err("Failed to capture archive listing".to_string());
+            }
+        };
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            thread::spawn(move || read_bounded_tail(stderr, MAX_TAR_ERROR_TAIL_BYTES))
+        });
+        let (cancel_watch_done, cancel_watch) =
+            spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
+
+        let parse_result = (|| -> Result<(), String> {
+            let mut reader = BufReader::with_capacity(8192, stdout);
+            let mut line = Vec::new();
+            loop {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Cancelled".to_string());
+                }
+                let has_line =
+                    read_bounded_line(&mut reader, &mut line, MAX_TAR_LIST_LINE_BYTES)
+                        .map_err(|error| format!("Failed to read archive contents: {}", error))?;
+                if !has_line {
+                    break;
+                }
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+
+                validate_archive_entry_path(&line)?;
+                total_files = total_files
+                    .checked_add(1)
+                    .ok_or_else(|| "Archive contains too many entries".to_string())?;
+
+                if (line.starts_with(b"tar:") || line.starts_with(b"gtar:"))
+                    && stdout_error_lines.len() < 16
+                {
+                    let truncated = &line[..line.len().min(4096)];
+                    stdout_error_lines.push(String::from_utf8_lossy(truncated).into_owned());
+                }
+            }
+            Ok(())
+        })();
+
+        if parse_result.is_err() {
+            crate::services::claude::kill_child_tree(&mut child);
+        }
+        let wait_result = child.wait();
+        cancel_watch_done.store(true, Ordering::Relaxed);
+        let _ = cancel_watch.join();
+        let stderr = stderr_handle
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
 
         if cancel_flag.load(Ordering::Relaxed) {
             return Err("Cancelled".to_string());
         }
+        parse_result?;
 
-        let output = output.map_err(|e| format!("Failed to list archive contents: {}", e))?;
+        let status = wait_result.map_err(|e| format!("Failed to list archive contents: {}", e))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stdout_error_lines: Vec<String> = stdout
-                .lines()
-                .map(|line| line.trim_end_matches('\r'))
-                .filter(|line| line.starts_with("tar:") || line.starts_with("gtar:"))
-                .map(ToString::to_string)
-                .collect();
-
+        if !status.success() {
             return Err(Self::process_error_message(
                 Some(stderr),
                 &stdout_error_lines,
@@ -5700,24 +7179,11 @@ impl App {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // tar -tvf output format: -rw-r--r-- user/group    1234 2024-01-01 12:00 filename
-            // Parse the line to extract size and filename
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 6 {
-                // Size is typically the 3rd field (index 2)
-                if let Ok(size) = parts[2].parse::<u64>() {
-                    // Filename is everything after the date/time (index 5+)
-                    let filename = parts[5..].join(" ");
-                    size_map.insert(filename, size);
-                    total_bytes += size;
-                }
-                total_files += 1;
-            }
+        if stderr.contains("Removing leading") || stderr.contains("Member name contains") {
+            return Err("Archive contains an unsafe absolute or parent-directory path".to_string());
         }
 
-        Ok((total_files, total_bytes, size_map))
+        Ok((total_files, 0, HashMap::new()))
     }
 
     /// Execute archive extraction with progress display
@@ -5770,16 +7236,9 @@ impl App {
             return;
         }
 
-        // Determine decompression option based on extension
-        let tar_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-            "xvfpz"
-        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
-            "xvfpj"
-        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
-            "xvfpJ"
-        } else {
-            "xvfp"
-        };
+        // Deliberately omit `p` (preserve permissions); safe-owner and
+        // safe-permission flags are added after probing the selected tar.
+        let tar_options = tar_extraction_options(&archive_name);
 
         let archive_path_owned = archive_path.to_path_buf();
         let archive_name_owned = archive_name.clone();
@@ -5859,6 +7318,19 @@ impl App {
                 }
             };
 
+            // Root tar implementations may otherwise restore archived owners
+            // and special permission bits even without an explicit `-p`.
+            // Probe the exact configured binary and fail closed if it cannot
+            // enforce the common safe extraction options.
+            if !tar_supports_safe_extraction_options(&tar_cmd) {
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    "tar command does not support safe extraction options".to_string(),
+                ));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
             // Check if stdbuf is available (in background)
             let has_stdbuf = Command::new("stdbuf")
                 .arg("--version")
@@ -5914,7 +7386,7 @@ impl App {
             }
 
             // Create extraction directory
-            if let Err(e) = std::fs::create_dir(&extract_path_clone) {
+            if let Err(e) = create_private_extract_directory(&extract_path_clone) {
                 let _ = tx.send(ProgressMessage::Error(
                     extract_dir_owned,
                     format!("Failed to create directory: {}", e),
@@ -5934,7 +7406,13 @@ impl App {
 
             // Build command arguments
             let archive_path_str = archive_path_owned.to_string_lossy().to_string();
-            let tar_args = vec![tar_options.to_string(), archive_path_str];
+            let tar_args = vec![
+                "--no-same-owner".to_string(),
+                "--no-same-permissions".to_string(),
+                "--no-overwrite-dir".to_string(),
+                tar_options.to_string(),
+                archive_path_str,
+            ];
 
             // Execute tar extraction. Each child is placed into its own
             // process group so kill_child_tree's group-targeted SIGKILL
@@ -5976,13 +7454,7 @@ impl App {
 
                     // Collect stderr in background for error messages
                     let stderr_handle = stderr.map(|stderr| {
-                        thread::spawn(move || {
-                            use std::io::Read;
-                            let mut err_str = String::new();
-                            let mut stderr = stderr;
-                            let _ = stderr.read_to_string(&mut err_str);
-                            err_str
-                        })
+                        thread::spawn(move || read_bounded_tail(stderr, MAX_TAR_ERROR_TAIL_BYTES))
                     });
 
                     // Read stdout line by line for progress updates
@@ -6014,7 +7486,10 @@ impl App {
                                     let filename = line.trim_end();
                                     if filename.starts_with("tar:") || filename.starts_with("gtar:")
                                     {
-                                        stdout_error_lines.push(filename.to_string());
+                                        if stdout_error_lines.len() < 16 {
+                                            stdout_error_lines
+                                                .push(filename.chars().take(4096).collect());
+                                        }
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
                                         // Look up file size from the map
@@ -6056,7 +7531,28 @@ impl App {
                                 return;
                             }
                             if status.success() {
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
+                                let sanitize_result =
+                                    enforce_private_extract_directory(&extract_path_clone)
+                                        .and_then(|_| {
+                                            strip_special_permission_bits(&extract_path_clone)
+                                        });
+                                match sanitize_result {
+                                    Ok(()) => {
+                                        let _ =
+                                            tx.send(ProgressMessage::Completed(completed_files, 0));
+                                    }
+                                    Err(error) => {
+                                        cleanup_extract_dir(&extract_path_clone);
+                                        let _ = tx.send(ProgressMessage::Error(
+                                            extract_dir_owned,
+                                            format!(
+                                                "Failed to sanitize extracted permissions: {}",
+                                                error
+                                            ),
+                                        ));
+                                        let _ = tx.send(ProgressMessage::Completed(0, 1));
+                                    }
+                                }
                             } else {
                                 cleanup_extract_dir(&extract_path_clone);
                                 let error_msg = Self::process_error_message(
@@ -6284,21 +7780,12 @@ impl App {
             return;
         }
 
-        let current = self.active_panel().path.display().to_string();
-        let new_path = if path_str == ".." {
-            // Go to parent directory
-            if current == "/" {
+        let new_path = match resolve_remote_path(&self.active_panel().path, path_str) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_message(&error);
                 return;
             }
-            let parent = std::path::Path::new(&current)
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            parent
-        } else if path_str.starts_with('/') {
-            path_str.to_string()
-        } else {
-            format!("{}/{}", current.trim_end_matches('/'), path_str)
         };
 
         self.spawn_remote_list_dir(&new_path);
@@ -6311,8 +7798,21 @@ impl App {
         }
 
         let (tx, rx) = mpsc::channel();
-        let profile_clone = profile.clone();
-        let path_clone = path.to_string();
+        let mut profile_clone = profile.clone();
+        profile_clone.host = match remote::canonical_remote_host(&profile.host) {
+            Ok(host) => host.to_string(),
+            Err(error) => {
+                self.show_message(&error);
+                return;
+            }
+        };
+        let path_clone = match resolve_remote_path(Path::new("/"), path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_message(&error);
+                return;
+            }
+        };
         let panel_idx = self.active_panel_index;
 
         thread::spawn(move || {
@@ -6430,7 +7930,7 @@ impl App {
             Some(ctx) => ctx,
             None => return,
         };
-        let path = self.panels[panel_idx].path.display().to_string();
+        let path = normalized_remote_path(&self.panels[panel_idx].path);
         let path_for_result = self.panels[panel_idx].path.clone();
         let (tx, rx) = mpsc::channel();
 
@@ -6459,7 +7959,7 @@ impl App {
             return false;
         }
 
-        let (panel_idx, remote_path, local_path, generation) = {
+        let (panel_idx, remote_path, local_path, edit_session_id, generation, expected_version) = {
             let Some(editor) = self.editor_state.as_mut() else {
                 return false;
             };
@@ -6473,21 +7973,45 @@ impl App {
                 editor.set_message("Saved locally, remote panel is no longer available", 50);
                 return false;
             }
-            let is_connected = self.panels[origin.panel_index]
-                .remote_ctx
-                .as_ref()
+            let current_context = self.panels[origin.panel_index].remote_ctx.as_ref();
+            let is_connected = current_context
                 .map(|ctx| matches!(ctx.status, ConnectionStatus::Connected))
                 .unwrap_or(false);
             if !is_connected {
                 editor.set_message("Saved locally, remote connection is not available", 50);
                 return false;
             }
+            if !current_context
+                .map(|ctx| origin.endpoint.matches_profile(&ctx.profile))
+                .unwrap_or(false)
+            {
+                editor.set_message(
+                    "Saved locally, but the panel is connected to a different remote endpoint",
+                    50,
+                );
+                return false;
+            }
             (
                 origin.panel_index,
                 origin.remote_path.clone(),
-                editor.file_path.display().to_string(),
+                editor.file_path.clone(),
+                origin.edit_session_id,
                 editor.remote_save_generation,
+                origin.expected_version.clone(),
             )
+        };
+
+        let local_snapshot = match remote::LocalUploadSnapshot::open(&local_path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if let Some(editor) = self.editor_state.as_mut() {
+                    editor.set_message(
+                        format!("Saved locally, upload snapshot failed: {error}"),
+                        50,
+                    );
+                }
+                return false;
+            }
         };
 
         let ctx = match self.panels[panel_idx].remote_ctx.take() {
@@ -6502,16 +8026,18 @@ impl App {
         let (tx, rx) = mpsc::channel();
 
         thread::spawn(move || {
-            let msg = match ctx.session.upload_file(&local_path, &remote_path) {
-                Ok(_) => Ok("Saved & uploaded to remote!".to_string()),
-                Err(e) => Err(format!("Saved locally, upload failed: {}", e)),
-            };
+            let status = remote_upload_save_status(ctx.session.upload_file(
+                local_snapshot,
+                &remote_path,
+                &expected_version,
+            ));
             let _ = tx.send(RemoteSpinnerResult::PanelOp {
                 ctx,
                 panel_idx,
                 outcome: PanelOpOutcome::RemoteSave {
-                    message: msg,
+                    status,
                     remote_path,
+                    edit_session_id,
                     generation,
                     reload: true,
                 },
@@ -6546,6 +8072,11 @@ impl App {
             Some(Err(())) => {
                 // Thread panicked or sender dropped — cancel spinner
                 self.remote_spinner = None;
+                if let Some(editor) = self.editor_state.as_mut() {
+                    if editor.pending_close_after_remote_save.take().is_some() {
+                        editor.exit_confirm_open = true;
+                    }
+                }
                 self.show_message("Remote operation failed unexpectedly");
                 return;
             }
@@ -6555,6 +8086,7 @@ impl App {
         // Spinner completed — remove it
         self.remote_spinner = None;
         let mut retry_pending_remote_save = true;
+        let mut close_editor_after_remote_save = false;
 
         match result {
             RemoteSpinnerResult::Connected { result, panel_idx } => {
@@ -6576,21 +8108,24 @@ impl App {
                         panel.apply_remote_entries(success.entries, &PathBuf::from(&success.path));
 
                         // Auto-save profile and bookmark on first connection to this server
-                        let already_has_profile = self.settings.remote_profiles.iter().any(|p| {
-                            p.user == success.profile.user
-                                && p.host == success.profile.host
-                                && p.port == success.profile.port
-                        });
+                        let already_has_profile = remote::find_matching_profile(
+                            &self.settings.remote_profiles,
+                            &success.profile.user,
+                            &success.profile.host,
+                            success.profile.port,
+                        )
+                        .is_some();
                         let already_bookmarked = self.settings.bookmarked_path.iter().any(|bm| {
                             if let Some((bu, bh, bp, _)) = remote::parse_remote_path(bm) {
                                 bu == success.profile.user
-                                    && bh == success.profile.host
+                                    && remote::remote_hosts_equal(&bh, &success.profile.host)
                                     && bp == success.profile.port
                             } else {
                                 false
                             }
                         });
                         let mut settings_changed = false;
+                        let previous_settings = self.settings.clone();
                         if !already_has_profile {
                             self.settings.remote_profiles.push(success.profile.clone());
                             settings_changed = true;
@@ -6601,12 +8136,38 @@ impl App {
                             self.settings.bookmarked_path.push(bookmark_path);
                             settings_changed = true;
                         }
-                        if settings_changed {
-                            let _ = self.settings.save();
-                        }
+                        let settings_save_error = if settings_changed {
+                            match self.settings.save() {
+                                Ok(()) => None,
+                                Err(error) => {
+                                    let reloaded =
+                                        self.reconcile_settings_after_save_error(previous_settings);
+                                    let reconciliation = if reloaded {
+                                        "effective settings were reloaded from disk"
+                                    } else {
+                                        "disk could not be reread; the last known settings were restored"
+                                    };
+                                    Some(format!("{error}; {reconciliation}"))
+                                }
+                            }
+                        } else {
+                            None
+                        };
 
                         if let Some(msg) = success.fallback_msg {
-                            self.show_extension_handler_error(&msg);
+                            let message = if let Some(error) = settings_save_error {
+                                format!(
+                                    "{msg}\n\nConnected, but could not confirm durable saving of the remote profile or bookmark: {error}"
+                                )
+                            } else {
+                                msg
+                            };
+                            self.show_extension_handler_error(&message);
+                        } else if let Some(error) = settings_save_error {
+                            self.show_message(&format!(
+                                "Connected to {}@{}, but could not confirm durable saving of the profile or bookmark: {}",
+                                success.profile.user, success.profile.host, error
+                            ));
                         } else {
                             self.show_message(&format!(
                                 "Connected to {}@{}",
@@ -6666,39 +8227,70 @@ impl App {
                         }
                     }
                     PanelOpOutcome::RemoteSave {
-                        message,
+                        status,
                         remote_path,
+                        edit_session_id,
                         generation,
                         reload,
                     } => {
-                        let (mut msg_text, is_err) = match &message {
-                            Ok(msg) => (msg.clone(), false),
-                            Err(e) => (format!("Error: {}", e), true),
+                        let (mut msg_text, is_err, has_warning, committed_version) = match status {
+                            RemoteSaveStatus::Complete(version) => (
+                                "Saved & uploaded to remote!".to_string(),
+                                false,
+                                false,
+                                Some(version),
+                            ),
+                            RemoteSaveStatus::CommittedWithWarning {
+                                version,
+                                warning,
+                            } => (
+                                format!(
+                                    "Warning: remote save committed, but follow-up attention is required: {}",
+                                    warning
+                                ),
+                                false,
+                                true,
+                                Some(version),
+                            ),
+                            RemoteSaveStatus::Failed(error) => (
+                                format!("Error: Saved locally, upload failed: {}", error),
+                                true,
+                                false,
+                                None,
+                            ),
                         };
                         let mut current_upload_failed = false;
-                        let mut editor_message_duration = if is_err { 50 } else { 30 };
+                        let mut editor_message_duration =
+                            if is_err || has_warning { 50 } else { 30 };
                         if let Some(ref mut editor) = self.editor_state {
                             let is_current = editor.apply_remote_save_result(
                                 panel_idx,
                                 &remote_path,
+                                edit_session_id,
                                 generation,
-                                is_err,
+                                committed_version,
                             );
                             current_upload_failed = is_current && is_err;
+                            if is_current && editor.resolve_pending_remote_close(generation) {
+                                close_editor_after_remote_save = true;
+                            }
                             if !is_current && editor.remote_dirty {
                                 msg_text = if is_err {
                                     "Previous upload failed; latest local save still needs upload"
                                         .to_string()
+                                } else if has_warning {
+                                    format!("{}; latest local save still needs upload", msg_text)
                                 } else {
                                     "Previous upload finished; latest local save still needs upload"
                                         .to_string()
                                 };
                             }
-                            editor_message_duration = if is_err || editor.remote_dirty {
-                                50
-                            } else {
-                                30
-                            };
+                            editor_message_duration =
+                                if is_err || has_warning || editor.remote_dirty {
+                                    50
+                                } else {
+                                    30
+                                };
                         }
                         if self.current_screen == Screen::FileEditor {
                             if let Some(ref mut editor) = self.editor_state {
@@ -6802,6 +8394,9 @@ impl App {
             },
         }
 
+        if close_editor_after_remote_save {
+            crate::ui::file_editor::close_file_editor(self, true);
+        }
         if retry_pending_remote_save {
             self.start_pending_remote_editor_upload();
         }
@@ -6863,6 +8458,134 @@ mod tests {
     /// Helper to cleanup temp directory
     fn cleanup_temp_dir(path: &Path) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn remote_cache_key_never_uses_remote_bytes_as_path_components() {
+        let root = PathBuf::from("/application-owned/cache");
+        let path = remote_cache_path_for_endpoint(
+            &root,
+            "../../user/escape",
+            "host/../../outside",
+            22,
+            "/../../etc/passwd/../../../payload.rs",
+        );
+        assert_eq!(path.parent(), Some(root.as_path()));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.ends_with(".rs"));
+        assert!(name[..64].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!name.contains(".."));
+        assert!(!name.contains("user"));
+        assert!(!name.contains("host"));
+    }
+
+    #[test]
+    fn remote_cache_key_separates_ports_and_rejects_unsafe_extensions() {
+        let root = PathBuf::from("cache");
+        let port_22 = remote_cache_path_for_endpoint(&root, "user", "host", 22, "/work/file.rs");
+        let port_2222 =
+            remote_cache_path_for_endpoint(&root, "user", "host", 2222, "/work/file.rs");
+        assert_ne!(port_22, port_2222);
+
+        let unsafe_suffix = remote_cache_path_for_endpoint(
+            &root,
+            "user",
+            "host",
+            22,
+            "/work/file.bad/../../escape",
+        );
+        assert_eq!(unsafe_suffix.parent(), Some(root.as_path()));
+        assert_eq!(unsafe_suffix.file_name().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn remote_cache_key_canonicalizes_bracketed_ipv6_hosts() {
+        let root = PathBuf::from("cache");
+        assert_eq!(
+            remote_cache_path_for_endpoint(&root, "user", "::1", 22, "/work/file.txt"),
+            remote_cache_path_for_endpoint(&root, "user", "[::1]", 22, "/work/file.txt")
+        );
+    }
+
+    #[test]
+    fn remote_child_path_normalizes_sftp_separators_and_rejects_ambiguous_names() {
+        assert_eq!(
+            normalized_remote_child_path(Path::new("\\home\\user"), "file.txt").unwrap(),
+            "/home/user/file.txt"
+        );
+        assert_eq!(
+            normalized_remote_child_path(Path::new("/"), "file.txt").unwrap(),
+            "/file.txt"
+        );
+        assert!(normalized_remote_child_path(Path::new("/home"), "../file").is_err());
+        assert!(normalized_remote_child_path(Path::new("/home"), "a\\b").is_err());
+        assert_eq!(remote_parent_path(Path::new("\\home\\user")), "/home");
+        assert_eq!(
+            resolve_remote_path(Path::new("\\home\\user"), "..\\other").unwrap(),
+            "/home/other"
+        );
+    }
+
+    #[test]
+    fn committed_upload_warning_is_not_a_failed_remote_save() {
+        let version = remote::RemoteFileVersion::for_test(7);
+        assert_eq!(
+            remote_upload_save_status(Ok(remote::UploadFileOutcome::CommittedWithWarning {
+                bytes: 7,
+                version: version.clone(),
+                warning: "mode could not be restored".to_string(),
+            })),
+            RemoteSaveStatus::CommittedWithWarning {
+                version,
+                warning: "mode could not be restored".to_string(),
+            }
+        );
+        assert_eq!(
+            remote_upload_save_status(Err("publish failed".to_string())),
+            RemoteSaveStatus::Failed("publish failed".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_handler_placeholder_is_safe_in_all_supported_quote_contexts() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let injected_marker = temp_dir.path().join("must-not-exist");
+        let hostile_path = format!(
+            "a path with 'quotes' ; $(touch {}) ; $HOME *.txt",
+            injected_marker.display()
+        );
+
+        for template in [
+            "printf '%s' {{FILEPATH}}",
+            "printf '%s' \"{{FILEPATH}}\"",
+            "printf '%s' '{{FILEPATH}}'",
+        ] {
+            let command = substitute_handler_filepath(template);
+            assert!(!command.contains(&hostile_path));
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .env(HANDLER_FILEPATH_ENV, &hostile_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), hostile_path);
+            assert!(!injected_marker.exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extension_handler_placeholder_preserves_existing_quotes() {
+        assert_eq!(
+            substitute_handler_filepath("viewer {{FILEPATH}}"),
+            format!("viewer \"%{}%\"", HANDLER_FILEPATH_ENV)
+        );
+        assert_eq!(
+            substitute_handler_filepath("viewer \"{{FILEPATH}}\""),
+            format!("viewer \"%{}%\"", HANDLER_FILEPATH_ENV)
+        );
     }
 
     // ========== get_valid_path tests ==========
@@ -7229,6 +8952,97 @@ mod tests {
     }
 
     #[test]
+    fn archive_entry_validation_rejects_paths_outside_the_extract_root() {
+        for unsafe_path in [
+            b"/etc/passwd".as_slice(),
+            b"../escape",
+            b"safe/../../escape",
+            br"C:\Windows\system.ini",
+            br"\\server\share\file",
+        ] {
+            assert!(validate_archive_entry_path(unsafe_path).is_err());
+        }
+        assert!(validate_archive_entry_path(b"./safe/directory/file.txt").is_ok());
+    }
+
+    #[test]
+    fn extraction_options_never_preserve_archived_permissions() {
+        for archive in ["a.tar", "a.tar.gz", "a.tgz", "a.tar.bz2", "a.tar.xz"] {
+            assert!(!tar_extraction_options(archive).contains('p'));
+        }
+    }
+
+    #[test]
+    fn archive_listing_line_reader_rejects_unbounded_names() {
+        let input = vec![b'a'; 33];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+        let mut line = Vec::new();
+
+        let error = read_bounded_line(&mut reader, &mut line, 32).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(line.len() <= 32);
+    }
+
+    #[test]
+    fn tar_error_capture_keeps_only_a_bounded_tail() {
+        let input = vec![b'x'; MAX_TAR_ERROR_TAIL_BYTES + 100];
+        let tail = read_bounded_tail(std::io::Cursor::new(input), MAX_TAR_ERROR_TAIL_BYTES);
+        assert_eq!(tail.len(), MAX_TAR_ERROR_TAIL_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_listing_fails_closed_on_parent_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fake_tar = temp_dir.path().join("fake_tar");
+        let archive = temp_dir.path().join("bad.tar");
+        fs::write(&fake_tar, "#!/bin/sh\nprintf '../escape\\n'\n").unwrap();
+        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&archive, "placeholder").unwrap();
+
+        let error = App::list_archive_contents(
+            fake_tar.to_str().unwrap(),
+            &archive,
+            "bad.tar",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("parent-directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_permission_sanitizer_does_not_follow_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("extract");
+        fs::create_dir(&root).unwrap();
+        let extracted = root.join("program");
+        let outside = temp_dir.path().join("outside");
+        fs::write(&extracted, "inside").unwrap();
+        fs::write(&outside, "outside").unwrap();
+        fs::set_permissions(&extracted, fs::Permissions::from_mode(0o6755)).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o6755)).unwrap();
+        symlink(&outside, root.join("outside-link")).unwrap();
+
+        strip_special_permission_bits(&root).unwrap();
+
+        assert_eq!(
+            fs::metadata(&extracted).unwrap().permissions().mode() & 0o6000,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o6000,
+            0o6000
+        );
+    }
+
+    #[test]
     fn test_app_toggle_selection() {
         let temp_dir = create_temp_dir();
         fs::write(temp_dir.join("file1.txt"), "").unwrap();
@@ -7310,6 +9124,203 @@ mod tests {
         assert_ne!(DialogType::Delete, DialogType::Mkdir);
     }
 
+    #[test]
+    fn encrypt_dialog_enables_integrity_verification_by_default() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("plain.txt"), "content").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+
+        app.show_encrypt_dialog();
+
+        let dialog = app.dialog.as_ref().expect("encrypt dialog");
+        assert_eq!(dialog.dialog_type, DialogType::EncryptConfirm);
+        assert!(dialog.use_md5);
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn mkfile_reports_existing_path_without_truncating_it() {
+        let temp_dir = create_temp_dir();
+        let existing = temp_dir.join("existing.txt");
+        fs::write(&existing, "keep this content").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+
+        app.execute_mkfile("existing.txt");
+
+        assert_eq!(fs::read_to_string(existing).unwrap(), "keep this content");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("'existing.txt' already exists!")
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn delete_confirmation_never_reauthorizes_a_replaced_selection() {
+        let temp_dir = create_temp_dir();
+        let selected = temp_dir.join("selected.txt");
+        let retained = temp_dir.join("retained.txt");
+        fs::write(&selected, "confirmed").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        let selected_index = app
+            .active_panel()
+            .files
+            .iter()
+            .position(|file| file.name == "selected.txt")
+            .unwrap();
+        app.active_panel_mut().selected_index = selected_index;
+
+        app.show_delete_dialog();
+        fs::rename(&selected, &retained).unwrap();
+        fs::write(&selected, "racer").unwrap();
+        app.execute_delete();
+        for _ in 0..200 {
+            app.poll_remote_spinner();
+            if app.remote_spinner.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.remote_spinner.is_none());
+        assert_eq!(fs::read_to_string(&selected).unwrap(), "racer");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "confirmed");
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn rename_dialog_never_reauthorizes_a_replaced_selection() {
+        let temp_dir = create_temp_dir();
+        let selected = temp_dir.join("selected.txt");
+        let retained = temp_dir.join("retained.txt");
+        let destination = temp_dir.join("renamed.txt");
+        fs::write(&selected, "confirmed").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        let selected_index = app
+            .active_panel()
+            .files
+            .iter()
+            .position(|file| file.name == "selected.txt")
+            .unwrap();
+        app.active_panel_mut().selected_index = selected_index;
+
+        app.show_rename_dialog();
+        fs::rename(&selected, &retained).unwrap();
+        fs::write(&selected, "racer").unwrap();
+        app.execute_rename("renamed.txt");
+
+        assert_eq!(fs::read_to_string(&selected).unwrap(), "racer");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "confirmed");
+        assert!(fs::symlink_metadata(&destination).is_err());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn tar_publish_never_overwrites_a_racing_destination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        fs::write(&destination, "created by another process").unwrap();
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        let owned_temp_path = reserved.path().to_path_buf();
+        fs::write(reserved.path(), "our completed archive").unwrap();
+
+        let error = publish_tar_archive(&reserved, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "created by another process"
+        );
+        assert!(owned_temp_path.exists());
+        drop(reserved);
+        assert!(!owned_temp_path.exists());
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "created by another process"
+        );
+    }
+
+    #[test]
+    fn tar_publish_moves_only_the_owned_temp_on_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        let owned_temp_path = reserved.path().to_path_buf();
+        fs::write(reserved.path(), "archive bytes").unwrap();
+
+        publish_tar_archive(&reserved, &destination).unwrap();
+
+        assert_eq!(fs::read_to_string(destination).unwrap(), "archive bytes");
+        assert!(!owned_temp_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_publish_rejects_replaced_staging_path_without_deleting_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        let replacement_path = reserved.path().to_path_buf();
+        let retained_owned_file = reserved.staging_dir.join("owned-retained.tmp");
+        fs::rename(&replacement_path, &retained_owned_file).unwrap();
+        fs::write(&replacement_path, "unowned replacement").unwrap();
+
+        let error = publish_tar_archive(&reserved, &destination).unwrap_err();
+        assert!(error.to_string().contains("replaced"));
+        drop(reserved);
+
+        assert_eq!(
+            fs::read_to_string(&replacement_path).unwrap(),
+            "unowned replacement"
+        );
+        assert_eq!(fs::read_to_string(retained_owned_file).unwrap(), "");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_temp_and_published_archives_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        assert_eq!(
+            fs::metadata(&reserved.staging_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(reserved.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::write(reserved.path(), "archive").unwrap();
+        publish_tar_archive(&reserved, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_directory_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let extract_dir = temp_dir.path().join("extract");
+
+        create_private_extract_directory(&extract_dir).unwrap();
+
+        assert_eq!(
+            fs::metadata(extract_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     // ========== Clipboard tests ==========
 
     #[test]
@@ -7356,6 +9367,57 @@ mod tests {
         assert_eq!(clipboard.operation, ClipboardOperation::Cut);
         assert_eq!(clipboard.files.len(), 1);
 
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_clipboard_map_uses_the_resolved_symlinked_source_directory() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("real-src");
+        let source_alias = temp_dir.join("source-alias");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("item"), "content").unwrap();
+        std::os::unix::fs::symlink(&source_dir, &source_alias).unwrap();
+        let names = vec!["item".to_string()];
+        let (source_authorizations, source_directory_authorization) =
+            capture_local_clipboard_authorizations(&source_alias, &names, false).unwrap();
+        let clipboard = Clipboard {
+            files: names,
+            source_path: source_alias.clone(),
+            operation: ClipboardOperation::Copy,
+            source_remote_profile: None,
+            source_authorizations,
+            source_directory_authorization,
+        };
+
+        let keyed = local_clipboard_authorization_map(&clipboard);
+        let resolved_source = clipboard
+            .source_directory_authorization
+            .as_ref()
+            .unwrap()
+            .resolved_path()
+            .to_path_buf();
+
+        assert!(keyed.contains_key(&resolved_source.join("item")));
+        assert!(!keyed.contains_key(&source_alias.join("item")));
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn applying_loaded_settings_replaces_the_complete_snapshot() {
+        let temp_dir = create_temp_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        let mut loaded = Settings::default();
+        loaded.bookmarked_path = vec!["/persisted/bookmark".to_string()];
+        loaded.telegram_polling_time = 9_000;
+        loaded.diff_compare_method = "modified_time".to_string();
+
+        app.apply_loaded_settings(loaded);
+
+        assert_eq!(app.settings.bookmarked_path, ["/persisted/bookmark"]);
+        assert_eq!(app.settings.telegram_polling_time, 9_000);
+        assert_eq!(app.settings.diff_compare_method, "modified_time");
         cleanup_temp_dir(&temp_dir);
     }
 
@@ -7456,6 +9518,127 @@ mod tests {
     }
 
     #[test]
+    fn failed_async_cut_restores_clipboard_for_retry() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("file.txt"), "still here").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_cut_clipboard = Some(Clipboard {
+            files: vec!["file.txt".to_string()],
+            source_path: temp_dir.clone(),
+            operation: ClipboardOperation::Cut,
+            source_remote_profile: None,
+            source_authorizations: HashMap::new(),
+            source_directory_authorization: None,
+        });
+
+        app.finish_pending_cut_operation(false);
+
+        let restored = app.clipboard.as_ref().expect("cut clipboard restored");
+        assert_eq!(restored.files, ["file.txt"]);
+        assert_eq!(restored.operation, ClipboardOperation::Cut);
+        assert!(app.pending_cut_clipboard.is_none());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn partially_completed_local_cut_restores_only_sources_that_remain() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("remaining.txt"), "not moved").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_cut_clipboard = Some(Clipboard {
+            files: vec!["moved.txt".to_string(), "remaining.txt".to_string()],
+            source_path: temp_dir.clone(),
+            operation: ClipboardOperation::Cut,
+            source_remote_profile: None,
+            source_authorizations: HashMap::new(),
+            source_directory_authorization: None,
+        });
+
+        app.finish_pending_cut_operation(false);
+
+        assert_eq!(
+            app.clipboard.as_ref().unwrap().files,
+            ["remaining.txt".to_string()]
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn retry_unsafe_cut_item_is_not_restored_even_when_source_name_exists() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("uncertain.txt"), "recovery copy").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_cut_clipboard = Some(Clipboard {
+            files: vec!["uncertain.txt".to_string()],
+            source_path: temp_dir.clone(),
+            operation: ClipboardOperation::Cut,
+            source_remote_profile: None,
+            source_authorizations: HashMap::new(),
+            source_directory_authorization: None,
+        });
+        let mut progress = FileOperationProgress::new(FileOperationType::Move);
+        progress
+            .terminal_item_names
+            .insert("uncertain.txt".to_string());
+        app.file_operation_progress = Some(progress);
+
+        app.finish_pending_cut_operation(false);
+
+        assert!(app.clipboard.is_none());
+        assert!(app.pending_cut_clipboard.is_none());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn successful_async_cut_consumes_pending_clipboard() {
+        let temp_dir = create_temp_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_cut_clipboard = Some(Clipboard {
+            files: vec!["file.txt".to_string()],
+            source_path: temp_dir.clone(),
+            operation: ClipboardOperation::Cut,
+            source_remote_profile: None,
+            source_authorizations: HashMap::new(),
+            source_directory_authorization: None,
+        });
+
+        app.finish_pending_cut_operation(true);
+
+        assert!(app.clipboard.is_none());
+        assert!(app.pending_cut_clipboard.is_none());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn successful_cut_retains_items_skipped_during_conflict_resolution() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("skipped.txt"), "not moved").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_cut_clipboard = Some(Clipboard {
+            files: vec!["moved.txt".to_string(), "skipped.txt".to_string()],
+            source_path: temp_dir.clone(),
+            operation: ClipboardOperation::Cut,
+            source_remote_profile: None,
+            source_authorizations: HashMap::new(),
+            source_directory_authorization: None,
+        });
+        let mut progress = FileOperationProgress::new(FileOperationType::Move);
+        progress
+            .skipped_cut_item_names
+            .insert("skipped.txt".to_string());
+        app.file_operation_progress = Some(progress);
+
+        app.finish_pending_cut_operation(true);
+
+        assert_eq!(
+            app.clipboard.as_ref().unwrap().files,
+            ["skipped.txt".to_string()]
+        );
+        assert!(app.pending_cut_clipboard.is_none());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
     fn test_clipboard_paste_same_folder_creates_duplicate() {
         let temp_dir = create_temp_dir();
         fs::write(temp_dir.join("file.txt"), "content").unwrap();
@@ -7495,6 +9678,49 @@ mod tests {
 
         // Clipboard should still exist (copy can be pasted multiple times)
         assert!(app.clipboard.is_some());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_same_folder_duplicate_preserves_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = create_temp_dir();
+        symlink("missing-target", temp_dir.join("dangling-link")).unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        let link_index = app
+            .active_panel()
+            .files
+            .iter()
+            .position(|file| file.name == "dangling-link")
+            .expect("dangling link should be listed");
+        app.active_panel_mut().selected_index = link_index;
+
+        app.clipboard_copy();
+        app.clipboard_paste();
+        while app
+            .file_operation_progress
+            .as_ref()
+            .map(|progress| progress.is_active)
+            .unwrap_or(false)
+        {
+            if let Some(progress) = app.file_operation_progress.as_mut() {
+                progress.poll();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let duplicate = temp_dir.join("dangling-link_dup");
+        assert!(std::fs::symlink_metadata(&duplicate)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(duplicate).unwrap(),
+            PathBuf::from("missing-target")
+        );
 
         cleanup_temp_dir(&temp_dir);
     }

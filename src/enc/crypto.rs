@@ -22,9 +22,19 @@ const PBKDF2_ITERATIONS: u32 = 100_000;
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
-/// Load and trim the key from a file.
-pub fn load_key_file(path: &std::path::Path) -> Result<Vec<u8>, CokacencError> {
-    let data = std::fs::read(path)?;
+/// Load and trim a bounded key from a reader.
+pub fn load_key(mut reader: impl Read) -> Result<Vec<u8>, CokacencError> {
+    const MAX_KEY_BYTES: u64 = 1024 * 1024;
+    let mut data = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_KEY_BYTES + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_KEY_BYTES {
+        return Err(CokacencError::Other(
+            "Encryption key file exceeds the 1 MiB size limit".to_string(),
+        ));
+    }
     let trimmed: Vec<u8> = match data.iter().rposition(|b| !b.is_ascii_whitespace()) {
         Some(pos) => data[..=pos].to_vec(),
         None => return Err(CokacencError::EmptyKeyFile),
@@ -33,6 +43,13 @@ pub fn load_key_file(path: &std::path::Path) -> Result<Vec<u8>, CokacencError> {
         return Err(CokacencError::EmptyKeyFile);
     }
     Ok(trimmed)
+}
+
+/// Load a key through a no-follow regular-file open so a path cannot be
+/// redirected to a symlink, FIFO, device, or Windows reparse point.
+pub fn load_key_file(path: &std::path::Path) -> Result<Vec<u8>, CokacencError> {
+    let (file, _) = crate::services::file_ops::open_regular_file_no_follow(path)?;
+    load_key(file)
 }
 
 /// Derive a 32-byte AES key from password + salt via PBKDF2-HMAC-SHA512.
@@ -187,32 +204,27 @@ pub fn decrypt_chunk_streaming(
 ) -> Result<(), CokacencError> {
     let mut decryptor = Aes256CbcDec::new(key.into(), iv.into());
 
-    // Read all ciphertext into memory in blocks
-    let mut ciphertext = Vec::new();
-    r.read_to_end(&mut ciphertext)?;
-
-    if ciphertext.is_empty() {
+    // Keep exactly one ciphertext block pending so that only the final block
+    // needs special PKCS7 handling.  Chunk files can be several gigabytes, so
+    // read_to_end() here is both unnecessary and capable of exhausting memory.
+    let mut last_block = [0u8; AES_BLOCK];
+    if !read_cipher_block(r, &mut last_block)? {
         return Err(CokacencError::InvalidPadding);
     }
 
-    if ciphertext.len() % AES_BLOCK != 0 {
-        return Err(CokacencError::InvalidPadding);
+    loop {
+        let mut next_block = [0u8; AES_BLOCK];
+        if !read_cipher_block(r, &mut next_block)? {
+            break;
+        }
+
+        decryptor.decrypt_blocks_mut(to_blocks_mut(&mut last_block));
+        w.write_all(&last_block)?;
+        last_block = next_block;
     }
 
-    let total_blocks = ciphertext.len() / AES_BLOCK;
-
-    // Decrypt all blocks except the last, write directly
-    if total_blocks > 1 {
-        let main_len = (total_blocks - 1) * AES_BLOCK;
-        let main_part = &mut ciphertext[..main_len];
-        decryptor.decrypt_blocks_mut(to_blocks_mut(main_part));
-        w.write_all(main_part)?;
-    }
-
-    // Decrypt the last block and remove PKCS7 padding
-    let last_start = (total_blocks - 1) * AES_BLOCK;
-    let last_block = &mut ciphertext[last_start..last_start + AES_BLOCK];
-    decryptor.decrypt_blocks_mut(to_blocks_mut(last_block));
+    // Decrypt the final block and remove PKCS7 padding.
+    decryptor.decrypt_blocks_mut(to_blocks_mut(&mut last_block));
 
     let pad_byte = last_block[AES_BLOCK - 1];
     if pad_byte == 0 || pad_byte as usize > AES_BLOCK {
@@ -231,6 +243,22 @@ pub fn decrypt_chunk_streaming(
     Ok(())
 }
 
+/// Read one complete ciphertext block. EOF is valid only before any byte of a
+/// new block has been read; a partial final block is malformed ciphertext.
+fn read_cipher_block(r: &mut dyn Read, block: &mut [u8; AES_BLOCK]) -> Result<bool, CokacencError> {
+    let mut filled = 0;
+    while filled < AES_BLOCK {
+        match r.read(&mut block[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => return Err(CokacencError::InvalidPadding),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(true)
+}
+
 /// Helper: reinterpret a mutable byte slice as mutable AES blocks.
 #[allow(unsafe_code)]
 fn to_blocks_mut(data: &mut [u8]) -> &mut [aes::Block] {
@@ -238,5 +266,56 @@ fn to_blocks_mut(data: &mut [u8]) -> &mut [aes::Block] {
     // SAFETY: aes::Block is [u8; 16] with the same alignment as u8
     unsafe {
         std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut aes::Block, data.len() / AES_BLOCK)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    struct BlockSizedReader<R> {
+        inner: R,
+    }
+
+    impl<R: Read> Read for BlockSizedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() > AES_BLOCK {
+                return Err(io::Error::other("reader was asked for more than one block"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn decrypt_is_constant_memory_and_accepts_short_reads() {
+        let key = [7u8; KEY_LEN];
+        let iv = [11u8; AES_BLOCK];
+        let plaintext = vec![0x5a; 128 * 1024 + 3];
+
+        let mut encryptor = ChunkEncryptor::new(&key, &iv);
+        let mut ciphertext = encryptor.update(&plaintext).to_vec();
+        ciphertext.extend_from_slice(&encryptor.finalize());
+
+        let cursor = Cursor::new(ciphertext);
+        let mut reader = BlockSizedReader { inner: cursor };
+        let mut decrypted = Vec::new();
+        decrypt_chunk_streaming(&mut reader, &mut decrypted, &key, &iv).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_rejects_partial_final_block() {
+        let key = [7u8; KEY_LEN];
+        let iv = [11u8; AES_BLOCK];
+        let mut output = Vec::new();
+        let error = decrypt_chunk_streaming(
+            &mut Cursor::new(vec![0u8; AES_BLOCK + 1]),
+            &mut output,
+            &key,
+            &iv,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CokacencError::InvalidPadding));
     }
 }

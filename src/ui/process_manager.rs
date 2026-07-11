@@ -1,3 +1,9 @@
+use super::{
+    app::{App, ProcessKillTarget, Screen},
+    theme::Theme,
+};
+use crate::services::process::{self, SortField};
+use crate::utils::format::pad_to_display_width;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::Rect,
@@ -6,14 +12,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
-
-use super::{
-    app::{App, Screen},
-    theme::Theme,
-};
-use crate::services::process::{self, SortField};
-use crate::utils::format::pad_to_display_width;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let block = Block::default()
@@ -176,11 +174,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     // Confirm dialog
-    if let Some(pid) = app.process_confirm_kill {
+    if let Some(target) = app.process_confirm_kill {
         let confirm_text = if app.process_force_kill {
-            format!("Force kill process {}? (y/n)", pid)
+            format!("Force kill process {}? (y/n)", target.pid)
         } else {
-            format!("Kill process {}? (y/n)", pid)
+            format!("Kill process {}? (y/n)", target.pid)
         };
         let confirm_line = Line::from(Span::styled(
             confirm_text,
@@ -278,14 +276,10 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     if app.process_confirm_kill.is_some() {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(pid) = app.process_confirm_kill {
-                    let result = if app.process_force_kill {
-                        process::force_kill_process(pid)
-                    } else {
-                        process::kill_process(pid)
-                    };
+                if let Some(target) = app.process_confirm_kill {
+                    let result = signal_process(target, app.process_force_kill);
                     match result {
-                        Ok(_) => app.show_message(&format!("Process {} killed", pid)),
+                        Ok(_) => app.show_message(&format!("Process {} killed", target.pid)),
                         Err(e) => app.show_message(&format!("Error: {}", e)),
                     }
                     app.processes = process::get_process_list();
@@ -345,13 +339,19 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             }
             ProcessManagerAction::Kill => {
                 if let Some(proc) = app.processes.get(app.process_selected_index) {
-                    app.process_confirm_kill = Some(proc.pid);
+                    app.process_confirm_kill = Some(ProcessKillTarget {
+                        pid: proc.pid,
+                        start_time_ticks: proc.start_time_ticks,
+                    });
                     app.process_force_kill = false;
                 }
             }
             ProcessManagerAction::ForceKill => {
                 if let Some(proc) = app.processes.get(app.process_selected_index) {
-                    app.process_confirm_kill = Some(proc.pid);
+                    app.process_confirm_kill = Some(ProcessKillTarget {
+                        pid: proc.pid,
+                        start_time_ticks: proc.start_time_ticks,
+                    });
                     app.process_force_kill = true;
                 }
             }
@@ -361,6 +361,32 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.show_message("Refreshed");
             }
         }
+    }
+}
+
+fn signal_process(target: ProcessKillTarget, force: bool) -> Result<(), String> {
+    signal_process_with(
+        target,
+        force,
+        process::kill_process_with_verification,
+        process::force_kill_process_with_verification,
+    )
+}
+
+fn signal_process_with<N, F>(
+    target: ProcessKillTarget,
+    force: bool,
+    normal: N,
+    forced: F,
+) -> Result<(), String>
+where
+    N: FnOnce(i32, Option<u64>) -> Result<(), String>,
+    F: FnOnce(i32, Option<u64>) -> Result<(), String>,
+{
+    if force {
+        forced(target.pid, target.start_time_ticks)
+    } else {
+        normal(target.pid, target.start_time_ticks)
     }
 }
 
@@ -397,4 +423,103 @@ fn sort_processes(app: &mut App) {
             cmp.reverse()
         }
     });
+
+    // A refresh (especially after killing the last visible process) can
+    // shrink the list.  Leaving the old index selected made navigation and
+    // subsequent kill actions appear unresponsive until the user moved back
+    // into range manually.
+    app.process_selected_index =
+        clamp_process_index(app.process_selected_index, app.processes.len());
+}
+
+fn clamp_process_index(selected: usize, len: usize) -> usize {
+    selected.min(len.saturating_sub(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use tempfile::tempdir;
+
+    use super::{clamp_process_index, handle_input, signal_process_with};
+    use crate::{
+        services::process::ProcessInfo,
+        ui::app::{App, ProcessKillTarget},
+    };
+
+    fn process_info(pid: i32, start_time_ticks: Option<u64>) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            user: String::new(),
+            cpu: 0.0,
+            mem: 0.0,
+            vsz: 0,
+            rss: 0,
+            tty: String::new(),
+            stat: String::new(),
+            start: String::new(),
+            time: String::new(),
+            command: "test".to_string(),
+            start_time_ticks,
+        }
+    }
+
+    #[test]
+    fn process_selection_is_clamped_after_refresh_shrinks_the_list() {
+        assert_eq!(clamp_process_index(8, 3), 2);
+        assert_eq!(clamp_process_index(8, 0), 0);
+        assert_eq!(clamp_process_index(1, 3), 1);
+    }
+
+    #[test]
+    fn kill_confirmation_keeps_the_original_process_identity() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        app.processes = vec![process_info(400, Some(111)), process_info(401, Some(222))];
+        app.process_selected_index = 0;
+
+        handle_input(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+
+        // Simulate a refresh after PID 400 has been reused and the selection
+        // has moved. The confirmation must retain the identity originally
+        // displayed to the user.
+        app.processes = vec![process_info(400, Some(999))];
+        app.process_selected_index = 0;
+        assert_eq!(
+            app.process_confirm_kill,
+            Some(ProcessKillTarget {
+                pid: 400,
+                start_time_ticks: Some(111),
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_kill_passes_the_saved_identity_to_the_verified_api() {
+        let normal_call = Cell::new(None);
+        let forced_call = Cell::new(None);
+        let target = ProcessKillTarget {
+            pid: 4321,
+            start_time_ticks: Some(9876),
+        };
+
+        signal_process_with(
+            target,
+            false,
+            |pid, start| {
+                normal_call.set(Some((pid, start)));
+                Ok(())
+            },
+            |pid, start| {
+                forced_call.set(Some((pid, start)));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(normal_call.get(), Some((4321, Some(9876))));
+        assert_eq!(forced_call.get(), None);
+    }
 }

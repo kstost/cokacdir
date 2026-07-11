@@ -7,11 +7,12 @@ use ratatui::{
     Frame,
 };
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use unicode_width::UnicodeWidthChar;
 
 use super::{
@@ -82,10 +83,39 @@ pub struct Selection {
     pub end_col: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEditEndpoint {
+    pub user: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl RemoteEditEndpoint {
+    pub(crate) fn from_profile(profile: &crate::services::remote::RemoteProfile) -> Self {
+        Self {
+            user: profile.user.clone(),
+            host: crate::services::remote::canonical_remote_host(&profile.host)
+                .unwrap_or(&profile.host)
+                .to_string(),
+            port: profile.port,
+        }
+    }
+
+    pub(crate) fn matches_profile(&self, profile: &crate::services::remote::RemoteProfile) -> bool {
+        self.user == profile.user
+            && crate::services::remote::remote_hosts_equal(&self.host, &profile.host)
+            && self.port == profile.port
+    }
+}
+
 #[derive(Debug)]
 pub struct RemoteEditOrigin {
     pub panel_index: usize,
     pub remote_path: String,
+    pub endpoint: RemoteEditEndpoint,
+    pub expected_version: crate::services::remote::RemoteFileVersion,
+    pub edit_session_id: u64,
+    pub committed_generation: u64,
 }
 
 impl Selection {
@@ -127,11 +157,65 @@ impl Selection {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone)]
 struct UnixSaveMetadata {
     permissions: fs::Permissions,
     uid: u32,
     gid: u32,
     xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    stable_identity: crate::services::file_ops::StablePathIdentity,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+    #[cfg(windows)]
+    attributes: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileVersion {
+    stamp: FileStamp,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+enum SaveExpectation {
+    Absent,
+    Present(FileVersion),
+}
+
+#[derive(Debug, Clone)]
+struct LoadedSaveState {
+    actual_path: PathBuf,
+    expectation: SaveExpectation,
+    #[cfg(unix)]
+    metadata: Option<UnixSaveMetadata>,
+}
+
+#[derive(Debug)]
+enum PublishError {
+    CleanupSafe(String),
+    RecoveryPreserved(String),
 }
 
 /// 찾기/바꾸기 모드
@@ -153,6 +237,16 @@ pub struct FindReplaceOptions {
 /// Default maximum memory for undo/redo stacks (50MB)
 const DEFAULT_MAX_UNDO_MEMORY: usize = 50 * 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static SAVE_BOUNDARY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static SAVE_CANDIDATE_PUBLISH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static SAVE_ROLLBACK_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// 편집기 상태
 #[derive(Debug)]
 pub struct EditorState {
@@ -170,6 +264,8 @@ pub struct EditorState {
     line_endings: Vec<String>,
     pub(crate) remote_dirty: bool,
     pub(crate) remote_save_generation: u64,
+    pub(crate) pending_close_after_remote_save: Option<u64>,
+    loaded_save_state: Option<LoadedSaveState>,
 
     // Undo/Redo
     pub undo_stack: VecDeque<EditAction>,
@@ -296,6 +392,8 @@ impl EditorState {
             line_endings: vec![String::new()],
             remote_dirty: false,
             remote_save_generation: 0,
+            pending_close_after_remote_save: None,
+            loaded_save_state: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             max_undo_size: 1000,
@@ -671,18 +769,230 @@ impl EditorState {
         Some((content, ending))
     }
 
+    fn file_stamp(file: &fs::File, metadata: &fs::Metadata) -> Result<FileStamp, String> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt;
+
+        #[cfg(windows)]
+        let stable_identity = crate::services::file_ops::stable_file_identity(file)
+            .map_err(|error| format!("Failed to inspect Windows file identity: {}", error))?;
+        #[cfg(not(windows))]
+        let _ = file;
+
+        Ok(FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            modified_seconds: metadata.mtime(),
+            #[cfg(unix)]
+            modified_nanoseconds: metadata.mtime_nsec(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            stable_identity,
+            #[cfg(windows)]
+            creation_time: metadata.creation_time(),
+            #[cfg(windows)]
+            last_write_time: metadata.last_write_time(),
+            #[cfg(windows)]
+            attributes: metadata.file_attributes(),
+        })
+    }
+
+    fn content_hash(content: &[u8]) -> [u8; 32] {
+        let digest = Sha256::digest(content);
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&digest);
+        hash
+    }
+
+    fn open_regular_nofollow(path: &Path) -> Result<fs::File, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = options
+            .open(path)
+            .map_err(|error| format!("Failed to open file safely: {}", error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("Failed to inspect opened file: {}", error))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("Cannot edit a Windows reparse point".to_string());
+            }
+        }
+        if !metadata.is_file() {
+            return Err("Cannot edit a non-regular file".to_string());
+        }
+        Ok(file)
+    }
+
+    fn read_version_from_file(file: &mut fs::File) -> Result<(Vec<u8>, FileVersion), String> {
+        let before = file
+            .metadata()
+            .map_err(|error| format!("Failed to inspect file before reading: {}", error))?;
+        if !before.is_file() {
+            return Err("Cannot edit a non-regular file".to_string());
+        }
+        if before.len() > Self::MAX_EDIT_FILE_SIZE {
+            return Err(format!(
+                "File too large for editing ({:.1} MB). Maximum size is {} MB. Use the viewer instead.",
+                before.len() as f64 / 1024.0 / 1024.0,
+                Self::MAX_EDIT_FILE_SIZE / 1024 / 1024
+            ));
+        }
+
+        let before_stamp = Self::file_stamp(file, &before)?;
+        let mut content = Vec::with_capacity(before.len().min(Self::MAX_EDIT_FILE_SIZE) as usize);
+        Read::by_ref(file)
+            .take(Self::MAX_EDIT_FILE_SIZE + 1)
+            .read_to_end(&mut content)
+            .map_err(|error| format!("Failed to read file: {}", error))?;
+        if content.len() as u64 > Self::MAX_EDIT_FILE_SIZE {
+            return Err(format!(
+                "File grew beyond the {} MB editing limit while it was being read",
+                Self::MAX_EDIT_FILE_SIZE / 1024 / 1024
+            ));
+        }
+
+        let after = file
+            .metadata()
+            .map_err(|error| format!("Failed to inspect file after reading: {}", error))?;
+        let after_stamp = Self::file_stamp(file, &after)?;
+        if before_stamp != after_stamp || after.len() != content.len() as u64 {
+            return Err("File changed while it was being read; please retry".to_string());
+        }
+
+        let version = FileVersion {
+            stamp: after_stamp,
+            sha256: Self::content_hash(&content),
+        };
+        Ok((content, version))
+    }
+
+    fn fingerprint_path(path: &Path) -> Result<FileVersion, String> {
+        let mut file = Self::open_regular_nofollow(path)?;
+        let (_, version) = Self::read_version_from_file(&mut file)?;
+        Ok(version)
+    }
+
+    fn same_version_across_rename(left: &FileVersion, right: &FileVersion) -> bool {
+        if left.sha256 != right.sha256
+            || left.stamp.len != right.stamp.len
+            || left.stamp.modified != right.stamp.modified
+        {
+            return false;
+        }
+
+        #[cfg(unix)]
+        {
+            left.stamp.device == right.stamp.device
+                && left.stamp.inode == right.stamp.inode
+                && left.stamp.modified_seconds == right.stamp.modified_seconds
+                && left.stamp.modified_nanoseconds == right.stamp.modified_nanoseconds
+        }
+        #[cfg(windows)]
+        {
+            left.stamp.stable_identity == right.stamp.stable_identity
+                && left.stamp.creation_time == right.stamp.creation_time
+                && left.stamp.last_write_time == right.stamp.last_write_time
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            left.stamp.created == right.stamp.created
+        }
+    }
+
+    fn same_published_candidate(left: &FileVersion, right: &FileVersion) -> bool {
+        #[cfg(windows)]
+        {
+            // ReplaceFileW deliberately carries the replaced file's creation
+            // time onto the replacement. The replacement's file identity,
+            // content, size, and last-write time still prove that this is the
+            // candidate we injected.
+            left.sha256 == right.sha256
+                && left.stamp.len == right.stamp.len
+                && left.stamp.modified == right.stamp.modified
+                && left.stamp.stable_identity == right.stamp.stable_identity
+                && left.stamp.last_write_time == right.stamp.last_write_time
+        }
+        #[cfg(not(windows))]
+        {
+            Self::same_version_across_rename(left, right)
+        }
+    }
+
+    fn canonical_missing_target(path: &Path) -> Result<PathBuf, String> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        let canonical_parent = fs::canonicalize(parent)
+            .map_err(|error| format!("Failed to resolve destination directory: {}", error))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| "Destination must name a file".to_string())?;
+        Ok(canonical_parent.join(file_name))
+    }
+
+    fn resolve_load_target(path: &Path) -> Result<(PathBuf, bool), String> {
+        match fs::canonicalize(path) {
+            Ok(actual_path) => Ok((actual_path, true)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let actual_path = Self::canonical_missing_target(path)?;
+                match fs::symlink_metadata(&actual_path) {
+                    Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
+                        Ok((actual_path, false))
+                    }
+                    Ok(_) => fs::canonicalize(&actual_path)
+                        .map(|resolved| (resolved, true))
+                        .map_err(|resolve_error| {
+                            format!(
+                                "Failed to resolve file created during load: {}",
+                                resolve_error
+                            )
+                        }),
+                    Err(metadata_error) => Err(format!(
+                        "Failed to inspect destination during load: {}",
+                        metadata_error
+                    )),
+                }
+            }
+            Err(error) => Err(format!("Failed to resolve file: {}", error)),
+        }
+    }
+
     fn create_save_temp_file(actual_path: &Path) -> Result<(PathBuf, fs::File), String> {
         let parent = actual_path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = actual_path
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| "untitled".into());
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
         for attempt in 0..1000u32 {
+            let nonce: u128 = rand::random();
             let temp_path = parent.join(format!(
                 ".{}.{}.{}.{}.tmp",
                 file_name,
@@ -711,12 +1021,12 @@ impl EditorState {
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| "untitled".into());
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
         for attempt in 0..1000u32 {
+            // ThreadRng is a cryptographically secure generator in rand 0.8.
+            // An unguessable name closes the remaining race between the
+            // absence check and ReplaceFileW, whose backup argument may
+            // otherwise replace an existing file.
+            let nonce: u128 = rand::random();
             let path = parent.join(format!(
                 ".{}.{}.{}.{}.{}",
                 file_name,
@@ -725,74 +1035,608 @@ impl EditorState {
                 attempt,
                 suffix
             ));
-            if !path.exists() {
-                return Ok(path);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
+                Ok(_) => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to inspect prospective {} path: {}",
+                        suffix, error
+                    ));
+                }
             }
         }
 
         Err(format!("Failed to create a unique {} path", suffix))
     }
 
-    #[cfg(not(windows))]
-    fn replace_saved_file(temp_path: &Path, actual_path: &Path) -> Result<(), String> {
-        fs::rename(temp_path, actual_path).map_err(|e| format!("Failed to save file: {}", e))
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn atomic_move_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid destination path"))?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn atomic_move_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid destination path"))?;
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     #[cfg(windows)]
-    fn replace_saved_file(temp_path: &Path, actual_path: &Path) -> Result<(), String> {
-        if !actual_path.exists() {
-            return fs::rename(temp_path, actual_path)
-                .map_err(|e| format!("Failed to save file: {}", e));
-        }
+    fn atomic_move_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        crate::services::file_ops::rename_noreplace(source, destination)
+    }
 
-        let backup_path = Self::unique_save_sidecar_path(actual_path, "bak")?;
-        fs::rename(actual_path, &backup_path)
-            .map_err(|e| format!("Failed to prepare existing file for replacement: {}", e))?;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    )))]
+    fn atomic_move_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Atomic no-clobber save is not supported on this platform",
+        ))
+    }
 
-        match fs::rename(temp_path, actual_path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&backup_path);
-                Ok(())
-            }
-            Err(e) => {
-                let save_error = e.to_string();
-                let rollback_result = if actual_path.exists() {
-                    Err("target path already exists after failed replacement".to_string())
-                } else {
-                    fs::rename(&backup_path, actual_path).map_err(|rollback| rollback.to_string())
-                };
-                if let Err(rollback_error) = rollback_result {
-                    return Err(format!(
-                        "Failed to save file: {}. Rollback failed: {}",
-                        save_error, rollback_error
-                    ));
-                }
-                Err(format!("Failed to save file: {}", save_error))
-            }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn atomic_exchange(source: &Path, destination: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid destination path"))?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn atomic_exchange(source: &Path, destination: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid source path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid destination path"))?;
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_SWAP) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    fn replace_file_with_backup(
+        replaced: &Path,
+        replacement: &Path,
+        backup: &Path,
+    ) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+
+        // ReplaceFileW may overwrite its backup argument. Recheck immediately
+        // before the API boundary, including dangling links/reparse points.
+        match fs::symlink_metadata(backup) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the recovery sidecar path already exists",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn ReplaceFileW(
+                replaced: *const u16,
+                replacement: *const u16,
+                backup: *const u16,
+                flags: u32,
+                exclude: *mut std::ffi::c_void,
+                reserved: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+
+        let replaced: Vec<u16> = replaced.as_os_str().encode_wide().chain(Some(0)).collect();
+        let replacement: Vec<u16> = replacement
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let backup: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            ReplaceFileW(
+                replaced.as_ptr(),
+                replacement.as_ptr(),
+                backup.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remove_if_version(path: &Path, expected: &FileVersion) {
+        if Self::fingerprint_path(path).as_ref() == Ok(expected) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[cfg(test)]
+    fn run_save_boundary_test_hook() {
+        SAVE_BOUNDARY_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    fn run_save_boundary_test_hook() {}
+
+    #[cfg(test)]
+    fn run_save_candidate_publish_test_hook() {
+        SAVE_CANDIDATE_PUBLISH_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    fn run_save_candidate_publish_test_hook() {}
+
+    #[cfg(test)]
+    fn run_save_rollback_test_hook() {
+        SAVE_ROLLBACK_TEST_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
+    #[cfg(not(test))]
+    fn run_save_rollback_test_hook() {}
+
+    fn verify_candidate_before_publish(
+        temp_path: &Path,
+        new_version: &FileVersion,
+    ) -> Result<(), PublishError> {
+        match Self::fingerprint_path(temp_path) {
+            Ok(current) if Self::same_published_candidate(&current, new_version) => Ok(()),
+            Ok(_) => Err(PublishError::RecoveryPreserved(format!(
+                "The save candidate changed before it could be published. The destination was not modified; inspect '{}'.",
+                temp_path.display()
+            ))),
+            Err(error) => Err(PublishError::RecoveryPreserved(format!(
+                "The save candidate could not be verified before publication ({}). The destination was not modified; inspect '{}'.",
+                error,
+                temp_path.display()
+            ))),
+        }
+    }
+
+    fn publish_absent(
+        temp_path: &Path,
+        actual_path: &Path,
+        new_version: &FileVersion,
+    ) -> Result<(), PublishError> {
+        Self::verify_candidate_before_publish(temp_path, new_version)?;
+        Self::run_save_candidate_publish_test_hook();
+        if let Err(error) = Self::atomic_move_noreplace(temp_path, actual_path) {
+            let candidate_unchanged = Self::fingerprint_path(temp_path)
+                .as_ref()
+                .is_ok_and(|version| Self::same_published_candidate(version, new_version));
+            return Err(if candidate_unchanged {
+                PublishError::CleanupSafe(format!(
+                    "Destination was created before save; refusing to overwrite '{}': {}",
+                    actual_path.display(),
+                    error
+                ))
+            } else {
+                PublishError::RecoveryPreserved(format!(
+                    "The save candidate changed at the publication boundary ({}). The destination was not overwritten; inspect '{}'.",
+                    error,
+                    temp_path.display()
+                ))
+            });
+        }
+
+        match Self::fingerprint_path(actual_path) {
+            Ok(current) if Self::same_published_candidate(&current, new_version) => Ok(()),
+            Ok(_) => Err(PublishError::RecoveryPreserved(format!(
+                "The save candidate changed at the publication boundary. An unexpected object is preserved at '{}'.",
+                actual_path.display()
+            ))),
+            Err(error) => Err(PublishError::RecoveryPreserved(format!(
+                "The newly published save candidate could not be verified ({}). Inspect '{}'.",
+                error,
+                actual_path.display()
+            ))),
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn publish_existing(
+        temp_path: &Path,
+        actual_path: &Path,
+        expected: &FileVersion,
+        new_version: &FileVersion,
+    ) -> Result<(), PublishError> {
+        match Self::fingerprint_path(actual_path) {
+            Ok(current) if &current == expected => {}
+            Ok(_) => {
+                return Err(PublishError::CleanupSafe(format!(
+                    "The file changed after it was loaded; refusing to overwrite '{}'",
+                    actual_path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(PublishError::CleanupSafe(format!(
+                    "The loaded file can no longer be verified at '{}': {}",
+                    actual_path.display(),
+                    error
+                )));
+            }
+        }
+        Self::run_save_boundary_test_hook();
+
+        Self::verify_candidate_before_publish(temp_path, new_version)?;
+        Self::run_save_candidate_publish_test_hook();
+        if let Err(error) = Self::atomic_exchange(temp_path, actual_path) {
+            let candidate_unchanged = Self::fingerprint_path(temp_path)
+                .as_ref()
+                .is_ok_and(|version| Self::same_published_candidate(version, new_version));
+            return Err(if candidate_unchanged {
+                PublishError::CleanupSafe(format!(
+                    "Failed to atomically exchange '{}' at the save boundary: {}",
+                    actual_path.display(),
+                    error
+                ))
+            } else {
+                PublishError::RecoveryPreserved(format!(
+                    "The save candidate changed at the atomic exchange boundary ({}). No recovery path was deleted; inspect '{}' and '{}'.",
+                    error,
+                    actual_path.display(),
+                    temp_path.display()
+                ))
+            });
+        }
+
+        let displaced = match Self::fingerprint_path(temp_path) {
+            Ok(version) => version,
+            Err(error) => {
+                return Err(PublishError::RecoveryPreserved(format!(
+                    "The displaced file at '{}' could not be verified during save ({}). The published object remains at '{}' and the displaced object is preserved at '{}'.",
+                    actual_path.display(),
+                    error,
+                    actual_path.display(),
+                    temp_path.display()
+                )));
+            }
+        };
+        let published = match Self::fingerprint_path(actual_path) {
+            Ok(version) => version,
+            Err(error) => {
+                return Err(PublishError::RecoveryPreserved(format!(
+                    "The object published at '{}' could not be verified ({}). The displaced object is preserved at '{}'.",
+                    actual_path.display(),
+                    error,
+                    temp_path.display()
+                )));
+            }
+        };
+        let displaced_is_expected = Self::same_version_across_rename(&displaced, expected);
+        let published_is_candidate = Self::same_published_candidate(&published, new_version);
+
+        if displaced_is_expected && published_is_candidate {
+            Self::remove_if_version(temp_path, &displaced);
+            return Ok(());
+        }
+
+        Self::run_save_rollback_test_hook();
+
+        let current_candidate = Self::fingerprint_path(actual_path);
+        let current_external = Self::fingerprint_path(temp_path);
+        if current_candidate.as_ref() != Ok(&published)
+            || current_external.as_ref() != Ok(&displaced)
+        {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed concurrently during conflict recovery. No further paths were overwritten; inspect '{}' and '{}'.",
+                actual_path.display(),
+                temp_path.display()
+            )));
+        }
+
+        if let Err(error) = Self::atomic_exchange(actual_path, temp_path) {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed after it was loaded and rollback failed ({}). Both versions are preserved at '{}' and '{}'.",
+                error,
+                actual_path.display(),
+                temp_path.display()
+            )));
+        }
+
+        let restored_external = Self::fingerprint_path(actual_path);
+        let recovered_candidate = Self::fingerprint_path(temp_path);
+        if !restored_external
+            .as_ref()
+            .is_ok_and(|version| Self::same_version_across_rename(version, &displaced))
+            || !recovered_candidate
+                .as_ref()
+                .is_ok_and(|version| Self::same_version_across_rename(version, &published))
+        {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed during rollback. No recovery file was deleted; inspect '{}' and '{}'.",
+                actual_path.display(),
+                temp_path.display()
+            )));
+        }
+
+        let message = if displaced_is_expected && !published_is_candidate {
+            format!(
+                "The save candidate changed at the publication boundary. The original file was restored at '{}' and the unexpected object is preserved at '{}'.",
+                actual_path.display(),
+                temp_path.display()
+            )
+        } else {
+            format!(
+                "The file changed after it was loaded. The external version was restored at '{}' and the unpublished object is preserved at '{}'.",
+                actual_path.display(),
+                temp_path.display()
+            )
+        };
+        Err(PublishError::RecoveryPreserved(message))
+    }
+
+    #[cfg(windows)]
+    fn publish_existing(
+        temp_path: &Path,
+        actual_path: &Path,
+        expected: &FileVersion,
+        new_version: &FileVersion,
+    ) -> Result<(), PublishError> {
+        match Self::fingerprint_path(actual_path) {
+            Ok(current) if &current == expected => {}
+            Ok(_) => {
+                return Err(PublishError::CleanupSafe(format!(
+                    "The file changed after it was loaded; refusing to overwrite '{}'",
+                    actual_path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(PublishError::CleanupSafe(format!(
+                    "The loaded file can no longer be verified at '{}': {}",
+                    actual_path.display(),
+                    error
+                )));
+            }
+        }
+        Self::run_save_boundary_test_hook();
+
+        let backup_path = Self::unique_save_sidecar_path(actual_path, "save-backup")
+            .map_err(PublishError::CleanupSafe)?;
+        Self::verify_candidate_before_publish(temp_path, new_version)?;
+        Self::run_save_candidate_publish_test_hook();
+        if let Err(error) = Self::replace_file_with_backup(actual_path, temp_path, &backup_path) {
+            let actual_unchanged = Self::fingerprint_path(actual_path).as_ref() == Ok(expected);
+            let candidate_unchanged = Self::fingerprint_path(temp_path)
+                .as_ref()
+                .is_ok_and(|version| Self::same_published_candidate(version, new_version));
+            let backup_absent = fs::symlink_metadata(&backup_path)
+                .is_err_and(|state_error| state_error.kind() == io::ErrorKind::NotFound);
+
+            if actual_unchanged && candidate_unchanged && backup_absent {
+                return Err(PublishError::CleanupSafe(format!(
+                    "Failed to atomically replace '{}' with a backup: {}",
+                    actual_path.display(),
+                    error
+                )));
+            }
+            return Err(PublishError::RecoveryPreserved(format!(
+                "ReplaceFileW reported an error after it may have moved a file ({}). No recovery path was deleted; inspect '{}', '{}', and '{}'.",
+                error,
+                actual_path.display(),
+                temp_path.display(),
+                backup_path.display()
+            )));
+        }
+
+        let displaced = match Self::fingerprint_path(&backup_path) {
+            Ok(version) => version,
+            Err(error) => {
+                return Err(PublishError::RecoveryPreserved(format!(
+                    "The displaced object could not be verified ({}). The published object remains at '{}' and the displaced object is preserved at '{}'.",
+                    error,
+                    actual_path.display(),
+                    backup_path.display()
+                )));
+            }
+        };
+        let published = match Self::fingerprint_path(actual_path) {
+            Ok(version) => version,
+            Err(error) => {
+                return Err(PublishError::RecoveryPreserved(format!(
+                    "The object published at '{}' could not be verified ({}). The displaced object is preserved at '{}'.",
+                    actual_path.display(),
+                    error,
+                    backup_path.display()
+                )));
+            }
+        };
+        let displaced_is_expected = Self::same_version_across_rename(&displaced, expected);
+        let published_is_candidate = Self::same_published_candidate(&published, new_version);
+
+        if displaced_is_expected && published_is_candidate {
+            Self::remove_if_version(&backup_path, &displaced);
+            return Ok(());
+        }
+
+        Self::run_save_rollback_test_hook();
+
+        if Self::fingerprint_path(actual_path).as_ref() != Ok(&published)
+            || Self::fingerprint_path(&backup_path).as_ref() != Ok(&displaced)
+        {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed concurrently during conflict recovery. Inspect '{}' and '{}'.",
+                actual_path.display(),
+                backup_path.display()
+            )));
+        }
+
+        let recovery_path = Self::unique_save_sidecar_path(actual_path, "edited-recovery")
+            .map_err(PublishError::RecoveryPreserved)?;
+        if let Err(error) =
+            Self::replace_file_with_backup(actual_path, &backup_path, &recovery_path)
+        {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed after it was loaded and rollback failed ({}). No recovery path was deleted; inspect '{}', '{}', and '{}'.",
+                error,
+                actual_path.display(),
+                backup_path.display(),
+                recovery_path.display()
+            )));
+        }
+
+        if !Self::fingerprint_path(actual_path)
+            .as_ref()
+            .is_ok_and(|version| Self::same_version_across_rename(version, &displaced))
+            || !Self::fingerprint_path(&recovery_path)
+                .as_ref()
+                .is_ok_and(|version| Self::same_published_candidate(version, &published))
+        {
+            return Err(PublishError::RecoveryPreserved(format!(
+                "The file changed during rollback. No recovery file was deleted; inspect '{}' and '{}'.",
+                actual_path.display(),
+                recovery_path.display()
+            )));
+        }
+
+        let message = if displaced_is_expected && !published_is_candidate {
+            format!(
+                "The save candidate changed at the publication boundary. The original file was restored at '{}' and the unexpected object is preserved at '{}'.",
+                actual_path.display(),
+                recovery_path.display()
+            )
+        } else {
+            format!(
+                "The file changed after it was loaded. The external version was restored at '{}' and the unpublished object is preserved at '{}'.",
+                actual_path.display(),
+                recovery_path.display()
+            )
+        };
+        Err(PublishError::RecoveryPreserved(message))
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    )))]
+    fn publish_existing(
+        _temp_path: &Path,
+        actual_path: &Path,
+        _expected: &FileVersion,
+        _new_version: &FileVersion,
+    ) -> Result<(), PublishError> {
+        Err(PublishError::CleanupSafe(format!(
+            "Safe stale-version checked replacement is not supported for '{}' on this platform",
+            actual_path.display()
+        )))
+    }
+
     #[cfg(unix)]
-    fn capture_unix_save_metadata(path: &Path) -> Option<UnixSaveMetadata> {
+    fn capture_unix_save_metadata(file: &fs::File) -> Option<UnixSaveMetadata> {
         use std::os::unix::fs::MetadataExt;
 
-        let metadata = fs::metadata(path).ok()?;
+        let metadata = file.metadata().ok()?;
         Some(UnixSaveMetadata {
             permissions: metadata.permissions(),
             uid: metadata.uid(),
             gid: metadata.gid(),
-            xattrs: Self::read_linux_xattrs(path),
+            xattrs: Self::read_linux_xattrs(file),
         })
     }
 
     #[cfg(unix)]
     fn apply_unix_save_metadata(
-        temp_path: &Path,
+        _temp_path: &Path,
         temp_file: &fs::File,
         metadata: &UnixSaveMetadata,
     ) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::io::AsRawFd;
+
+        // Replacing contents must not re-enable privilege-bearing mode bits
+        // that an in-place write would clear.
+        let mut safe_permissions = metadata.permissions.clone();
+        safe_permissions.set_mode(safe_permissions.mode() & !0o6000);
 
         let result = unsafe {
             libc::fchown(
@@ -805,9 +1649,9 @@ impl EditorState {
             if let Ok(temp_metadata) = temp_file.metadata() {
                 if temp_metadata.uid() == metadata.uid && temp_metadata.gid() == metadata.gid {
                     temp_file
-                        .set_permissions(metadata.permissions.clone())
+                        .set_permissions(safe_permissions.clone())
                         .map_err(|e| format!("Failed to preserve file permissions: {}", e))?;
-                    Self::write_linux_xattrs(temp_path, &metadata.xattrs)?;
+                    Self::write_linux_xattrs(temp_file, &metadata.xattrs)?;
                     return Ok(());
                 }
             }
@@ -817,36 +1661,27 @@ impl EditorState {
         }
 
         temp_file
-            .set_permissions(metadata.permissions.clone())
+            .set_permissions(safe_permissions)
             .map_err(|e| format!("Failed to preserve file permissions: {}", e))?;
 
-        Self::write_linux_xattrs(temp_path, &metadata.xattrs)?;
+        Self::write_linux_xattrs(temp_file, &metadata.xattrs)?;
         Ok(())
     }
 
     #[cfg(all(unix, target_os = "linux"))]
-    fn read_linux_xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn read_linux_xattrs(file: &fs::File) -> Vec<(Vec<u8>, Vec<u8>)> {
         use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
 
-        let c_path = match CString::new(path.as_os_str().as_bytes()) {
-            Ok(path) => path,
-            Err(_) => return Vec::new(),
-        };
-
-        let size = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+        let fd = file.as_raw_fd();
+        let size = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
         if size <= 0 {
             return Vec::new();
         }
 
         let mut names = vec![0u8; size as usize];
-        let size = unsafe {
-            libc::listxattr(
-                c_path.as_ptr(),
-                names.as_mut_ptr() as *mut libc::c_char,
-                names.len(),
-            )
-        };
+        let size =
+            unsafe { libc::flistxattr(fd, names.as_mut_ptr() as *mut libc::c_char, names.len()) };
         if size <= 0 {
             return Vec::new();
         }
@@ -857,22 +1692,24 @@ impl EditorState {
             .split(|byte| *byte == 0)
             .filter(|name| !name.is_empty())
         {
+            if !Self::should_preserve_linux_xattr(name) {
+                continue;
+            }
             let c_name = match CString::new(name) {
                 Ok(name) => name,
                 Err(_) => continue,
             };
 
-            let value_size = unsafe {
-                libc::getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0)
-            };
+            let value_size =
+                unsafe { libc::fgetxattr(fd, c_name.as_ptr(), std::ptr::null_mut(), 0) };
             if value_size < 0 {
                 continue;
             }
 
             let mut value = vec![0u8; value_size as usize];
             let read = unsafe {
-                libc::getxattr(
-                    c_path.as_ptr(),
+                libc::fgetxattr(
+                    fd,
                     c_name.as_ptr(),
                     value.as_mut_ptr() as *mut libc::c_void,
                     value.len(),
@@ -889,19 +1726,15 @@ impl EditorState {
     }
 
     #[cfg(not(all(unix, target_os = "linux")))]
-    fn read_linux_xattrs(_path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn read_linux_xattrs(_file: &fs::File) -> Vec<(Vec<u8>, Vec<u8>)> {
         Vec::new()
     }
 
     #[cfg(all(unix, target_os = "linux"))]
-    fn write_linux_xattrs(path: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+    fn write_linux_xattrs(file: &fs::File, xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
         use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let c_path = match CString::new(path.as_os_str().as_bytes()) {
-            Ok(path) => path,
-            Err(_) => return Ok(()),
-        };
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
 
         for (name, value) in xattrs {
             let c_name = match CString::new(name.as_slice()) {
@@ -910,8 +1743,8 @@ impl EditorState {
             };
 
             let result = unsafe {
-                libc::setxattr(
-                    c_path.as_ptr(),
+                libc::fsetxattr(
+                    fd,
                     c_name.as_ptr(),
                     value.as_ptr() as *const libc::c_void,
                     value.len(),
@@ -931,33 +1764,59 @@ impl EditorState {
     }
 
     #[cfg(not(all(unix, target_os = "linux")))]
-    fn write_linux_xattrs(_path: &Path, _xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
+    fn write_linux_xattrs(_file: &fs::File, _xattrs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
         Ok(())
     }
 
     #[cfg(all(unix, target_os = "linux"))]
     fn xattr_restore_failure_is_blocking(name: &[u8]) -> bool {
-        name.starts_with(b"user.")
-            || name.starts_with(b"system.posix_acl_")
-            || name == b"security.capability"
+        Self::should_preserve_linux_xattr(name)
+    }
+
+    fn should_preserve_linux_xattr(name: &[u8]) -> bool {
+        // User metadata and POSIX ACLs describe ordinary file semantics.
+        // security.capability, IMA/EVM signatures, and other security/trusted
+        // namespaces must not be transplanted onto newly edited contents.
+        name.starts_with(b"user.") || name.starts_with(b"system.posix_acl_")
     }
 
     /// 파일 로드
     pub fn load_file(&mut self, path: &PathBuf) -> Result<(), String> {
-        // Check file size before loading to prevent memory exhaustion
-        if path.exists() {
-            let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
-            if metadata.is_dir() {
-                return Err("Cannot edit a directory".to_string());
+        let (actual_path, exists) = Self::resolve_load_target(path)?;
+        let (content, loaded_save_state) = if exists {
+            let mut file = Self::open_regular_nofollow(&actual_path)?;
+            let (bytes, version) = Self::read_version_from_file(&mut file)?;
+            let content = String::from_utf8(bytes)
+                .map_err(|error| format!("Failed to read file: {}", error))?;
+
+            // Ensure the pathname still names the exact version read through the
+            // no-follow handle. A later change is allowed, but will conflict at save.
+            if Self::fingerprint_path(&actual_path).as_ref() != Ok(&version) {
+                return Err("File changed while it was being loaded; please retry".to_string());
             }
-            if metadata.len() > Self::MAX_EDIT_FILE_SIZE {
-                return Err(format!(
-                    "File too large for editing ({:.1} MB). Maximum size is {} MB. Use the viewer instead.",
-                    metadata.len() as f64 / 1024.0 / 1024.0,
-                    Self::MAX_EDIT_FILE_SIZE / 1024 / 1024
-                ));
-            }
-        }
+
+            #[cfg(unix)]
+            let metadata = Self::capture_unix_save_metadata(&file);
+            (
+                Some(content),
+                LoadedSaveState {
+                    actual_path,
+                    expectation: SaveExpectation::Present(version),
+                    #[cfg(unix)]
+                    metadata,
+                },
+            )
+        } else {
+            (
+                None,
+                LoadedSaveState {
+                    actual_path,
+                    expectation: SaveExpectation::Absent,
+                    #[cfg(unix)]
+                    metadata: None,
+                },
+            )
+        };
 
         self.file_path = path.clone();
         self.cursor_line = 0;
@@ -978,11 +1837,11 @@ impl EditorState {
         self.line_endings = vec![String::new()];
         self.remote_dirty = false;
         self.remote_save_generation = 0;
+        self.pending_close_after_remote_save = None;
+        self.loaded_save_state = Some(loaded_save_state);
 
         // 파일 읽기
-        if path.exists() {
-            let content =
-                fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+        if let Some(content) = content {
             let (lines, line_endings, line_ending, trailing_newline) =
                 Self::split_content_preserving_format(&content);
             self.lines = lines;
@@ -1009,22 +1868,15 @@ impl EditorState {
 
     /// 파일 저장
     /// Security: Preserves original file permissions and uses atomic write
-    pub fn save_file(&mut self) -> Result<(), String> {
-        // Resolve symlink to actual file path to avoid replacing symlink with regular file
-        let is_symlink = fs::symlink_metadata(&self.file_path)
-            .map(|m| m.is_symlink())
-            .unwrap_or(false);
-
-        let actual_path = if is_symlink {
-            fs::canonicalize(&self.file_path)
-                .map_err(|e| format!("Failed to resolve symlink: {}", e))?
-        } else {
-            self.file_path.clone()
-        };
-
-        // Save original metadata before writing
-        #[cfg(unix)]
-        let original_metadata = Self::capture_unix_save_metadata(&actual_path);
+    /// Save the buffer. `Ok(Some(..))` means the new bytes were atomically
+    /// published and verified, but crash-durability of the parent directory
+    /// could not be confirmed.
+    pub fn save_file(&mut self) -> Result<Option<String>, String> {
+        let loaded_state = self.loaded_save_state.clone().ok_or_else(|| {
+            "Cannot safely save a buffer that was not loaded from its destination; reload it first"
+                .to_string()
+        })?;
+        let actual_path = loaded_state.actual_path.clone();
 
         let content = self.serialize_content();
 
@@ -1039,7 +1891,7 @@ impl EditorState {
 
         // Restore original metadata on temp file before rename
         #[cfg(unix)]
-        if let Some(metadata) = &original_metadata {
+        if let Some(metadata) = &loaded_state.metadata {
             if let Err(e) = Self::apply_unix_save_metadata(&temp_path, &temp_file, metadata) {
                 let _ = fs::remove_file(&temp_path);
                 return Err(e);
@@ -1050,27 +1902,89 @@ impl EditorState {
             let _ = fs::remove_file(&temp_path);
             return Err(format!("Failed to sync temporary file: {}", e));
         }
+        let temp_metadata = match temp_file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                drop(temp_file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(format!("Failed to inspect save candidate: {}", error));
+            }
+        };
+        let temp_stamp = match Self::file_stamp(&temp_file, &temp_metadata) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                drop(temp_file);
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+        let new_version = FileVersion {
+            stamp: temp_stamp,
+            sha256: Self::content_hash(content.as_bytes()),
+        };
         drop(temp_file);
 
-        Self::replace_saved_file(&temp_path, &actual_path).map_err(|e| {
-            // Clean up temp file on failure
-            let _ = fs::remove_file(&temp_path);
-            e
+        let publish_result = match &loaded_state.expectation {
+            SaveExpectation::Absent => Self::publish_absent(&temp_path, &actual_path, &new_version),
+            SaveExpectation::Present(expected) => {
+                Self::publish_existing(&temp_path, &actual_path, expected, &new_version)
+            }
+        };
+        if let Err(error) = publish_result {
+            return match error {
+                PublishError::CleanupSafe(message) => {
+                    let _ = fs::remove_file(&temp_path);
+                    Err(message)
+                }
+                PublishError::RecoveryPreserved(message) => Err(message),
+            };
+        }
+
+        let final_version = Self::fingerprint_path(&actual_path).map_err(|error| {
+            format!(
+                "The save was published, but the destination could not be verified afterward: {}",
+                error
+            )
         })?;
+        if !Self::same_published_candidate(&final_version, &new_version) {
+            return Err(
+                "The destination changed immediately after save; the buffer remains marked modified"
+                    .to_string(),
+            );
+        }
 
         #[cfg(unix)]
-        if let Some(parent) = actual_path.parent() {
-            if let Ok(dir) = fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+        let final_metadata = Self::open_regular_nofollow(&actual_path)
+            .ok()
+            .and_then(|file| Self::capture_unix_save_metadata(&file));
+
+        #[cfg(unix)]
+        let durability_warning = actual_path.parent().and_then(|parent| {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .err()
+                .map(|error| {
+                    format!(
+                        "the file was saved, but the parent directory update could not be synced: {}",
+                        error
+                    )
+                })
+        });
+        #[cfg(not(unix))]
+        let durability_warning = None;
 
         self.modified = false;
         self.remote_dirty = false;
         self.ensure_line_endings();
         self.original_lines = self.lines.clone();
         self.original_line_endings = self.line_endings.clone();
-        Ok(())
+        self.loaded_save_state = Some(LoadedSaveState {
+            actual_path,
+            expectation: SaveExpectation::Present(final_version),
+            #[cfg(unix)]
+            metadata: final_metadata,
+        });
+        Ok(durability_warning)
     }
 
     /// 현재 상태와 원본을 비교하여 modified 플래그 업데이트
@@ -1078,6 +1992,13 @@ impl EditorState {
         self.modified = self.remote_dirty
             || self.lines != self.original_lines
             || self.line_endings != self.original_line_endings;
+    }
+
+    pub(crate) fn loaded_content_sha256(&self) -> Option<[u8; 32]> {
+        match self.loaded_save_state.as_ref()?.expectation {
+            SaveExpectation::Present(ref version) => Some(version.sha256),
+            SaveExpectation::Absent => None,
+        }
     }
 
     fn clamp_cursor(&mut self) {
@@ -1104,22 +2025,50 @@ impl EditorState {
         &mut self,
         panel_index: usize,
         remote_path: &str,
+        edit_session_id: u64,
         generation: u64,
-        failed: bool,
+        committed_version: Option<crate::services::remote::RemoteFileVersion>,
     ) -> bool {
-        let is_current = generation == self.remote_save_generation
-            && self
-                .remote_origin
-                .as_ref()
-                .map(|origin| {
-                    origin.panel_index == panel_index && origin.remote_path == remote_path
-                })
-                .unwrap_or(false);
+        let same_origin = self
+            .remote_origin
+            .as_ref()
+            .map(|origin| {
+                origin.panel_index == panel_index
+                    && origin.remote_path == remote_path
+                    && origin.edit_session_id == edit_session_id
+            })
+            .unwrap_or(false);
+        let is_current = same_origin && generation == self.remote_save_generation;
+        let mut committed_version_applied = false;
+        if same_origin {
+            if let (Some(version), Some(origin)) = (committed_version, self.remote_origin.as_mut())
+            {
+                let delta = generation.wrapping_sub(origin.committed_generation);
+                if generation == origin.committed_generation || delta < (1u64 << 63) {
+                    origin.expected_version = version;
+                    origin.committed_generation = generation;
+                    committed_version_applied = true;
+                }
+            }
+        }
         if is_current {
-            self.remote_dirty = failed;
+            self.remote_dirty = !committed_version_applied;
         }
         self.update_modified();
         is_current
+    }
+
+    pub(crate) fn resolve_pending_remote_close(&mut self, generation: u64) -> bool {
+        if self.pending_close_after_remote_save != Some(generation) {
+            return false;
+        }
+        self.pending_close_after_remote_save = None;
+        if self.modified {
+            self.exit_confirm_open = true;
+            false
+        } else {
+            true
+        }
     }
 
     pub fn has_selection_range(&self) -> bool {
@@ -4863,7 +5812,7 @@ pub fn handle_paste(app: &mut App, text: &str) {
     state.insert_str(&normalized);
 }
 
-fn close_file_editor(app: &mut App, reload_viewer: bool) {
+pub(crate) fn close_file_editor(app: &mut App, reload_viewer: bool) {
     let scroll = app
         .editor_state
         .as_ref()
@@ -4893,21 +5842,37 @@ fn save_current_editor(app: &mut App) -> bool {
         };
 
         let is_settings = App::is_settings_file(&state.file_path);
-        let remote_info = state
-            .remote_origin
-            .as_ref()
-            .map(|origin| (origin.panel_index, origin.remote_path.clone()));
+        let remote_info = state.remote_origin.as_ref().map(|origin| {
+            (
+                origin.panel_index,
+                origin.remote_path.clone(),
+                origin.endpoint.clone(),
+                origin.expected_version.clone(),
+                origin.edit_session_id,
+            )
+        });
         let is_remote_save = remote_info.is_some();
-        let local_path = state.file_path.display().to_string();
+        let local_path = state.file_path.clone();
 
         match state.save_file() {
-            Ok(_) => {
+            Ok(durability_warning) => {
                 state.exit_confirm_open = false;
                 let remote_save_generation = if is_remote_save {
-                    state.set_message("Saved locally, uploading...", 30);
-                    Some(state.begin_remote_save())
+                    if let Some(warning) = durability_warning.as_deref() {
+                        state.set_message(
+                            format!("Saved locally, uploading; warning: {warning}"),
+                            50,
+                        );
+                    } else {
+                        state.set_message("Saved locally, uploading...", 30);
+                    }
+                    let generation = state.begin_remote_save();
+                    state.pending_close_after_remote_save = Some(generation);
+                    Some(generation)
                 } else {
-                    if is_settings {
+                    if let Some(warning) = durability_warning.as_deref() {
+                        state.set_message(format!("Saved with durability warning: {warning}"), 50);
+                    } else if is_settings {
                         state.set_message("Settings saved and applied!", 30);
                     } else {
                         state.set_message("File saved!", 30);
@@ -4922,8 +5887,10 @@ fn save_current_editor(app: &mut App) -> bool {
             }
         }
     };
+    let remote_save_requested = remote_save_generation.is_some();
 
-    if let Some((panel_idx, remote_path)) = remote_info {
+    if let Some((panel_idx, remote_path, endpoint, expected_version, edit_session_id)) = remote_info
+    {
         if app.remote_spinner.is_some() {
             if let Some(ref mut editor) = app.editor_state {
                 editor.set_message("Saved locally, remote upload queued".to_string(), 50);
@@ -4940,12 +5907,35 @@ fn save_current_editor(app: &mut App) -> bool {
                     )
                 })
                 .unwrap_or(false);
+            let endpoint_matches = app
+                .panels
+                .get(panel_idx)
+                .and_then(|panel| panel.remote_ctx.as_ref())
+                .map(|ctx| endpoint.matches_profile(&ctx.profile))
+                .unwrap_or(false);
 
-            if is_connected {
+            if is_connected && endpoint_matches {
+                let local_snapshot =
+                    match crate::services::remote::LocalUploadSnapshot::open(&local_path) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            if let Some(ref mut editor) = app.editor_state {
+                                editor.pending_close_after_remote_save = None;
+                                editor.exit_confirm_open = true;
+                                editor.set_message(
+                                    format!("Saved locally, upload snapshot failed: {error}"),
+                                    50,
+                                );
+                            }
+                            return false;
+                        }
+                    };
                 let ctx = match app.panels[panel_idx].remote_ctx.take() {
                     Some(ctx) => ctx,
                     None => {
                         if let Some(ref mut editor) = app.editor_state {
+                            editor.pending_close_after_remote_save = None;
+                            editor.exit_confirm_open = true;
                             editor.set_message(
                                 "Saved locally, remote connection was disconnected".to_string(),
                                 50,
@@ -4955,22 +5945,23 @@ fn save_current_editor(app: &mut App) -> bool {
                             app.reload_settings();
                         }
                         app.refresh_panels();
-                        return true;
+                        return false;
                     }
                 };
                 let (tx, rx) = std::sync::mpsc::channel();
 
                 std::thread::spawn(move || {
-                    let msg = match ctx.session.upload_file(&local_path, &remote_path) {
-                        Ok(_) => Ok("Saved & uploaded to remote!".to_string()),
-                        Err(e) => Err(format!("Saved locally, upload failed: {}", e)),
-                    };
+                    let status = crate::ui::app::remote_upload_save_status(
+                        ctx.session
+                            .upload_file(local_snapshot, &remote_path, &expected_version),
+                    );
                     let _ = tx.send(crate::ui::app::RemoteSpinnerResult::PanelOp {
                         ctx,
                         panel_idx,
                         outcome: crate::ui::app::PanelOpOutcome::RemoteSave {
-                            message: msg,
+                            status,
                             remote_path,
+                            edit_session_id,
                             generation: remote_save_generation.unwrap_or(0),
                             reload: true,
                         },
@@ -4983,7 +5974,10 @@ fn save_current_editor(app: &mut App) -> bool {
                     receiver: rx,
                 });
             } else {
-                let msg = if app
+                let msg = if is_connected && !endpoint_matches {
+                    "Saved locally, but the panel is connected to a different remote endpoint"
+                        .to_string()
+                } else if app
                     .panels
                     .get(panel_idx)
                     .and_then(|panel| panel.remote_ctx.as_ref())
@@ -4994,6 +5988,8 @@ fn save_current_editor(app: &mut App) -> bool {
                     "Saved locally, remote connection was disconnected".to_string()
                 };
                 if let Some(ref mut editor) = app.editor_state {
+                    editor.pending_close_after_remote_save = None;
+                    editor.exit_confirm_open = true;
                     editor.set_message(msg, 50);
                 }
             }
@@ -5004,7 +6000,7 @@ fn save_current_editor(app: &mut App) -> bool {
         app.reload_settings();
     }
     app.refresh_panels();
-    true
+    !remote_save_requested
 }
 
 fn cancel_exit_confirm(state: &mut EditorState) {
@@ -5281,18 +6277,40 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             EditorAction::Save => {
                 let save_result = state.save_file();
                 let is_settings = App::is_settings_file(&state.file_path);
-                let remote_info = state
-                    .remote_origin
-                    .as_ref()
-                    .map(|o| (o.panel_index, o.remote_path.clone()));
+                let remote_info = state.remote_origin.as_ref().map(|origin| {
+                    (
+                        origin.panel_index,
+                        origin.remote_path.clone(),
+                        origin.endpoint.clone(),
+                        origin.expected_version.clone(),
+                        origin.edit_session_id,
+                    )
+                });
                 let is_remote_save = remote_info.is_some();
-                let local_path = state.file_path.display().to_string();
+                let local_path = state.file_path.clone();
                 let mut remote_save_generation = None;
                 match save_result {
-                    Ok(_) => {
+                    Ok(durability_warning) => {
                         if is_remote_save {
-                            remote_save_generation = Some(state.begin_remote_save());
-                            state.set_message("Saved locally, uploading...", 30);
+                            let close_after_save = state.pending_close_after_remote_save.is_some();
+                            let generation = state.begin_remote_save();
+                            if close_after_save {
+                                state.pending_close_after_remote_save = Some(generation);
+                            }
+                            remote_save_generation = Some(generation);
+                            if let Some(warning) = durability_warning.as_deref() {
+                                state.set_message(
+                                    format!("Saved locally, uploading; warning: {warning}"),
+                                    50,
+                                );
+                            } else {
+                                state.set_message("Saved locally, uploading...", 30);
+                            }
+                        } else if let Some(warning) = durability_warning.as_deref() {
+                            state.set_message(
+                                format!("Saved with durability warning: {warning}"),
+                                50,
+                            );
                         } else if is_settings {
                             state.set_message("Settings saved and applied!", 30);
                         } else {
@@ -5305,7 +6323,9 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                     }
                 }
                 // state borrow ends here due to NLL — now access app freely
-                if let Some((panel_idx, remote_path)) = remote_info {
+                if let Some((panel_idx, remote_path, endpoint, expected_version, edit_session_id)) =
+                    remote_info
+                {
                     if app.remote_spinner.is_some() {
                         // Spinner already active — skip upload
                         if let Some(ref mut editor) = app.editor_state {
@@ -5324,8 +6344,31 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                                 )
                             })
                             .unwrap_or(false);
+                        let endpoint_matches = app
+                            .panels
+                            .get(panel_idx)
+                            .and_then(|panel| panel.remote_ctx.as_ref())
+                            .map(|ctx| endpoint.matches_profile(&ctx.profile))
+                            .unwrap_or(false);
 
-                        if is_connected {
+                        if is_connected && endpoint_matches {
+                            let local_snapshot =
+                                match crate::services::remote::LocalUploadSnapshot::open(
+                                    &local_path,
+                                ) {
+                                    Ok(snapshot) => snapshot,
+                                    Err(error) => {
+                                        if let Some(ref mut editor) = app.editor_state {
+                                            editor.set_message(
+                                                format!(
+                                                    "Saved locally, upload snapshot failed: {error}"
+                                                ),
+                                                50,
+                                            );
+                                        }
+                                        return;
+                                    }
+                                };
                             let ctx = match app.panels[panel_idx].remote_ctx.take() {
                                 Some(ctx) => ctx,
                                 None => {
@@ -5346,16 +6389,20 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                             let (tx, rx) = std::sync::mpsc::channel();
 
                             std::thread::spawn(move || {
-                                let msg = match ctx.session.upload_file(&local_path, &remote_path) {
-                                    Ok(_) => Ok("Saved & uploaded to remote!".to_string()),
-                                    Err(e) => Err(format!("Saved locally, upload failed: {}", e)),
-                                };
+                                let status = crate::ui::app::remote_upload_save_status(
+                                    ctx.session.upload_file(
+                                        local_snapshot,
+                                        &remote_path,
+                                        &expected_version,
+                                    ),
+                                );
                                 let _ = tx.send(crate::ui::app::RemoteSpinnerResult::PanelOp {
                                     ctx,
                                     panel_idx,
                                     outcome: crate::ui::app::PanelOpOutcome::RemoteSave {
-                                        message: msg,
+                                        status,
                                         remote_path,
+                                        edit_session_id,
                                         generation: remote_save_generation.unwrap_or(0),
                                         reload: true,
                                     },
@@ -5368,7 +6415,10 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                                 receiver: rx,
                             });
                         } else {
-                            let msg = if app
+                            let msg = if is_connected && !endpoint_matches {
+                                "Saved locally, but the panel is connected to a different remote endpoint"
+                                    .to_string()
+                            } else if app
                                 .panels
                                 .get(panel_idx)
                                 .and_then(|p| p.remote_ctx.as_ref())
@@ -5631,6 +6681,21 @@ mod tests {
         editor
     }
 
+    fn test_remote_origin(panel_index: usize, remote_path: &str) -> RemoteEditOrigin {
+        RemoteEditOrigin {
+            panel_index,
+            remote_path: remote_path.to_string(),
+            endpoint: RemoteEditEndpoint {
+                user: "user".to_string(),
+                host: "host".to_string(),
+                port: 22,
+            },
+            expected_version: crate::services::remote::RemoteFileVersion::for_test(1),
+            edit_session_id: 42,
+            committed_generation: 0,
+        }
+    }
+
     #[test]
     fn load_missing_file_opens_empty_buffer() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5654,6 +6719,50 @@ mod tests {
 
         assert!(err.contains("Failed to read file"));
         assert_eq!(editor.lines, vec![""]);
+    }
+
+    #[test]
+    fn load_directory_is_rejected_as_non_regular() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut editor = EditorState::new();
+
+        let err = editor
+            .load_file(&temp_dir.path().to_path_buf())
+            .unwrap_err();
+
+        assert!(err.contains("non-regular"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("pipe.txt");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let mut editor = EditorState::new();
+        let started = std::time::Instant::now();
+        let err = editor.load_file(&path).unwrap_err();
+
+        assert!(err.contains("non-regular"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_dangling_symlink_is_not_treated_as_a_new_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("dangling.txt");
+        std::os::unix::fs::symlink("missing-target", &path).unwrap();
+        let mut editor = EditorState::new();
+
+        let err = editor.load_file(&path).unwrap_err();
+
+        assert!(err.contains("Failed"));
     }
 
     #[test]
@@ -5905,6 +7014,241 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sibling_tmp).unwrap(), "keep");
     }
 
+    #[test]
+    fn save_rejects_external_in_place_modification() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        std::fs::write(&path, "loaded").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+
+        std::fs::write(&path, "external").unwrap();
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("changed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+        assert!(editor.modified);
+    }
+
+    #[test]
+    fn save_rejects_replaced_path_even_when_content_is_similar() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        let displaced = temp_dir.path().join("loaded-version");
+        std::fs::write(&path, "loaded").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+
+        std::fs::rename(&path, &displaced).unwrap();
+        std::fs::write(&path, "loaded").unwrap();
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("changed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "loaded");
+        assert_eq!(std::fs::read_to_string(&displaced).unwrap(), "loaded");
+    }
+
+    #[test]
+    fn save_new_file_refuses_a_late_created_destination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("new.txt");
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+
+        std::fs::write(&path, "external").unwrap();
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("refusing to overwrite"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external");
+    }
+
+    #[test]
+    fn successful_save_refreshes_the_expected_version() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        std::fs::write(&path, "one").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+
+        editor.lines[0] = "two".to_string();
+        editor.save_file().unwrap();
+        editor.lines[0] = "three".to_string();
+        editor.modified = true;
+        editor.save_file().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three");
+        assert!(!editor.modified);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_retarget_after_load_does_not_change_the_save_target() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let first = temp_dir.path().join("first.txt");
+        let second = temp_dir.path().join("second.txt");
+        let link = temp_dir.path().join("current.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&link).unwrap();
+        editor.lines[0] = "edited-first".to_string();
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        editor.save_file().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "edited-first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "second");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn save_boundary_conflict_restores_external_and_preserves_candidate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        std::fs::write(&path, "loaded").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+
+        let hook_path = path.clone();
+        SAVE_BOUNDARY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(hook_path, "external-at-boundary").unwrap();
+            }));
+        });
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("preserved"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "external-at-boundary"
+        );
+        let recovered = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| candidate != &path)
+            .find(|candidate| std::fs::read_to_string(candidate).ok().as_deref() == Some("edited"));
+        assert!(
+            recovered.is_some(),
+            "edited recovery file was not preserved"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        windows
+    ))]
+    #[test]
+    fn candidate_swap_at_publish_boundary_never_deletes_the_original() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        std::fs::write(&path, "loaded").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+
+        let hook_dir = temp_dir.path().to_path_buf();
+        let hook_actual = path.clone();
+        SAVE_CANDIDATE_PUBLISH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let candidate = std::fs::read_dir(&hook_dir)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|entry| {
+                        entry != &hook_actual
+                            && entry
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| {
+                                    name.starts_with(".note.txt.") && name.ends_with(".tmp")
+                                })
+                    })
+                    .expect("save candidate path");
+                std::fs::remove_file(&candidate).unwrap();
+                std::fs::write(candidate, "attacker-candidate").unwrap();
+            }));
+        });
+
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("save candidate changed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "loaded");
+        assert!(editor.modified);
+        assert!(std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| entry != &path)
+            .any(|entry| {
+                std::fs::read_to_string(entry).ok().as_deref() == Some("attacker-candidate")
+            }));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn rollback_does_not_overwrite_an_injected_current_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        let injected = temp_dir.path().join("injected.txt");
+        std::fs::write(&path, "loaded").unwrap();
+        std::fs::write(&injected, "injected").unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "edited".to_string();
+
+        let boundary_path = path.clone();
+        SAVE_BOUNDARY_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(boundary_path, "external-at-boundary").unwrap();
+            }));
+        });
+        let rollback_path = path.clone();
+        SAVE_ROLLBACK_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(injected, rollback_path).unwrap();
+            }));
+        });
+
+        let error = editor.save_file().unwrap_err();
+
+        assert!(error.contains("No further paths were overwritten"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "injected");
+        assert!(std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .any(|candidate| {
+                std::fs::read_to_string(candidate).ok().as_deref() == Some("external-at-boundary")
+            }));
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_preserves_unix_file_mode() {
@@ -5922,6 +7266,40 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o754);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_restore_setuid_or_setgid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("privileged.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o6755)).unwrap();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+
+        editor.lines[0] = "new".to_string();
+        editor.save_file().unwrap();
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn edited_contents_only_inherit_non_privileged_xattrs() {
+        assert!(EditorState::should_preserve_linux_xattr(b"user.note"));
+        assert!(EditorState::should_preserve_linux_xattr(
+            b"system.posix_acl_access"
+        ));
+        assert!(!EditorState::should_preserve_linux_xattr(
+            b"security.capability"
+        ));
+        assert!(!EditorState::should_preserve_linux_xattr(b"security.ima"));
+        assert!(!EditorState::should_preserve_linux_xattr(
+            b"trusted.overlay"
+        ));
     }
 
     #[cfg(all(unix, target_os = "linux"))]
@@ -6096,8 +7474,9 @@ mod tests {
         std::fs::write(&path, "old").unwrap();
 
         let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
-        let mut editor = editor_with_lines(&["changed"]);
-        editor.file_path = path.clone();
+        let mut editor = EditorState::new();
+        editor.load_file(&path).unwrap();
+        editor.lines[0] = "changed".to_string();
         editor.modified = true;
         app.current_screen = Screen::FileEditor;
         app.editor_state = Some(editor);
@@ -6287,10 +7666,7 @@ mod tests {
     #[test]
     fn remote_dirty_keeps_modified_state_until_upload_success() {
         let mut editor = editor_with_lines(&["saved"]);
-        editor.remote_origin = Some(RemoteEditOrigin {
-            panel_index: 2,
-            remote_path: "/remote/file.txt".to_string(),
-        });
+        editor.remote_origin = Some(test_remote_origin(2, "/remote/file.txt"));
 
         editor.remote_dirty = true;
         editor.update_modified();
@@ -6709,36 +8085,204 @@ mod tests {
     #[test]
     fn stale_remote_upload_result_does_not_clear_newer_local_save() {
         let mut editor = editor_with_lines(&["saved"]);
-        editor.remote_origin = Some(RemoteEditOrigin {
-            panel_index: 2,
-            remote_path: "/remote/file.txt".to_string(),
-        });
+        editor.remote_origin = Some(test_remote_origin(2, "/remote/file.txt"));
 
         let first_generation = editor.begin_remote_save();
         let second_generation = editor.begin_remote_save();
+        let first_committed_version = crate::services::remote::RemoteFileVersion::for_test(2);
+        let second_committed_version = crate::services::remote::RemoteFileVersion::for_test(3);
 
         assert!(editor.remote_dirty);
-        assert!(!editor.apply_remote_save_result(2, "/remote/file.txt", first_generation, false));
+        assert!(!editor.apply_remote_save_result(
+            2,
+            "/remote/file.txt",
+            42,
+            first_generation,
+            Some(first_committed_version.clone())
+        ));
         assert!(editor.remote_dirty);
         assert!(editor.modified);
+        assert_eq!(
+            editor.remote_origin.as_ref().unwrap().expected_version,
+            first_committed_version
+        );
 
-        assert!(editor.apply_remote_save_result(2, "/remote/file.txt", second_generation, false));
+        assert!(editor.apply_remote_save_result(
+            2,
+            "/remote/file.txt",
+            42,
+            second_generation,
+            Some(second_committed_version.clone())
+        ));
         assert!(!editor.remote_dirty);
+        assert_eq!(
+            editor.remote_origin.as_ref().unwrap().expected_version,
+            second_committed_version
+        );
     }
 
     #[test]
     fn remote_save_result_ignores_same_generation_for_different_remote_file() {
         let mut editor = editor_with_lines(&["saved"]);
-        editor.remote_origin = Some(RemoteEditOrigin {
-            panel_index: 1,
-            remote_path: "/remote/current.txt".to_string(),
-        });
+        editor.remote_origin = Some(test_remote_origin(1, "/remote/current.txt"));
         let generation = editor.begin_remote_save();
+        let committed_version = crate::services::remote::RemoteFileVersion::for_test(2);
 
-        assert!(!editor.apply_remote_save_result(1, "/remote/previous.txt", generation, false));
+        assert!(!editor.apply_remote_save_result(
+            1,
+            "/remote/previous.txt",
+            42,
+            generation,
+            Some(committed_version.clone())
+        ));
+        assert!(editor.remote_dirty);
+        assert_eq!(
+            editor.remote_origin.as_ref().unwrap().expected_version,
+            crate::services::remote::RemoteFileVersion::for_test(1)
+        );
+
+        assert!(editor.apply_remote_save_result(
+            1,
+            "/remote/current.txt",
+            42,
+            generation,
+            Some(committed_version)
+        ));
+        assert!(!editor.remote_dirty);
+    }
+
+    #[test]
+    fn failed_or_late_remote_result_cannot_replace_expected_version() {
+        let mut editor = editor_with_lines(&["saved"]);
+        editor.remote_origin = Some(test_remote_origin(1, "/remote/file.txt"));
+        let first_generation = editor.begin_remote_save();
+        let second_generation = editor.begin_remote_save();
+        let newest = crate::services::remote::RemoteFileVersion::for_test(3);
+
+        assert!(editor.apply_remote_save_result(
+            1,
+            "/remote/file.txt",
+            42,
+            second_generation,
+            Some(newest.clone())
+        ));
+        assert!(!editor.remote_dirty);
+
+        assert!(!editor.apply_remote_save_result(
+            1,
+            "/remote/file.txt",
+            42,
+            first_generation,
+            Some(crate::services::remote::RemoteFileVersion::for_test(2))
+        ));
+        assert_eq!(
+            editor.remote_origin.as_ref().unwrap().expected_version,
+            newest
+        );
+
+        let third_generation = editor.begin_remote_save();
+        assert!(editor.apply_remote_save_result(1, "/remote/file.txt", 42, third_generation, None));
+        assert!(editor.remote_dirty);
+        assert_eq!(
+            editor.remote_origin.as_ref().unwrap().expected_version,
+            newest
+        );
+    }
+
+    #[test]
+    fn remote_result_is_bound_to_edit_session_and_endpoint() {
+        let mut editor = editor_with_lines(&["saved"]);
+        editor.remote_origin = Some(test_remote_origin(1, "/remote/file.txt"));
+        let generation = editor.begin_remote_save();
+        assert!(!editor.apply_remote_save_result(
+            1,
+            "/remote/file.txt",
+            99,
+            generation,
+            Some(crate::services::remote::RemoteFileVersion::for_test(2))
+        ));
         assert!(editor.remote_dirty);
 
-        assert!(editor.apply_remote_save_result(1, "/remote/current.txt", generation, false));
+        let profile: crate::services::remote::RemoteProfile =
+            serde_json::from_value(serde_json::json!({
+                "name": "different",
+                "host": "other-host",
+                "port": 22,
+                "user": "user",
+                "auth": {"type": "password", "password": "secret"},
+                "default_path": "/"
+            }))
+            .unwrap();
+        assert!(!editor
+            .remote_origin
+            .as_ref()
+            .unwrap()
+            .endpoint
+            .matches_profile(&profile));
+    }
+
+    #[test]
+    fn remote_edit_endpoint_treats_ipv6_brackets_as_display_only() {
+        let profile: crate::services::remote::RemoteProfile =
+            serde_json::from_value(serde_json::json!({
+                "name": "ipv6",
+                "host": "[::1]",
+                "port": 22,
+                "user": "user",
+                "auth": {"type": "password", "password": "secret"},
+                "default_path": "/"
+            }))
+            .unwrap();
+        let endpoint = RemoteEditEndpoint::from_profile(&profile);
+        assert_eq!(endpoint.host, "::1");
+        assert!(endpoint.matches_profile(&profile));
+    }
+
+    #[test]
+    fn pending_remote_exit_closes_only_after_committed_current_generation() {
+        let mut editor = editor_with_lines(&["saved"]);
+        editor.remote_origin = Some(test_remote_origin(1, "/remote/file.txt"));
+        let generation = editor.begin_remote_save();
+        editor.pending_close_after_remote_save = Some(generation);
+
+        editor.apply_remote_save_result(1, "/remote/file.txt", 42, generation, None);
+        assert!(!editor.resolve_pending_remote_close(generation));
+        assert!(editor.remote_dirty);
+        assert!(editor.exit_confirm_open);
+
+        editor.exit_confirm_open = false;
+        let retry_generation = editor.begin_remote_save();
+        editor.pending_close_after_remote_save = Some(retry_generation);
+        editor.apply_remote_save_result(
+            1,
+            "/remote/file.txt",
+            42,
+            retry_generation,
+            Some(crate::services::remote::RemoteFileVersion::for_test(2)),
+        );
+        assert!(editor.resolve_pending_remote_close(retry_generation));
         assert!(!editor.remote_dirty);
+        assert!(!editor.exit_confirm_open);
+    }
+
+    #[test]
+    fn pending_remote_exit_does_not_close_over_new_unsaved_edits() {
+        let mut editor = editor_with_lines(&["saved"]);
+        editor.remote_origin = Some(test_remote_origin(1, "/remote/file.txt"));
+        let generation = editor.begin_remote_save();
+        editor.pending_close_after_remote_save = Some(generation);
+        editor.lines[0] = "edited while upload ran".to_string();
+        editor.update_modified();
+
+        editor.apply_remote_save_result(
+            1,
+            "/remote/file.txt",
+            42,
+            generation,
+            Some(crate::services::remote::RemoteFileVersion::for_test(2)),
+        );
+        assert!(!editor.resolve_pending_remote_close(generation));
+        assert!(editor.modified);
+        assert!(editor.exit_confirm_open);
     }
 }

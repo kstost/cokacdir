@@ -954,8 +954,7 @@ fn get_handler_placeholder(extension: &str) -> String {
         // Videos
         "mp4" | "avi" | "mkv" | "webm" | "mov" => "vlc {{FILEPATH}}",
         "flv" | "wmv" | "m4v" | "mpg" | "mpeg" => "vlc {{FILEPATH}}",
-        "3gp" | "3g2" | "ogv" | "vob" | "mts" | "m2ts" => "vlc {{FILEPATH}}",
-        "ts" => "vlc {{FILEPATH}}",
+        "3gp" | "3g2" | "ogv" | "vob" | "m2ts" => "vlc {{FILEPATH}}",
 
         // Audio
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => "vlc {{FILEPATH}}",
@@ -1038,7 +1037,7 @@ fn get_handler_placeholder(extension: &str) -> String {
         "ada" | "adb" | "ads" => "vim {{FILEPATH}}",
         "f" | "f90" | "f95" | "f03" | "f08" | "for" => "vim {{FILEPATH}}",
         "cob" | "cbl" => "vim {{FILEPATH}}",
-        "pro" | "pl" => "vim {{FILEPATH}}",
+        "pro" => "vim {{FILEPATH}}",
 
         // Markup/Config - Web
         "html" | "htm" | "xhtml" | "shtml" => "firefox {{FILEPATH}}",
@@ -1886,7 +1885,10 @@ fn draw_goto_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, t
             let display =
                 crate::services::remote::format_remote_display(&profile, &profile.default_path);
             if filter_lower.is_empty() || fuzzy_match(&display.to_lowercase(), &filter_lower) {
-                let key = (profile.user.clone(), profile.host.clone(), profile.port);
+                let host = crate::services::remote::canonical_remote_host(&profile.host)
+                    .unwrap_or(&profile.host)
+                    .to_string();
+                let key = (profile.user.clone(), host, profile.port);
                 if !remote_groups.contains_key(&key) {
                     remote_group_order.push(key.clone());
                 }
@@ -2156,11 +2158,11 @@ fn draw_duplicate_conflict_dialog(
     frame.render_widget(block, area);
 
     // Get current conflict info
-    let (_, _, display_name) = state
+    let display_name = state
         .conflicts
         .get(state.current_index)
-        .cloned()
-        .unwrap_or_else(|| (PathBuf::new(), PathBuf::new(), String::new()));
+        .map(|(_, _, display_name, _)| display_name.clone())
+        .unwrap_or_default();
 
     // Line 1: "File already exists:"
     let label_area = Rect::new(inner.x + 2, inner.y + 1, inner.width - 4, 1);
@@ -2677,6 +2679,7 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         app.dialog = None;
+                        app.cancel_pending_delete();
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                         // 버튼 토글 (0: Yes, 1: No)
@@ -2688,6 +2691,7 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                             app.execute_delete();
                         } else {
                             app.dialog = None;
+                            app.cancel_pending_delete();
                         }
                     }
                     _ => {}
@@ -2914,18 +2918,6 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                             }
                         }
 
-                        // For Rename dialog, check if target file already exists
-                        if dialog_type == DialogType::Rename && !input.trim().is_empty() {
-                            let current_path = app.active_panel().path.clone();
-                            let new_path = current_path.join(&input);
-                            if new_path.exists() {
-                                if let Some(ref mut d) = app.dialog {
-                                    d.message = format!("'{}' already exists!", input);
-                                }
-                                return false;
-                            }
-                        }
-
                         // For Mkdir/Mkfile dialog, check if already exists
                         if (dialog_type == DialogType::Mkdir || dialog_type == DialogType::Mkfile)
                             && !input.trim().is_empty()
@@ -2976,10 +2968,16 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
                                 DialogType::Goto => app.execute_goto(&input),
                                 _ => {}
                             }
+                        } else if dialog_type == DialogType::Rename {
+                            app.cancel_pending_rename();
                         }
                     }
                     KeyCode::Esc => {
+                        let is_rename = dialog.dialog_type == DialogType::Rename;
                         app.dialog = None;
+                        if is_rename {
+                            app.cancel_pending_rename();
+                        }
                     }
                     KeyCode::Backspace => {
                         if dialog.cursor_pos > 0 {
@@ -3373,7 +3371,10 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                 let display =
                     crate::services::remote::format_remote_display(&profile, &profile.default_path);
                 if filter_lower.is_empty() || fuzzy_match(&display.to_lowercase(), &filter_lower) {
-                    let key = (profile.user.clone(), profile.host.clone(), profile.port);
+                    let host = crate::services::remote::canonical_remote_host(&profile.host)
+                        .unwrap_or(&profile.host)
+                        .to_string();
+                    let key = (profile.user.clone(), host, profile.port);
                     if !remote_groups.contains_key(&key) {
                         remote_group_order.push(key.clone());
                     }
@@ -3431,7 +3432,10 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                 let same_server =
                                     app.active_panel().remote_ctx.as_ref().map_or(false, |ctx| {
                                         ctx.profile.user == user
-                                            && ctx.profile.host == host
+                                            && crate::services::remote::remote_hosts_equal(
+                                                &ctx.profile.host,
+                                                &host,
+                                            )
                                             && ctx.profile.port == port
                                     });
                                 if same_server {
@@ -3575,6 +3579,7 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                 if let Some(Some(profile_idx)) =
                                     remote_profile_map.get(selected_idx)
                                 {
+                                    let settings_before = app.settings.clone();
                                     let profile_idx = *profile_idx;
                                     if let Some(profile) =
                                         app.settings.remote_profiles.get(profile_idx)
@@ -3588,7 +3593,11 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                                 if let Some((bu, bh, bp, _)) =
                                                     crate::services::remote::parse_remote_path(bm)
                                                 {
-                                                    bu == user && bh == host && bp == port
+                                                    bu == user
+                                                        && crate::services::remote::remote_hosts_equal(
+                                                            &bh, &host,
+                                                        )
+                                                        && bp == port
                                                 } else {
                                                     false
                                                 }
@@ -3607,10 +3616,26 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                         } else {
                                             app.settings.remote_profiles.remove(profile_idx);
                                         }
-                                        let _ = app.settings.save();
+                                        if let Err(error) = app.settings.save() {
+                                            let reloaded = app.reconcile_settings_after_save_error(
+                                                settings_before,
+                                            );
+                                            let detail = if reloaded {
+                                                "effective settings were reloaded from disk"
+                                            } else {
+                                                "disk could not be reread; the last known settings were restored"
+                                            };
+                                            app.message = Some(format!(
+                                                "Could not confirm bookmark durability ({}); {}",
+                                                error, detail
+                                            ));
+                                            app.message_timer = 30;
+                                            return false;
+                                        }
                                     }
                                 } else if let Some(entry) = mixed_entries.get(selected_idx) {
                                     let entry = entry.clone();
+                                    let settings_before = app.settings.clone();
                                     if let Some(pos) = app
                                         .settings
                                         .bookmarked_path
@@ -3625,7 +3650,9 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                             if let Some(pidx) =
                                                 app.settings.remote_profiles.iter().position(|p| {
                                                     p.user == user
-                                                        && p.host == host
+                                                        && crate::services::remote::remote_hosts_equal(
+                                                            &p.host, &host,
+                                                        )
                                                         && p.port == port
                                                         && p.default_path == path
                                                 })
@@ -3633,7 +3660,12 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                                 // 같은 서버의 다른 북마크가 있으면 그 경로로 교체
                                                 let other_path = app.settings.bookmarked_path.iter().find_map(|bm| {
                                                     if let Some((bu, bh, bp, bp_path)) = crate::services::remote::parse_remote_path(bm) {
-                                                        if bu == user && bh == host && bp == port {
+                                                        if bu == user
+                                                            && crate::services::remote::remote_hosts_equal(
+                                                                &bh, &host,
+                                                            )
+                                                            && bp == port
+                                                        {
                                                             return Some(bp_path);
                                                         }
                                                     }
@@ -3647,7 +3679,22 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                                 }
                                             }
                                         }
-                                        let _ = app.settings.save();
+                                        if let Err(error) = app.settings.save() {
+                                            let reloaded = app.reconcile_settings_after_save_error(
+                                                settings_before,
+                                            );
+                                            let detail = if reloaded {
+                                                "effective settings were reloaded from disk"
+                                            } else {
+                                                "disk could not be reread; the last known settings were restored"
+                                            };
+                                            app.message = Some(format!(
+                                                "Could not confirm bookmark durability ({}); {}",
+                                                error, detail
+                                            ));
+                                            app.message_timer = 30;
+                                            return false;
+                                        }
                                     }
                                 }
                                 if let Some(ref mut completion) = dialog.completion {
@@ -3690,14 +3737,16 @@ fn handle_goto_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifier
                                     if let Some((user, host, port, _path)) =
                                         crate::services::remote::parse_remote_path(entry)
                                     {
-                                        if let Some((idx, profile)) = app
-                                            .settings
-                                            .remote_profiles
-                                            .iter()
-                                            .enumerate()
-                                            .find(|(_, p)| {
-                                                p.user == user && p.host == host && p.port == port
-                                            })
+                                        if let Some((idx, profile)) =
+                                            app.settings.remote_profiles.iter().enumerate().find(
+                                                |(_, p)| {
+                                                    p.user == user
+                                                    && crate::services::remote::remote_hosts_equal(
+                                                        &p.host, &host,
+                                                    )
+                                                    && p.port == port
+                                                },
+                                            )
                                         {
                                             let profile = profile.clone();
                                             let state =
@@ -3909,17 +3958,14 @@ fn handle_duplicate_conflict_input(app: &mut App, code: KeyCode, _modifiers: Key
             }
 
             KeyCode::Esc => {
-                // Cancel entire operation - restore clipboard if it was a copy operation
-                if let Some(ref state) = app.conflict_state {
-                    if !state.is_move_operation {
-                        // Restore clipboard for copy operations
-                        if let Some(ref backup) = state.clipboard_backup {
-                            app.clipboard = Some(backup.clone());
-                        }
+                // No worker has started yet, so cancelling conflict resolution
+                // must restore both copy and cut clipboards unchanged.
+                if let Some(state) = app.conflict_state.take() {
+                    if let Some(backup) = state.clipboard_backup {
+                        app.clipboard = Some(backup);
                     }
                 }
                 app.dialog = None;
-                app.conflict_state = None;
                 app.show_message("Paste operation cancelled");
             }
 
@@ -3940,14 +3986,18 @@ fn resolve_current_conflict(app: &mut App, resolution: ConflictResolution) {
         match resolution {
             ConflictResolution::Overwrite => {
                 // Mark current file for overwrite
-                if let Some((src, _, _)) = state.conflicts.get(state.current_index) {
-                    state.files_to_overwrite.push(src.clone());
+                if let Some((src, _, _, authorization)) =
+                    state.conflicts.get_mut(state.current_index)
+                {
+                    if let Some(authorization) = authorization.take() {
+                        state.files_to_overwrite.insert(src.clone(), authorization);
+                    }
                 }
                 advance_to_next_conflict(state)
             }
             ConflictResolution::Skip => {
                 // Mark current file for skip
-                if let Some((src, _, _)) = state.conflicts.get(state.current_index) {
+                if let Some((src, _, _, _)) = state.conflicts.get(state.current_index) {
                     state.files_to_skip.push(src.clone());
                 }
                 advance_to_next_conflict(state)
@@ -3955,8 +4005,10 @@ fn resolve_current_conflict(app: &mut App, resolution: ConflictResolution) {
             ConflictResolution::OverwriteAll => {
                 // Mark all remaining conflicts for overwrite
                 for i in state.current_index..state.conflicts.len() {
-                    if let Some((src, _, _)) = state.conflicts.get(i) {
-                        state.files_to_overwrite.push(src.clone());
+                    if let Some((src, _, _, authorization)) = state.conflicts.get_mut(i) {
+                        if let Some(authorization) = authorization.take() {
+                            state.files_to_overwrite.insert(src.clone(), authorization);
+                        }
                     }
                 }
                 true // Finished
@@ -3964,7 +4016,7 @@ fn resolve_current_conflict(app: &mut App, resolution: ConflictResolution) {
             ConflictResolution::SkipAll => {
                 // Mark all remaining conflicts for skip
                 for i in state.current_index..state.conflicts.len() {
-                    if let Some((src, _, _)) = state.conflicts.get(i) {
+                    if let Some((src, _, _, _)) = state.conflicts.get(i) {
                         state.files_to_skip.push(src.clone());
                     }
                 }
@@ -4115,27 +4167,52 @@ fn handle_binary_file_handler_input(app: &mut App, code: KeyCode) -> bool {
                     if input.is_empty() {
                         // Empty input - remove handler (only meaningful in edit mode)
                         if is_edit_mode {
+                            let settings_before = app.settings.clone();
                             app.settings.extension_handler.remove(&ext_lower);
-                            app.message = Some(format!("Handler removed for .{}", ext_lower));
-                            app.message_timer = 30;
-
-                            // Save settings
-                            if let Err(e) = app.settings.save() {
-                                app.message = Some(format!("Failed to save settings: {}", e));
-                                app.message_timer = 30;
+                            match app.settings.save() {
+                                Ok(()) => {
+                                    app.message =
+                                        Some(format!("Handler removed for .{}", ext_lower));
+                                    app.message_timer = 30;
+                                }
+                                Err(error) => {
+                                    let reloaded =
+                                        app.reconcile_settings_after_save_error(settings_before);
+                                    let detail = if reloaded {
+                                        "effective settings were reloaded from disk"
+                                    } else {
+                                        "disk could not be reread; the last known settings were restored"
+                                    };
+                                    app.message = Some(format!(
+                                        "Could not confirm handler durability ({}); {}",
+                                        error, detail
+                                    ));
+                                    app.message_timer = 30;
+                                }
                             }
                         }
                         // In set mode with empty input, just close without action
                     } else {
                         // Non-empty input - set handler (replaces any existing)
+                        let settings_before = app.settings.clone();
                         app.settings
                             .extension_handler
                             .insert(ext_lower.clone(), vec![input.clone()]);
 
-                        // Save settings
-                        if let Err(e) = app.settings.save() {
-                            app.message = Some(format!("Failed to save settings: {}", e));
+                        if let Err(error) = app.settings.save() {
+                            let reloaded = app.reconcile_settings_after_save_error(settings_before);
+                            let detail = if reloaded {
+                                "effective settings were reloaded from disk"
+                            } else {
+                                "disk could not be reread; the last known settings were restored"
+                            };
+                            app.message = Some(format!(
+                                "Could not confirm handler durability ({}); {}",
+                                error, detail
+                            ));
                             app.message_timer = 30;
+                            app.dialog = None;
+                            return false;
                         }
 
                         // Close dialog and try to execute the handler on the file
@@ -4832,8 +4909,6 @@ fn draw_remote_connect_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &
 
 /// Handle input for the remote connect dialog
 fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
-    use super::app::{RemoteAuthType, RemoteField};
-
     if app.remote_connect_state.is_none() {
         app.dialog = None;
         return false;
@@ -4886,6 +4961,12 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
                     }
                     return false;
                 }
+                if let Err(error) = crate::services::remote::canonical_remote_host(&state.host) {
+                    if let Some(ref mut state) = app.remote_connect_state {
+                        state.error = Some(error);
+                    }
+                    return false;
+                }
 
                 let profile = state.to_profile();
                 let path = state.remote_path.clone();
@@ -4897,8 +4978,21 @@ fn handle_remote_connect_input(app: &mut App, code: KeyCode) -> bool {
                 if let Some(idx) = editing_idx {
                     // Editing existing profile — auto-update and skip Save Profile dialog
                     if idx < app.settings.remote_profiles.len() {
+                        let settings_before = app.settings.clone();
                         app.settings.remote_profiles[idx] = profile;
-                        let _ = app.settings.save();
+                        if let Err(error) = app.settings.save() {
+                            let reloaded = app.reconcile_settings_after_save_error(settings_before);
+                            let detail = if reloaded {
+                                "effective settings were reloaded from disk"
+                            } else {
+                                "disk could not be reread; the last known settings were restored"
+                            };
+                            app.message = Some(format!(
+                                "Could not confirm remote profile durability ({}); {}",
+                                error, detail
+                            ));
+                            app.message_timer = 30;
+                        }
                     }
                 }
                 // New connection profile saving is handled in the connection success handler
@@ -4991,17 +5085,35 @@ fn handle_remote_profile_save_input(app: &mut App, code: KeyCode) -> bool {
                         profile.name = dialog.input.clone();
                     }
                 }
+                let settings_before = app.settings.clone();
                 // Check for duplicate
                 let existing = app.settings.remote_profiles.iter().position(|p| {
-                    p.host == profile.host && p.user == profile.user && p.port == profile.port
+                    crate::services::remote::remote_hosts_equal(&p.host, &profile.host)
+                        && p.user == profile.user
+                        && p.port == profile.port
                 });
                 if let Some(idx) = existing {
                     app.settings.remote_profiles[idx] = profile;
                 } else {
                     app.settings.remote_profiles.push(profile);
                 }
-                let _ = app.settings.save();
-                app.show_message("Remote profile saved");
+                match app.settings.save() {
+                    Ok(()) => app.show_message("Remote profile saved"),
+                    Err(error) => {
+                        let reloaded = app.reconcile_settings_after_save_error(settings_before);
+                        let detail = if reloaded {
+                            "effective settings were reloaded from disk"
+                        } else {
+                            "disk could not be reread; the last known settings were restored"
+                        };
+                        app.message = Some(format!(
+                            "Could not confirm remote profile durability ({}); {}",
+                            error, detail
+                        ));
+                        app.message_timer = 30;
+                        return false;
+                    }
+                }
             }
             app.dialog = None;
             app.remote_connect_state = None;
@@ -5106,6 +5218,14 @@ mod tests {
             wrap_dialog_text("abcdef", 3),
             vec!["abc".to_string(), "def".to_string()]
         );
+    }
+
+    #[test]
+    fn handler_placeholder_does_not_misclassify_typescript_as_video() {
+        for extension in ["ts", "mts", "cts", "TS", "MTS"] {
+            assert_eq!(get_handler_placeholder(extension), "vim {{FILEPATH}}");
+        }
+        assert_eq!(get_handler_placeholder("m2ts"), "vlc {{FILEPATH}}");
     }
 
     #[test]

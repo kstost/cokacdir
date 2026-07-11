@@ -35,10 +35,32 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
         }
 
         let mut map = HashMap::new();
-        for (action, key_strings) in &merged {
+        // Defaults are inserted first and explicit user bindings second.  Iterating the
+        // merged HashMap directly made a user override that reused another action's
+        // default key non-deterministic (HashMap iteration order is randomized).
+        for (action, key_strings) in defaults {
+            let explicitly_changed = overrides
+                .get(action)
+                .is_some_and(|configured| configured != key_strings);
+            if explicitly_changed {
+                continue;
+            }
             for key_str in key_strings {
                 let binds = parse_key(key_str);
                 for bind in binds {
+                    map.insert(bind, *action);
+                }
+            }
+        }
+        for (action, key_strings) in overrides {
+            // KeybindingsConfig::default() contains a complete copy of every
+            // default binding.  Only entries whose value actually differs are
+            // user overrides and need the second-pass precedence.
+            if defaults.get(action) == Some(key_strings) {
+                continue;
+            }
+            for key_str in key_strings {
+                for bind in parse_key(key_str) {
                     map.insert(bind, *action);
                 }
             }
@@ -114,7 +136,17 @@ pub fn parse_key(s: &str) -> Vec<KeyBind> {
         return Vec::new();
     }
     let s = trimmed.to_lowercase();
-    let parts: Vec<&str> = s.split('+').collect();
+    // `+` is both the modifier separator and a valid character key.  Treat a
+    // trailing double plus as a literal plus key (for example `ctrl++`).
+    let parts: Vec<&str> = if s == "+" {
+        vec!["+"]
+    } else if let Some(modifier_prefix) = s.strip_suffix("++") {
+        let mut parts: Vec<&str> = modifier_prefix.split('+').collect();
+        parts.push("+");
+        parts
+    } else {
+        s.split('+').collect()
+    };
 
     let mut modifiers = KeyModifiers::NONE;
     let key_part;
@@ -1875,6 +1907,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_plus_key() {
+        assert_eq!(
+            parse_key("+"),
+            vec![KeyBind {
+                code: KeyCode::Char('+'),
+                modifiers: KeyModifiers::NONE,
+            }]
+        );
+        assert_eq!(
+            parse_key("ctrl++"),
+            vec![KeyBind {
+                code: KeyCode::Char('+'),
+                modifiers: KeyModifiers::CONTROL,
+            }]
+        );
+    }
+
+    #[test]
     fn test_ctrl_shift_letter() {
         let binds = parse_key("ctrl+shift+a");
         assert_eq!(binds.len(), 2);
@@ -2003,6 +2053,23 @@ mod tests {
             kb.panel_action(KeyCode::Char(' '), KeyModifiers::NONE),
             Some(PanelAction::ToggleSelect)
         );
+    }
+
+    #[test]
+    fn test_user_binding_wins_when_reusing_a_default_key() {
+        let mut config = KeybindingsConfig::default();
+        config
+            .file_panel
+            .insert(PanelAction::Help, vec!["q".to_string()]);
+
+        // Rebuild repeatedly to guard against randomized HashMap iteration order.
+        for _ in 0..32 {
+            let kb = Keybindings::from_config(&config);
+            assert_eq!(
+                kb.panel_action(KeyCode::Char('q'), KeyModifiers::NONE),
+                Some(PanelAction::Help)
+            );
+        }
     }
 
     #[test]

@@ -1,13 +1,16 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
-use crate::services::claude::{debug_log_to, kill_child_tree, CancelToken, StreamMessage};
+use crate::services::claude::{
+    create_private_temp_file, debug_log_to, kill_child_tree, CancelToken, PrivateTempFile,
+    StreamMessage,
+};
 
 /// Context required to detect images that Codex's built-in `image_gen` tool
 /// drops into `~/.codex/generated_images/<session_id>/` without surfacing any
@@ -31,6 +34,7 @@ fn short_sha(s: &str) -> String {
     hex::encode(&r[..6])
 }
 
+#[derive(Debug)]
 enum CodexJsonLine {
     Blank,
     Json(Value),
@@ -149,6 +153,27 @@ fn codex_debug_log(msg: &str) {
     debug_log_to("codex.log", msg);
 }
 
+/// Forward a streaming event, terminating the spawned CLI when the consumer
+/// has gone away.  Returning from the stdout loop and then calling
+/// `child.wait()` is not sufficient: the reader still owns the stdout pipe,
+/// so a child that keeps producing output can fill that pipe and block before
+/// it exits.  Killing the request process group here makes receiver-drop a
+/// terminal condition and prevents the worker thread from hanging forever.
+fn send_or_abort_child(
+    sender: &Sender<StreamMessage>,
+    message: StreamMessage,
+    child: &mut std::process::Child,
+) -> bool {
+    if sender.send(message).is_ok() {
+        return true;
+    }
+
+    codex_debug_log("  ERROR: Channel receiver dropped; terminating Codex process tree");
+    kill_child_tree(child);
+    let _ = child.wait();
+    false
+}
+
 /// Verify whether a Codex session's task has been fully completed.
 ///
 /// Mirrors the high-level contract of `claude::verify_completion`, but the
@@ -233,16 +258,11 @@ pub fn verify_completion_codex(
     // directly would therefore ALWAYS find `mission_pending` (false positive)
     // and keep the loop running to its iteration cap. Reading the last-message
     // file instead yields only the model's actual reply.
-    let out_path = std::env::temp_dir().join(format!(
-        "cokac_verify_codex_{}_{}.txt",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    // Best-effort pre-clean; ignore failure.
-    let _ = std::fs::remove_file(&out_path);
+    let temp_dir = crate::utils::path::cokacdir_temp_dir()
+        .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {e}"))?;
+    let out_guard = create_private_temp_file(&temp_dir, "verify_last_message", b"")
+        .map_err(|e| format!("Failed to create verify output file: {e}"))?;
+    let out_path = out_guard.path();
 
     // Note: `codex exec` does not accept `--ask-for-approval`; exec is
     // inherently non-interactive so there's nothing to prompt for. The
@@ -312,8 +332,7 @@ pub fn verify_completion_codex(
 
     // Read and clean up the last-message file regardless of exit status so we
     // don't leak tempfiles even on failure paths.
-    let last_message = std::fs::read_to_string(&out_path).ok();
-    let _ = std::fs::remove_file(&out_path);
+    let last_message = std::fs::read_to_string(out_path).ok();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -485,36 +504,40 @@ fn find_codex_rollout_from_state(session_id: &str) -> Option<PathBuf> {
 }
 
 fn collect_codex_rollouts(dir: &Path, session_id: &str, out: &mut Vec<(u64, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
     let exact_suffix = format!("-{}.jsonl", session_id);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        if file_type.is_dir() {
-            collect_codex_rollouts(&path, session_id, out);
-            continue;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(&exact_suffix) {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push((mtime, path));
         }
-        if !file_type.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(&exact_suffix) {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.push((mtime, path));
     }
 }
 
@@ -532,9 +555,169 @@ fn find_codex_rollout(session_id: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Codex rollout not found for session {}", session_id))
 }
 
+const MAX_CODEX_ROLLOUT_BYTES: u64 = 512 * 1024 * 1024;
+
+fn read_stable_codex_rollout(path: &Path) -> Result<String, String> {
+    for attempt in 0..3 {
+        let before = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("Failed to inspect Codex rollout {}: {}", path.display(), e))?;
+        if !before.file_type().is_file() || before.file_type().is_symlink() {
+            return Err(format!(
+                "Codex rollout is not a real regular file: {}",
+                path.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "Codex rollout is a reparse point: {}",
+                    path.display()
+                ));
+            }
+        }
+        if before.len() > MAX_CODEX_ROLLOUT_BYTES {
+            return Err(format!(
+                "Codex rollout exceeds the {} MiB safety limit: {}",
+                MAX_CODEX_ROLLOUT_BYTES / 1024 / 1024,
+                path.display()
+            ));
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|e| format!("Failed to open Codex rollout {}: {}", path.display(), e))?;
+        let opened = file
+            .metadata()
+            .map_err(|e| format!("Failed to inspect Codex rollout {}: {}", path.display(), e))?;
+        if !opened.is_file() || opened.len() > MAX_CODEX_ROLLOUT_BYTES {
+            return Err(format!(
+                "Codex rollout is not a bounded regular file: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if before.dev() != opened.dev() || before.ino() != opened.ino() {
+                if attempt < 2 {
+                    continue;
+                }
+                return Err(format!(
+                    "Codex rollout kept changing while being opened: {}",
+                    path.display()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                || opened.creation_time() != before.creation_time()
+                || opened.last_write_time() != before.last_write_time()
+                || opened.file_size() != before.file_size()
+            {
+                if attempt < 2 {
+                    continue;
+                }
+                return Err(format!(
+                    "Codex rollout kept changing while being opened: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(opened.len().min(1024 * 1024) as usize);
+        Read::by_ref(&mut file)
+            .take(MAX_CODEX_ROLLOUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("Failed to read Codex rollout {}: {}", path.display(), e))?;
+        if bytes.len() as u64 > MAX_CODEX_ROLLOUT_BYTES {
+            return Err(format!(
+                "Codex rollout grew beyond the {} MiB safety limit: {}",
+                MAX_CODEX_ROLLOUT_BYTES / 1024 / 1024,
+                path.display()
+            ));
+        }
+        let after = file
+            .metadata()
+            .map_err(|e| format!("Failed to recheck Codex rollout {}: {}", path.display(), e))?;
+        let current = std::fs::symlink_metadata(path).ok();
+        #[cfg(unix)]
+        let stable = {
+            use std::os::unix::fs::MetadataExt;
+            current.as_ref().is_some_and(|current| {
+                current.file_type().is_file()
+                    && !current.file_type().is_symlink()
+                    && current.dev() == opened.dev()
+                    && current.ino() == opened.ino()
+            }) && after.dev() == opened.dev()
+                && after.ino() == opened.ino()
+                && after.len() == opened.len()
+                && after.mtime() == opened.mtime()
+                && after.mtime_nsec() == opened.mtime_nsec()
+                && after.ctime() == opened.ctime()
+                && after.ctime_nsec() == opened.ctime_nsec()
+                && bytes.len() as u64 == opened.len()
+        };
+        #[cfg(windows)]
+        let stable = {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            current.as_ref().is_some_and(|current| {
+                current.file_type().is_file()
+                    && current.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                    && current.creation_time() == opened.creation_time()
+                    && current.last_write_time() == opened.last_write_time()
+                    && current.file_size() == opened.file_size()
+            }) && after.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && after.creation_time() == opened.creation_time()
+                && after.last_write_time() == opened.last_write_time()
+                && after.file_size() == opened.file_size()
+                && bytes.len() as u64 == opened.len()
+        };
+        #[cfg(not(any(unix, windows)))]
+        let stable = current.as_ref().is_some_and(|current| {
+            current.file_type().is_file()
+                && current.len() == opened.len()
+                && current.modified().ok() == opened.modified().ok()
+        }) && after.len() == opened.len()
+            && after.modified().ok() == opened.modified().ok()
+            && bytes.len() as u64 == opened.len();
+
+        if stable {
+            return String::from_utf8(bytes).map_err(|e| {
+                format!("Codex rollout is not valid UTF-8 {}: {}", path.display(), e)
+            });
+        }
+        if attempt == 2 {
+            return Err(format!(
+                "Codex rollout kept changing while it was read: {}",
+                path.display()
+            ));
+        }
+    }
+    unreachable!()
+}
+
 fn read_codex_jsonl_lines(path: &Path) -> Result<Vec<CodexJsonLine>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read Codex rollout {}: {}", path.display(), e))?;
+    let content = read_stable_codex_rollout(path)?;
     let ended_with_newline = content.ends_with('\n') || content.is_empty();
     let raw_lines = content.split('\n').collect::<Vec<_>>();
     let line_count = if ended_with_newline {
@@ -551,15 +734,6 @@ fn read_codex_jsonl_lines(path: &Path) -> Result<Vec<CodexJsonLine>, String> {
         match serde_json::from_str::<Value>(line) {
             Ok(value) => lines.push(CodexJsonLine::Json(value)),
             Err(e) => {
-                if !ended_with_newline && idx + 1 == line_count && !lines.is_empty() {
-                    codex_debug_log(&format!(
-                        "[session-clone] ignoring incomplete final Codex rollout line {} in {}: {}",
-                        idx + 1,
-                        path.display(),
-                        e
-                    ));
-                    break;
-                }
                 return Err(format!(
                     "Failed to parse Codex rollout line {} in {}: {}",
                     idx + 1,
@@ -635,17 +809,20 @@ fn write_codex_jsonl_lines_atomic(path: &Path, lines: &[CodexJsonLine]) -> Resul
         .unwrap_or("clone.jsonl");
     let tmp_path = path.with_file_name(format!(".{}.tmp-{}", file_name, make_codex_uuid()));
     let result = (|| -> Result<u64, String> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
-            .map_err(|e| {
-                format!(
-                    "Failed to create temp Codex rollout {}: {}",
-                    tmp_path.display(),
-                    e
-                )
-            })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp_path).map_err(|e| {
+            format!(
+                "Failed to create temp Codex rollout {}: {}",
+                tmp_path.display(),
+                e
+            )
+        })?;
         for line in lines {
             match line {
                 CodexJsonLine::Blank => {
@@ -670,6 +847,18 @@ fn write_codex_jsonl_lines_atomic(path: &Path, lines: &[CodexJsonLine]) -> Resul
                 e
             )
         })?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|e| {
+                    format!(
+                        "Failed to sync Codex rollout directory {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+        }
         Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
     })();
     if result.is_err() {
@@ -888,22 +1077,7 @@ pub fn execute_command_streaming(
     // Write system prompt to file and use -c model_instructions_file to pass it,
     // mirroring Claude's --append-system-prompt-file pattern.
     // This works for both new sessions and resume (instruction changes take effect immediately).
-    struct SpFileGuard(Option<std::path::PathBuf>);
-    impl Drop for SpFileGuard {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.0 {
-                match std::fs::remove_file(p) {
-                    Ok(()) => { /* SpFileGuard: cleaned up temp file */ }
-                    Err(e) => {
-                        // Cannot call codex_debug_log from Drop (no access),
-                        // but the file is in ~/.cokacdir so it won't leak silently.
-                        eprintln!("[codex] WARN: SpFileGuard failed to remove {:?}: {}", p, e);
-                    }
-                }
-            }
-        }
-    }
-    let mut _sp_guard = SpFileGuard(None);
+    let mut _sp_guard: Option<PrivateTempFile> = None;
 
     // Build CLI arguments
     let mut args = if let Some(sid) = session_id {
@@ -951,32 +1125,21 @@ pub fn execute_command_streaming(
                 is_resume,
                 sp.len()
             ));
-            let sp_dir = dirs::home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".cokacdir");
+            let sp_dir = crate::utils::path::cokacdir_temp_dir()
+                .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {}", e))?;
             codex_debug_log(&format!("[SP-FILE] sp_dir={:?}", sp_dir));
-            match std::fs::create_dir_all(&sp_dir) {
-                Ok(()) => codex_debug_log("[SP-FILE] create_dir_all OK"),
-                Err(e) => codex_debug_log(&format!(
-                    "[SP-FILE] WARN: create_dir_all failed: {} (write may also fail)",
-                    e
-                )),
-            }
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let sp_path = sp_dir.join(format!("codex_sp_{:x}_{}", nanos, std::process::id()));
+            let sp_guard =
+                create_private_temp_file(&sp_dir, "codex_sp", sp.as_bytes()).map_err(|e| {
+                    codex_debug_log(&format!(
+                        "[SP-FILE] ERROR: Failed to write system prompt file: {}",
+                        e
+                    ));
+                    format!("Failed to write system prompt file: {}", e)
+                })?;
+            let sp_path = sp_guard.path();
             codex_debug_log(&format!("[SP-FILE] sp_path={:?}", sp_path));
-            if let Err(e) = std::fs::write(&sp_path, sp) {
-                codex_debug_log(&format!(
-                    "[SP-FILE] ERROR: Failed to write system prompt file: {}",
-                    e
-                ));
-                return Err(format!("Failed to write system prompt file: {}", e));
-            }
             // Verify the file was written correctly
-            match std::fs::metadata(&sp_path) {
+            match std::fs::metadata(sp_path) {
                 Ok(meta) => codex_debug_log(&format!(
                     "[SP-FILE] Written OK: file_size={}, sp_len={}, match={}",
                     meta.len(),
@@ -992,7 +1155,7 @@ pub fn execute_command_streaming(
             codex_debug_log(&format!("[SP-FILE] Adding args: -c {}", arg_value));
             args.push("-c".to_string());
             args.push(arg_value);
-            _sp_guard = SpFileGuard(Some(sp_path));
+            _sp_guard = Some(sp_guard);
         } else {
             codex_debug_log("[SP-FILE] system_prompt is Some but EMPTY — skipping file creation");
         }
@@ -1042,8 +1205,6 @@ pub fn execute_command_streaming(
     } else {
         HashSet::new()
     };
-    let turn_started_at = std::time::SystemTime::now();
-
     let spawn_start = std::time::Instant::now();
     let mut cmd = Command::new(codex_bin);
     cmd.args(&args)
@@ -1122,7 +1283,7 @@ pub fn execute_command_streaming(
     let mut model_sent_paths: Vec<PathBuf> = Vec::new();
 
     codex_debug_log("Entering JSONL lines loop...");
-    'lines: for line in reader.lines() {
+    for line in reader.lines() {
         // Check cancel token
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1176,7 +1337,6 @@ pub fn execute_command_streaming(
                                     sid,
                                     &image_dir_snapshot,
                                     &model_sent_paths,
-                                    turn_started_at,
                                     ctx,
                                     &sender,
                                 );
@@ -1223,9 +1383,10 @@ pub fn execute_command_streaming(
                     StreamMessage::TaskNotification { .. } => {}
                 }
 
-                if sender.send(msg).is_err() {
-                    codex_debug_log("  ERROR: Channel send failed (receiver dropped)");
-                    break 'lines;
+                if !send_or_abort_child(&sender, msg, &mut child) {
+                    // `send_or_abort_child` has already reaped the child.  Do
+                    // not fall through to the normal `child.wait()` path.
+                    return Ok(());
                 }
             }
         } else {
@@ -1257,7 +1418,7 @@ pub fn execute_command_streaming(
         "Process finished, exit_code: {:?}, is_resume={}, sp_file_used={}",
         status.code(),
         is_resume,
-        _sp_guard.0.is_some()
+        _sp_guard.is_some()
     ));
 
     // Handle errors
@@ -1340,14 +1501,7 @@ pub fn execute_command_streaming(
         // fire. Still try to deliver any image_gen output before closing the turn.
         if let Some(ctx) = auto_send {
             if let Some(sid) = last_session_id.as_deref() {
-                auto_deliver_new_images(
-                    sid,
-                    &image_dir_snapshot,
-                    &model_sent_paths,
-                    turn_started_at,
-                    ctx,
-                    &sender,
-                );
+                auto_deliver_new_images(sid, &image_dir_snapshot, &model_sent_paths, ctx, &sender);
             }
         }
         let _ = sender.send(StreamMessage::Done {
@@ -1358,7 +1512,8 @@ pub fn execute_command_streaming(
 
     codex_debug_log(&format!(
         "[SP-FILE] About to drop SpFileGuard (path={:?}), is_resume={}",
-        _sp_guard.0, is_resume
+        _sp_guard.as_ref().map(PrivateTempFile::path),
+        is_resume
     ));
     codex_debug_log("=== codex execute_command_streaming END (success) ===");
     Ok(())
@@ -1367,11 +1522,23 @@ pub fn execute_command_streaming(
 
 /// Resolve `~/.codex/generated_images/<session_id>/` for the given session.
 fn generated_images_dir(session_id: &str) -> Option<PathBuf> {
-    Some(
-        dirs::home_dir()?
-            .join(".codex/generated_images")
-            .join(session_id),
+    generated_images_dir_from_roots(
+        session_id,
+        std::env::var_os("CODEX_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
     )
+}
+
+fn generated_images_dir_from_roots(
+    session_id: &str,
+    codex_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let codex_home = codex_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".codex")))?;
+    Some(codex_home.join("generated_images").join(session_id))
 }
 
 /// Snapshot existing files in the codex generated-images directory for a
@@ -1443,9 +1610,49 @@ fn extract_sendfile_path(name: &str, input_json: &str) -> Option<PathBuf> {
     None
 }
 
+fn build_auto_send_command(ctx: &CodexAutoSendCtx, path: &str) -> Command {
+    let mut command = Command::new(&ctx.cokacdir_bin);
+    command
+        .args([
+            "--sendfile",
+            path,
+            "--chat",
+            &ctx.chat_id.to_string(),
+            "--key-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn run_auto_send_command(
+    ctx: &CodexAutoSendCtx,
+    path: &str,
+) -> std::io::Result<std::process::Output> {
+    let mut child = build_auto_send_command(ctx, path).spawn()?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("sendfile child stdin was not piped"))
+        .and_then(|mut stdin| {
+            stdin.write_all(ctx.bot_key.as_bytes())?;
+            stdin.write_all(b"\n")
+        });
+    if let Err(error) = write_result {
+        // A failed key handoff can leave the child blocked waiting for EOF.
+        // Kill and reap it before returning so automatic delivery never leaks
+        // a subprocess.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait_with_output()
+}
+
 /// After a Codex turn completes, scan the session's generated-images directory
-/// for image files created during this turn (mtime ≥ `started_at`) that aren't
-/// in the pre-turn snapshot and weren't already delivered by the model itself,
+/// for image files that aren't in the pre-turn snapshot and weren't already
+/// delivered by the model itself,
 /// then invoke `cokacdir --sendfile` for each one and emit synthetic
 /// ToolUse/ToolResult events so the polling loop renders them like a normal
 /// model-issued sendfile.
@@ -1453,7 +1660,6 @@ fn auto_deliver_new_images(
     session_id: &str,
     snapshot: &HashSet<PathBuf>,
     model_sent: &[PathBuf],
-    started_at: std::time::SystemTime,
     ctx: &CodexAutoSendCtx,
     sender: &Sender<StreamMessage>,
 ) {
@@ -1499,9 +1705,6 @@ fn auto_deliver_new_images(
         }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
-        if mtime < started_at {
-            continue;
-        }
         if model_sent.iter().any(|p| paths_equivalent(p, &path)) {
             codex_debug_log(&format!(
                 "[auto-send] skip (already sent by model): {}",
@@ -1562,16 +1765,9 @@ fn auto_deliver_new_images(
             path_str
         ));
 
-        let output = Command::new(&ctx.cokacdir_bin)
-            .args([
-                "--sendfile",
-                &path_str,
-                "--chat",
-                &ctx.chat_id.to_string(),
-                "--key",
-                &ctx.bot_key,
-            ])
-            .output();
+        // Pass the capability through a pipe, never argv or the environment.
+        // Process listings and crash reports can expose command-line values.
+        let output = run_auto_send_command(ctx, &path_str);
 
         let (stdout, exit_code, is_error) = match output {
             Ok(out) => {
@@ -1606,7 +1802,7 @@ fn auto_deliver_new_images(
         // by basename of any whitespace-split token, so the bin path here makes
         // the polling loop route this exactly like a model-issued sendfile.
         let cmd_str = format!(
-            "{} --sendfile {} --chat {} --key <auto>",
+            "{} --sendfile {} --chat {} --key-stdin",
             ctx.cokacdir_bin, path_str, ctx.chat_id
         );
         let tool_input = serde_json::json!({
@@ -2149,4 +2345,139 @@ fn extract_text_content(item: &Value) -> String {
     }
 
     String::new()
+}
+
+#[cfg(test)]
+mod receiver_drop_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_sendfile_command_keeps_key_out_of_argv() {
+        let ctx = CodexAutoSendCtx {
+            cokacdir_bin: "cokacdir-test".to_string(),
+            chat_id: 42,
+            bot_key: "capability-that-must-not-be-an-argument".to_string(),
+            send_files: true,
+        };
+        let command = build_auto_send_command(&ctx, "/tmp/generated image.png");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "--sendfile",
+                "/tmp/generated image.png",
+                "--chat",
+                "42",
+                "--key-stdin",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg.contains(&ctx.bot_key)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_sendfile_writes_key_only_to_child_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let receiver = temp.path().join("receiver.sh");
+        std::fs::write(&receiver, "#!/bin/sh\ncat\n").unwrap();
+        std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ctx = CodexAutoSendCtx {
+            cokacdir_bin: receiver.to_string_lossy().into_owned(),
+            chat_id: 42,
+            bot_key: "private-capability".to_string(),
+            send_files: true,
+        };
+
+        let output = run_auto_send_command(&ctx, "/tmp/image.png").unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"private-capability\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_stream_receiver_terminates_and_reaps_child() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "while :; do printf xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::services::claude::detach_into_own_pgroup(&mut command);
+        let mut child = command.spawn().expect("spawn output-producing child");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        assert!(!send_or_abort_child(
+            &sender,
+            StreamMessage::Text {
+                content: "ignored".to_string(),
+            },
+            &mut child,
+        ));
+        assert!(child.try_wait().expect("query reaped child").is_some());
+    }
+
+    #[test]
+    fn generated_images_honor_custom_codex_home() {
+        let custom = std::path::Path::new("/custom/codex-home");
+        let fallback = std::path::Path::new("/home/tester");
+        assert_eq!(
+            generated_images_dir_from_roots("session-1", Some(custom.as_os_str()), Some(fallback),),
+            Some(custom.join("generated_images").join("session-1"))
+        );
+    }
+
+    #[test]
+    fn rollout_scan_handles_deep_directory_trees_iteratively() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut current = temp.path().to_path_buf();
+        for _ in 0..160 {
+            current.push("d");
+            std::fs::create_dir(&current).unwrap();
+        }
+        let rollout = current.join("rollout-session-1.jsonl");
+        std::fs::write(&rollout, b"{}\n").unwrap();
+
+        let mut found = Vec::new();
+        collect_codex_rollouts(temp.path(), "session-1", &mut found);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, rollout);
+    }
+
+    #[test]
+    fn session_clone_rejects_an_incomplete_final_rollout_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("rollout.jsonl");
+        std::fs::write(&rollout, b"{\"type\":\"ok\"}\n{\"incomplete\":").unwrap();
+
+        let error = read_codex_jsonl_lines(&rollout).unwrap_err();
+
+        assert!(error.contains("Failed to parse Codex rollout line 2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_clone_rejects_symlink_rollout_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.jsonl");
+        let rollout = temp.path().join("rollout.jsonl");
+        std::fs::write(&outside, b"{\"secret\":true}\n").unwrap();
+        symlink(&outside, &rollout).unwrap();
+
+        assert!(read_codex_jsonl_lines(&rollout).is_err());
+    }
 }

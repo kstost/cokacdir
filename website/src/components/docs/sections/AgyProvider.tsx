@@ -13,20 +13,38 @@ export default function AgyProvider() {
 
       <SubSection title={String(t('Invocation', '실행 방식'))}>
         <P>{t(
-          <>Agy is run in print mode. The prompt is written through stdin, and cokacdir always passes an explicit empty string to <IC>--print</IC>.</>,
-          <>Agy는 print mode로 실행됩니다. 프롬프트는 stdin으로 전달하고, cokacdir는 <IC>--print</IC>에 항상 명시적인 빈 문자열을 넘깁니다.</>
+          <>Only the current user request is written to non-TTY stdin. On Linux, the complete system prompt is injected separately as a transient system message through Agy's official <IC>PreInvocation</IC> hook.</>,
+          <>non-TTY stdin에는 현재 사용자 요청만 전달합니다. Linux에서는 전체 시스템 프롬프트를 Agy 공식 <IC>PreInvocation</IC> 훅을 통해 별도의 일시적 시스템 메시지로 주입합니다.</>
         )}</P>
-        <CodeBlock code={'agy --print "" --print-timeout <duration> --log-file <temp-log> --dangerously-skip-permissions'} />
+        <CodeBlock code={'agy --print-timeout <duration> --log-file ~/.cokacdir/tmp/<private-log> --dangerously-skip-permissions'} />
         <P>{t(
-          <>For resumed sessions, cokacdir adds <IC>--conversation &lt;session_id&gt;</IC>. The bare form <IC>agy --print</IC> is intentionally avoided because measured runs showed it can consume unintended context and produce unrelated output.</>,
-          <>세션 재개 시에는 <IC>--conversation &lt;session_id&gt;</IC>를 추가합니다. 실측 결과 <IC>agy --print</IC>처럼 값 없는 형태는 의도하지 않은 컨텍스트를 소비해 무관한 출력을 만들 수 있어 의도적으로 피합니다.</>
+          <>cokacdir installs one namespaced global Agy plugin under <IC>~/.gemini/config/plugins/</IC>. For each run, the full system prompt is stored in an owner-only <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> file and returned by the hook as an <IC>ephemeralMessage</IC>.</>,
+          <>cokacdir는 <IC>~/.gemini/config/plugins/</IC> 아래에 이름이 분리된 전역 Agy 플러그인 하나를 설치합니다. 실행마다 전체 시스템 프롬프트를 소유자 전용 <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> 파일에 두고 훅이 <IC>ephemeralMessage</IC>로 반환합니다.</>
         )}</P>
+        <P>{t(
+          <>No <IC>--print</IC>, <IC>-p</IC>, or <IC>--prompt</IC> flag is used. Agy 1.1.1 reads piped stdin when prompt flags are absent; a flag prompt disables stdin prompt reading.</>,
+          <><IC>--print</IC>, <IC>-p</IC>, <IC>--prompt</IC> 플래그는 사용하지 않습니다. Agy 1.1.1은 프롬프트 플래그가 없을 때 파이프 stdin을 읽으며, 플래그 프롬프트를 주면 stdin 프롬프트를 읽지 않습니다.</>
+        )}</P>
+        <P>{t(
+          <>Resume uses a fresh file with the current complete system prompt plus <IC>--conversation &lt;session_id&gt;</IC>. No <IC>--add-dir</IC> is used, so the project, <IC>AGENTS.md</IC>, and active workspace are unchanged.</>,
+          <>세션 재개 때도 현재의 전체 시스템 프롬프트를 새 파일에 담고 <IC>--conversation &lt;session_id&gt;</IC>를 사용합니다. <IC>--add-dir</IC>를 쓰지 않으므로 프로젝트, <IC>AGENTS.md</IC>, 실제 작업공간은 바뀌지 않습니다.</>
+        )}</P>
+        <P>{t(
+          <>Every hook call records a private start/success ledger entry. cokacdir buffers all Agy output until every entry is complete, terminates an incomplete hook after 30 seconds, and removes prompt files after exit. Locks let the next run safely remove files left by a crash without touching active runs.</>,
+          <>모든 훅 호출은 비공개 시작/성공 ledger를 기록합니다. cokacdir는 모든 항목이 완료될 때까지 Agy 출력을 보류하고, 30초 동안 완료되지 않은 훅은 종료하며, 종료 뒤 프롬프트 파일을 삭제합니다. 잠금으로 실행 중인 파일을 구분해 다음 실행에서 crash 잔여 파일도 안전하게 정리합니다.</>
+        )}</P>
+        <InfoBox type="info">
+          {t(
+            <>The hook transport is enabled only on verified Linux builds. Windows and macOS currently use the legacy combined-stdin fallback. The installed global plugin returns no injected message when cokacdir's private per-process environment is absent.</>,
+            <>훅 전송은 검증된 Linux 빌드에서만 활성화됩니다. Windows와 macOS는 현재 기존의 합성 stdin 방식으로 대체합니다. 설치된 전역 플러그인은 cokacdir의 실행별 비공개 환경이 없으면 아무 메시지도 주입하지 않습니다.</>
+          )}
+        </InfoBox>
       </SubSection>
 
       <SubSection title={String(t('Stdout Contract', 'stdout 규약'))}>
         <P>{t(
-          <>Agy print mode emits plain stdout. It does not emit structured tool-use events like Claude or Codex JSONL streams.</>,
-          <>Agy print mode는 평문 stdout을 출력합니다. Claude나 Codex의 JSONL 스트림처럼 구조화된 도구 사용 이벤트를 내보내지 않습니다.</>
+          <>Agy headless stdin mode emits plain stdout. It does not emit structured tool-use events like Claude or Codex JSONL streams.</>,
+          <>Agy headless stdin 모드는 평문 stdout을 출력합니다. Claude나 Codex의 JSONL 스트림처럼 구조화된 도구 사용 이벤트를 내보내지 않습니다.</>
         )}</P>
         <UL>
           <li>{t('Successful output may be only the final answer.', '성공 출력은 최종 답변만 포함할 수 있습니다.')}</li>
@@ -80,6 +98,9 @@ export default function AgyProvider() {
           <li>{t(<><IC>/allowed</IC> tool restrictions do not constrain Agy; they are enforced only for Claude.</>, <><IC>/allowed</IC> 도구 제한은 Agy를 제약하지 않습니다. 현재 Claude에만 적용됩니다.</>)}</li>
           <li>{t(<><IC>/loop</IC> verification is rejected for Agy because no isolated no-tools verifier mode has been measured.</>, <><IC>/loop</IC> 검증은 Agy에서 거부됩니다. 격리된 no-tools verifier mode가 실측되지 않았기 때문입니다.</>)}</li>
           <li>{t('Agy conversation files live under ~/.gemini/antigravity-cli because that is the storage path used by Antigravity CLI.', 'Agy 대화 파일은 Antigravity CLI가 사용하는 저장 경로인 ~/.gemini/antigravity-cli 아래에 있습니다.')}</li>
+          <li>{t('Agy treats hook errors as fail-open. The ledger and acknowledgement let cokacdir detect a hook that never started (or did not complete) and discard its output, but cannot prove that Agy applied an otherwise valid hook response or undo model/tool side effects that already happened.', 'Agy는 훅 오류를 fail-open으로 처리합니다. ledger와 acknowledgement를 통해 훅이 시작되지 않았거나 완료되지 않은 경우를 감지해 출력을 폐기하지만, Agy가 형식상 유효한 훅 응답을 실제로 적용했는지는 증명할 수 없고 이미 발생한 모델·도구 부작용도 되돌릴 수 없습니다.')}</li>
+          <li>{t('The system step is separate from user stdin, but Agy 1.1.1 still stores it as plaintext in the conversation database.', '시스템 단계는 사용자 stdin과 분리되지만 Agy 1.1.1은 이를 대화 데이터베이스에 평문으로 저장합니다.')}</li>
+          <li>{t('Agy tool subprocesses inherit the hook file paths and token. Full permissions are intentional, so this transport is not a security boundary against same-user code.', 'Agy 도구 하위 프로세스도 훅 파일 경로와 토큰을 상속합니다. full 권한은 의도된 것이므로 이 전송 방식은 같은 사용자 권한의 코드에 대한 보안 경계가 아닙니다.')}</li>
         </UL>
       </SubSection>
     </div>

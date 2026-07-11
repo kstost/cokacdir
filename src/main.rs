@@ -15,7 +15,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
-use std::io;
+use std::io::{self, Read, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -28,6 +28,9 @@ use crate::ui::app::{App, Screen};
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROJECT_LICENSE: &str = include_str!("../LICENSE");
+const THIRD_PARTY_NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.md");
+const OPENSSL_LICENSE: &str = include_str!("../LICENSES/OpenSSL-3.6.3.txt");
 
 /// Global binary path, resolved once at startup via `std::env::current_exe()`.
 /// Works on Linux (/proc/self/exe), macOS (_NSGetExecutablePath), Windows (GetModuleFileNameW).
@@ -53,6 +56,290 @@ pub fn bin_path() -> &'static str {
     BIN_PATH.get().map(|s| s.as_str()).unwrap_or("cokacdir")
 }
 
+fn open_private_directory(
+    path: &std::path::Path,
+) -> io::Result<(
+    std::fs::File,
+    std::path::PathBuf,
+    crate::services::file_ops::StablePathIdentity,
+)> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let (directory, stable_path, metadata) =
+        crate::services::file_ops::open_directory_for_read(path)?;
+    let identity = crate::services::file_ops::stable_file_identity(&directory)?;
+    if !metadata.file_type().is_dir()
+        || crate::services::file_ops::stable_path_identity(path)? != identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a stable real directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    if crate::services::file_ops::stable_path_identity(path)? != identity {
+        return Err(io::Error::other(format!(
+            "{} changed while it was secured",
+            path.display()
+        )));
+    }
+    Ok((directory, stable_path, identity))
+}
+
+fn ensure_private_directory(path: &std::path::Path) -> io::Result<()> {
+    open_private_directory(path).map(|_| ())
+}
+
+/// Preserve an unreadable settings file without ever truncating an older
+/// recovery copy.  A malformed settings file may later be replaced when the
+/// user changes an in-memory setting, so the backup must be complete and
+/// durable before the TUI starts accepting input.
+fn backup_unparseable_settings(path: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let (parent_guard, stable_parent, parent_identity) = open_private_directory(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid settings path"))?
+        .to_string_lossy();
+    let source_before = std::fs::symlink_metadata(path)?;
+    if !source_before.file_type().is_file() || source_before.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings path is not a real regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if source_before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings path is a reparse point",
+            ));
+        }
+    }
+    let mut source_options = std::fs::OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        source_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let stable_source_path = stable_parent.join(
+        path.file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid settings path"))?,
+    );
+    let mut source = source_options.open(&stable_source_path)?;
+    let source_opened = source.metadata()?;
+    if !source_opened.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings path is not a real regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if source_opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings path is a reparse point",
+            ));
+        }
+    }
+    let source_identity = crate::services::file_ops::stable_file_identity(&source)?;
+    if crate::services::file_ops::stable_path_identity(path)? != source_identity
+        || crate::services::file_ops::stable_path_identity(parent)? != parent_identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "settings path changed while being opened",
+        ));
+    }
+
+    for attempt in 0..128u32 {
+        let backup_name = if attempt == 0 {
+            format!("{file_name}.bak")
+        } else {
+            format!("{file_name}.bak.{:032x}", rand::random::<u128>())
+        };
+        let backup_path = parent.join(backup_name);
+        let stable_backup_path = stable_parent.join(backup_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid settings backup path")
+        })?);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut backup = match options.open(&stable_backup_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+
+        let backup_identity = match crate::services::file_ops::stable_file_identity(&backup) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(backup);
+                let _ = std::fs::remove_file(&stable_backup_path);
+                return Err(error);
+            }
+        };
+        let result = (|| {
+            io::copy(&mut source, &mut backup)?;
+            let source_after = source.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if source_after.dev() != source_opened.dev()
+                    || source_after.ino() != source_opened.ino()
+                    || source_after.len() != source_opened.len()
+                    || source_after.mtime() != source_opened.mtime()
+                    || source_after.mtime_nsec() != source_opened.mtime_nsec()
+                    || source_after.ctime() != source_opened.ctime()
+                    || source_after.ctime_nsec() != source_opened.ctime_nsec()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "settings changed while being backed up",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            if source_after.len() != source_opened.len()
+                || source_after.modified().ok() != source_opened.modified().ok()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "settings changed while being backed up",
+                ));
+            }
+            backup.flush()?;
+            backup.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            drop(backup);
+            let _ = crate::services::file_ops::remove_file_by_identity(
+                &stable_backup_path,
+                backup_identity,
+            );
+            return Err(e);
+        }
+
+        drop(backup);
+        let published_identity = crate::services::file_ops::stable_path_identity(&backup_path);
+        let current_parent_identity = crate::services::file_ops::stable_path_identity(parent);
+        if published_identity.as_ref().ok() != Some(&backup_identity)
+            || current_parent_identity.as_ref().ok() != Some(&parent_identity)
+        {
+            let _ = crate::services::file_ops::remove_file_by_identity(
+                &stable_backup_path,
+                backup_identity,
+            );
+            return Err(published_identity
+                .err()
+                .or_else(|| current_parent_identity.err())
+                .unwrap_or_else(|| {
+                    io::Error::other("settings backup path changed while it was written")
+                }));
+        }
+        #[cfg(unix)]
+        parent_guard.sync_all()?;
+
+        return Ok(backup_path);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a settings recovery file",
+    ))
+}
+
+fn create_new_private_file_with(
+    path: &std::path::Path,
+    write_contents: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file has no parent"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file has no name"))?;
+    let (directory, stable_directory, directory_identity) = open_private_directory(parent)?;
+    let stable_path = stable_directory.join(file_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&stable_path)?;
+    let file_identity = match crate::services::file_ops::stable_file_identity(&file) {
+        Ok(identity) => identity,
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(&stable_path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_contents(&mut file).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, file_identity);
+        return Err(error);
+    }
+    drop(file);
+    let published_identity = crate::services::file_ops::stable_path_identity(path);
+    let current_directory_identity = crate::services::file_ops::stable_path_identity(parent);
+    if published_identity.as_ref().ok() != Some(&file_identity)
+        || current_directory_identity.as_ref().ok() != Some(&directory_identity)
+    {
+        let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, file_identity);
+        return Err(published_identity
+            .err()
+            .or_else(|| current_directory_identity.err())
+            .unwrap_or_else(|| {
+                io::Error::other("private file path changed while it was created")
+            }));
+    }
+    #[cfg(unix)]
+    if let Err(error) = directory.sync_all() {
+        // The create-new entry is already committed and the file itself is
+        // synced. Returning an error here could make callers retry a message
+        // or upload request that a concurrent bot process can already see.
+        eprintln!(
+            "Warning: private file was created, but directory durability could not be confirmed: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn write_new_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    create_new_private_file_with(path, |file| file.write_all(contents))
+}
+
 fn print_help() {
     println!("cokacdir {} - Multi-panel terminal file manager", VERSION);
     println!();
@@ -65,29 +352,39 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    -h, --help              Print help information");
     println!("    -v, --version           Print version information");
+    println!("    --licenses              Print project license and third-party notices");
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
+    println!("    --ccserver-token-file <PATH>");
     println!(
-        "    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord/Slack)"
+        "                            Start bot server(s), reading one token per line (recommended)"
     );
-    println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
+    println!(
+        "    --ccserver-stdin         Start bot server(s), reading one token per line from stdin"
+    );
+    println!("    --ccserver <TOKEN>...   Legacy token arguments (visible in process listings)");
+    println!("    --sendfile <PATH> --chat <ID> --key-file <PATH>");
     println!(
         "                            Send file via Telegram bot (internal use, HASH = token hash)"
     );
     println!("    --currenttime            Print current server time");
-    println!("    --cron <PROMPT> --at <TIME> --chat <ID> --key <HASH> [--once] [--session <SID>]");
+    println!(
+        "    --cron <PROMPT> --at <TIME> --chat <ID> --key-file <PATH> [--once] [--session <SID>]"
+    );
     println!("                            Register a scheduled task");
-    println!("    --cron-list --chat <ID> --key <HASH>");
+    println!("    --cron-list --chat <ID> --key-file <PATH>");
     println!("                            List registered schedules");
-    println!("    --cron-remove <SID> --chat <ID> --key <HASH>");
+    println!("    --cron-remove <SID> --chat <ID> --key-file <PATH>");
     println!("                            Remove a schedule");
-    println!("    --cron-update <SID> --at <TIME> --chat <ID> --key <HASH>");
+    println!("    --cron-update <SID> --at <TIME> --chat <ID> --key-file <PATH>");
     println!("                            Update schedule time");
-    println!("    --cron-history <SID> --chat <ID> --key <HASH>");
+    println!("    --cron-history <SID> --chat <ID> --key-file <PATH>");
     println!("                            Read run history of a schedule (JSONL records)");
-    println!("    --message <TEXT> --to <BOT> --chat <ID> --key <HASH>");
+    println!("    --message <TEXT> --to <BOT> --chat <ID> --key-file <PATH>");
     println!("                            Send message to another bot (internal use)");
+    println!("    --key-file <PATH>       Read an internal authorization key from a private file");
+    println!("    --key-stdin             Read an internal authorization key from stdin");
     println!("    --read_chat_log <CHAT_ID> [--range <N|START-END>] [--bot <USERNAME>]");
     println!("                            Read group chat shared log");
     println!();
@@ -110,33 +407,67 @@ fn handle_base64(encoded: &str) {
     }
 }
 
-fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
-    use md5::{Digest, Md5};
-
-    let file_path = std::path::Path::new(path);
-    if !file_path.exists() {
-        eprintln!(
-            "{}",
-            serde_json::json!({"status":"error","message":format!("file not found: {}", path)})
-        );
-        std::process::exit(1);
-    }
-
-    let abs_path = match file_path
+fn canonical_sendfile_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let canonical = path
         .canonicalize()
         .map(crate::utils::format::strip_unc_prefix)
-    {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(e) => {
+        .map_err(|e| format!("failed to resolve path: {}", e))?;
+    if !canonical.is_file() {
+        return Err(format!("not a regular file: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn enqueue_upload_request(
+    queue_dir: &std::path::Path,
+    abs_path: &std::path::Path,
+    chat_id: i64,
+    hash_key: &str,
+) -> io::Result<std::path::PathBuf> {
+    use md5::{Digest, Md5};
+    use rand::RngCore;
+
+    let abs_path_text = abs_path.to_string_lossy();
+    let queue_content = serde_json::to_vec(&serde_json::json!({
+        "path": abs_path_text,
+        "chat_id": chat_id,
+        "key": hash_key,
+    }))
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d-%H-%M-%S-%3f").to_string();
+    let path_hash = format!("{:x}", Md5::digest(abs_path_text.as_bytes()));
+
+    for _ in 0..100 {
+        let mut nonce = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let filename = format!("{}.{}.{}.queue", timestamp, path_hash, hex::encode(nonce));
+        let queue_path = queue_dir.join(filename);
+        match write_new_private_file(&queue_path, &queue_content) {
+            Ok(()) => return Ok(queue_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to allocate a unique upload queue filename",
+    ))
+}
+
+fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
+    let file_path = std::path::Path::new(path);
+    let abs_path = match canonical_sendfile_path(file_path) {
+        Ok(path) => path,
+        Err(message) => {
             eprintln!(
                 "{}",
-                serde_json::json!({"status":"error","message":format!("failed to resolve path: {}", e)})
+                serde_json::json!({"status":"error","message":message})
             );
             std::process::exit(1);
         }
     };
 
-    // Create upload queue directory
     let queue_dir = match dirs::home_dir() {
         Some(h) => h.join(".cokacdir").join("upload_queue"),
         None => {
@@ -147,30 +478,11 @@ fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) {
             std::process::exit(1);
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&queue_dir) {
-        eprintln!(
+    match enqueue_upload_request(&queue_dir, &abs_path, chat_id, hash_key) {
+        Ok(_) => println!(
             "{}",
-            serde_json::json!({"status":"error","message":format!("failed to create queue directory: {}", e)})
-        );
-        std::process::exit(1);
-    }
-
-    // Generate queue filename: YYYY-MM-DD-hh-mm-ii-ss-mmm.{MD5}.queue
-    let now = chrono::Local::now();
-    let timestamp = now.format("%Y-%m-%d-%H-%M-%S").to_string();
-    let millis = now.format("%3f").to_string();
-    let md5_hash = format!("{:x}", Md5::digest(abs_path.as_bytes()));
-    let filename = format!("{}-{}.{}.queue", timestamp, millis, md5_hash);
-
-    // Write queue file
-    let queue_content = serde_json::json!({
-        "path": abs_path,
-        "chat_id": chat_id,
-        "key": hash_key,
-    });
-    let queue_path = queue_dir.join(&filename);
-    match std::fs::write(&queue_path, queue_content.to_string()) {
-        Ok(_) => println!("{}", serde_json::json!({"status":"ok","path":abs_path})),
+            serde_json::json!({"status":"ok","path":abs_path.to_string_lossy()})
+        ),
         Err(e) => {
             eprintln!(
                 "{}",
@@ -453,8 +765,8 @@ fn handle_cron_register(
     // break the suggested command. Matches the `\"{bin}\"` quoting used throughout the
     // system-prompt SCHEDULE sections.
     let hint = format!(
-        "To inspect run history of this schedule, call: \"{}\" --cron-history {} --chat {} --key {}",
-        bin, id, chat_id, hash_key
+        "To inspect run history of this schedule, call: \"{}\" --cron-history {} --chat {} --key-file <PRIVATE_KEY_FILE>",
+        bin, id, chat_id
     );
     output
         .as_object_mut()
@@ -467,7 +779,10 @@ fn handle_cron_register(
             .join(".cokacdir")
             .join("schedule")
             .join(format!("{}.result", id));
-        let _ = std::fs::write(&result_path, output.to_string());
+        let _ = services::telegram::write_private_file_atomically(
+            &result_path,
+            output.to_string().as_bytes(),
+        );
         cron_debug(&format!("  Result file written: {}", result_path.display()));
     }
     println!("{}", output);
@@ -882,7 +1197,7 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
             std::process::exit(1);
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&msg_dir) {
+    if let Err(e) = ensure_private_directory(&msg_dir) {
         msg_debug(&format!(
             "[handle_bot_message] create_dir_all failed: {}",
             e
@@ -898,7 +1213,7 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
     // 4. Generate message file
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
-    let random_hex = format!("{:08x}", rand::random::<u32>());
+    let random_hex = format!("{:032x}", rand::random::<u128>());
     let msg_id = format!("msg_{}_{}", timestamp, random_hex);
     msg_debug(&format!(
         "[handle_bot_message] generated msg_id={}, timestamp={}",
@@ -919,10 +1234,8 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
         "[handle_bot_message] writing message file: {}",
         file_path.display()
     ));
-    match std::fs::write(
-        &file_path,
-        serde_json::to_string_pretty(&msg_json).unwrap_or_default(),
-    ) {
+    let message_bytes = serde_json::to_vec_pretty(&msg_json).unwrap_or_default();
+    match write_new_private_file(&file_path, &message_bytes) {
         Ok(_) => {
             msg_debug(&format!(
                 "[handle_bot_message] OK: from={}, to={}, id={}, path={}",
@@ -947,6 +1260,29 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
 
 fn print_version() {
     println!("cokacdir {}", VERSION);
+}
+
+fn print_licenses() {
+    println!("cokacdir project license (MIT)");
+    println!("================================");
+    print!("{}", PROJECT_LICENSE);
+    if !PROJECT_LICENSE.ends_with('\n') {
+        println!();
+    }
+
+    println!("\nThird-party notices");
+    println!("===================");
+    print!("{}", THIRD_PARTY_NOTICES);
+    if !THIRD_PARTY_NOTICES.ends_with('\n') {
+        println!();
+    }
+
+    println!("\nOpenSSL 3.6.3 license (Apache License 2.0)");
+    println!("============================================");
+    print!("{}", OPENSSL_LICENSE);
+    if !OPENSSL_LICENSE.ends_with('\n') {
+        println!();
+    }
 }
 
 /// Telegram token format: `<digits>:<alphanumeric_hash>`
@@ -983,6 +1319,230 @@ fn parse_slack_pair(s: &str) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+const MAX_CCSERVER_TOKEN_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_CLI_KEY_BYTES: u64 = 16 * 1024;
+
+fn read_cli_key<R: Read>(reader: R) -> Result<String, String> {
+    let mut input = String::new();
+    let mut limited = reader.take(MAX_CLI_KEY_BYTES + 1);
+    limited
+        .read_to_string(&mut input)
+        .map_err(|e| format!("failed to read authorization key: {}", e))?;
+    if input.len() as u64 > MAX_CLI_KEY_BYTES {
+        return Err(format!(
+            "authorization key exceeds {} bytes",
+            MAX_CLI_KEY_BYTES
+        ));
+    }
+    let key = input.trim();
+    if key.is_empty() {
+        return Err("authorization key is empty".to_string());
+    }
+    Ok(key.to_string())
+}
+
+fn open_private_secret_file(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<std::fs::File, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "failed to inspect {description} file '{}': {e}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{description} path '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    let inspected_identity =
+        crate::services::file_ops::stable_path_identity(path).map_err(|e| {
+            format!(
+                "failed to identify {description} file '{}': {e}",
+                path.display()
+            )
+        })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{description} path '{}' is a reparse point",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{description} file '{}' must not be accessible by group or other users (use chmod 600)",
+                path.display()
+            ));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|e| {
+        format!(
+            "failed to open {description} file '{}': {e}",
+            path.display()
+        )
+    })?;
+    let opened_metadata = file.metadata().map_err(|e| {
+        format!(
+            "failed to inspect {description} file '{}': {e}",
+            path.display()
+        )
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(format!(
+            "{description} path '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    let opened_identity = crate::services::file_ops::stable_file_identity(&file).map_err(|e| {
+        format!(
+            "failed to identify opened {description} file '{}': {e}",
+            path.display()
+        )
+    })?;
+    let current_identity = crate::services::file_ops::stable_path_identity(path).map_err(|e| {
+        format!(
+            "failed to re-identify {description} file '{}': {e}",
+            path.display()
+        )
+    })?;
+    if inspected_identity != opened_identity || current_identity != opened_identity {
+        return Err(format!(
+            "{description} file '{}' changed while being opened",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{description} path '{}' is a reparse point",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if opened_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{description} file '{}' must not be accessible by group or other users (use chmod 600)",
+                path.display()
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn read_cli_key_file(path: &std::path::Path) -> Result<String, String> {
+    read_cli_key(open_private_secret_file(path, "key")?)
+}
+
+fn parse_cli_key_argument(
+    args: &[String],
+    index: usize,
+) -> Result<Option<(String, usize)>, String> {
+    match args.get(index).map(String::as_str) {
+        Some("--key") => {
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "--key requires a value".to_string())?;
+            eprintln!(
+                "Warning: --key exposes the authorization key in process listings; use --key-file or --key-stdin"
+            );
+            Ok(Some((value.clone(), index + 2)))
+        }
+        Some("--key-file") => {
+            let path = args
+                .get(index + 1)
+                .ok_or_else(|| "--key-file requires a path".to_string())?;
+            Ok(Some((
+                read_cli_key_file(std::path::Path::new(path))?,
+                index + 2,
+            )))
+        }
+        Some("--key-stdin") => Ok(Some((read_cli_key(std::io::stdin().lock())?, index + 1))),
+        _ => Ok(None),
+    }
+}
+
+fn redact_cli_args_for_log(args: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for argument in args {
+        if redact_next {
+            redacted.push("<redacted>".to_string());
+            redact_next = false;
+        } else if argument == "--key" {
+            redacted.push(argument.clone());
+            redact_next = true;
+        } else if argument.starts_with("--key=") {
+            redacted.push("--key=<redacted>".to_string());
+        } else {
+            redacted.push(argument.clone());
+        }
+    }
+    redacted
+}
+
+fn parse_ccserver_token_input(input: &str) -> Result<Vec<String>, String> {
+    let tokens: Vec<String> = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if tokens.is_empty() {
+        return Err("token input is empty".to_string());
+    }
+    Ok(tokens)
+}
+
+fn read_ccserver_tokens<R: Read>(reader: R) -> Result<Vec<String>, String> {
+    let mut input = String::new();
+    let mut limited = reader.take(MAX_CCSERVER_TOKEN_INPUT_BYTES + 1);
+    limited
+        .read_to_string(&mut input)
+        .map_err(|e| format!("failed to read token input: {}", e))?;
+    if input.len() as u64 > MAX_CCSERVER_TOKEN_INPUT_BYTES {
+        return Err(format!(
+            "token input exceeds {} bytes",
+            MAX_CCSERVER_TOKEN_INPUT_BYTES
+        ));
+    }
+    parse_ccserver_token_input(&input)
+}
+
+fn read_ccserver_token_file(path: &std::path::Path) -> Result<Vec<String>, String> {
+    read_ccserver_tokens(open_private_secret_file(path, "token")?)
 }
 
 fn handle_ccserver(tokens: Vec<String>) {
@@ -1038,14 +1598,8 @@ fn handle_ccserver(tokens: Vec<String>) {
         } else {
             "telegram (fallback)"
         };
-        // Mask token for security: show only a short prefix (char-boundary safe).
-        let masked = crate::utils::format::safe_prefix(token, 8);
-        eprintln!(
-            "  [ccserver] token #{}: {} → {}",
-            i + 1,
-            kind,
-            format!("{}...", masked)
-        );
+        // Never include any portion of a credential in diagnostics.
+        eprintln!("  [ccserver] token #{}: {}", i + 1, kind);
     }
 
     let total = tg_tokens.len() + discord_tokens.len() + slack_tokens.len();
@@ -1080,7 +1634,7 @@ fn handle_ccserver(tokens: Vec<String>) {
         eprintln!();
         eprintln!("  Error: No AI provider available.");
         eprintln!("  Install Claude CLI, Codex CLI, Antigravity CLI (agy), or OpenCode.");
-        return;
+        std::process::exit(1);
     }
 
     if !tg_tokens.is_empty() {
@@ -1172,14 +1726,14 @@ fn handle_ccserver(tokens: Vec<String>) {
     }
 }
 
-fn handle_prompt(prompt: &str) {
+fn handle_prompt(prompt: &str) -> Result<(), String> {
     use crate::ui::theme::Theme;
 
     // Check if Claude is available
     if !claude::is_claude_available() {
-        eprintln!("Error: Claude CLI is not available.");
-        eprintln!("Please install Claude CLI: https://claude.ai/cli");
-        return;
+        return Err(
+            "Claude CLI is not available. Install it from https://claude.ai/cli".to_string(),
+        );
     }
 
     // Execute Claude command
@@ -1189,13 +1743,9 @@ fn handle_prompt(prompt: &str) {
     let response = claude::execute_command(prompt, None, &current_dir, None, None);
 
     if !response.success {
-        eprintln!(
-            "Error: {}",
-            response
-                .error
-                .unwrap_or_else(|| "Unknown error".to_string())
-        );
-        return;
+        return Err(response
+            .error
+            .unwrap_or_else(|| "Claude command failed with an unknown error".to_string()));
     }
 
     let content = response.response.unwrap_or_default();
@@ -1223,6 +1773,7 @@ fn handle_prompt(prompt: &str) {
             prev_was_empty = false;
         }
     }
+    Ok(())
 }
 
 /// Internal smoke test: drive `opencode::execute_command_streaming` with a
@@ -1665,6 +2216,10 @@ fn deploy_docs() {
             include_str!("../docs/how-to-use-shell-commands.md"),
         ),
         (
+            "how-to-use-agy-antigravity.md",
+            include_str!("../docs/how-to-use-agy-antigravity.md"),
+        ),
+        (
             "how-to-share-bot-with-others.md",
             include_str!("../docs/how-to-share-bot-with-others.md"),
         ),
@@ -1674,22 +2229,125 @@ fn deploy_docs() {
         let _ = std::fs::create_dir_all(&docs_dir);
         for (name, content) in DOCS {
             let path = docs_dir.join(name);
-            let _ = std::fs::write(&path, content);
+            let _ = services::telegram::write_private_file_atomically(&path, content.as_bytes());
         }
     }
 }
 
 /// Load ~/.cokacdir/.env.json and set environment variables.
 /// Values from this file take priority over the existing environment.
+fn is_valid_environment_entry(key: &str, value: &str) -> bool {
+    !key.is_empty() && !key.contains(['=', '\0']) && !value.contains('\0')
+}
+
 fn load_dot_env() {
     let env_path = match dirs::home_dir() {
         Some(h) => h.join(".cokacdir").join(".env.json"),
         None => return,
     };
-    let content = match std::fs::read_to_string(&env_path) {
-        Ok(c) => c,
+    let before = match std::fs::symlink_metadata(&env_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        _ => return,
+    };
+    const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return;
+        }
+    }
+    if before.len() > MAX_ENV_FILE_BYTES {
+        eprintln!("Warning: ~/.cokacdir/.env.json exceeds the 1 MiB size limit");
+        return;
+    }
+    let inspected_identity = match crate::services::file_ops::stable_path_identity(&env_path) {
+        Ok(identity) => identity,
         Err(_) => return,
     };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = match options.open(&env_path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let opened = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_ENV_FILE_BYTES => metadata,
+        _ => return,
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return;
+        }
+    }
+    let opened_identity = match crate::services::file_ops::stable_file_identity(&file) {
+        Ok(identity) => identity,
+        Err(_) => return,
+    };
+    if inspected_identity != opened_identity
+        || crate::services::file_ops::stable_path_identity(&env_path).ok() != Some(opened_identity)
+    {
+        return;
+    }
+    let mut bytes = Vec::new();
+    let content = match Read::by_ref(&mut file)
+        .take(MAX_ENV_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) if bytes.len() as u64 <= MAX_ENV_FILE_BYTES => match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => return,
+        },
+        Err(_) => return,
+        Ok(_) => return,
+    };
+    let after = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    if crate::services::file_ops::stable_file_identity(&file).ok() != Some(opened_identity)
+        || crate::services::file_ops::stable_path_identity(&env_path).ok() != Some(opened_identity)
+    {
+        eprintln!("Warning: ~/.cokacdir/.env.json changed while being read");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+            || after.len() != opened.len()
+            || after.mtime() != opened.mtime()
+            || after.mtime_nsec() != opened.mtime_nsec()
+            || after.ctime() != opened.ctime()
+            || after.ctime_nsec() != opened.ctime_nsec()
+        {
+            eprintln!("Warning: ~/.cokacdir/.env.json changed while being read");
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    if after.len() != opened.len() || after.modified().ok() != opened.modified().ok() {
+        eprintln!("Warning: ~/.cokacdir/.env.json changed while being read");
+        return;
+    }
     let map: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&content) {
         Ok(m) => m,
         Err(e) => {
@@ -1698,34 +2356,72 @@ fn load_dot_env() {
         }
     };
     for (key, val) in &map {
-        if let Some(s) = val.as_str() {
-            std::env::set_var(key, s);
+        let value = if let Some(s) = val.as_str() {
+            Some(s.to_string())
         } else if val.is_number() || val.is_boolean() {
-            std::env::set_var(key, val.to_string());
+            Some(val.to_string())
         } else {
             eprintln!(
-                "Warning: ~/.cokacdir/.env.json: skipping '{}' (unsupported value type)",
-                key
+                "Warning: ~/.cokacdir/.env.json: skipping {:?} (unsupported value type)",
+                key.escape_debug().to_string()
             );
+            None
+        };
+        if let Some(value) = value {
+            if is_valid_environment_entry(key, &value) {
+                std::env::set_var(key, value);
+            } else {
+                eprintln!("Warning: ~/.cokacdir/.env.json: skipping invalid environment entry");
+            }
         }
     }
 }
 
 fn main() -> io::Result<()> {
+    // Agy invokes this private hook entry point before each model call. Handle
+    // it before normal startup so the hook neither loads user env overrides
+    // nor initializes the TUI, bot state, or deployed documentation.
+    let mut early_args = std::env::args_os();
+    let _program = early_args.next();
+    let first_early_arg = early_args.next();
+    let has_more_early_args = early_args.next().is_some();
+    if first_early_arg.as_deref()
+        == Some(std::ffi::OsStr::new("--internal-agy-pre-invocation-hook"))
+        && !has_more_early_args
+    {
+        return agy::run_agy_pre_invocation_hook();
+    }
+    // Keep license material available even when no home directory can be
+    // resolved and normal application initialization is therefore impossible.
+    if first_early_arg.as_deref() == Some(std::ffi::OsStr::new("--licenses"))
+        && !has_more_early_args
+    {
+        print_licenses();
+        return Ok(());
+    }
+
     // Resolve binary path at startup (works on Linux, macOS, Windows)
     init_bin_path();
+
+    // Create and repair the private application directory before reading env
+    // files, deploying docs, or writing bearer-bearing upload queue entries.
+    let config_dir = match dirs::home_dir() {
+        Some(home) => home.join(".cokacdir"),
+        None => {
+            eprintln!("Error: Cannot determine home directory. ~/.cokacdir is required.");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = ensure_private_directory(&config_dir) {
+        eprintln!("Error: Cannot secure ~/.cokacdir: {}", e);
+        std::process::exit(1);
+    }
 
     // Load ~/.cokacdir/.env.json — overrides existing environment variables
     load_dot_env();
 
     // Initialize debug flag from environment variable
     claude::init_debug_from_env();
-
-    // Ensure home directory is available (~/.cokacdir is required)
-    if dirs::home_dir().is_none() {
-        eprintln!("Error: Cannot determine home directory. ~/.cokacdir is required.");
-        std::process::exit(1);
-    }
 
     // Deploy documentation to ~/.cokacdir/docs/
     deploy_docs();
@@ -1746,13 +2442,20 @@ fn main() -> io::Result<()> {
                 print_version();
                 return Ok(());
             }
+            "--licenses" => {
+                print_licenses();
+                return Ok(());
+            }
             "--prompt" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --prompt requires a text argument");
                     eprintln!("Usage: cokacdir --prompt \"your question\"");
-                    return Ok(());
+                    std::process::exit(2);
                 }
-                handle_prompt(&args[i + 1]);
+                if let Err(error) = handle_prompt(&args[i + 1]) {
+                    eprintln!("Error: {}", error);
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             "--test-opencode-sse" => {
@@ -1770,9 +2473,36 @@ fn main() -> io::Result<()> {
             }
             "--base64" => {
                 if i + 1 >= args.len() {
-                    std::process::exit(1);
+                    eprintln!("Error: --base64 requires a text argument");
+                    std::process::exit(2);
                 }
                 handle_base64(&args[i + 1]);
+                return Ok(());
+            }
+            "--ccserver-token-file" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --ccserver-token-file requires a path");
+                    std::process::exit(2);
+                }
+                let tokens = match read_ccserver_token_file(std::path::Path::new(&args[i + 1])) {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(2);
+                    }
+                };
+                handle_ccserver(tokens);
+                return Ok(());
+            }
+            "--ccserver-stdin" => {
+                let tokens = match read_ccserver_tokens(std::io::stdin().lock()) {
+                    Ok(tokens) => tokens,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(2);
+                    }
+                };
+                handle_ccserver(tokens);
                 return Ok(());
             }
             "--ccserver" => {
@@ -1781,11 +2511,29 @@ fn main() -> io::Result<()> {
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
-                if tokens.is_empty() {
-                    eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
-                    return Ok(());
-                }
+                let tokens = if tokens.is_empty() {
+                    match std::env::var("COKACDIR_CCSERVER_TOKEN_FILE") {
+                        Ok(path) => match read_ccserver_token_file(std::path::Path::new(&path)) {
+                            Ok(tokens) => tokens,
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(2);
+                            }
+                        },
+                        Err(_) => {
+                            eprintln!("Error: --ccserver requires a secure token source");
+                            eprintln!(
+                                "Use --ccserver-token-file <PATH>, --ccserver-stdin, or set COKACDIR_CCSERVER_TOKEN_FILE"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "Warning: token arguments are visible in process listings; use --ccserver-token-file or --ccserver-stdin"
+                    );
+                    tokens
+                };
                 handle_ccserver(tokens);
                 return Ok(());
             }
@@ -1798,8 +2546,11 @@ fn main() -> io::Result<()> {
             }
             "--cron" => {
                 cron_debug("=== --cron argument parsing START ===");
-                cron_debug(&format!("  Raw args: {:?}", &args[i..]));
-                // Parse: --cron "prompt" --at "time" --chat ID --key KEY [--once] [--session SID]
+                cron_debug(&format!(
+                    "  Args (authorization key redacted): {:?}",
+                    redact_cli_args_for_log(&args[i..])
+                ));
+                // Parse: --cron "prompt" --at "time" --chat ID <key source> [--once] [--session SID]
                 let mut prompt: Option<String> = None;
                 let mut at_value: Option<String> = None;
                 let mut chat_id: Option<i64> = None;
@@ -1825,12 +2576,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         "--session" => {
@@ -1872,8 +2628,9 @@ fn main() -> io::Result<()> {
                         cron_debug("  ERROR: Missing required arguments");
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--cron requires \"prompt\", --at \"time\", --chat <ID>, --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--cron requires \"prompt\", --at \"time\", --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 cron_debug("=== --cron argument parsing END ===");
@@ -1885,7 +2642,7 @@ fn main() -> io::Result<()> {
                     "{}",
                     serde_json::json!({"status":"error","message":"--cron-context is no longer supported; scheduled runs clone provider sessions at execution time"})
                 );
-                return Ok(());
+                std::process::exit(2);
             }
             "--cron-list" => {
                 let mut chat_id: Option<i64> = None;
@@ -1901,12 +2658,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ => {
@@ -1919,8 +2681,9 @@ fn main() -> io::Result<()> {
                     _ => {
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--cron-list requires --chat <ID> --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--cron-list requires --chat <ID> and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
@@ -1940,12 +2703,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
@@ -1962,8 +2730,9 @@ fn main() -> io::Result<()> {
                     _ => {
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--cron-remove requires <ID> --chat <ID> --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--cron-remove requires <ID>, --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
@@ -1983,12 +2752,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
@@ -2005,8 +2779,9 @@ fn main() -> io::Result<()> {
                     _ => {
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--cron-history requires <ID> --chat <ID> --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--cron-history requires <ID>, --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
@@ -2035,12 +2810,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ if sched_id.is_none() && !args[j].starts_with("--") => {
@@ -2059,14 +2839,15 @@ fn main() -> io::Result<()> {
                     _ => {
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--cron-update requires <ID> --at \"time\" --chat <ID> --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--cron-update requires <ID>, --at \"time\", --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
             }
             "--sendfile" => {
-                // Parse: --sendfile <PATH> --chat <ID> --key <TOKEN>
+                // Parse: --sendfile <PATH> --chat <ID> <key source>
                 let mut file_path: Option<String> = None;
                 let mut chat_id: Option<i64> = None;
                 let mut key: Option<String> = None;
@@ -2081,12 +2862,17 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                j += 2;
-                            } else {
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ if file_path.is_none() && !args[j].starts_with("--") => {
@@ -2105,14 +2891,15 @@ fn main() -> io::Result<()> {
                     _ => {
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--sendfile requires <PATH>, --chat <ID>, and --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--sendfile requires <PATH>, --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
             }
             "--message" => {
-                // Parse: --message <TEXT> --to <BOT> --chat <ID> --key <HASH>
+                // Parse: --message <TEXT> --to <BOT> --chat <ID> <key source>
                 msg_debug(&format!(
                     "[main:--message] parsing args starting at i={}, remaining_args={}",
                     i,
@@ -2124,7 +2911,7 @@ fn main() -> io::Result<()> {
                 let mut key: Option<String> = None;
                 let mut j = i + 1;
                 while j < args.len() {
-                    msg_debug(&format!("[main:--message] arg[{}]={:?}", j, args[j]));
+                    msg_debug(&format!("[main:--message] examining arg index {}", j));
                     match args[j].as_str() {
                         "--to" => {
                             if j + 1 < args.len() {
@@ -2150,14 +2937,19 @@ fn main() -> io::Result<()> {
                                 j += 1;
                             }
                         }
-                        "--key" => {
-                            if j + 1 < args.len() {
-                                key = Some(args[j + 1].clone());
-                                msg_debug(&format!("[main:--message] --key={}", args[j + 1]));
-                                j += 2;
-                            } else {
-                                msg_debug("[main:--message] --key missing value");
-                                j += 1;
+                        "--key" | "--key-file" | "--key-stdin" => {
+                            match parse_cli_key_argument(&args, j) {
+                                Ok(Some((value, next))) => {
+                                    key = Some(value);
+                                    msg_debug("[main:--message] authorization key supplied");
+                                    j = next;
+                                }
+                                Ok(None) => unreachable!(),
+                                Err(error) => {
+                                    msg_debug("[main:--message] invalid authorization key source");
+                                    eprintln!("Error: {}", error);
+                                    std::process::exit(2);
+                                }
                             }
                         }
                         _ if message.is_none() && !args[j].starts_with("--") => {
@@ -2170,8 +2962,8 @@ fn main() -> io::Result<()> {
                         }
                         _ => {
                             msg_debug(&format!(
-                                "[main:--message] skipping unrecognized arg: {:?}",
-                                args[j]
+                                "[main:--message] skipping unrecognized arg at index {}",
+                                j
                             ));
                             j += 1;
                         }
@@ -2196,8 +2988,9 @@ fn main() -> io::Result<()> {
                         msg_debug("[main:--message] incomplete arguments, showing error");
                         eprintln!(
                             "{}",
-                            serde_json::json!({"status":"error","message":"--message requires <TEXT> --to <BOT> --chat <ID> --key <HASH>"})
+                            serde_json::json!({"status":"error","message":"--message requires <TEXT>, --to <BOT>, --chat <ID>, and --key-file <PATH> (or --key-stdin)"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
@@ -2244,6 +3037,7 @@ fn main() -> io::Result<()> {
                             "{}",
                             serde_json::json!({"status":"error","message":"--read_chat_log requires <CHAT_ID>"})
                         );
+                        std::process::exit(2);
                     }
                 }
                 return Ok(());
@@ -2254,7 +3048,7 @@ fn main() -> io::Result<()> {
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
                 eprintln!("Use --help for usage information");
-                return Ok(());
+                std::process::exit(2);
             }
             path => {
                 // Treat as a directory path
@@ -2323,7 +3117,22 @@ fn main() -> io::Result<()> {
     // Load settings and create app state
     let (settings, settings_error) = match config::Settings::load_with_error() {
         Ok(s) => (s, None),
-        Err(e) => (config::Settings::default(), Some(e)),
+        Err(e) if e.is_parse_error() => (config::Settings::default(), Some(e)),
+        Err(e) => {
+            // Directory, file-type, permission, and I/O failures are not a
+            // malformed JSON recovery case. Starting with defaults would let
+            // eager settings changes write into a path we have not established
+            // as safe, so fail closed after restoring the terminal.
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                crossterm::cursor::Show
+            );
+            return Err(io::Error::new(io::ErrorKind::Other, e.to_string()));
+        }
     };
     // If the on-disk settings failed to parse, we run on in-memory defaults — but must NOT
     // save on exit, or we would overwrite the user's intact-but-unparseable settings file
@@ -2332,13 +3141,34 @@ fn main() -> io::Result<()> {
     // The exit-save skip alone is not enough: changing any setting during the session
     // (bookmarks, remote profiles, ...) also calls settings.save() and would clobber the
     // original. Preserve the unparseable file with a one-time backup copy.
-    let mut settings_backup_made = false;
-    if settings_load_failed {
-        if let Some(path) = config::Settings::config_path() {
-            let backup = path.with_extension("json.bak");
-            settings_backup_made = std::fs::copy(&path, &backup).is_ok();
+    let settings_backup_path = if settings_load_failed {
+        match config::Settings::config_path() {
+            Some(path) => match backup_unparseable_settings(&path) {
+                Ok(backup) => Some(backup),
+                Err(e) => {
+                    // Do not enter an interactive session backed by defaults
+                    // when we could not preserve the malformed original:
+                    // settings dialogs save eagerly and could otherwise
+                    // destroy the only recoverable copy.
+                    let _ = disable_raw_mode();
+                    let _ = execute!(
+                        terminal.backend_mut(),
+                        LeaveAlternateScreen,
+                        DisableMouseCapture,
+                        DisableBracketedPaste,
+                        crossterm::cursor::Show
+                    );
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("settings could not be parsed and the recovery backup failed: {e}"),
+                    ));
+                }
+            },
+            None => None,
         }
-    }
+    } else {
+        None
+    };
     let mut app = App::with_settings(settings);
     app.image_picker = Some(picker);
     app.design_mode = design_mode;
@@ -2350,10 +3180,11 @@ fn main() -> io::Result<()> {
 
     // Show settings load error if any
     if let Some(err) = settings_error {
-        if settings_backup_made {
+        if let Some(backup) = settings_backup_path {
             app.show_message(&format!(
-                "Settings error: {} (using defaults; original backed up to settings.json.bak)",
-                err
+                "Settings error: {} (using defaults; original backed up to {})",
+                err,
+                backup.display()
             ));
         } else {
             app.show_message(&format!("Settings error: {} (using defaults)", err));
@@ -2370,9 +3201,11 @@ fn main() -> io::Result<()> {
 
     // Save settings before exit — but only if the original file parsed. Otherwise we would
     // clobber the user's existing (unparseable) settings with defaults.
-    if !settings_load_failed {
-        app.save_settings();
-    }
+    let settings_save_result = if !settings_load_failed {
+        app.save_settings()
+    } else {
+        Ok(())
+    };
 
     // Save last directory for shell cd (skip remote paths). When launched via
     // the shell wrapper, write to a per-run file so non-TUI commands cannot
@@ -2383,25 +3216,47 @@ fn main() -> io::Result<()> {
             let _ = write_shell_lastdir_output(&path, &last_dir);
         } else if let Some(config_dir) = config::Settings::config_dir() {
             let lastdir_path = config_dir.join("lastdir");
-            let _ = std::fs::write(&lastdir_path, &last_dir);
+            let _ = services::telegram::write_private_file_atomically(
+                &lastdir_path,
+                last_dir.as_bytes(),
+            );
         }
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        crossterm::cursor::MoveTo(0, 0),
-        crossterm::cursor::Show
-    )?;
+    // Restore the terminal even when the application loop fails, then return
+    // the original failure so shells and supervisors receive a non-zero exit.
+    let restore_result = (|| -> io::Result<()> {
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0),
+            crossterm::cursor::Show
+        )?;
+        Ok(())
+    })();
 
-    if let Err(err) = result {
-        eprintln!("Error: {}", err);
+    match (result, restore_result) {
+        (Err(app_error), Err(restore_error)) => {
+            return Err(io::Error::new(
+                app_error.kind(),
+                format!(
+                    "{} (terminal restoration also failed: {})",
+                    app_error, restore_error
+                ),
+            ));
+        }
+        (Err(app_error), Ok(())) => return Err(app_error),
+        (Ok(()), Err(restore_error)) => return Err(restore_error),
+        (Ok(()), Ok(())) => {}
     }
+
+    // Report persistence failure only after leaving raw/alternate-screen
+    // mode so the diagnostic is visible and the process returns non-zero.
+    settings_save_result?;
 
     // Print goodbye message
     print_goodbye_message();
@@ -2571,18 +3426,32 @@ fn file_operation_completion_message(
     };
     let total = result.success_count + result.failure_count;
     if result.failure_count == 0 {
+        let warning = if result.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(". Warning: {}", result.warnings.join("; "))
+        };
         (
-            Some(format!("{} {} file(s)", op_name, result.success_count)),
+            Some(format!(
+                "{} {} file(s){}",
+                op_name, result.success_count, warning
+            )),
             None,
         )
     } else {
+        let warning = if result.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(". Warning: {}", result.warnings.join("; "))
+        };
         (
             Some(format!(
-                "{} {}/{}. Error: {}",
+                "{} {}/{}. Error: {}{}",
                 op_name,
                 result.success_count,
                 total,
-                result.last_error.as_deref().unwrap_or("Unknown error")
+                result.last_error.as_deref().unwrap_or("Unknown error"),
+                warning
             )),
             None,
         )
@@ -2626,18 +3495,78 @@ fn is_valid_shell_lastdir_output_path(
 }
 
 fn write_shell_lastdir_output(path: &std::path::Path, last_dir: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let (parent_guard, stable_parent, parent_identity) = open_private_directory(parent)?;
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "last-directory output is not a real regular file",
+        ));
+    }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).truncate(true);
+    options.write(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
-    let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(last_dir.as_bytes())
+    let stable_path = stable_parent.join(path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "last-directory output has no name",
+        )
+    })?);
+    let mut file = options.open(&stable_path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "last-directory output is not a real regular file",
+        ));
+    }
+    let opened_identity = crate::services::file_ops::stable_file_identity(&file)?;
+    if crate::services::file_ops::stable_path_identity(path)? != opened_identity
+        || crate::services::file_ops::stable_path_identity(parent)? != parent_identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "last-directory output changed while being opened",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "last-directory output is a reparse point",
+            ));
+        }
+    }
+    file.set_len(0)?;
+    file.write_all(last_dir.as_bytes())?;
+    file.sync_all()?;
+    if crate::services::file_ops::stable_file_identity(&file)? != opened_identity
+        || crate::services::file_ops::stable_path_identity(path)? != opened_identity
+        || crate::services::file_ops::stable_path_identity(parent)? != parent_identity
+    {
+        return Err(io::Error::other(
+            "last-directory output changed while it was written",
+        ));
+    }
+    #[cfg(unix)]
+    parent_guard.sync_all()?;
+    Ok(())
 }
 
 fn new_tar_error_dialog(message: String) -> crate::ui::app::Dialog {
@@ -2791,14 +3720,14 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Handle progress completion (outside of borrow)
         if progress_message.is_some() {
+            let operation_succeeded = app
+                .file_operation_progress
+                .as_ref()
+                .map(completed_file_operation_succeeded)
+                .unwrap_or(false);
+
             // 원격 다운로드 완료 → 편집기/뷰어 열기
             if let Some(pending) = app.pending_remote_open.take() {
-                let download_succeeded = app
-                    .file_operation_progress
-                    .as_ref()
-                    .map(completed_file_operation_succeeded)
-                    .unwrap_or(false);
-
                 app.file_operation_progress = None;
                 app.dialog = None;
 
@@ -2810,7 +3739,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 };
 
-                if !download_succeeded || !tmp_exists {
+                if !operation_succeeded || !tmp_exists {
                     if let Some(msg) = progress_message {
                         app.show_message(&msg);
                     } else {
@@ -2822,15 +3751,38 @@ fn run_app<B: ratatui::backend::Backend>(
                             tmp_path,
                             panel_index,
                             remote_path,
+                            endpoint,
+                            edit_session_id,
+                            version,
                         } => {
+                            let Some(version) = version.get().cloned() else {
+                                app.show_message(
+                                    "Cannot open remote file: downloaded version is unavailable",
+                                );
+                                continue;
+                            };
                             let mut editor = crate::ui::file_editor::EditorState::new();
                             editor.set_syntax_colors(app.theme.syntax);
                             match editor.load_file(&tmp_path) {
                                 Ok(_) => {
+                                    let local_hash_matches = editor
+                                        .loaded_content_sha256()
+                                        .map(|hash| version.matches_content_hash(hash))
+                                        .unwrap_or(false);
+                                    if !local_hash_matches {
+                                        app.show_message(
+                                            "Cannot open remote file: local cache changed after download",
+                                        );
+                                        continue;
+                                    }
                                     editor.remote_origin =
                                         Some(crate::ui::file_editor::RemoteEditOrigin {
                                             panel_index,
                                             remote_path,
+                                            endpoint,
+                                            expected_version: version,
+                                            edit_session_id,
+                                            committed_generation: 0,
                                         });
                                     app.editor_state = Some(editor);
                                     app.current_screen = Screen::FileEditor;
@@ -2863,6 +3815,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
             } else {
+                app.finish_pending_cut_operation(operation_succeeded);
                 let show_tar_error_dialog = tar_error_dialog.is_some();
                 if let Some(msg) = progress_message {
                     if !show_tar_error_dialog {
@@ -2924,8 +3877,7 @@ fn run_app<B: ratatui::backend::Backend>(
                         continue;
                     }
                     if key.code == KeyCode::Esc {
-                        app.remote_spinner = None;
-                        app.show_message("Connection cancelled");
+                        request_remote_spinner_cancel(app);
                     }
                 }
                 continue;
@@ -3121,6 +4073,15 @@ fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
+fn request_remote_spinner_cancel(app: &mut App) {
+    if let Some(spinner) = app.remote_spinner.as_mut() {
+        // The worker owns the RemoteContext until it sends its result. Dropping
+        // the receiver here permanently disconnects the panel. Keep polling so
+        // the context is always returned when the in-flight operation finishes.
+        spinner.message = "Waiting for remote operation to finish safely...".to_string();
+    }
+}
+
 /// Windows: paste burst로 감지된 텍스트를 현재 화면 컨텍스트에 맞게 처리
 #[cfg(windows)]
 fn handle_windows_paste(app: &mut App, text: &str) {
@@ -3274,7 +4235,12 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
 #[cfg(test)]
 mod cli_token_tests {
-    use super::{is_slack_token, parse_slack_pair};
+    use super::{
+        is_slack_token, parse_ccserver_token_input, parse_slack_pair, read_ccserver_token_file,
+        read_ccserver_tokens, read_cli_key, read_cli_key_file, redact_cli_args_for_log,
+        MAX_CCSERVER_TOKEN_INPUT_BYTES, MAX_CLI_KEY_BYTES,
+    };
+    use std::io::Cursor;
 
     #[test]
     fn parses_explicit_slack_token_pair() {
@@ -3306,11 +4272,257 @@ mod cli_token_tests {
         assert!(is_slack_token("slack:xoxb-bot-token,xapp-app-token"));
         assert!(!is_slack_token("123456789:telegram-token"));
     }
+
+    #[test]
+    fn parses_one_ccserver_token_per_nonempty_line() {
+        let tokens = parse_ccserver_token_input(
+            "# one token per line\nfirst-placeholder\n\n second-placeholder \r\n",
+        )
+        .unwrap();
+        assert_eq!(tokens, ["first-placeholder", "second-placeholder"]);
+    }
+
+    #[test]
+    fn rejects_empty_ccserver_token_input() {
+        assert!(parse_ccserver_token_input(" \n\r\n").is_err());
+    }
+
+    #[test]
+    fn bounds_ccserver_token_input_size() {
+        let oversized = vec![b'x'; MAX_CCSERVER_TOKEN_INPUT_BYTES as usize + 1];
+        let error = read_ccserver_tokens(Cursor::new(oversized)).unwrap_err();
+        assert!(error.contains("exceeds"));
+    }
+
+    #[test]
+    fn redacts_legacy_authorization_key_arguments() {
+        let args = vec![
+            "--cron".to_string(),
+            "prompt".to_string(),
+            "--key".to_string(),
+            "super-secret".to_string(),
+            "--key=second-secret".to_string(),
+        ];
+        let rendered = format!("{:?}", redact_cli_args_for_log(&args));
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("second-secret"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bounds_and_trims_cli_authorization_keys() {
+        assert_eq!(
+            read_cli_key(Cursor::new(b"  placeholder-key\n")).unwrap(),
+            "placeholder-key"
+        );
+        let oversized = vec![b'x'; MAX_CLI_KEY_BYTES as usize + 1];
+        assert!(read_cli_key(Cursor::new(oversized)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_key_file_must_be_private_and_not_a_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let key_path = temp.path().join("key");
+        let link_path = temp.path().join("key-link");
+        std::fs::write(&key_path, b"placeholder-key\n").unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_cli_key_file(&key_path).is_err());
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_cli_key_file(&key_path).unwrap(), "placeholder-key");
+        symlink(&key_path, &link_path).unwrap();
+        assert!(read_cli_key_file(&link_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ccserver_token_file_must_be_private_and_not_a_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("tokens");
+        let link_path = temp.path().join("tokens-link");
+        std::fs::write(&token_path, b"placeholder-token\n").unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_ccserver_token_file(&token_path).is_err());
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_ccserver_token_file(&token_path).unwrap(),
+            ["placeholder-token"]
+        );
+        symlink(&token_path, &link_path).unwrap();
+        assert!(read_ccserver_token_file(&link_path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod settings_recovery_tests {
+    use super::backup_unparseable_settings;
+
+    #[test]
+    fn recovery_backup_never_truncates_an_older_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = temp.path().join("settings.json");
+        let old_backup = temp.path().join("settings.json.bak");
+        std::fs::write(&settings, b"current malformed settings").unwrap();
+        std::fs::write(&old_backup, b"older recovery copy").unwrap();
+
+        let new_backup = backup_unparseable_settings(&settings).unwrap();
+
+        assert_ne!(new_backup, old_backup);
+        assert_eq!(std::fs::read(&old_backup).unwrap(), b"older recovery copy");
+        assert_eq!(
+            std::fs::read(&new_backup).unwrap(),
+            b"current malformed settings"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(new_backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod remote_spinner_cancel_tests {
+    use super::request_remote_spinner_cancel;
+    use crate::ui::app::{App, RemoteSpinner, RemoteSpinnerResult};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    #[test]
+    fn escape_keeps_receiver_until_worker_result_is_processed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        let (tx, rx) = mpsc::channel();
+        app.remote_spinner = Some(RemoteSpinner {
+            message: "Working...".to_string(),
+            started_at: Instant::now(),
+            receiver: rx,
+        });
+
+        request_remote_spinner_cancel(&mut app);
+        assert!(app.remote_spinner.is_some());
+        assert_eq!(
+            app.remote_spinner.as_ref().unwrap().message,
+            "Waiting for remote operation to finish safely..."
+        );
+
+        tx.send(RemoteSpinnerResult::LocalOp {
+            message: Ok("finished".to_string()),
+            reload: false,
+        })
+        .unwrap();
+        app.poll_remote_spinner();
+        assert!(app.remote_spinner.is_none());
+    }
+}
+
+#[cfg(test)]
+mod sendfile_queue_tests {
+    use super::{canonical_sendfile_path, enqueue_upload_request, ensure_private_directory};
+    use std::fs;
+
+    #[test]
+    fn sendfile_rejects_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(canonical_sendfile_path(temp.path()).is_err());
+    }
+
+    #[test]
+    fn same_file_requests_get_distinct_queue_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_dir = temp.path().join("queue");
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"payload").unwrap();
+
+        let first = enqueue_upload_request(&queue_dir, &payload, 1, "placeholder-hash").unwrap();
+        let second = enqueue_upload_request(&queue_dir, &payload, 1, "placeholder-hash").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read_dir(&queue_dir).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_directory_and_entries_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let queue_dir = temp.path().join("queue");
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"payload").unwrap();
+        ensure_private_directory(&queue_dir).unwrap();
+        fs::set_permissions(&queue_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let entry = enqueue_upload_request(&queue_dir, &payload, 1, "placeholder-hash").unwrap();
+        assert_eq!(
+            fs::metadata(&queue_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(entry).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_symlink_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let link = temp.path().join("messages");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&shared, &link).unwrap();
+
+        let error = ensure_private_directory(&link).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+}
+
+#[cfg(test)]
+mod environment_entry_tests {
+    use super::is_valid_environment_entry;
+
+    #[test]
+    fn rejects_entries_that_would_make_set_var_panic() {
+        assert!(!is_valid_environment_entry("", "value"));
+        assert!(!is_valid_environment_entry("BAD=NAME", "value"));
+        assert!(!is_valid_environment_entry("BAD\0NAME", "value"));
+        assert!(!is_valid_environment_entry("GOOD_NAME", "bad\0value"));
+        assert!(is_valid_environment_entry("GOOD_NAME", "value"));
+    }
+}
+
+#[cfg(test)]
+mod license_material_tests {
+    use super::{OPENSSL_LICENSE, THIRD_PARTY_NOTICES};
+
+    #[test]
+    fn bundled_openssl_license_and_notice_are_present() {
+        assert!(OPENSSL_LICENSE.contains("Apache License"));
+        assert!(OPENSSL_LICENSE.contains("Version 2.0, January 2004"));
+        assert!(THIRD_PARTY_NOTICES.contains("`openssl-src` 300.6.1+3.6.3"));
+        assert!(THIRD_PARTY_NOTICES.contains("cokacdir --licenses"));
+    }
 }
 
 #[cfg(test)]
 mod shell_lastdir_tests {
-    use super::is_valid_shell_lastdir_output_path;
+    use super::{is_valid_shell_lastdir_output_path, write_shell_lastdir_output};
     use std::path::PathBuf;
 
     #[test]
@@ -3355,6 +4567,44 @@ mod shell_lastdir_tests {
 
         assert!(!is_valid_shell_lastdir_output_path(&path, &config_dir));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_rejects_symlinked_parent_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        let parent_link = temp.path().join("_lastdir");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("cokacdir-lastdir.test");
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&outside, &parent_link).unwrap();
+
+        let error =
+            write_shell_lastdir_output(&parent_link.join("cokacdir-lastdir.test"), "/replacement")
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert_eq!(std::fs::read(victim).unwrap(), b"must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_rejects_symlinked_output_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("_lastdir");
+        std::fs::create_dir(&parent).unwrap();
+        let victim = temp.path().join("victim");
+        let output = parent.join("cokacdir-lastdir.test");
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &output).unwrap();
+
+        assert!(write_shell_lastdir_output(&output, "/replacement").is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"must survive");
+    }
 }
 
 #[cfg(test)]
@@ -3372,6 +4622,7 @@ mod file_operation_completion_tests {
             success_count: 0,
             failure_count: 1,
             last_error: Some("line 1\nline 2".to_string()),
+            warnings: Vec::new(),
         });
 
         let (status, modal) = file_operation_completion_message(&progress, Some("bad.tar"), None);
@@ -3390,6 +4641,7 @@ mod file_operation_completion_tests {
             success_count: 0,
             failure_count: 1,
             last_error: Some("Cancelled".to_string()),
+            warnings: Vec::new(),
         });
 
         let (status, modal) = file_operation_completion_message(&progress, Some("bad.tar"), None);
@@ -3416,6 +4668,7 @@ mod file_operation_completion_tests {
             success_count: 0,
             failure_count: 1,
             last_error: Some("failed".to_string()),
+            warnings: Vec::new(),
         });
         assert!(!completed_file_operation_succeeded(&progress));
 
@@ -3423,6 +4676,7 @@ mod file_operation_completion_tests {
             success_count: 1,
             failure_count: 0,
             last_error: None,
+            warnings: Vec::new(),
         });
         assert!(completed_file_operation_succeeded(&progress));
     }

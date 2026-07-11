@@ -1,3 +1,5 @@
+use super::theme::Theme;
+use crate::utils::format::pad_to_display_width;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -6,10 +8,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
-
-use super::theme::Theme;
-use crate::utils::format::pad_to_display_width;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfoTab {
@@ -31,6 +29,7 @@ pub struct SystemInfoState {
     pub current_tab: InfoTab,
     pub disks: Vec<DiskInfo>,
     pub disk_selected: usize,
+    system: SystemData,
     #[allow(dead_code)]
     pub last_update: std::time::Instant,
 }
@@ -39,8 +38,11 @@ impl Default for SystemInfoState {
     fn default() -> Self {
         Self {
             current_tab: InfoTab::System,
-            disks: load_disk_info(),
+            // Disk enumeration may invoke `df`/`wmic` and can be slow on network
+            // filesystems. Load it only when the Disk tab is opened.
+            disks: Vec::new(),
             disk_selected: 0,
+            system: SystemData::load(),
             last_update: std::time::Instant::now(),
         }
     }
@@ -52,6 +54,12 @@ impl SystemInfoState {
         if self.disk_selected >= self.disks.len() {
             self.disk_selected = self.disks.len().saturating_sub(1);
         }
+        self.last_update = std::time::Instant::now();
+    }
+
+    pub fn refresh_system(&mut self) {
+        self.system = SystemData::load();
+        self.last_update = std::time::Instant::now();
     }
 }
 
@@ -88,7 +96,7 @@ impl SystemData {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "unknown".to_string());
 
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             // Kernel version
             if let Ok(output) = std::process::Command::new("uname").arg("-r").output() {
@@ -156,6 +164,94 @@ impl SystemData {
                     .next()
                     .unwrap_or("")
                     .to_string();
+            }
+
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", "kern.boottime"])
+                .output()
+            {
+                let value = String::from_utf8_lossy(&output.stdout);
+                if let Some(seconds) = value
+                    .split("sec =")
+                    .nth(1)
+                    .and_then(|rest| rest.trim().split([',', ' ']).next())
+                    .and_then(|seconds| seconds.parse::<i64>().ok())
+                {
+                    data.uptime_secs = chrono::Local::now()
+                        .timestamp()
+                        .saturating_sub(seconds)
+                        .max(0) as u64;
+                }
+            }
+
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+            {
+                data.total_mem = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            }
+
+            if let Ok(output) = std::process::Command::new("vm_stat").output() {
+                let value = String::from_utf8_lossy(&output.stdout);
+                let page_size = value
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split("page size of ").nth(1))
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|size| size.parse::<u64>().ok())
+                    .unwrap_or(4096);
+                let available_pages = value
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("Pages free:")
+                            || line.starts_with("Pages inactive:")
+                            || line.starts_with("Pages speculative:")
+                    })
+                    .filter_map(|line| {
+                        line.split(':')
+                            .nth(1)?
+                            .trim()
+                            .trim_end_matches('.')
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .fold(0u64, u64::saturating_add);
+                data.free_mem = available_pages.saturating_mul(page_size);
+            }
+
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", "hw.logicalcpu"])
+                .output()
+            {
+                data.cpu_count = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+            }
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", "machdep.cpu.brand_string"])
+                .output()
+            {
+                data.cpu_model = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+            if let Ok(output) = std::process::Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+            {
+                let values: Vec<f64> = String::from_utf8_lossy(&output.stdout)
+                    .trim_matches(|character: char| {
+                        character.is_whitespace() || character == '{' || character == '}'
+                    })
+                    .split_whitespace()
+                    .filter_map(|value| value.parse().ok())
+                    .take(3)
+                    .collect();
+                if values.len() == 3 {
+                    data.load_avg.copy_from_slice(&values);
+                }
             }
         }
 
@@ -298,7 +394,7 @@ fn load_disk_info() -> Vec<DiskInfo> {
                             continue;
                         }
 
-                        let used = total_size - free_space;
+                        let used = total_size.saturating_sub(free_space);
                         let use_percent = ((used as f64 / total_size as f64) * 100.0) as u8;
 
                         disks.push(DiskInfo {
@@ -375,7 +471,7 @@ pub fn draw(
 
     // Content based on current tab
     match state.current_tab {
-        InfoTab::System => draw_system_tab(frame, chunks[1], theme),
+        InfoTab::System => draw_system_tab(frame, &state.system, chunks[1], theme),
         InfoTab::Disk => draw_disk_tab(frame, state, chunks[1], theme),
     }
 
@@ -423,9 +519,7 @@ fn draw_tab_bar(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_system_tab(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let data = SystemData::load();
-
+fn draw_system_tab(frame: &mut Frame, data: &SystemData, area: Rect, theme: &Theme) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -688,6 +782,8 @@ pub fn handle_input(
                 };
                 if state.current_tab == InfoTab::Disk {
                     state.refresh_disks();
+                } else {
+                    state.refresh_system();
                 }
             }
             SystemInfoAction::MoveUp => {

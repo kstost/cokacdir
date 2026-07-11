@@ -2,6 +2,7 @@
 Build executor for Rust projects with cross-compilation support.
 """
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -14,6 +15,13 @@ from .config import BuildConfig
 from .logger import Logger
 from .targets import Target, TargetManager
 from .tools import ToolInstaller
+
+
+DISTRIBUTION_NOTICE_PATHS = (
+    Path("LICENSE"),
+    Path("THIRD_PARTY_NOTICES.md"),
+    Path("LICENSES/OpenSSL-3.6.3.txt"),
+)
 
 
 @dataclass
@@ -62,7 +70,8 @@ class BuildExecutor:
             )
 
             if result.returncode != 0:
-                self.logger.warning(f"cargo clean failed: {result.stderr}")
+                self.logger.error(f"cargo clean failed: {result.stderr}")
+                return False
 
             # Remove dist directory
             if self.dist_dir.exists():
@@ -88,6 +97,11 @@ class BuildExecutor:
         else:
             cmd = ["cargo", "build"]
 
+        # This is an application release build.  Resolve exactly the graph
+        # reviewed and committed in Cargo.lock instead of silently updating it
+        # (or selecting newer transitive crates) on a builder machine.
+        cmd.append("--locked")
+
         # Add release flag
         if self.config.release:
             cmd.append("--release")
@@ -100,6 +114,14 @@ class BuildExecutor:
 
         # Get environment
         env = self.tool_installer.get_env()
+
+        # cargo-xwin 0.21.x checks Path::exists() before replacing its cached
+        # clang-cl symlink. A previous ARM64 build can leave that symlink
+        # pointing at our now-removed temporary clang wrapper, and a broken
+        # symlink reports exists() == false while still causing symlink() to
+        # fail with EEXIST. Remove only that stale managed link up front.
+        if target.needs_xwin:
+            self._cleanup_xwin_clang_cl_symlink(env)
 
         # For Windows ARM64 cross-compilation, cargo-xwin passes /imsvc flags
         # (clang-cl syntax) via CFLAGS, but the ring crate uses plain clang
@@ -125,6 +147,17 @@ class BuildExecutor:
             if result.returncode == 0:
                 # Find the built binary
                 binary_path = self._find_binary(target)
+                if binary_path is None:
+                    message = (
+                        f"Build command succeeded but no binary was found for "
+                        f"{target.friendly_name}"
+                    )
+                    self.logger.error(message)
+                    return BuildResult(
+                        target=target,
+                        success=False,
+                        error_message=message,
+                    )
                 self.logger.success(f"Built: {target.friendly_name}")
 
                 return BuildResult(
@@ -153,22 +186,78 @@ class BuildExecutor:
                 success=False,
                 error_message=str(e),
             )
+        finally:
+            if clang_wrapper_dir:
+                # cargo-xwin may have cached clang-cl as a symlink to this
+                # temporary wrapper. Remove the managed link before deleting
+                # the wrapper so the next Windows build never sees it broken.
+                self._cleanup_xwin_clang_cl_symlink(env, clang_wrapper_dir)
+                shutil.rmtree(clang_wrapper_dir, ignore_errors=True)
+
+    def _xwin_cache_dir(self, env: dict) -> Path:
+        """Return cargo-xwin's cache directory and make it explicit in env."""
+        configured = env.get("XWIN_CACHE_DIR")
+        if configured:
+            cache_dir = Path(configured).expanduser()
+            if not cache_dir.is_absolute():
+                cache_dir = self.project_root / cache_dir
+        else:
+            home = Path(env.get("HOME") or Path.home())
+            if self.config.host_os == "macos":
+                cache_root = home / "Library" / "Caches"
+            else:
+                cache_root = Path(env.get("XDG_CACHE_HOME") or home / ".cache")
+            cache_dir = cache_root / "cargo-xwin"
+
+        cache_dir = cache_dir.resolve(strict=False)
+        env["XWIN_CACHE_DIR"] = str(cache_dir)
+        return cache_dir
+
+    def _cleanup_xwin_clang_cl_symlink(
+        self, env: dict, wrapper_dir: Optional[str] = None
+    ) -> None:
+        """Remove a broken or temporary-wrapper cargo-xwin clang-cl symlink."""
+        symlink = self._xwin_cache_dir(env) / "clang-cl"
+        try:
+            if not symlink.is_symlink():
+                return
+
+            should_remove = not symlink.exists()
+            if wrapper_dir is not None and not should_remove:
+                link_target = Path(os.readlink(symlink))
+                if not link_target.is_absolute():
+                    link_target = symlink.parent / link_target
+                link_target = link_target.resolve(strict=False)
+                wrapper_path = Path(wrapper_dir).resolve(strict=False)
+                should_remove = (
+                    link_target == wrapper_path or wrapper_path in link_target.parents
+                )
+
+            if should_remove:
+                symlink.unlink()
+        except OSError as error:
+            self.logger.debug(
+                f"Could not clean cargo-xwin clang-cl symlink {symlink}: {error}"
+            )
 
     def _create_clang_wrapper(self) -> Optional[str]:
         """Create a clang wrapper that converts /imsvc to -isystem for plain clang."""
         try:
-            wrapper_dir = os.path.join(tempfile.gettempdir(), "clang-xwin-wrapper")
-            os.makedirs(wrapper_dir, exist_ok=True)
-            wrapper_path = os.path.join(wrapper_dir, "clang")
-
             clang_path = shutil.which("clang")
             if not clang_path:
                 return None
+            wrapper_dir = tempfile.mkdtemp(prefix="cokacdir-clang-xwin-")
+            wrapper_path = os.path.join(wrapper_dir, "clang")
+            clang_cl_wrapper_path = os.path.join(wrapper_dir, "clang-cl")
 
             wrapper_script = f"""#!/bin/bash
 args=()
+assembly_source=false
 skip_next=false
 for arg in "$@"; do
+    case "$arg" in
+        *.s|*.S) assembly_source=true ;;
+    esac
     if $skip_next; then
         args+=("-isystem" "$arg")
         skip_next=false
@@ -178,13 +267,31 @@ for arg in "$@"; do
         args+=("$arg")
     fi
 done
-exec {clang_path} "${{args[@]}}"
+extra_args=()
+if $assembly_source; then
+    # psm selects its preprocessed GNU AArch64 source while cross-compiling
+    # Windows with clang-cl, but cc-rs omits the preprocessing flags because
+    # it identifies the compiler as MSVC-like. Supply the equivalent target
+    # defines so the source produces a Windows ARM64 COFF object.
+    extra_args+=(
+        "-x" "assembler-with-cpp"
+        "-DCFG_TARGET_OS_windows"
+        "-DCFG_TARGET_ARCH_aarch64"
+        "-DCFG_TARGET_ENV_msvc"
+    )
+fi
+exec {shlex.quote(clang_path)} "${{extra_args[@]}}" "${{args[@]}}"
 """
             with open(wrapper_path, "w") as f:
                 f.write(wrapper_script)
-            os.chmod(wrapper_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            os.chmod(wrapper_path, stat.S_IRWXU)
+            # cargo-xwin invokes `clang-cl`, and a system clang-cl earlier in
+            # PATH would otherwise bypass the argument conversion entirely.
+            os.symlink("clang", clang_cl_wrapper_path)
             return wrapper_dir
         except Exception:
+            if "wrapper_dir" in locals():
+                shutil.rmtree(wrapper_dir, ignore_errors=True)
             return None
 
     def _find_binary(self, target: Target) -> Optional[Path]:
@@ -204,8 +311,13 @@ exec {clang_path} "${{args[@]}}"
         return None
 
     def copy_to_dist(self, results: List[BuildResult]) -> List[Tuple[Path, str]]:
-        """Copy built binaries to dist directory."""
+        """Copy required notices and built binaries to the dist directory."""
         self.dist_dir.mkdir(parents=True, exist_ok=True)
+
+        # A release binary must never be newly published without the license
+        # material required by its statically bundled OpenSSL dependency.
+        if not self._copy_distribution_notices():
+            return []
 
         copied: List[Tuple[Path, str]] = []
 
@@ -219,10 +331,28 @@ exec {clang_path} "${{args[@]}}"
             else:
                 dest_name = f"cokacdir-{result.target.friendly_name}"
             dest_path = self.dist_dir / dest_name
+            temp_path = None
 
             try:
-                shutil.copy2(result.binary_path, dest_path)
-                dest_path.chmod(0o755)
+                if not result.binary_path.is_file():
+                    raise FileNotFoundError(
+                        f"built binary is not a regular file: {result.binary_path}"
+                    )
+
+                # Never copy directly over a previously published binary. A
+                # short write (for example, a full disk) must leave it intact.
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=f".{dest_name}.", suffix=".tmp", dir=self.dist_dir
+                )
+                temp_path = Path(temp_name)
+                with os.fdopen(fd, "wb") as output:
+                    with result.binary_path.open("rb") as source:
+                        shutil.copyfileobj(source, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+                temp_path.chmod(0o755)
+                os.replace(temp_path, dest_path)
+                temp_path = None
 
                 # Get file size
                 size = dest_path.stat().st_size
@@ -233,8 +363,59 @@ exec {clang_path} "${{args[@]}}"
 
             except Exception as e:
                 self.logger.error(f"Failed to copy {result.binary_path}: {e}")
+            finally:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
 
         return copied
+
+    def _copy_distribution_notices(self) -> bool:
+        """Atomically copy required license material into the release tree."""
+        for relative_path in DISTRIBUTION_NOTICE_PATHS:
+            source_path = self.project_root / relative_path
+            destination_path = self.dist_dir / relative_path
+            temp_path = None
+
+            try:
+                if not source_path.is_file():
+                    raise FileNotFoundError(
+                        f"required distribution notice is missing: {source_path}"
+                    )
+                if source_path.stat().st_size == 0:
+                    raise ValueError(
+                        f"required distribution notice is empty: {source_path}"
+                    )
+
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, temp_name = tempfile.mkstemp(
+                    prefix=f".{destination_path.name}.",
+                    suffix=".tmp",
+                    dir=destination_path.parent,
+                )
+                temp_path = Path(temp_name)
+                with os.fdopen(fd, "wb") as output:
+                    with source_path.open("rb") as source:
+                        shutil.copyfileobj(source, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+                temp_path.chmod(0o644)
+                os.replace(temp_path, destination_path)
+                temp_path = None
+                self.logger.debug(f"Copied required notice: {relative_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to copy required notice {relative_path}: {e}")
+                return False
+            finally:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+        return True
 
     def _format_size(self, size: int) -> str:
         """Format file size in human-readable format."""
@@ -341,7 +522,8 @@ def run_build(
 
     # Clean if requested
     if config.clean:
-        executor.clean()
+        if not executor.clean():
+            return False
 
     # Resolve targets
     resolved_targets = target_manager.resolve_targets(targets)
@@ -390,9 +572,17 @@ def run_build(
     results = executor.build_all(resolved_targets)
 
     # Copy to dist
+    copied = []
     if any(r.success for r in results):
         copied = executor.copy_to_dist(results)
         logger.results(copied)
 
-    # Return success if all builds passed
-    return all(r.success for r in results)
+    # Empty/incomplete result sets and failed distribution copies are failures,
+    # even though all([]) would otherwise report success.
+    successful_results = [r for r in results if r.success]
+    return (
+        len(results) == len(resolved_targets)
+        and bool(results)
+        and all(r.success for r in results)
+        and len(copied) == len(successful_results)
+    )

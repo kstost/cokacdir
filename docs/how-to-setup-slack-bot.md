@@ -70,9 +70,18 @@ cokacdir's Slack backend uses **Socket Mode**, so no public HTTPS endpoint is re
 
 ## 8. Run cokacdir with the Slack Bot
 
+Store the token pair in a user-only file, one bot configuration per line:
+
 ```bash
-cokacdir --ccserver slack:<xoxb-...>,<xapp-...>
+install -m 600 /dev/null ~/.cokacdir/ccserver.tokens
+${EDITOR:-vi} ~/.cokacdir/ccserver.tokens
+cokacdir --ccserver-token-file ~/.cokacdir/ccserver.tokens
 ```
+
+The Slack line in that file has the form `slack:<xoxb-...>,<xapp-...>`. You can
+also pipe the same line to `cokacdir --ccserver-stdin`. Avoid putting real
+tokens directly after `--ccserver`: command-line arguments are visible to other
+processes and system monitoring tools on many platforms.
 
 Token-string rules:
 
@@ -82,17 +91,13 @@ Token-string rules:
 
 Examples:
 
-```bash
-# Explicit prefix
-cokacdir --ccserver slack:xoxb-1234-abcd,xapp-5678-efgh
+```text
+# ~/.cokacdir/ccserver.tokens
+slack:<xoxb-...>,<xapp-...>
 
-# Auto-detected
-cokacdir --ccserver xoxb-1234-abcd,xapp-5678-efgh
-
-# Running multiple bots side by side
-cokacdir --ccserver \
-  123456:AAH-telegramtoken \
-  slack:xoxb-1234-abcd,xapp-5678-efgh
+# Multiple bots: add one configuration per line
+<telegram-token>
+slack:<xoxb-...>,<xapp-...>
 ```
 
 ## 9. Final Checklist

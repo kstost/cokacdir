@@ -1,27 +1,42 @@
 //! Antigravity CLI (`agy`) provider.
 //!
-//! `agy --print` is a plain-stdout interface, not a Claude/Gemini-compatible
-//! JSON event stream. This adapter synthesizes cokacdir's shared
-//! `StreamMessage` contract from stdout.
+//! Agy's non-TTY stdin interface emits plain stdout rather than a
+//! Claude/Gemini-compatible JSON event stream. This adapter synthesizes
+//! cokacdir's shared `StreamMessage` contract from that stdout.
 
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, DatabaseName, OpenFlags};
+use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::services::claude::{
-    debug_log_to, enhanced_path_for_bin, kill_child_tree, CancelToken, ClaudeResponse,
-    StreamMessage,
+    create_private_temp_file, debug_log_to, enhanced_path_for_bin, kill_child_tree, CancelToken,
+    ClaudeResponse, PrivateTempFile, StreamMessage,
+};
+use crate::services::file_ops::{
+    open_directory_for_read, stable_file_identity, stable_path_identity, StablePathIdentity,
 };
 
 static AGY_PATH: OnceLock<Option<String>> = OnceLock::new();
 static AGY_VERSION: OnceLock<Option<String>> = OnceLock::new();
 static AGY_MODELS: OnceLock<Vec<String>> = OnceLock::new();
+
+const AGY_SYSTEM_PROMPT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const AGY_SYSTEM_PROMPT_PREFIX: &str = "agy_system_prompt";
+const AGY_HOOK_ENV_PROMPT_FILE: &str = "COKACDIR_AGY_SYSTEM_PROMPT_FILE";
+const AGY_HOOK_ENV_TOKEN: &str = "COKACDIR_AGY_SYSTEM_PROMPT_TOKEN";
+const AGY_HOOK_ENV_EXECUTABLE: &str = "COKACDIR_AGY_HOOK_EXECUTABLE";
+const AGY_HOOK_ENV_STATE_FILE: &str = "COKACDIR_AGY_HOOK_STATE_FILE";
+const AGY_HOOK_EXECUTABLE_OVERRIDE: &str = "COKACDIR_AGY_HOOK_EXECUTABLE_OVERRIDE";
+const AGY_HOOK_INTERNAL_ARG: &str = "--internal-agy-pre-invocation-hook";
+const AGY_HOOK_PLUGIN_DIR: &str = "cokacdir-runtime-system-prompt";
+const AGY_HOOK_PLUGIN_MARKER: &[u8] = b"cokacdir agy runtime hook v1\n";
+const AGY_HOOK_NAME: &str = "cokacdir-runtime-system-prompt-v1";
 
 fn agy_debug(msg: &str) {
     debug_log_to("agy.log", msg);
@@ -249,14 +264,6 @@ fn default_print_timeout() -> String {
         .unwrap_or_else(|| "1h".to_string())
 }
 
-fn make_agy_log_file_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!("cokacdir-agy-{}-{}.log", std::process::id(), nanos))
-}
-
 fn conversation_dir() -> Option<PathBuf> {
     Some(
         dirs::home_dir()?
@@ -338,19 +345,1115 @@ fn stdout_absence_error_message(raw_stdout: &str) -> Option<String> {
     Some("Agy exited successfully but produced no stdout response.".to_string())
 }
 
-fn build_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
-    match system_prompt.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(sp) => format!("SYSTEM INSTRUCTIONS:\n{}\n\nUSER REQUEST:\n{}", sp, prompt),
+#[cfg(not(target_os = "linux"))]
+fn build_legacy_agy_stdin_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
+    match system_prompt.filter(|value| !value.trim().is_empty()) {
+        Some(system) => format!(
+            "SYSTEM INSTRUCTIONS:\n{}\n\nUSER REQUEST:\n{}",
+            system, prompt
+        ),
         None => prompt.to_string(),
     }
 }
 
+fn build_agy_command_args(
+    session_id: Option<&str>,
+    print_timeout: &str,
+    log_path: &Path,
+    model: Option<&str>,
+) -> Vec<OsString> {
+    let mut args = Vec::<OsString>::new();
+    if let Some(sid) = session_id {
+        args.push("--conversation".into());
+        args.push(sid.into());
+    }
+    args.push("--print-timeout".into());
+    args.push(print_timeout.into());
+    args.push("--log-file".into());
+    args.push(log_path.as_os_str().to_owned());
+    args.push("--dangerously-skip-permissions".into());
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    args
+}
+
+fn verify_real_directory(path: &Path) -> io::Result<()> {
+    let (directory, _, metadata) = open_directory_for_read(path)?;
+    if !metadata.file_type().is_dir()
+        || stable_file_identity(&directory)? != stable_path_identity(path)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a stable real directory", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let (directory, _, metadata) = open_directory_for_read(path)?;
+    let identity = stable_file_identity(&directory)?;
+    if !metadata.file_type().is_dir() || stable_path_identity(path)? != identity {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a stable real directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    if stable_path_identity(path)? != identity {
+        return Err(io::Error::other(format!(
+            "{} changed while it was secured",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn derived_hook_ack_path(prompt_path: &Path) -> io::Result<PathBuf> {
+    let parent = prompt_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Agy system-prompt file has no parent directory",
+        )
+    })?;
+    let mut name = prompt_path
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Agy system-prompt file has no filename",
+            )
+        })?
+        .to_os_string();
+    name.push(".ack");
+    Ok(parent.join(name))
+}
+
+fn valid_hook_token(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_small_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let path_identity = stable_path_identity(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a real regular file", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a reparse point", path.display()),
+            ));
+        }
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    if stable_file_identity(&file)? != path_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{} changed while opening", path.display()),
+        ));
+    }
+    if file.metadata()?.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds the allowed size", path.display()),
+        ));
+    }
+    let mut contents = Vec::new();
+    Read::by_ref(&mut file)
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds the allowed size", path.display()),
+        ));
+    }
+    if stable_path_identity(path)? != path_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{} changed while reading", path.display()),
+        ));
+    }
+    Ok(contents)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgyHookState {
+    Pending,
+    Complete,
+    Failed,
+}
+
+fn open_and_lock_owned_temp_file(file: &PrivateTempFile) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let opened = options.open(file.path())?;
+    if stable_file_identity(&opened)? != file.identity()
+        || stable_path_identity(file.path())? != file.identity()
+    {
+        return Err(io::Error::other(format!(
+            "{} changed while locking",
+            file.path().display()
+        )));
+    }
+    fs2::FileExt::lock_exclusive(&opened)?;
+    Ok(opened)
+}
+
+fn is_random_agy_temp_name(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == 33
+            && suffix.starts_with('_')
+            && suffix[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn acquire_agy_temp_cleanup_lock(base: &Path) -> io::Result<std::fs::File> {
+    let path = base.join(".agy-hook-cleanup.lock");
+    verify_regular_file_or_absent(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let lock = options.open(&path)?;
+    if !lock.metadata()?.is_file() || stable_file_identity(&lock)? != stable_path_identity(&path)? {
+        return Err(io::Error::other(
+            "Agy temporary cleanup lock is not a stable regular file",
+        ));
+    }
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn try_lock_stale_agy_file(path: &Path) -> io::Result<Option<(std::fs::File, StablePathIdentity)>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let identity = stable_file_identity(&file)?;
+    if stable_path_identity(path)? != identity {
+        return Ok(None);
+    }
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some((file, identity))),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_regular_file_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            let identity = stable_path_identity(path)?;
+            crate::services::file_ops::remove_file_by_identity(path, identity)
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Remove hook files whose advisory locks were released by a crash. The
+/// caller holds the directory-wide cleanup lock, so another process cannot
+/// create an unlocked file in the scan/create gap.
+fn cleanup_stale_agy_hook_files(base: &Path) -> io::Result<()> {
+    verify_real_directory(base)?;
+    let entries: Vec<PathBuf> = std::fs::read_dir(base)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+
+    for path in &entries {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX)
+            && !is_random_agy_temp_name(name, "agy_hook_state")
+        {
+            continue;
+        }
+        let Some((_lock, identity)) = try_lock_stale_agy_file(path)? else {
+            continue;
+        };
+        if is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX) {
+            let ack_path = derived_hook_ack_path(path)?;
+            remove_regular_file_if_present(&ack_path)?;
+        }
+        crate::services::file_ops::remove_file_by_identity(path, identity)?;
+    }
+
+    // A crash normally leaves the prompt beside its acknowledgement. This
+    // second pass also handles an acknowledgement whose prompt was removed by
+    // an external process before the next startup.
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(prompt_name) = name.strip_suffix(".ack") else {
+            continue;
+        };
+        if is_random_agy_temp_name(prompt_name, AGY_SYSTEM_PROMPT_PREFIX)
+            && !path.with_file_name(prompt_name).exists()
+        {
+            remove_regular_file_if_present(&path)?;
+        }
+    }
+    Ok(())
+}
+
+struct AgyHookPrompt {
+    prompt_file: PrivateTempFile,
+    state_file: PrivateTempFile,
+    _prompt_lock: std::fs::File,
+    _state_lock: std::fs::File,
+    state_identity: StablePathIdentity,
+    ack_path: PathBuf,
+    token: String,
+}
+
+impl AgyHookPrompt {
+    fn create_in(base: &Path, system_prompt: &str) -> io::Result<Self> {
+        if system_prompt.len() > AGY_SYSTEM_PROMPT_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Agy system prompt exceeds {} bytes",
+                    AGY_SYSTEM_PROMPT_MAX_BYTES
+                ),
+            ));
+        }
+        let prompt_file =
+            create_private_temp_file(base, AGY_SYSTEM_PROMPT_PREFIX, system_prompt.as_bytes())?;
+        let prompt_lock = open_and_lock_owned_temp_file(&prompt_file)?;
+        // The shell wrapper records a start/ok pair for every hook invocation
+        // in this pre-created ledger. An unmatched start or explicit failure
+        // means a successful first invocation cannot hide a failed second one
+        // after a tool call.
+        let state_file = create_private_temp_file(base, "agy_hook_state", b"")?;
+        let state_lock = open_and_lock_owned_temp_file(&state_file)?;
+        let state_identity = stable_path_identity(state_file.path())?;
+        let ack_path = derived_hook_ack_path(prompt_file.path())?;
+        match std::fs::symlink_metadata(&ack_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Agy hook acknowledgement path already exists",
+                ))
+            }
+        }
+        Ok(Self {
+            prompt_file,
+            state_file,
+            _prompt_lock: prompt_lock,
+            _state_lock: state_lock,
+            state_identity,
+            ack_path,
+            token: format!("{:032x}", rand::random::<u128>()),
+        })
+    }
+
+    fn prompt_path(&self) -> &Path {
+        self.prompt_file.path()
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn state_path(&self) -> &Path {
+        self.state_file.path()
+    }
+
+    fn hook_state(&self) -> AgyHookState {
+        if stable_path_identity(self.state_path()).ok() != Some(self.state_identity) {
+            return AgyHookState::Failed;
+        }
+        let contents = match read_small_regular_file(self.state_path(), 1024 * 1024) {
+            Ok(contents) => contents,
+            Err(_) => return AgyHookState::Failed,
+        };
+        if contents.is_empty() || !contents.ends_with(b"\n") {
+            return AgyHookState::Pending;
+        }
+        let contents = match std::str::from_utf8(&contents) {
+            Ok(contents) => contents,
+            Err(_) => return AgyHookState::Failed,
+        };
+        let expected_start = format!("start {}", self.token);
+        let expected_ok = format!("ok {}", self.token);
+        let expected_fail = format!("fail {}", self.token);
+        let mut starts = 0usize;
+        let mut successes = 0usize;
+        for line in contents.lines() {
+            if line == expected_start {
+                starts += 1;
+            } else if line == expected_ok {
+                successes += 1;
+            } else if line == expected_fail {
+                return AgyHookState::Failed;
+            } else {
+                return AgyHookState::Failed;
+            }
+        }
+        if starts == 0 || successes > starts {
+            AgyHookState::Failed
+        } else if starts == successes {
+            AgyHookState::Complete
+        } else {
+            AgyHookState::Pending
+        }
+    }
+
+    fn acknowledged(&self) -> bool {
+        read_small_regular_file(&self.ack_path, 128)
+            .map(|contents| contents == self.token.as_bytes())
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for AgyHookPrompt {
+    fn drop(&mut self) {
+        if self.acknowledged() {
+            let _ = std::fs::remove_file(&self.ack_path);
+        }
+    }
+}
+
+fn prepare_agy_hook_prompt(
+    base: &Path,
+    system_prompt: Option<&str>,
+) -> io::Result<Option<AgyHookPrompt>> {
+    match system_prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        Some(prompt) => {
+            let _cleanup_lock = acquire_agy_temp_cleanup_lock(base)?;
+            cleanup_stale_agy_hook_files(base)?;
+            AgyHookPrompt::create_in(base, prompt).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+fn hook_executable_path() -> io::Result<PathBuf> {
+    let path = std::env::var_os(AGY_HOOK_EXECUTABLE_OVERRIDE)
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe)?;
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Agy hook executable does not exist: {}", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn agy_hook_command() -> String {
+    format!(
+        "if [ -z \"${{{exec}:-}}\" ]; then cat >/dev/null; printf '{{}}\\n'; else if [ -z \"${{{state}:-}}\" ] || [ -z \"${{{token}:-}}\" ]; then exit 125; fi; umask 077; printf 'start %s\\n' \"${{{token}}}\" >> \"${{{state}}}\" || exit 125; \"${{{exec}}}\" {arg}; status=$?; if [ \"$status\" -eq 0 ]; then phase=ok; else phase=fail; fi; printf '%s %s\\n' \"$phase\" \"${{{token}}}\" >> \"${{{state}}}\" || exit 125; exit \"$status\"; fi",
+        exec = AGY_HOOK_ENV_EXECUTABLE,
+        arg = AGY_HOOK_INTERNAL_ARG,
+        state = AGY_HOOK_ENV_STATE_FILE,
+        token = AGY_HOOK_ENV_TOKEN,
+    )
+}
+
+#[cfg(windows)]
+fn agy_hook_command() -> String {
+    format!(
+        "if not defined {} (more >nul & echo {{}}) else (\"%{}%\" {})",
+        AGY_HOOK_ENV_EXECUTABLE, AGY_HOOK_ENV_EXECUTABLE, AGY_HOOK_INTERNAL_ARG
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn agy_hook_command() -> String {
+    "printf '{}\\n'".to_string()
+}
+
+fn verify_regular_file_or_absent(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} is a reparse point", path.display()),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a real regular file", path.display()),
+        )),
+    }
+}
+
+fn write_private_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
+    verify_regular_file_or_absent(path)?;
+    if std::fs::read(path)
+        .map(|existing| existing == contents)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    crate::services::telegram::write_private_file_atomically(path, contents)
+}
+
+fn ensure_agy_hook_plugin_in(config_root: &Path) -> io::Result<PathBuf> {
+    let plugins_dir = config_root.join("plugins");
+    std::fs::create_dir_all(&plugins_dir)?;
+    verify_real_directory(&plugins_dir)?;
+
+    let lock_path = plugins_dir.join(".cokacdir-runtime-system-prompt.lock");
+    verify_regular_file_or_absent(&lock_path)?;
+    let mut lock_options = std::fs::OpenOptions::new();
+    lock_options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        lock_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let lock_file = lock_options.open(&lock_path)?;
+    let lock_metadata = lock_file.metadata()?;
+    if !lock_metadata.is_file()
+        || stable_file_identity(&lock_file)? != stable_path_identity(&lock_path)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Agy hook installation lock is not a stable regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if lock_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Agy hook installation lock is a reparse point",
+            ));
+        }
+    }
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+
+    let plugin_dir = plugins_dir.join(AGY_HOOK_PLUGIN_DIR);
+    match std::fs::symlink_metadata(&plugin_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_private_directory(&plugin_dir)?;
+        }
+        Err(error) => return Err(error),
+        Ok(_) => verify_real_directory(&plugin_dir)?,
+    }
+
+    let marker_path = plugin_dir.join(".cokacdir-owned");
+    match std::fs::symlink_metadata(&marker_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let directory_was_empty = std::fs::read_dir(&plugin_dir)?.next().is_none();
+            if !directory_was_empty {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "unowned Agy hook plugin directory already exists: {}",
+                        plugin_dir.display()
+                    ),
+                ));
+            }
+            write_private_file_if_changed(&marker_path, AGY_HOOK_PLUGIN_MARKER)?;
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {
+            if read_small_regular_file(&marker_path, 128)? != AGY_HOOK_PLUGIN_MARKER {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Agy hook plugin directory is not owned by cokacdir: {}",
+                        plugin_dir.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+        "name": AGY_HOOK_PLUGIN_DIR,
+        "description": "Injects per-process Cokacdir system instructions through an Agy PreInvocation hook."
+    }))?;
+    let command = agy_hook_command();
+    let hooks = serde_json::to_vec_pretty(&serde_json::json!({
+        AGY_HOOK_NAME: {
+            "PreInvocation": [{
+                "type": "command",
+                "command": command,
+                "timeout": 10
+            }]
+        }
+    }))?;
+    let disabled_manifest = plugin_dir.join("plugin.json.disabled");
+    match std::fs::symlink_metadata(&disabled_manifest) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            verify_regular_file_or_absent(&disabled_manifest)?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "the cokacdir Agy hook plugin is disabled: {}",
+                    disabled_manifest.display()
+                ),
+            ));
+        }
+    }
+    write_private_file_if_changed(&plugin_dir.join("plugin.json"), &manifest)?;
+    write_private_file_if_changed(&plugin_dir.join("hooks.json"), &hooks)?;
+    Ok(plugin_dir)
+}
+
+fn ensure_agy_hook_plugin() -> io::Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cannot determine home directory for Agy hook configuration",
+        )
+    })?;
+    ensure_agy_hook_plugin_in(&home.join(".gemini").join("config"))
+}
+
+fn write_hook_ack(path: &Path, token: &str) -> io::Result<()> {
+    if let Ok(existing) = read_small_regular_file(path, 128) {
+        if existing == token.as_bytes() {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Agy hook acknowledgement belongs to a different invocation",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()
+}
+
+fn build_agy_hook_response(
+    hook_input: &str,
+    prompt_path: &Path,
+    token: &str,
+) -> io::Result<(Vec<u8>, PathBuf)> {
+    if !valid_hook_token(token) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Agy hook token",
+        ));
+    }
+    let input: Value = serde_json::from_str(hook_input).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Agy hook input: {error}"),
+        )
+    })?;
+    let _invocation_num = input
+        .get("invocationNum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Agy hook input is missing invocationNum",
+            )
+        })?;
+    if input
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy hook input is missing PreInvocation fields",
+        ));
+    }
+
+    let temp_dir = crate::utils::path::cokacdir_temp_dir()?;
+    let owned_name = prompt_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{}_", AGY_SYSTEM_PROMPT_PREFIX)))
+        .is_some_and(|suffix| {
+            suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if prompt_path.parent() != Some(temp_dir.as_path()) || !owned_name {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Agy hook prompt path is outside cokacdir's private temporary directory",
+        ));
+    }
+    let prompt = read_small_regular_file(prompt_path, AGY_SYSTEM_PROMPT_MAX_BYTES)?;
+    let prompt = String::from_utf8(prompt).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy system prompt is not valid UTF-8",
+        )
+    })?;
+    let response = serde_json::to_vec(&serde_json::json!({
+        "injectSteps": [{ "ephemeralMessage": prompt }]
+    }))
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((response, derived_hook_ack_path(prompt_path)?))
+}
+
+pub(crate) fn run_agy_pre_invocation_hook() -> io::Result<()> {
+    let prompt_path = std::env::var_os(AGY_HOOK_ENV_PROMPT_FILE);
+    let token = std::env::var(AGY_HOOK_ENV_TOKEN).ok();
+    if prompt_path.is_none() && token.is_none() {
+        println!("{{}}");
+        return Ok(());
+    }
+    let prompt_path = prompt_path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing Cokacdir Agy system-prompt file environment",
+        )
+    })?;
+    let token = token.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "missing Cokacdir Agy system-prompt token environment",
+        )
+    })?;
+    let mut input = String::new();
+    std::io::stdin()
+        .take(1024 * 1024)
+        .read_to_string(&mut input)?;
+    let (response, ack_path) = build_agy_hook_response(&input, Path::new(&prompt_path), &token)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&response)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    write_hook_ack(&ack_path, &token)
+}
+
+/// Ensures that every return path, including I/O errors and unwinding, reaps
+/// Agy before the per-invocation rule directory is allowed to disappear.
+struct ReapingAgyChild {
+    child: std::process::Child,
+    status: Option<std::process::ExitStatus>,
+}
+
+impl ReapingAgyChild {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            status: None,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    fn kill_and_reap(&mut self) {
+        if self.status.is_some() {
+            return;
+        }
+        if matches!(self.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        kill_child_tree(&mut self.child);
+        let _ = self.child.kill();
+        if let Ok(status) = self.child.wait() {
+            self.status = Some(status);
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let status = self.child.try_wait()?;
+        if let Some(status) = status {
+            self.status = Some(status);
+        }
+        Ok(status)
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let status = self.child.wait()?;
+        self.status = Some(status);
+        Ok(status)
+    }
+}
+
+impl Drop for ReapingAgyChild {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
 fn make_conversation_clone_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{}_{}_{}", prefix, std::process::id(), nanos)
+    format!("{}_{:032x}", prefix, rand::random::<u128>())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CloneFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn clone_file_identity(file: &std::fs::File) -> std::io::Result<CloneFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clone target is not a regular file",
+        ));
+    }
+    Ok(CloneFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn clone_path_identity(path: &Path) -> std::io::Result<CloneFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clone target path is not a regular file",
+        ));
+    }
+    Ok(CloneFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+type CloneFileIdentity = crate::services::file_ops::StablePathIdentity;
+
+#[cfg(windows)]
+fn clone_file_identity(file: &std::fs::File) -> std::io::Result<CloneFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clone target is not a real regular file",
+        ));
+    }
+    crate::services::file_ops::stable_file_identity(file)
+}
+
+#[cfg(windows)]
+fn clone_path_identity(path: &Path) -> std::io::Result<CloneFileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    clone_file_identity(&file)
+}
+
+fn clone_target_still_owned(
+    path: &Path,
+    reserved_identity: CloneFileIdentity,
+) -> std::io::Result<bool> {
+    clone_path_identity(path).map(|identity| identity == reserved_identity)
+}
+
+fn cleanup_owned_failed_clone(
+    target: &Path,
+    parent: &Path,
+    reserved_identity: CloneFileIdentity,
+) -> Result<bool, String> {
+    if !clone_target_still_owned(target, reserved_identity).unwrap_or(false) {
+        return Ok(false);
+    }
+    std::fs::remove_file(target).map_err(|e| {
+        format!(
+            "Failed to remove owned partial Agy clone {}: {}",
+            target.display(),
+            e
+        )
+    })?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| {
+            format!(
+                "Failed to persist cleanup of partial Agy clone {}: {}",
+                target.display(),
+                e
+            )
+        })?;
+    Ok(true)
+}
+
+fn clone_failure_with_safe_cleanup(
+    error: String,
+    target: &Path,
+    parent: &Path,
+    reserved_identity: CloneFileIdentity,
+) -> String {
+    match cleanup_owned_failed_clone(target, parent, reserved_identity) {
+        Ok(true) => error,
+        Ok(false) => format!(
+            "{}; clone target identity changed, so no path was deleted and the owned inode was left as recovery state",
+            error
+        ),
+        Err(cleanup_error) => format!(
+            "{}; partial clone cleanup failed and recovery state was preserved: {}",
+            error, cleanup_error
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn sqlite_connection_matches_reserved_identity(
+    _connection: &Connection,
+    reserved: &std::fs::File,
+    expected: CloneFileIdentity,
+) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let fd_root = Path::new("/proc/self/fd");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let fd_root = Path::new("/dev/fd");
+
+    std::fs::read_dir(fd_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|fd| *fd != reserved.as_raw_fd())
+        .any(|fd| {
+            std::fs::metadata(fd_root.join(fd.to_string()))
+                .map(|metadata| {
+                    metadata.is_file()
+                        && metadata.dev() == expected.device
+                        && metadata.ino() == expected.inode
+                })
+                .unwrap_or(false)
+        })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn sqlite_connection_matches_reserved_identity(
+    connection: &Connection,
+    _reserved: &std::fs::File,
+    expected: CloneFileIdentity,
+) -> bool {
+    use std::os::windows::io::BorrowedHandle;
+
+    let main = c"main";
+    let mut raw_handle: *mut std::ffi::c_void = std::ptr::null_mut();
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            main.as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
+            (&mut raw_handle as *mut *mut std::ffi::c_void).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || raw_handle.is_null() {
+        return false;
+    }
+    // SAFETY: SQLite returned this live database handle for `connection`; the
+    // borrow is confined to this identity query and does not close the handle.
+    let borrowed = unsafe { BorrowedHandle::borrow_raw(raw_handle.cast()) };
+    crate::services::file_ops::stable_windows_handle_identity(&borrowed)
+        .map(|identity| identity == expected)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn sqlite_destination_path_for_reserved(reserved: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let fd_root = "/proc/self/fd";
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let fd_root = "/dev/fd";
+    PathBuf::from(fd_root).join(reserved.as_raw_fd().to_string())
+}
+
+#[cfg(windows)]
+fn sqlite_destination_path_for_reserved(_reserved: &std::fs::File, target: &Path) -> PathBuf {
+    target.to_path_buf()
+}
+
+fn open_reserved_sqlite_destination(
+    reserved: &std::fs::File,
+    target: &Path,
+    reserved_identity: CloneFileIdentity,
+) -> Result<Connection, String> {
+    #[cfg(unix)]
+    let destination_path = sqlite_destination_path_for_reserved(reserved);
+    #[cfg(windows)]
+    let destination_path = sqlite_destination_path_for_reserved(reserved, target);
+    let destination = Connection::open_with_flags(
+        &destination_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to open reserved Agy clone destination {}: {}",
+            target.display(),
+            e
+        )
+    })?;
+    destination
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| {
+            format!(
+                "Failed to configure Agy clone destination timeout {}: {}",
+                target.display(),
+                e
+            )
+        })?;
+    if !sqlite_connection_matches_reserved_identity(&destination, reserved, reserved_identity) {
+        return Err(format!(
+            "SQLite destination is not the reserved Agy clone file: {}",
+            target.display()
+        ));
+    }
+    if !clone_target_still_owned(target, reserved_identity).unwrap_or(false) {
+        return Err(format!(
+            "Agy clone target changed while opening SQLite destination: {}",
+            target.display()
+        ));
+    }
+    Ok(destination)
 }
 
 fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String> {
@@ -361,25 +1464,38 @@ fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String>
     let target = dir.join(format!("{}.{}", target_id, ext));
 
     if ext == "db" {
-        for path in [
+        let owned_paths = [
             target.clone(),
             dir.join(format!("{}.db-wal", target_id)),
             dir.join(format!("{}.db-shm", target_id)),
-        ] {
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(|e| {
-                    format!(
-                        "Failed to remove stale Agy clone target {}: {}",
+        ];
+        for path in &owned_paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "Refusing to overwrite existing Agy clone target {}",
+                        path.display()
+                    ))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to inspect Agy clone target {}: {}",
                         path.display(),
                         e
-                    )
-                })?;
+                    ))
+                }
             }
         }
 
+        // Open and validate the source before creating any clone path. SQLite's
+        // NOFOLLOW flag rejects a final-component symlink on every platform
+        // supported by the bundled SQLite build.
         let source_conn = Connection::open_with_flags(
             source,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|e| {
             format!(
@@ -397,26 +1513,284 @@ fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String>
                     e
                 )
             })?;
-        source_conn
-            .backup(DatabaseName::Main, &target, None)
-            .map_err(|e| {
+
+        // Reserve the randomly named destination with no-clobber semantics.
+        // rusqlite's backup API opens this file as the destination database;
+        // reserving it first prevents a concurrent clone from ever replacing
+        // or deleting another clone's state.
+        let mut reserve_options = std::fs::OpenOptions::new();
+        reserve_options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            reserve_options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            reserve_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let reserved = reserve_options.open(&target).map_err(|e| {
+            format!(
+                "Failed to reserve Agy clone target {}: {}",
+                target.display(),
+                e
+            )
+        })?;
+        let reserved_identity = clone_file_identity(&reserved).map_err(|e| {
+            format!(
+                "Failed to identify reserved Agy clone target {}: {}",
+                target.display(),
+                e
+            )
+        })?;
+
+        // Open SQLite through the already-open reservation on Unix. `/proc`
+        // and `/dev/fd` are magic links to the held inode, so a rename/symlink
+        // swap of `target` cannot redirect SQLite to an attacker-selected
+        // file. Windows SQLite holds the opened database without delete-share;
+        // the file-id checks before and after backup reject any pre-open swap.
+        let mut destination_conn =
+            match open_reserved_sqlite_destination(&reserved, &target, reserved_identity) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return Err(clone_failure_with_safe_cleanup(
+                        error,
+                        &target,
+                        dir,
+                        reserved_identity,
+                    ))
+                }
+            };
+
+        let backup_result = (|| -> Result<(), String> {
+            use rusqlite::backup::StepResult;
+
+            let backup = Backup::new(&source_conn, &mut destination_conn).map_err(|e| {
                 format!(
-                    "Failed to backup Agy conversation {} -> {}: {}",
+                    "Failed to initialize Agy backup {} -> {}: {}",
                     source.display(),
                     target.display(),
                     e
                 )
             })?;
+            let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match backup.step(100).map_err(|e| {
+                    format!(
+                        "Failed to backup Agy conversation {} -> {}: {}",
+                        source.display(),
+                        target.display(),
+                        e
+                    )
+                })? {
+                    StepResult::Done => return Ok(()),
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked
+                        if std::time::Instant::now() < retry_deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    StepResult::Busy => {
+                        return Err(format!(
+                            "Agy clone source or destination remained busy for 5 seconds: {}",
+                            target.display()
+                        ))
+                    }
+                    StepResult::Locked => {
+                        return Err(format!(
+                            "Agy clone source or destination remained locked for 5 seconds: {}",
+                            target.display()
+                        ))
+                    }
+                    _ => return Err(format!("Unknown Agy backup state for {}", target.display())),
+                }
+            }
+        })();
+        drop(destination_conn);
+        if let Err(backup_error) = backup_result {
+            return Err(clone_failure_with_safe_cleanup(
+                backup_error,
+                &target,
+                dir,
+                reserved_identity,
+            ));
+        }
+
+        // Flush through the original reservation, not by reopening the path.
+        reserved
+            .sync_all()
+            .map_err(|e| format!("Failed to sync Agy clone {}: {}", target.display(), e))?;
+        if !clone_target_still_owned(&target, reserved_identity).unwrap_or(false) {
+            // Never unlink here: `target` may now name an external file. The
+            // held/renamed clone inode is left as recovery state rather than
+            // risking deletion of a path we did not create.
+            return Err(format!(
+                "Agy clone target changed during backup; clone not published: {}",
+                target.display()
+            ));
+        }
+        #[cfg(unix)]
+        std::fs::File::open(dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| {
+                format!(
+                    "Failed to persist Agy clone directory {}: {}",
+                    dir.display(),
+                    e
+                )
+            })?;
     } else {
-        std::fs::copy(source, &target).map_err(|e| {
+        let source_before = std::fs::symlink_metadata(source).map_err(|e| {
             format!(
-                "Failed to copy Agy conversation {} -> {}: {}",
+                "Failed to inspect Agy conversation {}: {}",
                 source.display(),
+                e
+            )
+        })?;
+        if !source_before.file_type().is_file() || source_before.file_type().is_symlink() {
+            return Err(format!(
+                "Agy conversation is not a regular file: {}",
+                source.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if source_before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "Agy conversation is a reparse point: {}",
+                    source.display()
+                ));
+            }
+        }
+        let mut source_options = std::fs::OpenOptions::new();
+        source_options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            source_options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut source_file = source_options.open(source).map_err(|e| {
+            format!(
+                "Failed to open Agy conversation {}: {}",
+                source.display(),
+                e
+            )
+        })?;
+        let source_opened = source_file.metadata().map_err(|e| {
+            format!(
+                "Failed to inspect opened Agy conversation {}: {}",
+                source.display(),
+                e
+            )
+        })?;
+        if !source_opened.is_file() {
+            return Err(format!(
+                "Agy conversation is not a regular file: {}",
+                source.display()
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if source_opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(format!(
+                    "Agy conversation is a reparse point: {}",
+                    source.display()
+                ));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if source_before.dev() != source_opened.dev()
+                || source_before.ino() != source_opened.ino()
+            {
+                return Err(format!(
+                    "Agy conversation changed while opening: {}",
+                    source.display()
+                ));
+            }
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut target_file = options.open(&target).map_err(|e| {
+            format!(
+                "Failed to create Agy clone target {}: {}",
                 target.display(),
                 e
             )
         })?;
+        let copy_result = (|| -> std::io::Result<()> {
+            std::io::copy(&mut source_file, &mut target_file)?;
+            let source_after = source_file.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if source_after.dev() != source_opened.dev()
+                    || source_after.ino() != source_opened.ino()
+                    || source_after.len() != source_opened.len()
+                    || source_after.mtime() != source_opened.mtime()
+                    || source_after.mtime_nsec() != source_opened.mtime_nsec()
+                    || source_after.ctime() != source_opened.ctime()
+                    || source_after.ctime_nsec() != source_opened.ctime_nsec()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Agy conversation changed while it was being copied",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            if source_after.len() != source_opened.len()
+                || source_after.modified().ok() != source_opened.modified().ok()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Agy conversation changed while it was being copied",
+                ));
+            }
+            target_file.sync_all()
+        })();
+        if let Err(e) = copy_result {
+            drop(target_file);
+            let _ = std::fs::remove_file(&target);
+            return Err(format!(
+                "Failed to copy Agy conversation {} -> {}: {}",
+                source.display(),
+                target.display(),
+                e
+            ));
+        }
     }
+
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| {
+            format!(
+                "Failed to sync Agy clone directory {}: {}",
+                dir.display(),
+                e
+            )
+        })?;
 
     Ok(())
 }
@@ -434,13 +1808,21 @@ pub fn clone_session_for_schedule(session_id: &str, _working_dir: &str) -> Resul
     }
     let source = conversation_path(session_id)
         .ok_or_else(|| format!("Agy conversation not found: {}", session_id))?;
-    let clone_id = make_conversation_clone_id("cokacsched");
-    copy_conversation_to_id(&source, &clone_id)?;
-    agy_debug(&format!(
-        "[session-clone] cloned Agy conversation {} -> {}",
-        session_id, clone_id
-    ));
-    Ok(clone_id)
+    for _ in 0..32 {
+        let clone_id = make_conversation_clone_id("cokacsched");
+        match copy_conversation_to_id(&source, &clone_id) {
+            Ok(()) => {
+                agy_debug(&format!(
+                    "[session-clone] cloned Agy conversation {} -> {}",
+                    session_id, clone_id
+                ));
+                return Ok(clone_id);
+            }
+            Err(e) if e.contains("existing Agy clone target") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("Failed to allocate a unique Agy clone id".to_string())
 }
 
 pub fn execute_command(
@@ -546,46 +1928,80 @@ pub fn execute_command_streaming(
     let agy_bin = get_agy_path()
         .ok_or_else(|| "Agy CLI not found. Is Antigravity CLI installed?".to_string())?;
 
-    let mut args = Vec::<String>::new();
-    if let Some(sid) = session_id {
-        args.push("--conversation".into());
-        args.push(sid.to_string());
-    }
-    args.push("--print".into());
-    args.push(String::new());
-    args.push("--print-timeout".into());
-    args.push(default_print_timeout());
-    let agy_log_path = make_agy_log_file_path();
-    args.push("--log-file".into());
-    args.push(agy_log_path.display().to_string());
-    args.push("--dangerously-skip-permissions".into());
-    if let Some(m) = model {
-        args.push("--model".into());
-        args.push(m.to_string());
-    }
+    let temp_dir = crate::utils::path::cokacdir_temp_dir()
+        .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {}", e))?;
+    #[cfg(target_os = "linux")]
+    let agy_hook_prompt = prepare_agy_hook_prompt(&temp_dir, system_prompt)
+        .map_err(|e| format!("Failed to create private Agy system-prompt file: {}", e))?;
+    #[cfg(not(target_os = "linux"))]
+    let agy_hook_prompt: Option<AgyHookPrompt> = None;
 
-    let final_prompt = build_prompt(prompt, system_prompt);
+    #[cfg(target_os = "linux")]
+    let stdin_prompt: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(prompt);
+    #[cfg(not(target_os = "linux"))]
+    let stdin_prompt: std::borrow::Cow<'_, str> =
+        std::borrow::Cow::Owned(build_legacy_agy_stdin_prompt(prompt, system_prompt));
+
+    #[cfg(target_os = "linux")]
+    let (hook_plugin, hook_executable) = if agy_hook_prompt.is_some() {
+        let plugin = ensure_agy_hook_plugin()
+            .map_err(|e| format!("Failed to configure the Agy system-prompt hook: {}", e))?;
+        let executable = hook_executable_path()
+            .map_err(|e| format!("Failed to resolve the Agy hook executable: {}", e))?;
+        (Some(plugin), Some(executable))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (hook_plugin, hook_executable): (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    let agy_log_guard = create_private_temp_file(&temp_dir, "agy_log", b"")
+        .map_err(|e| format!("Failed to create private Agy log file: {}", e))?;
+    let args = build_agy_command_args(
+        session_id,
+        &default_print_timeout(),
+        agy_log_guard.path(),
+        model,
+    );
+    let _agy_log_guard = agy_log_guard;
+
     agy_debug(&format!(
-        "[stream] spawning {} {:?}; final_prompt_len={}",
+        "[stream] spawning {} {:?}; user_prompt_len={} system_prompt_len={} hook_plugin={:?}",
         agy_bin,
         args,
-        final_prompt.len()
+        prompt.len(),
+        system_prompt.map(str::len).unwrap_or_default(),
+        hook_plugin
     ));
 
     let mut cmd = Command::new(agy_bin);
     cmd.args(&args)
         .current_dir(working_dir)
         .env("PATH", enhanced_path_for_bin(agy_bin))
+        .env_remove(AGY_HOOK_ENV_PROMPT_FILE)
+        .env_remove(AGY_HOOK_ENV_TOKEN)
+        .env_remove(AGY_HOOK_ENV_EXECUTABLE)
+        .env_remove(AGY_HOOK_ENV_STATE_FILE)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(ref hook_prompt) = agy_hook_prompt {
+        cmd.env(AGY_HOOK_ENV_PROMPT_FILE, hook_prompt.prompt_path())
+            .env(AGY_HOOK_ENV_TOKEN, hook_prompt.token())
+            .env(AGY_HOOK_ENV_STATE_FILE, hook_prompt.state_path())
+            .env(
+                AGY_HOOK_ENV_EXECUTABLE,
+                hook_executable
+                    .as_ref()
+                    .expect("hook executable exists with hook prompt"),
+            );
+    }
     crate::services::claude::detach_into_own_pgroup(&mut cmd);
     crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = ReapingAgyChild::new(cmd.spawn().map_err(|e| {
         agy_debug(&format!("[stream] spawn failed: {}", e));
         format!("Failed to start agy: {}", e)
-    })?;
+    })?);
     agy_debug(&format!("[stream] spawned pid={}", child.id()));
 
     if let Some(ref token) = cancel_token {
@@ -593,50 +2009,183 @@ pub fn execute_command_streaming(
         *guard = Some(child.id());
         drop(guard);
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            kill_child_tree(&mut child);
-            let _ = child.wait();
+            child.kill_and_reap();
             return Ok(());
         }
     }
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(final_prompt.as_bytes()) {
-            agy_debug(&format!("[stream] stdin write failed: {}", e));
-        }
-        drop(stdin);
-    }
-
-    let stderr_thread = child.stderr.take().map(|stderr| {
+    let stderr_thread = child.take_stderr().map(|stderr| {
         std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
     });
 
+    // With no `--print`/`-p` flag, Agy treats non-TTY stdin as the complete
+    // headless prompt. Closing the pipe is required so Agy sees EOF and starts
+    // the request. On Linux, cokacdir's system instructions are supplied as a
+    // transient system message by Agy's PreInvocation hook and stdin contains
+    // only the user's current message. Other platforms retain the prior
+    // composed-stdin transport until Agy's cross-platform hook execution is
+    // reliable.
+    let stdin_result = match child.take_stdin() {
+        Some(mut stdin) => {
+            let result = stdin.write_all(stdin_prompt.as_bytes());
+            drop(stdin);
+            result.map_err(|e| format!("Failed to write Agy prompt to stdin: {}", e))
+        }
+        None => Err("Failed to open Agy stdin".to_string()),
+    };
+    if let Err(error) = stdin_result {
+        agy_debug(&format!("[stream] stdin failed: {}", error));
+        child.kill_and_reap();
+        let stderr_msg = stderr_thread
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+        if stderr_msg.is_empty() {
+            return Err(error);
+        }
+        return Err(format!("{}; stderr: {}", error, stderr_msg.trim()));
+    }
+    agy_debug(&format!(
+        "[stream] wrote {} stdin prompt bytes and closed it",
+        stdin_prompt.len()
+    ));
+
+    // Agy 1.1.1 treats hook failures as non-fatal and would otherwise call the
+    // model without cokacdir's system instructions. The helper acknowledges
+    // only after its complete JSON response has been written. Refuse to wait
+    // for or expose model output unless that handshake arrives promptly.
+    if let Some(ref hook_prompt) = agy_hook_prompt {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let hook_state = hook_prompt.hook_state();
+            if hook_state == AgyHookState::Failed {
+                child.kill_and_reap();
+                return Err(
+                    "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
+                        .to_string(),
+                );
+            }
+            if hook_prompt.acknowledged() && hook_state == AgyHookState::Complete {
+                break;
+            }
+            if let Some(ref token) = cancel_token {
+                if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    child.kill_and_reap();
+                    return Ok(());
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    child.kill_and_reap();
+                    return Err(format!(
+                        "Failed while waiting for the Agy system-prompt hook: {}",
+                        error
+                    ));
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                agy_debug("[stream] system-prompt hook acknowledgement timed out");
+                child.kill_and_reap();
+                let stderr_msg = stderr_thread
+                    .and_then(|handle| handle.join().ok())
+                    .unwrap_or_default();
+                let suffix = if stderr_msg.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("; stderr: {}", stderr_msg.trim())
+                };
+                return Err(format!(
+                    "Agy did not acknowledge cokacdir's system-prompt hook within 30 seconds{}",
+                    suffix
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "Failed to capture agy stdout".to_string())?;
-    let mut reader = BufReader::new(stdout);
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel::<Result<String, String>>();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut chunk = String::new();
+            match reader.read_line(&mut chunk) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if stdout_sender.send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ =
+                        stdout_sender.send(Err(format!("Failed to read agy output: {}", error)));
+                    break;
+                }
+            }
+        }
+    });
 
     let mut raw_stdout = String::new();
     let mut visible_output = String::new();
+    let mut forwarded_bytes = 0usize;
+    let mut hook_pending_since: Option<std::time::Instant> = None;
 
     loop {
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 agy_debug("[stream] cancelled during stdout read");
-                kill_child_tree(&mut child);
-                let _ = child.wait();
+                child.kill_and_reap();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.and_then(|handle| handle.join().ok());
                 return Ok(());
             }
         }
 
-        let mut chunk = String::new();
-        let bytes = reader.read_line(&mut chunk).map_err(|e| {
-            agy_debug(&format!("[stream] stdout read failed: {}", e));
-            format!("Failed to read agy output: {}", e)
-        })?;
-        if bytes == 0 {
-            break;
+        if let Some(ref hook_prompt) = agy_hook_prompt {
+            match hook_prompt.hook_state() {
+                AgyHookState::Complete => hook_pending_since = None,
+                AgyHookState::Failed => {
+                    agy_debug("[stream] Agy hook ledger reported failure");
+                    child.kill_and_reap();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.and_then(|handle| handle.join().ok());
+                    return Err(
+                        "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
+                            .to_string(),
+                    );
+                }
+                AgyHookState::Pending => {
+                    let pending_since =
+                        hook_pending_since.get_or_insert_with(std::time::Instant::now);
+                    if pending_since.elapsed() >= std::time::Duration::from_secs(30) {
+                        agy_debug("[stream] Agy hook ledger remained incomplete");
+                        child.kill_and_reap();
+                        let _ = stdout_thread.join();
+                        let _ = stderr_thread.and_then(|handle| handle.join().ok());
+                        return Err(
+                            "Agy's system-prompt hook did not complete within 30 seconds; the response was discarded."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
         }
+
+        let chunk = match stdout_receiver.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => {
+                agy_debug(&format!("[stream] stdout read failed: {}", error));
+                child.kill_and_reap();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.and_then(|handle| handle.join().ok());
+                return Err(error);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         raw_stdout.push_str(&chunk);
         agy_debug(&format!(
             "[stream] stdout chunk: {} bytes, preview={:?}",
@@ -645,22 +2194,39 @@ pub fn execute_command_streaming(
         ));
 
         visible_output.push_str(&chunk);
-        if sender
-            .send(StreamMessage::Text {
-                content: chunk.to_string(),
-            })
-            .is_err()
-        {
-            agy_debug("[stream] receiver dropped");
-            break;
+        // Agy's hook runner is fail-open. With a system prompt, retain all
+        // stdout until the child exits and every ledger start has a matching
+        // successful completion;
+        // otherwise a later failed PreInvocation could leak an answer after
+        // the first successful acknowledgement. Runs without a hook retain
+        // normal streaming behavior.
+        if agy_hook_prompt.is_none() && forwarded_bytes < visible_output.len() {
+            let pending = visible_output[forwarded_bytes..].to_string();
+            if sender
+                .send(StreamMessage::Text { content: pending })
+                .is_err()
+            {
+                agy_debug("[stream] receiver dropped");
+                child.kill_and_reap();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.and_then(|handle| handle.join().ok());
+                return Ok(());
+            }
+            forwarded_bytes = visible_output.len();
         }
+    }
+
+    if stdout_thread.join().is_err() {
+        child.kill_and_reap();
+        let _ = stderr_thread.and_then(|handle| handle.join().ok());
+        return Err("Agy stdout reader thread failed".to_string());
     }
 
     if let Some(ref token) = cancel_token {
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             agy_debug("[stream] cancelled after stdout read");
-            kill_child_tree(&mut child);
-            let _ = child.wait();
+            child.kill_and_reap();
+            let _ = stderr_thread.and_then(|handle| handle.join().ok());
             return Ok(());
         }
     }
@@ -683,12 +2249,32 @@ pub fn execute_command_streaming(
         .map(ToString::to_string)
         .or_else(|| read_last_conversation_id(working_dir));
 
-    let detected_error = if status.success() {
+    let hook_acknowledged = agy_hook_prompt
+        .as_ref()
+        .map(AgyHookPrompt::acknowledged)
+        .unwrap_or(true);
+    let hook_state = agy_hook_prompt
+        .as_ref()
+        .map(AgyHookPrompt::hook_state)
+        .unwrap_or(AgyHookState::Complete);
+    let hook_failed = hook_state != AgyHookState::Complete;
+    let detected_error = if hook_failed {
+        Some(
+            "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
+                .to_string(),
+        )
+    } else if !hook_acknowledged {
+        Some(
+            "Agy completed without running cokacdir's system-prompt hook; the response was discarded."
+                .to_string(),
+        )
+    } else if status.success() {
         stdout_absence_error_message(&raw_stdout)
     } else {
         None
     };
     if detected_error.is_some() || !status.success() {
+        let discard_hook_output = hook_failed || !hook_acknowledged;
         let message =
             detected_error.unwrap_or_else(|| format!("Agy exited with code {:?}", status.code()));
         agy_debug(&format!(
@@ -700,11 +2286,26 @@ pub fn execute_command_streaming(
         ));
         let _ = sender.send(StreamMessage::Error {
             message,
-            stdout: raw_stdout,
+            stdout: if discard_hook_output {
+                String::new()
+            } else {
+                raw_stdout
+            },
             stderr: stderr_msg,
             exit_code: status.code(),
         });
         return Ok(());
+    }
+
+    if forwarded_bytes < visible_output.len() {
+        if sender
+            .send(StreamMessage::Text {
+                content: visible_output[forwarded_bytes..].to_string(),
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
     }
 
     let _ = sender.send(StreamMessage::Done {
@@ -717,7 +2318,375 @@ pub fn execute_command_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{stdout_absence_error_message, working_dir_cache_keys};
+    use super::{
+        build_agy_command_args, build_agy_hook_response, cleanup_owned_failed_clone,
+        clone_file_identity, clone_target_still_owned, copy_conversation_to_id,
+        ensure_agy_hook_plugin_in, execute_command_streaming, open_reserved_sqlite_destination,
+        prepare_agy_hook_prompt, stdout_absence_error_message, working_dir_cache_keys,
+        write_hook_ack, AGY_HOOK_INTERNAL_ARG,
+    };
+
+    #[test]
+    fn agy_command_uses_user_stdin_without_prompt_or_workspace_flags() {
+        let args = build_agy_command_args(
+            Some("conversation-id"),
+            "1h",
+            std::path::Path::new(".cokacdir/tmp/agy.log"),
+            Some("Gemini 3.5 Flash (Medium)"),
+        );
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(!args.iter().any(|arg| matches!(
+            arg.as_str(),
+            "--print" | "-p" | "--prompt" | "--prompt-interactive" | "-i"
+        )));
+        assert!(!args.iter().any(|arg| arg == "--add-dir"));
+        assert_eq!(
+            args,
+            vec![
+                "--conversation",
+                "conversation-id",
+                "--print-timeout",
+                "1h",
+                "--log-file",
+                ".cokacdir/tmp/agy.log",
+                "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.5 Flash (Medium)",
+            ]
+        );
+    }
+
+    #[test]
+    fn hook_response_preserves_the_complete_utf8_system_prompt() {
+        let temp = crate::utils::path::cokacdir_temp_dir().unwrap();
+        let system_prompt = format!("  start\n{} end  ", "한글🙂".repeat(4_000));
+        let hook_prompt = prepare_agy_hook_prompt(&temp, Some(&system_prompt))
+            .unwrap()
+            .unwrap();
+        let input = r#"{"invocationNum":0,"initialNumSteps":1,"conversationId":"conversation"}"#;
+        let (response, ack_path) =
+            build_agy_hook_response(input, hook_prompt.prompt_path(), hook_prompt.token()).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+
+        assert_eq!(
+            response["injectSteps"][0]["ephemeralMessage"],
+            system_prompt
+        );
+        assert!(!hook_prompt.acknowledged());
+        write_hook_ack(&ack_path, hook_prompt.token()).unwrap();
+        assert!(hook_prompt.acknowledged());
+    }
+
+    #[test]
+    fn absent_or_blank_system_prompt_creates_no_hook_file() {
+        let temp = tempfile::tempdir().unwrap();
+        for prompt in [None, Some(""), Some(" \n\t ")] {
+            assert!(prepare_agy_hook_prompt(temp.path(), prompt)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn private_hook_prompt_and_ack_are_removed_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = prepare_agy_hook_prompt(temp.path(), Some("secret system instructions"))
+            .unwrap()
+            .unwrap();
+        let prompt_path = prompt.prompt_path().to_path_buf();
+        let state_path = prompt.state_path().to_path_buf();
+        let ack_path = super::derived_hook_ack_path(&prompt_path).unwrap();
+        write_hook_ack(&ack_path, prompt.token()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&prompt_path).unwrap(),
+            "secret system instructions"
+        );
+        assert!(state_path.exists());
+        assert!(ack_path.exists());
+        drop(prompt);
+        assert!(!prompt_path.exists());
+        assert!(!state_path.exists());
+        assert!(!ack_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_hook_prompt_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = prepare_agy_hook_prompt(temp.path(), Some("secret instructions"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(prompt.prompt_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(prompt.state_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_ledger_detects_a_later_invocation_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = prepare_agy_hook_prompt(temp.path(), Some("system instructions"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Pending);
+
+        let run_hook_shell = |executable: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &super::agy_hook_command()])
+                .env(super::AGY_HOOK_ENV_EXECUTABLE, executable)
+                .env(super::AGY_HOOK_ENV_STATE_FILE, prompt.state_path())
+                .env(super::AGY_HOOK_ENV_TOKEN, prompt.token())
+                .output()
+                .unwrap()
+        };
+
+        assert!(run_hook_shell("/bin/true").status.success());
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Complete);
+        assert!(run_hook_shell("/bin/true").status.success());
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Complete);
+
+        let failed = run_hook_shell("/bin/false");
+        assert!(!failed.status.success());
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Failed);
+        let ledger = std::fs::read_to_string(prompt.state_path()).unwrap();
+        assert_eq!(ledger.matches("start ").count(), 3);
+        assert_eq!(ledger.matches("ok ").count(), 2);
+        assert_eq!(ledger.matches("fail ").count(), 1);
+    }
+
+    #[test]
+    fn hook_ledger_rejects_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = prepare_agy_hook_prompt(temp.path(), Some("system instructions"))
+            .unwrap()
+            .unwrap();
+        let original = prompt.state_path().with_extension("owned-original");
+        std::fs::rename(prompt.state_path(), &original).unwrap();
+        std::fs::write(prompt.state_path(), b"").unwrap();
+
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Failed);
+
+        std::fs::remove_file(prompt.state_path()).unwrap();
+        std::fs::rename(original, prompt.state_path()).unwrap();
+    }
+
+    #[test]
+    fn stale_hook_cleanup_preserves_locked_runs_and_removes_crash_residue() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = prepare_agy_hook_prompt(temp.path(), Some("active instructions"))
+            .unwrap()
+            .unwrap();
+        let active_prompt = active.prompt_path().to_path_buf();
+        let active_state = active.state_path().to_path_buf();
+
+        let stale_prompt = crate::services::claude::create_private_temp_file(
+            temp.path(),
+            super::AGY_SYSTEM_PROMPT_PREFIX,
+            b"stale secret",
+        )
+        .unwrap();
+        let stale_prompt_path = stale_prompt.path().to_path_buf();
+        let stale_ack = super::derived_hook_ack_path(&stale_prompt_path).unwrap();
+        std::fs::write(&stale_ack, b"stale").unwrap();
+        std::mem::forget(stale_prompt);
+
+        let stale_state = crate::services::claude::create_private_temp_file(
+            temp.path(),
+            "agy_hook_state",
+            b"start stale",
+        )
+        .unwrap();
+        let stale_state_path = stale_state.path().to_path_buf();
+        std::mem::forget(stale_state);
+
+        let _cleanup_lock = super::acquire_agy_temp_cleanup_lock(temp.path()).unwrap();
+        super::cleanup_stale_agy_hook_files(temp.path()).unwrap();
+
+        assert!(active_prompt.exists());
+        assert!(active_state.exists());
+        assert!(!stale_prompt_path.exists());
+        assert!(!stale_ack.exists());
+        assert!(!stale_state_path.exists());
+    }
+
+    #[test]
+    fn namespaced_hook_plugin_is_created_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = ensure_agy_hook_plugin_in(temp.path()).unwrap();
+        let first_hooks = std::fs::read(plugin.join("hooks.json")).unwrap();
+        let second = ensure_agy_hook_plugin_in(temp.path()).unwrap();
+
+        assert_eq!(plugin, second);
+        assert_eq!(
+            first_hooks,
+            std::fs::read(plugin.join("hooks.json")).unwrap()
+        );
+        let hooks: serde_json::Value = serde_json::from_slice(&first_hooks).unwrap();
+        let command = hooks[super::AGY_HOOK_NAME]["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains(AGY_HOOK_INTERNAL_ARG));
+        assert!(command.contains(super::AGY_HOOK_ENV_STATE_FILE));
+        assert!(plugin.join("plugin.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_hook_is_a_shell_level_noop_without_cokacdir_environment() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &super::agy_hook_command()])
+            .env_remove(super::AGY_HOOK_ENV_EXECUTABLE)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn hook_plugin_never_overwrites_an_unowned_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugins").join(super::AGY_HOOK_PLUGIN_DIR);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("user-file"), b"keep").unwrap();
+
+        let error = ensure_agy_hook_plugin_in(temp.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(plugin.join("user-file")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn hook_plugin_respects_an_explicit_disabled_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = ensure_agy_hook_plugin_in(temp.path()).unwrap();
+        std::fs::rename(
+            plugin.join("plugin.json"),
+            plugin.join("plugin.json.disabled"),
+        )
+        .unwrap();
+
+        let error = ensure_agy_hook_plugin_in(temp.path()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!plugin.join("plugin.json").exists());
+        assert!(plugin.join("plugin.json.disabled").is_file());
+    }
+
+    #[test]
+    #[ignore = "requires an installed, authenticated Agy CLI and network access"]
+    fn live_agy_streaming_round_trip() {
+        if std::env::var("COKAC_AGY_LIVE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            std::env::var_os(super::AGY_HOOK_EXECUTABLE_OVERRIDE).is_some(),
+            "set COKACDIR_AGY_HOOK_EXECUTABLE_OVERRIDE to a built cokacdir binary"
+        );
+
+        fn collect_live_result(
+            receiver: std::sync::mpsc::Receiver<crate::services::claude::StreamMessage>,
+        ) -> (String, Option<String>) {
+            for message in receiver {
+                match message {
+                    crate::services::claude::StreamMessage::Done { result, session_id } => {
+                        return (result, session_id)
+                    }
+                    crate::services::claude::StreamMessage::Error {
+                        message,
+                        stdout,
+                        stderr,
+                        ..
+                    } => {
+                        panic!(
+                            "Agy live test failed: {message}; stdout={stdout:?}; stderr={stderr:?}"
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            panic!("Agy live test ended without a Done message")
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().into_owned();
+        let model = super::list_models()
+            .into_iter()
+            .next()
+            .expect("Agy must expose at least one model");
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        execute_command_streaming(
+            "What is 2 + 2? Return only the result.",
+            None,
+            &working_dir,
+            sender,
+            Some(
+                "For this integration check, create a file named cokacdir-hook-one.txt in the active workspace containing exactly HOOK_FILE_ONE. Then reply with exactly COKACDIR_AGY_LIVE_OK and nothing else.",
+            ),
+            None,
+            None,
+            Some(&model),
+            false,
+        )
+        .unwrap();
+
+        let (completed_result, session_id) = collect_live_result(receiver);
+        assert!(completed_result.contains("COKACDIR_AGY_LIVE_OK"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cokacdir-hook-one.txt"))
+                .unwrap()
+                .trim(),
+            "HOOK_FILE_ONE"
+        );
+        let session_id = session_id.expect("new Agy call must report its conversation id");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        execute_command_streaming(
+            "What is 3 + 3? Return only the result.",
+            Some(&session_id),
+            &working_dir,
+            sender,
+            Some(
+                "For this resumed integration check, create a file named cokacdir-hook-two.txt in the active workspace containing exactly HOOK_FILE_TWO. Then reply with exactly COKACDIR_AGY_RESUME_OK and nothing else.",
+            ),
+            None,
+            None,
+            Some(&model),
+            false,
+        )
+        .unwrap();
+
+        let (resumed_result, resumed_session_id) = collect_live_result(receiver);
+        assert!(resumed_result.contains("COKACDIR_AGY_RESUME_OK"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cokacdir-hook-two.txt"))
+                .unwrap()
+                .trim(),
+            "HOOK_FILE_TWO"
+        );
+        assert_eq!(resumed_session_id.as_deref(), Some(session_id.as_str()));
+    }
 
     #[test]
     fn detects_successful_empty_stdout_as_error() {
@@ -737,5 +2706,233 @@ mod tests {
         let keys = working_dir_cache_keys(r"C:\Users\kst\.cokacdir\workspace\eikfuccw");
         assert!(keys.contains(&r"C:\Users\kst\.cokacdir\workspace\eikfuccw".to_string()));
         assert!(keys.contains(&"C:/Users/kst/.cokacdir/workspace/eikfuccw".to_string()));
+    }
+
+    #[test]
+    fn agy_clone_never_overwrites_an_existing_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.pb");
+        let target = temp.path().join("fixed.pb");
+        std::fs::write(&source, b"source conversation").unwrap();
+        std::fs::write(&target, b"existing clone").unwrap();
+
+        let error = copy_conversation_to_id(&source, "fixed").unwrap_err();
+
+        assert!(error.contains("create Agy clone target"));
+        assert_eq!(std::fs::read(target).unwrap(), b"existing clone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_clone_rejects_symlink_conversation_sources() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.txt");
+        let source = temp.path().join("source.pb");
+        std::fs::write(&outside, b"must not be cloned").unwrap();
+        symlink(&outside, &source).unwrap();
+
+        let error = copy_conversation_to_id(&source, "clone").unwrap_err();
+
+        assert!(error.contains("not a regular file"));
+        assert!(!temp.path().join("clone.pb").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_sqlite_clone_rejects_symlink_source_before_reserving_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside.db");
+        let source = temp.path().join("source.db");
+        rusqlite::Connection::open(&outside)
+            .unwrap()
+            .execute_batch("CREATE TABLE data(value TEXT);")
+            .unwrap();
+        symlink(&outside, &source).unwrap();
+
+        let error = copy_conversation_to_id(&source, "clone").unwrap_err();
+
+        assert!(error.contains("Failed to open Agy conversation"));
+        assert!(!temp.path().join("clone.db").exists());
+    }
+
+    #[test]
+    fn concurrent_sqlite_clone_collision_keeps_one_complete_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        {
+            let conn = rusqlite::Connection::open(&source).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE messages(body TEXT); \
+                 INSERT INTO messages VALUES ('first'), ('second');",
+            )
+            .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let source = source.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                copy_conversation_to_id(&source, "same-clone")
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+        let clone = rusqlite::Connection::open(temp.path().join("same-clone.db")).unwrap();
+        let count: i64 = clone
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn sqlite_clone_waits_for_a_transient_exclusive_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let locker = rusqlite::Connection::open(&source).unwrap();
+        locker
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE messages(body TEXT); \
+                 INSERT INTO messages VALUES ('committed'); BEGIN EXCLUSIVE; \
+                 INSERT INTO messages VALUES ('pending');",
+            )
+            .unwrap();
+
+        let source_for_worker = source.clone();
+        let worker =
+            std::thread::spawn(move || copy_conversation_to_id(&source_for_worker, "writer-clone"));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        locker.execute_batch("COMMIT;").unwrap();
+
+        worker.join().unwrap().unwrap();
+        let clone = rusqlite::Connection::open(temp.path().join("writer-clone.db")).unwrap();
+        let count: i64 = clone
+            .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_sqlite_destination_rejects_symlink_swap_without_touching_replacement() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("clone.db");
+        let recovery = temp.path().join("clone-owned-recovery.db");
+        let victim = temp.path().join("victim.txt");
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let reserved = options.open(&target).unwrap();
+        let identity = clone_file_identity(&reserved).unwrap();
+        std::fs::rename(&target, &recovery).unwrap();
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &target).unwrap();
+
+        let error = match open_reserved_sqlite_destination(&reserved, &target, identity) {
+            Ok(_) => panic!("swapped target must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("changed while opening"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(recovery.exists());
+        assert!(!clone_target_still_owned(&target, identity).unwrap_or(false));
+        assert!(!cleanup_owned_failed_clone(&target, temp.path(), identity).unwrap());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_clone_cleanup_removes_only_the_reserved_inode() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("partial.db");
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let reserved = options.open(&target).unwrap();
+        let identity = clone_file_identity(&reserved).unwrap();
+
+        assert!(cleanup_owned_failed_clone(&target, temp.path(), identity).unwrap());
+        assert!(!target.exists());
+        reserved.sync_all().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_backup_stays_bound_to_reserved_inode_after_path_swap() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let target = temp.path().join("clone.db");
+        let recovery = temp.path().join("clone-owned-recovery.db");
+        let victim = temp.path().join("victim.txt");
+        let source_conn = rusqlite::Connection::open(&source).unwrap();
+        source_conn
+            .execute_batch("CREATE TABLE messages(body TEXT); INSERT INTO messages VALUES ('ok');")
+            .unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let reserved = options.open(&target).unwrap();
+        let identity = clone_file_identity(&reserved).unwrap();
+        let mut destination =
+            open_reserved_sqlite_destination(&reserved, &target, identity).unwrap();
+
+        std::fs::rename(&target, &recovery).unwrap();
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &target).unwrap();
+        {
+            let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination).unwrap();
+            backup
+                .run_to_completion(100, std::time::Duration::ZERO, None)
+                .unwrap();
+        }
+        drop(destination);
+        reserved.sync_all().unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
+        assert!(!clone_target_still_owned(&target, identity).unwrap_or(false));
+        let recovered = rusqlite::Connection::open(&recovery).unwrap();
+        let body: String = recovered
+            .query_row("SELECT body FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "ok");
     }
 }

@@ -1,13 +1,374 @@
 use crate::keybindings::KeybindingsConfig;
+use crate::services::file_ops::{
+    open_directory_for_read, open_regular_file_no_follow, remove_file_by_identity,
+    stable_file_identity, stable_path_identity, StablePathIdentity,
+};
 use crate::services::remote::RemoteProfile;
 use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::utils::format::strip_unc_prefix;
+
+#[derive(Debug)]
+pub enum SettingsLoadError {
+    Initialize(io::Error),
+    Read(io::Error),
+    Parse(serde_json::Error),
+}
+
+impl SettingsLoadError {
+    pub fn is_parse_error(&self) -> bool {
+        matches!(self, Self::Parse(_))
+    }
+}
+
+impl std::fmt::Display for SettingsLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initialize(error) => write!(formatter, "Failed to initialize settings: {error}"),
+            Self::Read(error) => write!(formatter, "Failed to read settings file: {error}"),
+            Self::Parse(error) => write!(formatter, "Invalid JSON in settings.json: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SettingsLoadError {}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+/// A real config directory kept open for the entire operation.
+///
+/// On Unix, `stable_path` is rooted at the open directory descriptor. On
+/// Windows, `open_directory_for_read` deliberately omits delete sharing, so
+/// the original directory name cannot be replaced while this value is alive.
+#[derive(Debug)]
+struct PrivateDirectory {
+    original_path: PathBuf,
+    stable_path: PathBuf,
+    handle: fs::File,
+    identity: StablePathIdentity,
+}
+
+impl PrivateDirectory {
+    fn open_or_create(path: &Path) -> io::Result<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match create_private_directory(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Self::open_paths(path.to_path_buf(), path)
+    }
+
+    fn open_paths(original_path: PathBuf, access_path: &Path) -> io::Result<Self> {
+        let before = fs::symlink_metadata(access_path)?;
+        if !before.file_type().is_dir()
+            || before.file_type().is_symlink()
+            || metadata_is_reparse_point(&before)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a real directory", original_path.display()),
+            ));
+        }
+        let before_identity = stable_path_identity(access_path)?;
+        let (handle, stable_path, opened) = open_directory_for_read(access_path)?;
+        let identity = stable_file_identity(&handle)?;
+        if !opened.is_dir()
+            || metadata_is_reparse_point(&opened)
+            || identity != before_identity
+            || stable_path_identity(access_path)? != identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed while being opened", original_path.display()),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+
+        let directory = Self {
+            original_path,
+            stable_path,
+            handle,
+            identity,
+        };
+        directory.validate_current()?;
+        Ok(directory)
+    }
+
+    fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        self.validate_current()?;
+        let stable_path = self.child_path(name)?;
+        let original_path = self.original_path.join(name);
+        match fs::symlink_metadata(&stable_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match create_private_directory(&stable_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        let child = Self::open_paths(original_path, &stable_path)?;
+        self.validate_current()?;
+        child.validate_current()?;
+        Ok(child)
+    }
+
+    fn child_path(&self, name: &str) -> io::Result<PathBuf> {
+        let component = Path::new(name);
+        if component.components().count() != 1
+            || component.file_name().and_then(|value| value.to_str()) != Some(name)
+            || name == "."
+            || name == ".."
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Config entry name must be one normal UTF-8 path component",
+            ));
+        }
+        Ok(self.stable_path.join(component))
+    }
+
+    fn validate_current(&self) -> io::Result<()> {
+        let held = self.handle.metadata()?;
+        if !held.is_dir()
+            || metadata_is_reparse_point(&held)
+            || stable_file_identity(&self.handle)? != self.identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Config directory handle changed: {}",
+                    self.original_path.display()
+                ),
+            ));
+        }
+        match stable_path_identity(&self.original_path) {
+            Ok(identity) if identity == self.identity => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Config directory changed during operation: {}",
+                    self.original_path.display()
+                ),
+            )),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Config directory became unavailable during operation ({}): {error}",
+                    self.original_path.display()
+                ),
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn sync(&self) -> io::Result<()> {
+        self.handle.sync_all()
+    }
+}
+
+fn open_private_regular_file_in(directory: &PrivateDirectory, name: &str) -> io::Result<fs::File> {
+    directory.validate_current()?;
+    let path = directory.child_path(name)?;
+    let (file, metadata) = open_regular_file_no_follow(&path)?;
+    let identity = stable_file_identity(&file)?;
+    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a real regular file", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    if stable_file_identity(&file)? != identity || stable_path_identity(&path)? != identity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} changed while its permissions were secured",
+                path.display()
+            ),
+        ));
+    }
+    directory.validate_current()?;
+    Ok(file)
+}
+
+fn cleanup_created_file(
+    path: &Path,
+    identity: StablePathIdentity,
+    primary_error: io::Error,
+) -> io::Error {
+    match remove_file_by_identity(path, identity) {
+        Ok(()) => primary_error,
+        Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => primary_error,
+        Err(cleanup_error) => io::Error::new(
+            primary_error.kind(),
+            format!(
+                "{primary_error}; additionally could not safely clean up '{}': {cleanup_error}",
+                path.display()
+            ),
+        ),
+    }
+}
+
+fn write_new_private_file_in(
+    directory: &PrivateDirectory,
+    name: &str,
+    contents: &[u8],
+) -> io::Result<()> {
+    directory.validate_current()?;
+    let path = directory.child_path(name)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&path)?;
+    let identity = stable_file_identity(&file)?;
+    if stable_path_identity(&path)? != identity {
+        drop(file);
+        return Err(cleanup_created_file(
+            &path,
+            identity,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed immediately after creation", path.display()),
+            ),
+        ));
+    }
+    if let Err(error) = directory
+        .validate_current()
+        .and_then(|_| file.write_all(contents))
+        .and_then(|_| file.sync_all())
+        .and_then(|_| directory.validate_current())
+    {
+        drop(file);
+        return Err(cleanup_created_file(&path, identity, error));
+    }
+    drop(file);
+    #[cfg(unix)]
+    directory.sync()?;
+    match directory.validate_current() {
+        Ok(()) => Ok(()),
+        Err(error) => Err(cleanup_created_file(&path, identity, error)),
+    }
+}
+
+fn ensure_private_regular_file_in(
+    directory: &PrivateDirectory,
+    name: &str,
+    default_contents: &[u8],
+) -> io::Result<()> {
+    directory.validate_current()?;
+    let path = directory.child_path(name)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            open_private_regular_file_in(directory, name)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match write_new_private_file_in(directory, name, default_contents) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    open_private_regular_file_in(directory, name)?;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Panel-specific settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,14 +479,14 @@ impl Default for Settings {
             extension_handler.insert(
                 "sh".to_string(),
                 vec![
-                    "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]".to_string(),
-                    "/bin/bash -c \"$(cat '{{FILEPATH}}')\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
+                    "read -r -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a; case \"$a\" in ''|[yY]) exit 1;; *) exit 0;; esac".to_string(),
+                    "/bin/bash \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
                 ],
             );
             extension_handler.insert(
                 "py".to_string(),
                 vec![
-                    "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]".to_string(),
+                    "read -r -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a; case \"$a\" in ''|[yY]) exit 1;; *) exit 0;; esac".to_string(),
                     "python \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
                     "python3 \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
                 ],
@@ -133,7 +494,7 @@ impl Default for Settings {
             extension_handler.insert(
                 "js".to_string(),
                 vec![
-                    "read -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a && [ -n \"$a\" ] && [ \"$a\" != \"y\" ]".to_string(),
+                    "read -r -p 'Run \"{{FILEPATH}}\"? (Y/n) ' a; case \"$a\" in ''|[yY]) exit 1;; *) exit 0;; esac".to_string(),
                     "node \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s".to_string(),
                 ],
             );
@@ -197,54 +558,53 @@ impl Settings {
 
     /// Ensures config directories and default files exist
     /// Called on app startup to initialize configuration
-    pub fn ensure_config_exists() {
-        // Create ~/.cokacdir/
-        if let Some(config_dir) = Self::config_dir() {
-            if !config_dir.exists() {
-                if fs::create_dir_all(&config_dir).is_ok() {
-                    // Set directory permissions to user-only on Unix
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let perms = fs::Permissions::from_mode(0o700);
-                        let _ = fs::set_permissions(&config_dir, perms);
-                    }
-                }
+    pub fn ensure_config_exists() -> io::Result<()> {
+        let config_dir = Self::config_dir().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine config directory",
+            )
+        })?;
+        Self::ensure_config_exists_in(&config_dir)
+    }
+
+    fn ensure_config_exists_in(config_dir: &Path) -> io::Result<()> {
+        Self::initialize_config_in(config_dir).map(drop)
+    }
+
+    fn initialize_config_in(config_dir: &Path) -> io::Result<PrivateDirectory> {
+        let config_directory = PrivateDirectory::open_or_create(config_dir)?;
+        let themes_directory = config_directory.open_or_create_child("themes")?;
+        ensure_private_regular_file_in(
+            &themes_directory,
+            "light.json",
+            Theme::light().to_json().as_bytes(),
+        )?;
+        ensure_private_regular_file_in(
+            &themes_directory,
+            "dark.json",
+            Theme::dark().to_json().as_bytes(),
+        )?;
+        ensure_private_regular_file_in(
+            &themes_directory,
+            "dawn_of_coding.json",
+            Theme::dawn_of_coding().to_json().as_bytes(),
+        )?;
+
+        config_directory.validate_current()?;
+        let config_path = config_directory.child_path("settings.json")?;
+        match fs::symlink_metadata(config_path) {
+            Ok(_) => {
+                open_private_regular_file_in(&config_directory, "settings.json")?;
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Self::default().save_to_private_dir(&config_directory)?;
+            }
+            Err(error) => return Err(error),
         }
-
-        // Create ~/.cokacdir/themes/
-        if let Some(themes_dir) = Self::themes_dir() {
-            if !themes_dir.exists() {
-                let _ = fs::create_dir_all(&themes_dir);
-            }
-
-            // Create default light.json if not exists
-            let light_theme_path = themes_dir.join("light.json");
-            if !light_theme_path.exists() {
-                let _ = fs::write(&light_theme_path, Theme::light().to_json());
-            }
-
-            // Create default dark.json if not exists
-            let dark_theme_path = themes_dir.join("dark.json");
-            if !dark_theme_path.exists() {
-                let _ = fs::write(&dark_theme_path, Theme::dark().to_json());
-            }
-
-            // Create default "dawn_of_coding.json" if not exists
-            let dawn_theme_path = themes_dir.join("dawn_of_coding.json");
-            if !dawn_theme_path.exists() {
-                let _ = fs::write(&dawn_theme_path, Theme::dawn_of_coding().to_json());
-            }
-        }
-
-        // Create default settings.json if not exists
-        if let Some(config_path) = Self::config_path() {
-            if !config_path.exists() {
-                let default_settings = Self::default();
-                let _ = default_settings.save();
-            }
-        }
+        themes_directory.validate_current()?;
+        config_directory.validate_current()?;
+        Ok(config_directory)
     }
 
     /// Loads settings from the config file, returns default if not found or invalid
@@ -254,17 +614,59 @@ impl Settings {
 
     /// Loads settings from the config file with error information
     /// Returns Ok(settings) on success, Err(error_message) on failure
-    pub fn load_with_error() -> Result<Self, String> {
-        // Ensure config directories and files exist
-        Self::ensure_config_exists();
+    pub fn load_with_error() -> Result<Self, SettingsLoadError> {
+        let config_dir = Self::config_dir().ok_or_else(|| {
+            SettingsLoadError::Initialize(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine config directory",
+            ))
+        })?;
+        // Keep the validated directory object pinned through initialization
+        // and the subsequent settings read.
+        let config_directory =
+            Self::initialize_config_in(&config_dir).map_err(SettingsLoadError::Initialize)?;
 
-        let config_path =
-            Self::config_path().ok_or_else(|| "Could not determine config path".to_string())?;
+        const MAX_SETTINGS_BYTES: u64 = 8 * 1024 * 1024;
+        let mut file = open_private_regular_file_in(&config_directory, "settings.json")
+            .map_err(SettingsLoadError::Read)?;
+        let settings_identity = stable_file_identity(&file).map_err(SettingsLoadError::Read)?;
+        if file.metadata().map_err(SettingsLoadError::Read)?.len() > MAX_SETTINGS_BYTES {
+            return Err(SettingsLoadError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings.json exceeds the 8 MiB size limit",
+            )));
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(MAX_SETTINGS_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(SettingsLoadError::Read)?;
+        let config_path = config_directory
+            .child_path("settings.json")
+            .map_err(SettingsLoadError::Read)?;
+        if stable_file_identity(&file).map_err(SettingsLoadError::Read)? != settings_identity
+            || stable_path_identity(&config_path).map_err(SettingsLoadError::Read)?
+                != settings_identity
+        {
+            return Err(SettingsLoadError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings.json changed while it was being read",
+            )));
+        }
+        config_directory
+            .validate_current()
+            .map_err(SettingsLoadError::Read)?;
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(SettingsLoadError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings.json exceeds the 8 MiB size limit",
+            )));
+        }
+        let content = String::from_utf8(bytes).map_err(|error| {
+            SettingsLoadError::Read(io::Error::new(io::ErrorKind::InvalidData, error))
+        })?;
 
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read settings file: {}", e))?;
-
-        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in settings.json: {}", e))
+        serde_json::from_str(&content).map_err(SettingsLoadError::Parse)
     }
 
     /// Saves settings to the config file using atomic write pattern
@@ -276,27 +678,108 @@ impl Settings {
             ));
         };
 
-        // Create config directory if it doesn't exist
-        if !config_dir.exists() {
-            fs::create_dir_all(&config_dir)?;
-            // Set directory permissions to user-only on Unix
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = fs::Permissions::from_mode(0o700);
-                let _ = fs::set_permissions(&config_dir, perms);
-            }
-        }
+        self.save_to_dir(&config_dir)
+    }
 
-        let config_path = config_dir.join("settings.json");
-        let temp_path = config_dir.join("settings.json.tmp");
+    fn save_to_dir(&self, config_dir: &Path) -> io::Result<()> {
+        let config_directory = PrivateDirectory::open_or_create(config_dir)?;
+        self.save_to_private_dir(&config_directory)
+    }
+
+    fn save_to_private_dir(&self, config_directory: &PrivateDirectory) -> io::Result<()> {
+        config_directory.validate_current()?;
+        let config_path = config_directory.child_path("settings.json")?;
         let content = serde_json::to_string_pretty(self)?;
 
-        // Atomic write: write to temp file first, then rename
-        fs::write(&temp_path, &content)?;
-        fs::rename(&temp_path, &config_path)?;
+        let (temp_path, mut temp_file, temp_identity) = (0..100)
+            .find_map(|_| {
+                let mut random = [0u8; 8];
+                rand::thread_rng().fill_bytes(&mut random);
+                let name = format!(".settings.json.{}.tmp", hex::encode(random));
+                let path = match config_directory.child_path(&name) {
+                    Ok(path) => path,
+                    Err(error) => return Some(Err(error)),
+                };
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+                }
+                match options.open(&path) {
+                    Ok(file) => match stable_file_identity(&file) {
+                        Ok(identity) => Some(Ok((path, file, identity))),
+                        Err(error) => Some(Err(error)),
+                    },
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "No unique temp path"))?;
 
-        Ok(())
+        let write_result = (|| -> io::Result<()> {
+            if stable_path_identity(&temp_path)? != temp_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Temporary settings file changed immediately after creation: {}",
+                        temp_path.display()
+                    ),
+                ));
+            }
+            config_directory.validate_current()?;
+            temp_file.write_all(content.as_bytes())?;
+            temp_file.sync_all()?;
+            if stable_file_identity(&temp_file)? != temp_identity
+                || stable_path_identity(&temp_path)? != temp_identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Temporary settings file changed before publication: {}",
+                        temp_path.display()
+                    ),
+                ));
+            }
+            config_directory.validate_current()?;
+            atomic_replace(&temp_path, &config_path)?;
+            if stable_file_identity(&temp_file)? != temp_identity
+                || stable_path_identity(&config_path)? != temp_identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Published settings file identity could not be verified: {}",
+                        config_path.display()
+                    ),
+                ));
+            }
+            config_directory.validate_current()?;
+            #[cfg(unix)]
+            {
+                // Persist the directory entry as well as the file contents.
+                config_directory.sync()?;
+            }
+            config_directory.validate_current()?;
+            Ok(())
+        })();
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                drop(temp_file);
+                // If publication did not happen, remove only the exact temporary
+                // object we created. A concurrently substituted path is preserved.
+                Err(cleanup_created_file(&temp_path, temp_identity, error))
+            }
+        }
     }
 
     /// Resolves a path setting to a valid directory
@@ -385,12 +868,17 @@ mod tests {
 
     #[test]
     fn test_ensure_config_exists() {
-        Settings::ensure_config_exists();
-        if let Some(themes_dir) = Settings::themes_dir() {
-            assert!(themes_dir.exists(), "themes directory should exist");
-            let light_theme = themes_dir.join("light.json");
-            assert!(light_theme.exists(), "light.json should exist");
-        }
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+
+        Settings::ensure_config_exists_in(&config_dir).unwrap();
+
+        let themes_dir = config_dir.join("themes");
+        assert!(themes_dir.exists(), "themes directory should exist");
+        assert!(themes_dir.join("light.json").exists());
+        assert!(themes_dir.join("dark.json").exists());
+        assert!(themes_dir.join("dawn_of_coding.json").exists());
+        assert!(config_dir.join("settings.json").exists());
     }
 
     #[test]
@@ -399,5 +887,217 @@ mod tests {
         assert!(json.contains("\"name\": \"light\""));
         assert!(json.contains("\"palette\""));
         assert!(json.contains("\"panel\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_shell_handler_executes_the_file_directly_and_accepts_uppercase_yes() {
+        let settings = Settings::default();
+        let handlers = settings.extension_handler.get("sh").unwrap();
+        assert!(handlers[0].contains("''|[yY]"));
+        assert_eq!(
+            handlers[1],
+            "/bin/bash \"{{FILEPATH}}\" && echo 'Press any key to return...' && read -n 1 -s"
+        );
+        assert!(!handlers[1].contains("$(cat"));
+    }
+
+    #[test]
+    fn save_to_dir_replaces_settings_and_leaves_valid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.encrypt_split_size = 10;
+        settings.save_to_dir(temp.path()).unwrap();
+        settings.encrypt_split_size = 20;
+        settings.save_to_dir(temp.path()).unwrap();
+
+        let saved: Settings =
+            serde_json::from_slice(&fs::read(temp.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved.encrypt_split_size, 20);
+        assert!(fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_dir_uses_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        Settings::default().save_to_dir(temp.path()).unwrap();
+
+        assert_eq!(
+            fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(temp.path().join("settings.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_dir_replaces_settings_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim.txt");
+        let settings_path = temp.path().join("settings.json");
+        fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &settings_path).unwrap();
+
+        Settings::default().save_to_dir(temp.path()).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert!(!fs::symlink_metadata(&settings_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_dir_rejects_a_symlinked_config_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let config_link = temp.path().join("config-link");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&shared, &config_link).unwrap();
+
+        let error = Settings::default().save_to_dir(&config_link).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!shared.join("settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_check_rejects_a_symlink_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        let themes_link = temp.path().join("themes");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&shared, &themes_link).unwrap();
+
+        let error = PrivateDirectory::open_or_create(&themes_link).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialization_rejects_a_symlinked_themes_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let shared = temp.path().join("shared-themes");
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&shared, config.join("themes")).unwrap();
+
+        let error = Settings::ensure_config_exists_in(&config).unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::NotADirectory | io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(fs::read_dir(&shared).unwrap().next().is_none());
+        assert!(!config.join("settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_file_creation_does_not_follow_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("outside.json");
+        let link = temp.path().join("light.json");
+        symlink(&victim, &link).unwrap();
+        let directory = PrivateDirectory::open_or_create(temp.path()).unwrap();
+
+        let error = write_new_private_file_in(&directory, "light.json", b"theme").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(victim).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_config_directory_rejects_a_path_swap_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let detached = temp.path().join("detached-config");
+        let victim = temp.path().join("victim");
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&victim).unwrap();
+        let directory = PrivateDirectory::open_or_create(&config).unwrap();
+
+        fs::rename(&config, &detached).unwrap();
+        symlink(&victim, &config).unwrap();
+        let error = Settings::default()
+            .save_to_private_dir(&directory)
+            .unwrap_err();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::NotFound
+        ));
+        assert!(!victim.join("settings.json").exists());
+        assert!(!detached.join("settings.json").exists());
+        assert!(fs::read_dir(&detached)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_cleanup_preserves_a_replacement_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_path = temp.path().join("settings.tmp");
+        let moved_path = temp.path().join("original.tmp");
+        fs::write(&temp_path, b"original").unwrap();
+        let identity = stable_path_identity(&temp_path).unwrap();
+        fs::rename(&temp_path, &moved_path).unwrap();
+        fs::write(&temp_path, b"replacement").unwrap();
+
+        let primary = io::Error::other("simulated publication failure");
+        let error = cleanup_created_file(&temp_path, identity, primary);
+
+        assert!(error.to_string().contains("could not safely clean up"));
+        assert_eq!(fs::read(&temp_path).unwrap(), b"replacement");
+        assert_eq!(fs::read(&moved_path).unwrap(), b"original");
     }
 }

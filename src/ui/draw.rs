@@ -277,7 +277,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         .iter()
         .filter(|f| !f.is_directory)
         .map(|f| f.size)
-        .sum();
+        .fold(0, u64::saturating_add);
 
     let right_text = if selected_count > 0 {
         format!(

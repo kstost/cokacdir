@@ -468,7 +468,10 @@ impl AIScreenState {
         }
 
         if let Ok(json) = serde_json::to_string_pretty(&session_data) {
-            let _ = fs::write(file_path, json);
+            let _ = crate::services::telegram::write_private_file_atomically(
+                &file_path,
+                json.as_bytes(),
+            );
         }
     }
 
@@ -852,15 +855,17 @@ impl AIScreenState {
             return;
         }
 
+        // Check claude availability before actual API call
+        if !self.claude_available {
+            // Keep the draft intact.  Clearing it before this check silently
+            // discarded everything the user typed when Claude was unavailable.
+            debug_log("submit: Claude not available, preserving input");
+            return;
+        }
+
         let user_input = input_text.trim().to_string();
         debug_log(&format!("User input: {}", user_input));
         self.set_input_text("");
-
-        // Check claude availability before actual API call
-        if !self.claude_available {
-            debug_log("submit: Claude not available, returning early");
-            return;
-        }
 
         debug_log(&format!(
             "submit: START - input_len={}, current_path={}",
@@ -1896,6 +1901,20 @@ mod tests {
         state.last_total_lines = 100;
         state.last_visible_height = 20;
         state
+    }
+
+    #[test]
+    fn submit_preserves_draft_when_claude_is_unavailable() {
+        let mut state = create_test_state();
+        state.claude_available = false;
+        state.input_lines = vec!["keep this draft".to_string()];
+        state.cursor_line = 0;
+        state.cursor_col = state.input_lines[0].chars().count();
+
+        state.submit();
+
+        assert_eq!(state.input_lines, vec!["keep this draft"]);
+        assert!(!state.is_processing);
     }
 
     fn default_kb() -> Keybindings {

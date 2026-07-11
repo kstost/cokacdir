@@ -115,29 +115,37 @@ fn calculate_dir_size_recursive(path: &Path, cancel_flag: &AtomicBool) -> DirCal
     let mut total_size: u64 = 0;
     let mut file_count: u64 = 0;
     let mut dir_count: u64 = 0;
+    let mut pending_dirs = vec![path.to_path_buf()];
 
-    if let Ok(entries) = fs::read_dir(path) {
+    // Use an explicit stack.  A deeply nested but otherwise valid directory
+    // tree must not overflow the UI worker thread's call stack.
+    while let Some(dir) = pending_dirs.pop() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.filter_map(|e| e.ok()) {
-            // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
-                break;
+                return DirCalcResult {
+                    total_size,
+                    file_count,
+                    dir_count,
+                };
             }
 
             let entry_path = entry.path();
             if let Ok(metadata) = fs::symlink_metadata(&entry_path) {
                 if metadata.file_type().is_symlink() {
                     // Symlink: count as file with size 0, don't follow
-                    file_count += 1;
+                    file_count = file_count.saturating_add(1);
                 } else if metadata.is_dir() {
-                    dir_count += 1;
-                    // Recursively calculate subdirectory
-                    let sub_result = calculate_dir_size_recursive(&entry_path, cancel_flag);
-                    total_size += sub_result.total_size;
-                    file_count += sub_result.file_count;
-                    dir_count += sub_result.dir_count;
+                    dir_count = dir_count.saturating_add(1);
+                    pending_dirs.push(entry_path);
                 } else {
-                    file_count += 1;
-                    total_size += metadata.len();
+                    file_count = file_count.saturating_add(1);
+                    total_size = total_size.saturating_add(metadata.len());
                 }
             }
         }
@@ -168,7 +176,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
     // Build content first to calculate required height
     let path = &app.info_file_path;
-    let metadata = fs::metadata(path);
+    // Do not follow the final symlink here.  Following it made the dedicated
+    // "Symbolic Link" branch unreachable and reported the target as though it
+    // were the selected entry itself.
+    let metadata = fs::symlink_metadata(path);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -199,13 +210,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             Span::styled(path.display().to_string(), path_style),
         ]));
 
-        let file_type = if meta.is_dir() {
-            "Directory"
-        } else if meta.is_symlink() {
-            "Symbolic Link"
-        } else {
-            "File"
-        };
+        let file_type = file_type_label(&meta);
         lines.push(Line::from(vec![
             Span::styled(format!("{:12}", "Type"), label_style),
             Span::styled(file_type.to_string(), type_style),
@@ -416,4 +421,32 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
     app.file_info_state = None;
     app.current_screen = Screen::FilePanel;
+}
+
+fn file_type_label(metadata: &fs::Metadata) -> &'static str {
+    if metadata.is_symlink() {
+        "Symbolic Link"
+    } else if metadata.is_dir() {
+        "Directory"
+    } else {
+        "File"
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn symlink_is_reported_as_a_link_instead_of_its_target_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+
+        let metadata = fs::symlink_metadata(&link).unwrap();
+        assert_eq!(file_type_label(&metadata), "Symbolic Link");
+    }
 }

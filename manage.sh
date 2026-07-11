@@ -8,6 +8,9 @@ set -e
 
 BINARY_NAME="cokacctl"
 BASE_URL="https://raw.githubusercontent.com/kstost/cokacctl/refs/heads/main/dist_beta"
+INSTALL_TMPFILE=""
+INSTALL_STAGEFILE=""
+INSTALL_STAGE_NEEDS_SUDO=0
 
 # Colors
 RED='\033[0;31m'
@@ -57,12 +60,12 @@ detect_arch() {
 
 # Get install directory
 get_install_dir() {
-    # Prefer /usr/local/bin (always in PATH)
-    if [ -d "/usr/local/bin" ]; then
+    # Prefer the system directory only when we can actually install there.
+    if [ -d "/usr/local/bin" ] && { [ -w "/usr/local/bin" ] || command -v sudo >/dev/null 2>&1; }; then
         echo "/usr/local/bin"
     else
         # Fallback to ~/.local/bin
-        mkdir -p "$HOME/.local/bin"
+        mkdir -p "$HOME/.local/bin" || return $?
         echo "$HOME/.local/bin"
     fi
 }
@@ -86,8 +89,93 @@ download() {
     fi
 }
 
-# Shell wrapper function to add
-SHELL_FUNC='cokacctl() { command cokacctl "$@" && cd "$(cat ~/.cokacctl/lastdir 2>/dev/null || pwd)"; }'
+validate_binary() {
+    local file="$1"
+    local os="$2"
+    local magic
+    magic="$(LC_ALL=C od -An -tx1 -N4 "$file" 2>/dev/null | tr -d ' \n')"
+    case "$os:$magic" in
+        linux:7f454c46) return 0 ;;
+        macos:feedface|macos:cefaedfe|macos:feedfacf|macos:cffaedfe|\
+        macos:cafebabe|macos:bebafeca|macos:cafebabf|macos:bfbafeca) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_install_files() {
+    if [ -n "${INSTALL_TMPFILE:-}" ]; then
+        rm -f "$INSTALL_TMPFILE" 2>/dev/null || true
+    fi
+    if [ -n "${INSTALL_STAGEFILE:-}" ]; then
+        if [ "${INSTALL_STAGE_NEEDS_SUDO:-0}" -eq 1 ]; then
+            sudo rm -f "$INSTALL_STAGEFILE" >/dev/null 2>&1 || true
+        else
+            rm -f "$INSTALL_STAGEFILE" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Canonical shell wrapper. The fixed lastdir file is a legacy cokacctl
+# contract, so remove it before every invocation and only consume a fresh,
+# valid directory written by that invocation.
+write_shell_wrapper() {
+    cat <<'COKACCTL_SHELL_WRAPPER'
+# BEGIN COKACCTL SAFE SHELL WRAPPER
+cokacctl() {
+    local cokacctl_state_dir="$HOME/.cokacctl"
+    local cokacctl_lastdir_file="$cokacctl_state_dir/lastdir"
+    local cokacctl_lock_dir="$cokacctl_state_dir/.lastdir.lock"
+    local cokacctl_status
+    local cokacctl_lastdir
+    local cokacctl_lock_owner
+
+    mkdir -p "$cokacctl_state_dir" || return $?
+    chmod 700 "$cokacctl_state_dir" 2>/dev/null || true
+
+    if ! mkdir "$cokacctl_lock_dir" 2>/dev/null; then
+        cokacctl_lock_owner="$(cat "$cokacctl_lock_dir/pid" 2>/dev/null || true)"
+        if [ -n "$cokacctl_lock_owner" ] && ! kill -0 "$cokacctl_lock_owner" 2>/dev/null; then
+            rm -rf "$cokacctl_lock_dir"
+            mkdir "$cokacctl_lock_dir" 2>/dev/null || {
+                echo "cokacctl: another invocation owns the last-directory state" >&2
+                return 75
+            }
+        else
+            echo "cokacctl: another invocation owns the last-directory state" >&2
+            return 75
+        fi
+    fi
+    printf '%s\n' "${BASHPID:-$$}" > "$cokacctl_lock_dir/pid" || {
+        rm -rf "$cokacctl_lock_dir"
+        return 1
+    }
+    if rm -f "$cokacctl_lastdir_file"; then
+        :
+    else
+        cokacctl_status=$?
+        rm -rf "$cokacctl_lock_dir"
+        return "$cokacctl_status"
+    fi
+
+    if command cokacctl "$@"; then
+        cokacctl_status=0
+    else
+        cokacctl_status=$?
+    fi
+
+    if [ "$cokacctl_status" -eq 0 ] && [ -s "$cokacctl_lastdir_file" ]; then
+        cokacctl_lastdir="$(cat "$cokacctl_lastdir_file" 2>/dev/null)" || cokacctl_lastdir=""
+        if [ -n "$cokacctl_lastdir" ] && [ -d "$cokacctl_lastdir" ]; then
+            cd -- "$cokacctl_lastdir" || cokacctl_status=$?
+        fi
+    fi
+    rm -f "$cokacctl_lastdir_file"
+    rm -rf "$cokacctl_lock_dir"
+    return "$cokacctl_status"
+}
+# END COKACCTL SAFE SHELL WRAPPER
+COKACCTL_SHELL_WRAPPER
+}
 
 # Get shell config file
 fallback_shell_config() {
@@ -142,8 +230,9 @@ setup_shell() {
         return
     fi
 
-    # Check if already configured
-    if [ -f "$config_file" ] && grep -q "cokacctl()" "$config_file"; then
+    # Append the repaired definition after any legacy function so re-running
+    # the installer upgrades existing shell profiles.
+    if [ -f "$config_file" ] && grep -Fq "BEGIN COKACCTL SAFE SHELL WRAPPER" "$config_file"; then
         return
     fi
 
@@ -154,8 +243,7 @@ setup_shell() {
 
     # Add function
     echo "" >> "$config_file"
-    echo "# cokacctl - cd to last directory on exit" >> "$config_file"
-    echo "$SHELL_FUNC" >> "$config_file"
+    write_shell_wrapper >> "$config_file"
 }
 
 main() {
@@ -170,37 +258,63 @@ main() {
     local filename="${BINARY_NAME}-${os}-${arch}"
     local url="${BASE_URL}/${filename}"
 
-    # Create temp file
-    local tmpfile
-    tmpfile="$(mktemp)"
-    trap 'rm -f "$tmpfile"' EXIT
-
-    # Download
-    if ! download "$url" "$tmpfile"; then
-        error "Download failed"
+    # Select the destination before downloading so writable installations can
+    # stage on the same filesystem and publish with one atomic rename.
+    local install_dir
+    install_dir="$(get_install_dir)" || error "Could not create an install directory"
+    local install_path="${install_dir}/${BINARY_NAME}"
+    if [ -L "$install_path" ] || { [ -e "$install_path" ] && [ ! -f "$install_path" ]; }; then
+        error "Refusing to replace non-regular install path: $install_path"
     fi
 
-    # Make executable
-    chmod +x "$tmpfile"
-
-    # Get install directory
-    local install_dir
-    install_dir="$(get_install_dir)"
-    local install_path="${install_dir}/${BINARY_NAME}"
-
-    # Install
     if [ -w "$install_dir" ]; then
-        mv "$tmpfile" "$install_path"
+        INSTALL_TMPFILE="$(mktemp "$install_dir/.${BINARY_NAME}.XXXXXX")"
     else
-        sudo mv "$tmpfile" "$install_path"
+        INSTALL_TMPFILE="$(mktemp)"
+    fi
+
+    # Download
+    if ! download "$url" "$INSTALL_TMPFILE"; then
+        error "Download failed"
+    fi
+    if [ ! -s "$INSTALL_TMPFILE" ]; then
+        error "Downloaded binary is empty"
+    fi
+    if ! validate_binary "$INSTALL_TMPFILE" "$os"; then
+        error "Downloaded file is not a valid $os executable"
+    fi
+
+    chmod 755 "$INSTALL_TMPFILE"
+
+    # Stage privileged installs beside the destination before the atomic
+    # rename, so a failed /tmp-to-system copy cannot damage the old binary.
+    if [ -w "$install_dir" ]; then
+        mv -f "$INSTALL_TMPFILE" "$install_path"
+        INSTALL_TMPFILE=""
+    else
+        INSTALL_STAGEFILE="$install_dir/.${BINARY_NAME}.$(basename "$INSTALL_TMPFILE").tmp"
+        INSTALL_STAGE_NEEDS_SUDO=1
+        if ! sudo cp "$INSTALL_TMPFILE" "$INSTALL_STAGEFILE"; then
+            error "Could not stage the downloaded binary"
+        fi
+        if ! sudo chmod 755 "$INSTALL_STAGEFILE"; then
+            error "Could not set executable permissions"
+        fi
+        if ! sudo mv -f "$INSTALL_STAGEFILE" "$install_path"; then
+            error "Could not publish the downloaded binary"
+        fi
+        INSTALL_STAGEFILE=""
+        rm -f "$INSTALL_TMPFILE"
+        INSTALL_TMPFILE=""
     fi
 
     # Verify installation
     if [ -x "$install_path" ]; then
         # Check if in PATH
-        if ! echo "$PATH" | grep -q "$install_dir"; then
-            warn "Add to PATH: export PATH=\"$install_dir:\$PATH\""
-        fi
+        case ":$PATH:" in
+            *":$install_dir:"*) ;;
+            *) warn "Add to PATH: export PATH=\"$install_dir:\$PATH\"" ;;
+        esac
 
         # Setup shell wrapper
         setup_shell
@@ -213,4 +327,8 @@ main() {
     fi
 }
 
+trap cleanup_install_files EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 main "$@"

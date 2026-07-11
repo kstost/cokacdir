@@ -7,14 +7,135 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
-/// Generate a unique ID from timestamp nanoseconds + PID
-fn simple_uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}_{}", nanos, std::process::id())
+pub(crate) struct PrivateTempFile {
+    path: std::path::PathBuf,
+    stable_path: std::path::PathBuf,
+    identity: crate::services::file_ops::StablePathIdentity,
+    directory_path: std::path::PathBuf,
+    directory_identity: crate::services::file_ops::StablePathIdentity,
+    directory_guard: Option<std::fs::File>,
+}
+
+impl PrivateTempFile {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn identity(&self) -> crate::services::file_ops::StablePathIdentity {
+        self.identity
+    }
+
+    pub(crate) fn verified_path(&self) -> std::io::Result<&std::path::Path> {
+        if crate::services::file_ops::stable_path_identity(&self.directory_path)?
+            != self.directory_identity
+            || crate::services::file_ops::stable_path_identity(&self.path)? != self.identity
+        {
+            return Err(std::io::Error::other(
+                "private temporary path changed before use",
+            ));
+        }
+        Ok(&self.path)
+    }
+}
+
+impl Drop for PrivateTempFile {
+    fn drop(&mut self) {
+        let _ =
+            crate::services::file_ops::remove_file_by_identity(&self.stable_path, self.identity);
+        drop(self.directory_guard.take());
+    }
+}
+
+/// Create an application-owned temporary file without predictable names,
+/// symlink following, or a truncate-existing window. The guard removes only
+/// the file it successfully created.
+pub(crate) fn create_private_temp_file(
+    dir: &std::path::Path,
+    prefix: &str,
+    contents: &[u8],
+) -> std::io::Result<PrivateTempFile> {
+    std::fs::create_dir_all(dir)?;
+    let (directory_guard, stable_directory, metadata) =
+        crate::services::file_ops::open_directory_for_read(dir)?;
+    let directory_identity = crate::services::file_ops::stable_file_identity(&directory_guard)?;
+    if !metadata.file_type().is_dir()
+        || crate::services::file_ops::stable_path_identity(dir)? != directory_identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "private temporary path is not a stable real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory_guard.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    if crate::services::file_ops::stable_path_identity(dir)? != directory_identity {
+        return Err(std::io::Error::other(
+            "private temporary directory changed while it was secured",
+        ));
+    }
+
+    for _ in 0..32 {
+        let file_name = format!("{}_{:032x}", prefix, rand::random::<u128>());
+        let path = dir.join(&file_name);
+        let stable_path = stable_directory.join(&file_name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&stable_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let identity = match crate::services::file_ops::stable_file_identity(&file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(file);
+                let _ = std::fs::remove_file(&stable_path);
+                return Err(error);
+            }
+        };
+        if let Err(e) = file.write_all(contents).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            return Err(e);
+        }
+        drop(file);
+        let published_identity = crate::services::file_ops::stable_path_identity(&path);
+        let current_directory_identity = crate::services::file_ops::stable_path_identity(dir);
+        if published_identity.as_ref().ok() != Some(&identity)
+            || current_directory_identity.as_ref().ok() != Some(&directory_identity)
+        {
+            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            return Err(published_identity
+                .err()
+                .or_else(|| current_directory_identity.err())
+                .unwrap_or_else(|| {
+                    std::io::Error::other(
+                        "private temporary path changed while the file was created",
+                    )
+                }));
+        }
+        return Ok(PrivateTempFile {
+            path: path.clone(),
+            stable_path,
+            identity,
+            directory_path: dir.to_path_buf(),
+            directory_identity,
+            directory_guard: Some(directory_guard),
+        });
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique private temporary file",
+    ))
 }
 
 /// Global debug flag — toggled by /debug command or COKACDIR_DEBUG=1 env var
@@ -60,22 +181,51 @@ pub fn init_debug_from_env() {
 /// Once resolved, reused for all subsequent calls.
 static CLAUDE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
+fn claude_path_is_runnable(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(extension.as_str(), "exe" | "cmd" | "bat" | "com")
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        true
+    }
+}
+
+fn runnable_claude_candidate(candidate: Option<String>) -> Option<String> {
+    candidate.filter(|path| !path.is_empty() && claude_path_is_runnable(path))
+}
+
 /// Resolve the path to the claude binary.
 /// First tries `which claude`, then falls back to `bash -lc "which claude"`
 /// (for non-interactive SSH sessions where ~/.profile isn't loaded).
 #[cfg(unix)]
 fn resolve_claude_path() -> Option<String> {
-    if let Ok(val) = std::env::var("COKAC_CLAUDE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() {
-            return Some(val);
-        }
+    if let Some(path) = runnable_claude_candidate(std::env::var("COKAC_CLAUDE_PATH").ok()) {
+        return Some(path);
     }
 
     // Try direct `which claude` first
     if let Ok(output) = Command::new("which").arg("claude").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
+            if let Some(path) = runnable_claude_candidate(Some(path)) {
                 return Some(path);
             }
         }
@@ -85,7 +235,7 @@ fn resolve_claude_path() -> Option<String> {
     if let Ok(output) = Command::new("bash").args(["-lc", "which claude"]).output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
+            if let Some(path) = runnable_claude_candidate(Some(path)) {
                 return Some(path);
             }
         }
@@ -221,29 +371,33 @@ pub fn search_path_wide(name: &str, ext: Option<&str>) -> Option<String> {
 
 #[cfg(windows)]
 fn resolve_claude_path() -> Option<String> {
-    if let Ok(val) = std::env::var("COKAC_CLAUDE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() {
-            return Some(val);
-        }
+    if let Some(path) = runnable_claude_candidate(std::env::var("COKAC_CLAUDE_PATH").ok()) {
+        return Some(path);
     }
 
     // Use SearchPathW (UTF-16 native) — no code page issues with non-ASCII paths
     if let Some(path) = search_path_wide("claude", Some(".exe")) {
-        return Some(path);
+        if claude_path_is_runnable(&path) {
+            return Some(path);
+        }
     }
     if let Some(path) = search_path_wide("claude", Some(".cmd")) {
-        return Some(path);
+        if claude_path_is_runnable(&path) {
+            return Some(path);
+        }
     }
 
     // Fallback: check npm global install paths
     if let Ok(output) = Command::new("cmd").args(["/c", "npm root -g"]).output() {
         if output.status.success() {
             let npm_root = decode_windows_output(&output.stdout).trim().to_string();
+            // `npm root -g` points at .../npm/node_modules. CreateProcessW
+            // cannot execute the package's cli.js directly; npm installs the
+            // runnable command shim one directory above node_modules.
             let claude_path = std::path::Path::new(&npm_root)
-                .join("@anthropic-ai")
-                .join("claude-code")
-                .join("cli.js");
-            if claude_path.exists() {
+                .parent()
+                .map(|npm_bin| npm_bin.join("claude.cmd"))?;
+            if claude_path_is_runnable(&claude_path.to_string_lossy()) {
                 return Some(claude_path.display().to_string());
             }
         }
@@ -512,6 +666,14 @@ pub fn kill_child_tree(child: &mut std::process::Child) {
     }
 }
 
+/// Receiver shutdown means nobody can consume any more pipe output. Kill and
+/// reap immediately instead of breaking the read loop and then waiting while
+/// the child can block forever on a full stdout pipe.
+pub(crate) fn terminate_child_after_receiver_drop(child: &mut std::process::Child) {
+    kill_child_tree(child);
+    let _ = child.wait();
+}
+
 /// Cached regex pattern for session ID validation
 fn session_id_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
@@ -599,31 +761,50 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use headers (## Title) to organize longer responses
 - Keep formatting minimal and terminal-friendly"#;
 
-    // Write system prompt to file to avoid OS "Argument list too long" (E2BIG)
-    struct SpFileGuard(Option<std::path::PathBuf>);
-    impl Drop for SpFileGuard {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.0 {
-                let _ = std::fs::remove_file(p);
+    // Write system prompt to file to avoid OS "Argument list too long" (E2BIG).
+    let sp_dir = match crate::utils::path::cokacdir_temp_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return ClaudeResponse {
+                success: false,
+                response: None,
+                session_id: None,
+                error: Some(format!(
+                    "Failed to prepare cokacdir temporary directory: {}",
+                    e
+                )),
             }
         }
-    }
-    let sp_dir = dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".cokacdir");
-    let _ = std::fs::create_dir_all(&sp_dir);
-    let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
-    if let Err(e) = std::fs::write(&sp_path, default_system_prompt) {
-        return ClaudeResponse {
-            success: false,
-            response: None,
-            session_id: None,
-            error: Some(format!("Failed to write system prompt file: {}", e)),
-        };
-    }
+    };
+    let sp_guard = match create_private_temp_file(
+        &sp_dir,
+        "system_prompt",
+        default_system_prompt.as_bytes(),
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ClaudeResponse {
+                success: false,
+                response: None,
+                session_id: None,
+                error: Some(format!("Failed to write system prompt file: {}", e)),
+            }
+        }
+    };
     args.push("--append-system-prompt-file".to_string());
-    args.push(sp_path.to_string_lossy().to_string());
-    let _sp_guard = SpFileGuard(Some(sp_path));
+    let verified_prompt_path = match sp_guard.verified_path() {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(error) => {
+            return ClaudeResponse {
+                success: false,
+                response: None,
+                session_id: None,
+                error: Some(format!("System prompt file changed before use: {error}")),
+            }
+        }
+    };
+    args.push(verified_prompt_path);
+    let _sp_guard = sp_guard;
 
     // Set model if specified
     if let Some(m) = model {
@@ -1050,33 +1231,28 @@ IMPORTANT: Format your responses using Markdown for better readability:
         Some("") => None,
         Some(p) => Some(p),
     };
-    struct SpFileGuard(Option<std::path::PathBuf>);
-    impl Drop for SpFileGuard {
-        fn drop(&mut self) {
-            if let Some(ref p) = self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-    let mut _sp_guard = SpFileGuard(None);
+    let mut _sp_guard: Option<PrivateTempFile> = None;
     if let Some(sp) = effective_prompt {
-        let sp_dir = dirs::home_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join(".cokacdir");
-        let _ = std::fs::create_dir_all(&sp_dir);
-        let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
-        std::fs::write(&sp_path, sp).map_err(|e| {
-            debug_log(&format!("ERROR: Failed to write system prompt file: {}", e));
-            format!("Failed to write system prompt file: {}", e)
-        })?;
+        let sp_dir = crate::utils::path::cokacdir_temp_dir()
+            .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {}", e))?;
+        let sp_guard =
+            create_private_temp_file(&sp_dir, "system_prompt", sp.as_bytes()).map_err(|e| {
+                debug_log(&format!("ERROR: Failed to write system prompt file: {}", e));
+                format!("Failed to write system prompt file: {}", e)
+            })?;
         debug_log(&format!(
             "System prompt written to {:?} ({} bytes)",
-            sp_path,
+            sp_guard.path(),
             sp.len()
         ));
+        let verified_prompt_path = sp_guard
+            .verified_path()
+            .map_err(|error| format!("System prompt file changed before use: {error}"))?
+            .to_string_lossy()
+            .to_string();
         args.push("--append-system-prompt-file".to_string());
-        args.push(sp_path.to_string_lossy().to_string());
-        _sp_guard = SpFileGuard(Some(sp_path));
+        args.push(verified_prompt_path);
+        _sp_guard = Some(sp_guard);
     }
 
     // Set model if specified
@@ -1222,6 +1398,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
     let mut final_result: Option<String> = None;
     let mut stdout_error: Option<(String, String)> = None; // (message, raw_line)
     let mut line_count = 0;
+    let mut receiver_dropped = false;
 
     debug_log("Entering lines loop - will block until first line arrives...");
     for line in reader.lines() {
@@ -1358,6 +1535,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 let send_result = sender.send(msg);
                 if send_result.is_err() {
                     debug_log("  ERROR: Channel send failed (receiver dropped)");
+                    receiver_dropped = true;
                     break;
                 }
                 debug_log("  Message sent to channel successfully");
@@ -1377,6 +1555,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
     debug_log(&format!("Total lines read: {}", line_count));
     debug_log(&format!("final_result present: {}", final_result.is_some()));
     debug_log(&format!("last_session_id: {:?}", last_session_id));
+
+    if receiver_dropped {
+        debug_log("Receiver dropped — terminating child before wait");
+        terminate_child_after_receiver_drop(&mut child);
+        return Ok(());
+    }
 
     // Check cancel token after exiting the loop
     if let Some(ref token) = cancel_token {
@@ -1599,6 +1783,110 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_temp_files_are_unique_no_clobber_and_raii_cleaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("private");
+        std::fs::create_dir(&dir).unwrap();
+        let existing = dir.join("system_prompt_existing");
+        std::fs::write(&existing, b"must survive").unwrap();
+
+        let dir = std::sync::Arc::new(dir);
+        let workers: Vec<_> = (0..16)
+            .map(|index| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    create_private_temp_file(
+                        &dir,
+                        "system_prompt",
+                        format!("prompt-{index}").as_bytes(),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let guards: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let paths: std::collections::HashSet<_> = guards
+            .iter()
+            .map(|guard| guard.path().to_path_buf())
+            .collect();
+        assert_eq!(paths.len(), guards.len());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"must survive");
+        #[cfg(unix)]
+        for path in &paths {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(guards);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn private_temp_guard_never_deletes_a_replacement_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let guard = create_private_temp_file(temp.path(), "prompt", b"owned").unwrap();
+        let path = guard.path().to_path_buf();
+        let original = temp.path().join("moved-owned-file");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+
+        drop(guard);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&original).unwrap(), b"owned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_temp_directory_symlink_is_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&real, &link).unwrap();
+        assert!(create_private_temp_file(&link, "prompt", b"secret").is_err());
+        assert!(std::fs::read_dir(real).unwrap().next().is_none());
+        assert_eq!(
+            std::fs::metadata(temp.path().join("real"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_runnable_override_falls_through_to_runnable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let override_directory = dir.path().join("not-a-program");
+        let fallback = dir.path().join("claude");
+        std::fs::create_dir(&override_directory).expect("create invalid override directory");
+        std::fs::write(&fallback, b"#!/bin/sh\nexit 0\n").expect("write fallback");
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755))
+            .expect("make fallback executable");
+
+        let selected =
+            runnable_claude_candidate(Some(override_directory.to_string_lossy().into_owned()))
+                .or_else(|| {
+                    runnable_claude_candidate(Some(fallback.to_string_lossy().into_owned()))
+                });
+
+        assert_eq!(selected.as_deref(), fallback.to_str());
+    }
 
     // ========== is_valid_session_id tests ==========
 

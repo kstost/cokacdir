@@ -7,7 +7,7 @@ Marketing and documentation website for [COKACDIR](https://github.com/kstost/cok
 ## Tech Stack
 
 - **Framework:** React 18.2 + TypeScript 5.3
-- **Build Tool:** Vite 5.0
+- **Build Tool:** Vite 8.1
 - **Styling:** Tailwind CSS 3.4
 - **Animations:** Framer Motion 11.0
 - **Icons:** Lucide React
@@ -45,7 +45,7 @@ website/
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20.19+ or 22.12+
 - npm or yarn
 
 ### Installation

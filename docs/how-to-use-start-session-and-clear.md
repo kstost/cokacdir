@@ -69,7 +69,7 @@ cd "/home/user/project"; claude --resume 550e8400-e29b-41d4-a716-446655440000
 |----------|---------|
 | Claude | `claude --resume <session_id>` |
 | Codex | `codex resume <session_id>` |
-| Agy | `agy --conversation <session_id> --print ""` |
+| Agy | `agy --conversation <session_id>` |
 | OpenCode | `opencode -s <session_id>` |
 
 ### No Active Session

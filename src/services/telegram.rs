@@ -13,6 +13,10 @@ use tokio::sync::Mutex;
 use crate::services::agy;
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
+use crate::services::file_ops::{
+    open_directory_for_read, open_regular_file_no_follow, remove_file_by_identity,
+    stable_file_identity, stable_path_identity, StablePathIdentity,
+};
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -27,6 +31,11 @@ static TG_DEBUG: AtomicBool = AtomicBool::new(false);
 static TG_BOT_TOKENS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
     std::sync::OnceLock::new();
 static TRANSCRIPTOR_BINARY_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+static BOT_KEY_FILE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PathBuf>>> =
+    std::sync::OnceLock::new();
+const MAX_BOT_SETTINGS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SCHEDULE_ENTRY_BYTES: usize = 1024 * 1024;
+const MAX_GROUP_CHAT_LOG_BYTES: usize = 64 * 1024 * 1024;
 
 fn register_token_for_redaction(token: &str) {
     let lock = TG_BOT_TOKENS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
@@ -64,14 +73,289 @@ fn redact_err(e: &impl std::fmt::Display) -> String {
     redact_known_tokens(&e.to_string())
 }
 
+struct PrivateDirectory {
+    handle: fs::File,
+    original_path: PathBuf,
+    stable_path: PathBuf,
+    identity: StablePathIdentity,
+}
+
+impl PrivateDirectory {
+    fn open_or_create(dir: &Path) -> std::io::Result<Self> {
+        let normalized = normalize_private_directory_path(dir);
+        fs::create_dir_all(&normalized)?;
+        Self::open_existing(&normalized)
+    }
+
+    fn open_existing(dir: &Path) -> std::io::Result<Self> {
+        let normalized = normalize_private_directory_path(dir);
+        let dir = normalized.as_path();
+        let (handle, stable_path, _) = open_directory_for_read(dir)?;
+        let identity = stable_file_identity(&handle)?;
+        if stable_path_identity(dir)? != identity {
+            return Err(std::io::Error::other(format!(
+                "private directory changed while it was being opened: '{}'",
+                dir.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+
+        let directory = Self {
+            handle,
+            original_path: dir.to_path_buf(),
+            stable_path,
+            identity,
+        };
+        directory.verify_current_path()?;
+        Ok(directory)
+    }
+
+    fn verify_current_path(&self) -> std::io::Result<()> {
+        if stable_path_identity(&self.original_path)? != self.identity {
+            return Err(std::io::Error::other(format!(
+                "private directory path changed during the operation: '{}'",
+                self.original_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn stable_child(&self, file_name: &std::ffi::OsStr) -> PathBuf {
+        self.stable_path.join(file_name)
+    }
+
+    fn public_child(&self, file_name: &std::ffi::OsStr) -> PathBuf {
+        self.original_path.join(file_name)
+    }
+}
+
+fn normalize_private_directory_path(dir: &Path) -> PathBuf {
+    let normalized: PathBuf = dir.components().collect();
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn private_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn private_file_name(path: &Path) -> std::io::Result<&std::ffi::OsStr> {
+    path.file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("private file path has no filename: '{}'", path.display()),
+            )
+        })
+}
+
+fn validate_private_file_handle(
+    file: &fs::File,
+    path: &Path,
+) -> std::io::Result<StablePathIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || private_metadata_is_reparse_point(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "private file is not a real regular file: '{}'",
+                path.display()
+            ),
+        ));
+    }
+
+    let identity = stable_file_identity(file)?;
+    if stable_path_identity(path)? != identity {
+        return Err(std::io::Error::other(format!(
+            "private file path changed while it was being opened: '{}'",
+            path.display()
+        )));
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
+fn private_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x0400 != 0
+}
+
+#[cfg(not(windows))]
+fn private_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn private_regular_file_has_private_permissions(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() || private_metadata_is_reparse_point(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o077 == 0;
+    }
+    #[cfg(not(unix))]
+    {
+        // On Windows the validated, non-reparse file resides inside the
+        // pinned private bot-key directory. The current implementation does
+        // not create a distinct per-file Unix-style mode to inspect.
+        true
+    }
+}
+
+fn private_regular_file_has_single_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return metadata.nlink() == 1;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn secure_private_file_handle(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_directory(dir: &Path) -> std::io::Result<()> {
+    let _directory = PrivateDirectory::open_or_create(dir)?;
+    Ok(())
+}
+
+fn open_private_file(path: &Path, append: bool) -> std::io::Result<fs::File> {
+    let directory = PrivateDirectory::open_or_create(private_parent(path))?;
+    open_private_file_in_directory(&directory, private_file_name(path)?, append)
+}
+
+fn open_private_file_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+    append: bool,
+) -> std::io::Result<fs::File> {
+    directory.verify_current_path()?;
+    let stable_path = directory.stable_child(file_name);
+    let mut options = fs::OpenOptions::new();
+    options
+        .create(true)
+        .write(true)
+        .append(append)
+        .read(!append);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        if !append {
+            // Keep a lock filename pinned while the advisory lock is held;
+            // otherwise another process could replace it and lock a different
+            // file, defeating the coordination boundary.
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+    }
+
+    let file = options.open(&stable_path)?;
+    validate_private_file_handle(&file, &stable_path)?;
+    secure_private_file_handle(&file)?;
+    directory.verify_current_path()?;
+    Ok(file)
+}
+
+fn open_private_append_file(path: &Path) -> std::io::Result<fs::File> {
+    open_private_file(path, true)
+}
+
+fn open_private_lock_file(path: &Path) -> std::io::Result<fs::File> {
+    open_private_file(path, false)
+}
+
+fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let directory = PrivateDirectory::open_existing(private_parent(path))?;
+    read_private_regular_file_bounded_in_directory(&directory, private_file_name(path)?, max_bytes)
+}
+
+fn open_private_regular_file_bounded_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> std::io::Result<fs::File> {
+    directory.verify_current_path()?;
+    let stable_path = directory.stable_child(file_name);
+    let (file, _) = open_regular_file_no_follow(&stable_path)?;
+    secure_private_file_handle(&file)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("private file exceeds the {max_bytes}-byte limit"),
+        ));
+    }
+    directory.verify_current_path()?;
+    Ok(file)
+}
+
+fn open_private_regular_file_bounded(path: &Path, max_bytes: usize) -> std::io::Result<fs::File> {
+    let directory = PrivateDirectory::open_existing(private_parent(path))?;
+    open_private_regular_file_bounded_in_directory(&directory, private_file_name(path)?, max_bytes)
+}
+
+fn read_private_regular_file_bounded_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = open_private_regular_file_bounded_in_directory(directory, file_name, max_bytes)?;
+
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut contents = Vec::with_capacity(max_bytes.min(4096));
+    file.by_ref().take(limit).read_to_end(&mut contents)?;
+    if contents.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("private file exceeds the {max_bytes}-byte limit"),
+        ));
+    }
+    directory.verify_current_path()?;
+    Ok(contents)
+}
+
 fn any_saved_bot_debug_enabled() -> bool {
     let Some(path) = bot_settings_path() else {
         return false;
     };
-    let Ok(content) = fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Ok(json) = read_bot_settings_json(&path) else {
         return false;
     };
     let Some(obj) = json.as_object() else {
@@ -103,7 +387,6 @@ fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
     let Some(debug_dir) = dirs::home_dir().map(|h| h.join(".cokacdir").join("debug")) else {
         return;
     };
-    let _ = fs::create_dir_all(&debug_dir);
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let log_path = debug_dir.join(format!("{}.log", date));
     let ts = chrono::Local::now().format("%H:%M:%S%.3f");
@@ -115,11 +398,7 @@ fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
         Err(e) => redact_known_tokens(&format!("✗ {e}")),
     };
     let line = format!("[{ts}] {name}: {status}\n");
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open(&log_path)
+    let _ = open_private_append_file(&log_path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
@@ -253,21 +532,7 @@ const PAYLOAD_TRUNCATE_LIMIT: usize = 500;
 /// Returns None if saving fails.
 fn save_payload_value(content: &str) -> Option<String> {
     let dir = dirs::home_dir()?.join(".cokacdir").join("values");
-    if fs::create_dir_all(&dir).is_err() {
-        return None;
-    }
-    let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
-    use rand::Rng;
-    let rand_suffix: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(6)
-        .map(|b| (b as char).to_ascii_lowercase())
-        .collect();
-    let filename = format!("{}_{}.txt", ts, rand_suffix);
-    let path = dir.join(&filename);
-    if fs::write(&path, content).is_err() {
-        return None;
-    }
+    let path = create_unique_private_file(&dir, "payload", "txt", content.as_bytes()).ok()?;
     Some(path.display().to_string())
 }
 
@@ -318,13 +583,8 @@ async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
         return None;
     }
     let dir = dirs::home_dir()?.join(".cokacdir").join("chat_locks");
-    let _ = std::fs::create_dir_all(&dir);
     let lock_path = dir.join(format!("{}.lock", chat_id));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .ok()?;
+    let file = open_private_lock_file(&lock_path).ok()?;
     let mut waited = false;
     loop {
         match file.try_lock_exclusive() {
@@ -383,9 +643,9 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
         return;
     };
     if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
+        if let Err(e) = ensure_private_directory(parent) {
             msg_debug(&format!(
-                "[append_group_chat_log] LOST: create_dir_all({:?}) failed for chat_id={}: {}",
+                "[append_group_chat_log] LOST: securing directory {:?} failed for chat_id={}: {}",
                 parent, chat_id, e
             ));
             return;
@@ -394,7 +654,9 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
 
     // Serialize before acquiring lock to minimize lock hold time
     let json = match serde_json::to_string(entry) {
-        Ok(j) => j,
+        // User messages and provider tool output can echo a bot token. Apply
+        // the same redaction boundary used by debug logs before persistence.
+        Ok(j) => redact_known_tokens(&j),
         Err(e) => {
             msg_debug(&format!(
                 "[append_group_chat_log] LOST: serialize failed for chat_id={}: {}",
@@ -419,11 +681,7 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     // Lock via a dedicated lock file (not the data file itself)
     // On Windows, LockFileEx is mandatory and can conflict with WriteFile on the same handle
     let lock_path = path.with_extension("jsonl.lock");
-    let lock_file = match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    {
+    let lock_file = match open_private_lock_file(&lock_path) {
         Ok(f) => f,
         Err(e) => {
             msg_debug(&format!(
@@ -442,12 +700,7 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     }
 
     // Write to data file without locking it
-    match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open(&path)
-    {
+    match open_private_append_file(&path) {
         Ok(mut data_file) => {
             use std::io::Write;
             if let Err(e) = data_file.write_all(line.as_bytes()) {
@@ -483,11 +736,7 @@ fn remove_group_chat_log_user_records(
         return 0;
     };
     let lock_path = path.with_extension("jsonl.lock");
-    let lock_file = match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    {
+    let lock_file = match open_private_lock_file(&lock_path) {
         Ok(f) => f,
         Err(e) => {
             msg_debug(&format!(
@@ -505,21 +754,25 @@ fn remove_group_chat_log_user_records(
         return 0;
     }
 
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = lock_file.unlock();
-            return 0;
-        }
-        Err(e) => {
-            msg_debug(&format!(
-                "[remove_group_chat_log_user_records] read failed for chat_id={}: {}",
-                chat_id, e
-            ));
-            let _ = lock_file.unlock();
-            return 0;
-        }
-    };
+    let content =
+        match read_private_regular_file_bounded(&path, MAX_GROUP_CHAT_LOG_BYTES).and_then(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        }) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = lock_file.unlock();
+                return 0;
+            }
+            Err(e) => {
+                msg_debug(&format!(
+                    "[remove_group_chat_log_user_records] read failed for chat_id={}: {}",
+                    chat_id, e
+                ));
+                let _ = lock_file.unlock();
+                return 0;
+            }
+        };
 
     let mut remaining: HashMap<&str, usize> = HashMap::new();
     for record in records {
@@ -567,7 +820,7 @@ fn remove_group_chat_log_user_records(
         if !new_content.is_empty() {
             new_content.push('\n');
         }
-        if let Err(e) = fs::write(&path, new_content) {
+        if let Err(e) = write_private_file_atomically(&path, new_content.as_bytes()) {
             msg_debug(&format!(
                 "[remove_group_chat_log_user_records] rewrite failed for chat_id={}: {}",
                 chat_id, e
@@ -598,24 +851,21 @@ pub fn read_group_chat_log_range(
 
     // Use the same dedicated lock file as append_group_chat_log for coordination
     let lock_path = path.with_extension("jsonl.lock");
-    let Ok(lock_file) = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    else {
+    let Ok(lock_file) = open_private_lock_file(&lock_path) else {
         return Vec::new();
     };
     if fs2::FileExt::lock_shared(&lock_file).is_err() {
         return Vec::new();
     }
 
-    let Ok(file) = fs::File::open(&path) else {
+    let Ok(file) = open_private_regular_file_bounded(&path, MAX_GROUP_CHAT_LOG_BYTES) else {
         let _ = fs2::FileExt::unlock(&lock_file);
         return Vec::new();
     };
 
-    let reader = std::io::BufReader::new(&file);
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
+    let reader =
+        std::io::BufReader::new((&file).take(MAX_GROUP_CHAT_LOG_BYTES.saturating_add(1) as u64));
 
     // First pass: collect all entries and find the last clear marker per bot.
     // Track corrupt lines so a sudden surge in malformed entries is at least
@@ -695,7 +945,7 @@ pub fn read_group_chat_log_tail(
     filter_bot: Option<&str>,
 ) -> Vec<(usize, GroupChatLogEntry)> {
     use std::collections::VecDeque;
-    use std::io::BufRead;
+    use std::io::{BufRead, Read, Seek};
 
     if n == 0 {
         return Vec::new();
@@ -710,11 +960,7 @@ pub fn read_group_chat_log_tail(
     };
 
     let lock_path = path.with_extension("jsonl.lock");
-    let Ok(lock_file) = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    else {
+    let Ok(lock_file) = open_private_lock_file(&lock_path) else {
         return Vec::new();
     };
     if fs2::FileExt::lock_shared(&lock_file).is_err() {
@@ -724,15 +970,19 @@ pub fn read_group_chat_log_tail(
     let mut dropped_io: usize = 0;
     let mut dropped_parse: usize = 0;
 
+    let Ok(mut file) = open_private_regular_file_bounded(&path, MAX_GROUP_CHAT_LOG_BYTES) else {
+        let _ = fs2::FileExt::unlock(&lock_file);
+        return Vec::new();
+    };
+
     // Pass 1: scan for clear markers (small per-bot map). We need to know
     // every marker before deciding which entries in the tail are suppressed.
     let mut last_clear: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     {
-        let Ok(file) = fs::File::open(&path) else {
-            let _ = fs2::FileExt::unlock(&lock_file);
-            return Vec::new();
-        };
-        for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
+        let reader = std::io::BufReader::new(
+            (&mut file).take(MAX_GROUP_CHAT_LOG_BYTES.saturating_add(1) as u64),
+        );
+        for (i, line_result) in reader.lines().enumerate() {
             let line_num = i + 1;
             let line = match line_result {
                 Ok(l) => l,
@@ -757,12 +1007,15 @@ pub fn read_group_chat_log_tail(
     // Pass 2: stream forward, keep a sliding window of the last `n` entries
     // that pass the marker and bot filters.
     let mut tail: VecDeque<(usize, GroupChatLogEntry)> = VecDeque::with_capacity(n + 1);
+    if file.seek(std::io::SeekFrom::Start(0)).is_err() {
+        let _ = fs2::FileExt::unlock(&lock_file);
+        return Vec::new();
+    }
     {
-        let Ok(file) = fs::File::open(&path) else {
-            let _ = fs2::FileExt::unlock(&lock_file);
-            return Vec::new();
-        };
-        for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
+        let reader = std::io::BufReader::new(
+            (&mut file).take(MAX_GROUP_CHAT_LOG_BYTES.saturating_add(1) as u64),
+        );
+        for (i, line_result) in reader.lines().enumerate() {
             let line_num = i + 1;
             // Pass 1 already counted any io / parse errors on this same file
             // (locked shared, deterministic). Re-counting here would
@@ -811,25 +1064,21 @@ pub fn read_group_chat_log_tail(
 ///
 /// Returns a Vec of (bot_username, Option<display_name>) sorted by username.
 pub fn collect_group_chat_bots(chat_id: i64) -> Vec<(String, Option<String>)> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
 
     let Some(path) = group_chat_log_path(chat_id) else {
         return Vec::new();
     };
 
     let lock_path = path.with_extension("jsonl.lock");
-    let Ok(lock_file) = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    else {
+    let Ok(lock_file) = open_private_lock_file(&lock_path) else {
         return Vec::new();
     };
     if fs2::FileExt::lock_shared(&lock_file).is_err() {
         return Vec::new();
     }
 
-    let Ok(file) = fs::File::open(&path) else {
+    let Ok(file) = open_private_regular_file_bounded(&path, MAX_GROUP_CHAT_LOG_BYTES) else {
         let _ = fs2::FileExt::unlock(&lock_file);
         return Vec::new();
     };
@@ -837,7 +1086,9 @@ pub fn collect_group_chat_bots(chat_id: i64) -> Vec<(String, Option<String>)> {
     // Scan forward — later entries overwrite earlier ones, keeping the latest display name
     let mut bots: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
-    for line in std::io::BufReader::new(&file).lines().flatten() {
+    let reader =
+        std::io::BufReader::new((&file).take(MAX_GROUP_CHAT_LOG_BYTES.saturating_add(1) as u64));
+    for line in reader.lines().map_while(Result::ok) {
         if let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) {
             if !entry.bot.is_empty() {
                 bots.insert(entry.bot.clone(), entry.bot_display_name);
@@ -1236,6 +1487,72 @@ enum CompanionPingCompletion {
     Leave,
     Reschedule,
     WaitForUser,
+}
+
+/// Apply post-run scheduling only if no user activity happened after this
+/// companion ping was reserved for dispatch. A user message can arrive while
+/// the ping is running and be queued behind it; that ingress already resets
+/// the timer. Letting the older ping write `waiting_for_user = true` afterward
+/// would overwrite the reset and leave proactive pings disabled indefinitely.
+fn apply_companion_ping_completion(
+    cfg: &mut CompanionPingSettings,
+    completion: CompanionPingCompletion,
+    dispatch_activity_epoch: u64,
+    current_activity_epoch: u64,
+) -> bool {
+    if dispatch_activity_epoch != current_activity_epoch {
+        return false;
+    }
+    match completion {
+        CompanionPingCompletion::Leave => false,
+        CompanionPingCompletion::Reschedule => {
+            schedule_companion_ping_next(cfg);
+            true
+        }
+        CompanionPingCompletion::WaitForUser => {
+            cfg.waiting_for_user = true;
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod companion_ping_completion_tests {
+    use super::{apply_companion_ping_completion, CompanionPingCompletion, CompanionPingSettings};
+
+    fn settings() -> CompanionPingSettings {
+        CompanionPingSettings {
+            min_minutes: 5,
+            max_minutes: 60,
+            next_fire_at: 123,
+            waiting_for_user: false,
+        }
+    }
+
+    #[test]
+    fn older_ping_completion_does_not_overwrite_new_user_activity() {
+        let mut cfg = settings();
+        assert!(!apply_companion_ping_completion(
+            &mut cfg,
+            CompanionPingCompletion::WaitForUser,
+            7,
+            8,
+        ));
+        assert!(!cfg.waiting_for_user);
+        assert_eq!(cfg.next_fire_at, 123);
+    }
+
+    #[test]
+    fn unchanged_activity_generation_allows_wait_for_user_transition() {
+        let mut cfg = settings();
+        assert!(apply_companion_ping_completion(
+            &mut cfg,
+            CompanionPingCompletion::WaitForUser,
+            7,
+            7,
+        ));
+        assert!(cfg.waiting_for_user);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1849,6 +2166,61 @@ fn companion_visible_image_extension_allowed(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn companion_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn companion_windows_file_identity(
+    file: &fs::File,
+) -> std::io::Result<crate::services::file_ops::StablePathIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || companion_metadata_is_reparse_point(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image source is not a real regular file",
+        ));
+    }
+    crate::services::file_ops::stable_file_identity(file)
+}
+
+#[cfg(windows)]
+fn open_companion_windows_regular_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || companion_metadata_is_reparse_point(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image source is not a real regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn companion_windows_path_names_open_file(file: &fs::File, path: &Path) -> std::io::Result<bool> {
+    let current = open_companion_windows_regular_nofollow(path)?;
+    Ok(companion_windows_file_identity(file)? == companion_windows_file_identity(&current)?)
+}
+
 fn path_is_under(path: &Path, base: &Path) -> bool {
     let Ok(path) = path.canonicalize() else {
         return false;
@@ -1874,7 +2246,10 @@ fn codex_generated_images_roots() -> Vec<PathBuf> {
 }
 
 fn companion_visible_image_source_allowed(chat_id: ChatId, path: &Path) -> bool {
-    if !path.is_absolute() || !path.is_file() || !companion_visible_image_extension_allowed(path) {
+    let is_regular_file = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false);
+    if !path.is_absolute() || !is_regular_file || !companion_visible_image_extension_allowed(path) {
         return false;
     }
     if let Some(dir) = companion_visible_dir(chat_id) {
@@ -1887,13 +2262,250 @@ fn companion_visible_image_source_allowed(chat_id: ChatId, path: &Path) -> bool 
         .any(|root| path_is_under(path, root))
 }
 
-fn paths_point_to_same_file(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn opened_companion_source_allowed(chat_id: ChatId, file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let Ok(opened_path) = fs::read_link(fd_path) else {
+        return false;
+    };
+    // Linux appends " (deleted)" when the opened name was replaced. Such a
+    // handle no longer has a trustworthy allowed-root pathname.
+    if opened_path.to_string_lossy().ends_with(" (deleted)") {
+        return false;
     }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+    companion_visible_image_source_allowed(chat_id, &opened_path)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn opened_companion_source_allowed(chat_id: ChatId, file: &fs::File, path: &Path) -> bool {
+    if !companion_visible_image_source_allowed(chat_id, path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return match (file.metadata(), fs::symlink_metadata(path)) {
+            (Ok(opened), Ok(current)) => {
+                current.file_type().is_file()
+                    && current.dev() == opened.dev()
+                    && current.ino() == opened.ino()
+            }
+            _ => false,
+        };
+    }
+    #[cfg(windows)]
+    {
+        return companion_windows_path_names_open_file(file, path).unwrap_or(false);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        file.metadata()
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    }
+}
+
+const MAX_COMPANION_VISIBLE_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+fn ensure_private_companion_visible_dir(dir: &Path) -> std::io::Result<()> {
+    ensure_private_directory(dir)
+}
+
+fn open_regular_file_without_following(path: &Path) -> std::io::Result<fs::File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file()
+        || before.file_type().is_symlink()
+        || companion_metadata_is_reparse_point(&before)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image source is not a regular file",
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || companion_metadata_is_reparse_point(&opened) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image source is not a regular file",
+        ));
+    }
+
+    // Confirm that the name still identifies the handle we opened. This
+    // closes the ordinary validate-then-open swap window; all bytes below are
+    // read from this handle rather than reopening the path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let after = fs::symlink_metadata(path)?;
+        if !after.file_type().is_file()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image source changed while being opened",
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !companion_windows_path_names_open_file(&file, path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image source changed while being opened",
+            ));
+        }
+    }
+    Ok(file)
+}
+
+fn copy_regular_file_atomically_private(
+    chat_id: ChatId,
+    source: &Path,
+    destination: &Path,
+    max_bytes: u64,
+) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut source_file = open_regular_file_without_following(source)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let source_allowed = opened_companion_source_allowed(chat_id, &source_file);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let source_allowed = opened_companion_source_allowed(chat_id, &source_file, source);
+    if !source_allowed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "opened image source is outside the allowed roots",
+        ));
+    }
+    if source_file.metadata()?.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "image source exceeds the size limit",
+        ));
+    }
+    let directory = PrivateDirectory::open_or_create(private_parent(destination))?;
+    let destination = directory.stable_child(private_file_name(destination)?);
+    directory.verify_current_path()?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+
+    for _ in 0..32 {
+        let temp_path = directory.stable_path.join(format!(
+            ".{name}.tmp.{}.{:032x}",
+            std::process::id(),
+            rand::random::<u128>()
+        ));
+        let (mut temp_file, temp_identity) = match create_new_private_file(&temp_path) {
+            Ok(created) => created,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+
+        let copy_result = (|| -> std::io::Result<bool> {
+            let copied = std::io::copy(
+                &mut Read::by_ref(&mut source_file).take(max_bytes.saturating_add(1)),
+                &mut temp_file,
+            )?;
+            if copied > max_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "image source exceeds the size limit",
+                ));
+            }
+            temp_file.flush()?;
+            temp_file.sync_all()?;
+            drop(temp_file);
+            directory.verify_current_path()?;
+            replace_file_preserving_existing(&temp_path, &destination)?;
+            if stable_path_identity(&destination)? != temp_identity {
+                return Err(std::io::Error::other(
+                    "companion image publication was replaced unexpectedly",
+                ));
+            }
+            if let Err(error) = directory.verify_current_path() {
+                let _ = remove_file_by_identity(&destination, temp_identity);
+                return Err(error);
+            }
+            #[cfg(unix)]
+            directory.handle.sync_all()?;
+            Ok(true)
+        })();
+        if !matches!(copy_result, Ok(true)) {
+            let _ = remove_file_by_identity(&temp_path, temp_identity);
+        }
+        return copy_result.map(|_| ());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique companion image temp file",
+    ))
+}
+
+#[cfg(all(test, windows))]
+mod companion_windows_source_tests {
+    use super::{
+        companion_windows_path_names_open_file, open_companion_windows_regular_nofollow,
+        open_regular_file_without_following,
+    };
+
+    #[test]
+    fn opened_image_handle_rejects_a_replaced_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("source.png");
+        let displaced = dir.path().join("displaced.png");
+        std::fs::write(&source, b"first").expect("write source");
+
+        let opened = open_regular_file_without_following(&source).expect("open source");
+        std::fs::rename(&source, &displaced).expect("displace opened source");
+        std::fs::write(&source, b"other").expect("install replacement");
+
+        assert!(!companion_windows_path_names_open_file(&opened, &source)
+            .expect("compare Windows file identities"));
+    }
+
+    #[test]
+    fn nofollow_open_rejects_a_file_symlink() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("target.png");
+        let link = dir.path().join("link.png");
+        std::fs::write(&target, b"target").expect("write target");
+        if let Err(error) = symlink_file(&target, &link) {
+            // Creating symlinks requires Developer Mode or SeCreateSymbolicLink
+            // privilege on some supported Windows installations.
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("create file symlink: {error}");
+        }
+
+        let error = open_companion_windows_regular_nofollow(&link)
+            .expect_err("reparse-point source must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 
@@ -1906,7 +2518,7 @@ fn persist_companion_visible_image(chat_id: ChatId, source: &Path) -> Option<Pat
         return None;
     }
     let dir = companion_visible_dir(chat_id)?;
-    if let Err(e) = fs::create_dir_all(&dir) {
+    if let Err(e) = ensure_private_companion_visible_dir(&dir) {
         msg_debug(&format!(
             "[companion_visible] failed to create dir {}: {}",
             dir.display(),
@@ -1916,16 +2528,19 @@ fn persist_companion_visible_image(chat_id: ChatId, source: &Path) -> Option<Pat
     }
 
     let latest = companion_visible_latest_path(chat_id)?;
-    if !paths_point_to_same_file(source, &latest) {
-        if let Err(e) = fs::copy(source, &latest) {
-            msg_debug(&format!(
-                "[companion_visible] failed to copy latest {} -> {}: {}",
-                source.display(),
-                latest.display(),
-                e
-            ));
-            return None;
-        }
+    if let Err(e) = copy_regular_file_atomically_private(
+        chat_id,
+        source,
+        &latest,
+        MAX_COMPANION_VISIBLE_IMAGE_BYTES,
+    ) {
+        msg_debug(&format!(
+            "[companion_visible] failed to copy latest {} -> {}: {}",
+            source.display(),
+            latest.display(),
+            e
+        ));
+        return None;
     }
 
     Some(latest)
@@ -1940,7 +2555,7 @@ fn persist_companion_visible_reference(chat_id: ChatId, source: &Path) -> Option
         return None;
     }
     let dir = companion_visible_dir(chat_id)?;
-    if let Err(e) = fs::create_dir_all(&dir) {
+    if let Err(e) = ensure_private_companion_visible_dir(&dir) {
         msg_debug(&format!(
             "[companion_visible] failed to create dir {}: {}",
             dir.display(),
@@ -1950,16 +2565,19 @@ fn persist_companion_visible_reference(chat_id: ChatId, source: &Path) -> Option
     }
 
     let reference = companion_visible_reference_path(chat_id)?;
-    if !paths_point_to_same_file(source, &reference) {
-        if let Err(e) = fs::copy(source, &reference) {
-            msg_debug(&format!(
-                "[companion_visible] failed to copy reference {} -> {}: {}",
-                source.display(),
-                reference.display(),
-                e
-            ));
-            return None;
-        }
+    if let Err(e) = copy_regular_file_atomically_private(
+        chat_id,
+        source,
+        &reference,
+        MAX_COMPANION_VISIBLE_IMAGE_BYTES,
+    ) {
+        msg_debug(&format!(
+            "[companion_visible] failed to copy reference {} -> {}: {}",
+            source.display(),
+            reference.display(),
+            e
+        ));
+        return None;
     }
 
     Some(reference)
@@ -1977,7 +2595,8 @@ fn load_default_companion_profile() -> (String, &'static str) {
                 if trimmed == LEGACY_COMPANION_PROFILE.trim()
                     || trimmed == PREVIOUS_COMPANION_PROFILE.trim()
                 {
-                    match std::fs::write(&path, DEFAULT_COMPANION_PROFILE) {
+                    match write_private_file_atomically(&path, DEFAULT_COMPANION_PROFILE.as_bytes())
+                    {
                         Ok(()) => {
                             msg_debug(&format!(
                                 "[load_default_companion_profile] migrated legacy default file: {}",
@@ -2011,10 +2630,8 @@ fn load_default_companion_profile() -> (String, &'static str) {
                 ));
             }
         }
-    } else if let Some(parent) = path.parent() {
-        match std::fs::create_dir_all(parent)
-            .and_then(|_| std::fs::write(&path, DEFAULT_COMPANION_PROFILE))
-        {
+    } else {
+        match write_private_file_atomically(&path, DEFAULT_COMPANION_PROFILE.as_bytes()) {
             Ok(()) => {
                 msg_debug(&format!(
                     "[load_default_companion_profile] created default file: {}",
@@ -2215,11 +2832,12 @@ mod rich_message_mode_tests {
         format_rich_message_mode_status, format_rich_message_prompt_guidance,
         get_rich_message_draft, get_rich_message_mode, get_rich_message_profile,
         get_rich_message_rtl, is_owner_only_command, is_owner_private_chat,
-        parse_rich_message_mode, parse_rich_message_profile, rich_message_content_is_within_limits,
-        sanitize_rich_markdown, select_companion_visible_image_path, set_rich_message_draft,
-        set_rich_message_mode, set_rich_message_profile, set_rich_message_rtl,
-        should_try_rich_message, telegram_retry_after_seconds, BotSettings, RichMessageMode,
-        RichMessageProfile, TELEGRAM_MSG_LIMIT,
+        parse_rich_message_mode, parse_rich_message_profile, persist_companion_visible_image,
+        rich_message_content_is_within_limits, sanitize_rich_markdown,
+        select_companion_visible_image_path, set_rich_message_draft, set_rich_message_mode,
+        set_rich_message_profile, set_rich_message_rtl, should_try_rich_message,
+        telegram_retry_after_seconds, BotSettings, RichMessageMode, RichMessageProfile,
+        TELEGRAM_MSG_LIMIT,
     };
     use std::fs;
     use teloxide::types::ChatId;
@@ -2536,6 +3154,62 @@ mod rich_message_mode_tests {
 
         assert_eq!(selected.as_deref(), Some(tagged.as_path()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_visible_copy_replaces_destination_symlink_without_truncating_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let chat_id = ChatId(9_876_543_210_003);
+        let dir = companion_visible_dir(chat_id).expect("home dir is required for this test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("generated.png");
+        let victim = dir.parent().unwrap().join("companion-victim.txt");
+        let latest = dir.join("latest.png");
+        fs::write(&source, b"safe png bytes").unwrap();
+        fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &latest).unwrap();
+
+        let stored = persist_companion_visible_image(chat_id, &source).unwrap();
+
+        assert_eq!(stored, latest);
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert_eq!(fs::read(&latest).unwrap(), b"safe png bytes");
+        assert!(!fs::symlink_metadata(&latest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(&latest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = fs::remove_file(victim);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_visible_copy_rejects_symlink_source() {
+        use std::os::unix::fs::symlink;
+
+        let chat_id = ChatId(9_876_543_210_004);
+        let dir = companion_visible_dir(chat_id).expect("home dir is required for this test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.png");
+        let link = dir.join("linked.png");
+        fs::write(&real, b"png").unwrap();
+        symlink(&real, &link).unwrap();
+
+        assert!(persist_companion_visible_image(chat_id, &link).is_none());
+        assert!(!dir.join("latest.png").exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3006,14 +3680,8 @@ fn msg_debug(msg: &str) {
 fn ai_trace(msg: &str) {
     if let Some(home) = dirs::home_dir() {
         let debug_dir = home.join(".cokacdir").join("debug");
-        let _ = std::fs::create_dir_all(&debug_dir);
         let log_path = debug_dir.join("ai_trace.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(log_path)
-        {
+        if let Ok(mut file) = open_private_append_file(&log_path) {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             let redacted = redact_known_tokens(msg);
             let _ = std::io::Write::write_fmt(
@@ -3034,7 +3702,6 @@ fn log_incoming_message(msg: &Message, accepted: bool, reject_reason: &str) {
         Some(h) => h.join(".cokacdir").join("logs"),
         None => return,
     };
-    let _ = fs::create_dir_all(&logs_dir);
     let log_path = logs_dir.join(format!("telegram_{}.jsonl", date_str));
 
     let chat_id = msg.chat.id.0;
@@ -3091,14 +3758,11 @@ fn log_incoming_message(msg: &Message, accepted: bool, reject_reason: &str) {
         "reject_reason": if accepted { "" } else { reject_reason },
     });
 
-    if let Ok(mut line) = serde_json::to_string(&entry) {
+    if let Ok(line) = serde_json::to_string(&entry) {
+        let mut line = redact_known_tokens(&line);
         line.push('\n');
         use std::io::Write;
-        if let Ok(mut f) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        if let Ok(mut f) = open_private_append_file(&log_path) {
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -3114,16 +3778,54 @@ struct BotMessage {
     content: String,
     created_at: String,
     file_path: std::path::PathBuf,
+    file_identity: StablePathIdentity,
 }
 
 /// Read a single bot message from a JSON file
 fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
+    use std::io::Read;
+
     msg_debug(&format!("[read_bot_message] reading: {}", path.display()));
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
+    const MAX_BOT_MESSAGE_BYTES: u64 = 1024 * 1024;
+    let (mut file, metadata) = match open_regular_file_no_follow(path) {
+        Ok(opened) => opened,
         Err(e) => {
             msg_debug(&format!(
-                "[read_bot_message] read failed: {} (path={})",
+                "[read_bot_message] safe open failed: {} (path={})",
+                e,
+                path.display()
+            ));
+            return None;
+        }
+    };
+    if metadata.len() > MAX_BOT_MESSAGE_BYTES {
+        msg_debug(&format!(
+            "[read_bot_message] file exceeds 1 MiB (path={})",
+            path.display()
+        ));
+        return None;
+    }
+    let file_identity = stable_file_identity(&file).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if let Err(e) = Read::by_ref(&mut file)
+        .take(MAX_BOT_MESSAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        msg_debug(&format!(
+            "[read_bot_message] read failed: {} (path={})",
+            e,
+            path.display()
+        ));
+        return None;
+    }
+    if bytes.len() as u64 > MAX_BOT_MESSAGE_BYTES {
+        return None;
+    }
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(e) => {
+            msg_debug(&format!(
+                "[read_bot_message] invalid UTF-8: {} (path={})",
                 e,
                 path.display()
             ));
@@ -3166,6 +3868,7 @@ fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
         content: content_val.unwrap().to_string(),
         created_at: created_at.unwrap().to_string(),
         file_path: path.to_path_buf(),
+        file_identity,
     };
     msg_debug(&format!(
         "[read_bot_message] ok: id={}, from={}, to={}, chat_id={}",
@@ -3249,19 +3952,27 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
         msg_debug("[check_message_timeouts] messages_dir() returned None");
         return;
     };
-    if !dir.is_dir() {
-        msg_debug(&format!(
-            "[check_message_timeouts] dir not found: {}",
-            dir.display()
-        ));
-        return;
-    }
-    let Ok(entries) = fs::read_dir(&dir) else {
-        msg_debug(&format!(
-            "[check_message_timeouts] read_dir failed: {}",
-            dir.display()
-        ));
-        return;
+    let directory = match PrivateDirectory::open_existing(&dir) {
+        Ok(directory) => directory,
+        Err(error) => {
+            msg_debug(&format!(
+                "[check_message_timeouts] unsafe or unavailable directory {}: {}",
+                dir.display(),
+                error
+            ));
+            return;
+        }
+    };
+    let entries = match fs::read_dir(&directory.stable_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            msg_debug(&format!(
+                "[check_message_timeouts] read_dir failed: {}: {}",
+                dir.display(),
+                error
+            ));
+            return;
+        }
     };
 
     let now = chrono::Local::now();
@@ -3297,7 +4008,9 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
                     ));
                     if elapsed.num_minutes() >= 30 {
                         // Delete the timed-out message
-                        let remove_result = fs::remove_file(&path);
+                        let remove_result = directory
+                            .verify_current_path()
+                            .and_then(|_| remove_file_by_identity(&path, msg.file_identity));
                         msg_debug(&format!("[check_message_timeouts] deleted timed-out message: {} (to={}, remove_ok={})",
                             msg.id, msg.to, remove_result.is_ok()));
                         timed_out += 1;
@@ -3341,18 +4054,32 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
 
 /// Read a single schedule entry from a JSON file
 fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
+    let directory = PrivateDirectory::open_existing(private_parent(path)).ok()?;
+    let file_name = private_file_name(path).ok()?;
+    read_schedule_entry_in_directory(&directory, file_name)
+}
+
+fn read_schedule_entry_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+) -> Option<ScheduleEntry> {
+    let path = directory.public_child(file_name);
     sched_debug(&format!(
         "[read_schedule_entry] reading: {}",
         path.display()
     ));
-    let content = match fs::read_to_string(path) {
+    let content = match read_private_regular_file_bounded_in_directory(
+        directory,
+        file_name,
+        MAX_SCHEDULE_ENTRY_BYTES,
+    ) {
         Ok(c) => c,
         Err(e) => {
             sched_debug(&format!("[read_schedule_entry] read failed: {}", e));
             return None;
         }
     };
-    let v: serde_json::Value = match serde_json::from_str(&content) {
+    let v: serde_json::Value = match serde_json::from_slice(&content) {
         Ok(v) => v,
         Err(e) => {
             sched_debug(&format!("[read_schedule_entry] parse failed: {}", e));
@@ -3427,6 +4154,389 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
         "[write_schedule_entry] id={}, type={}, schedule={}, once={:?}, last_run={:?}",
         entry.id, entry.schedule_type, entry.schedule, entry.once, entry.last_run
     ));
+    let dir = schedule_dir().ok_or("Cannot determine home directory")?;
+    let lock = acquire_schedule_dir_lock(&dir)?;
+    write_schedule_entry_in_directory(entry, &lock.directory, false).map(|_| ())
+}
+
+/// Update an existing schedule without racing a concurrent delete. The
+/// existence check and atomic replacement happen while holding the same lock
+/// used by `delete_schedule_entry`, so a completed delete cannot be undone by
+/// a late-running scheduled task.
+fn write_schedule_entry_if_present(entry: &ScheduleEntry) -> Result<bool, String> {
+    let dir = schedule_dir().ok_or("Cannot determine home directory")?;
+    let lock = acquire_schedule_dir_lock(&dir)?;
+    write_schedule_entry_in_directory(entry, &lock.directory, true)
+}
+
+struct ScheduleDirectoryLock {
+    _lock: fs::File,
+    directory: PrivateDirectory,
+}
+
+fn acquire_schedule_dir_lock(dir: &Path) -> Result<ScheduleDirectoryLock, String> {
+    use fs2::FileExt;
+
+    let directory = PrivateDirectory::open_or_create(dir)
+        .map_err(|e| format!("Failed to create or secure schedule dir: {e}"))?;
+    let lock =
+        open_private_file_in_directory(&directory, std::ffi::OsStr::new(".schedule.lock"), false)
+            .map_err(|e| format!("Failed to open schedule lock: {e}"))?;
+    lock.lock_exclusive()
+        .map_err(|e| format!("Failed to lock schedule directory: {e}"))?;
+    directory
+        .verify_current_path()
+        .map_err(|e| format!("Schedule directory changed while locking: {e}"))?;
+    Ok(ScheduleDirectoryLock {
+        _lock: lock,
+        directory,
+    })
+}
+
+fn create_schedule_temp_file(
+    directory: &PrivateDirectory,
+    id: &str,
+) -> Result<(PathBuf, fs::File, StablePathIdentity), String> {
+    directory
+        .verify_current_path()
+        .map_err(|e| format!("Schedule directory changed before temp creation: {e}"))?;
+    for _ in 0..16 {
+        let path = directory.stable_path.join(format!(
+            ".{id}.json.tmp.{}.{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match create_new_private_file(&path) {
+            Ok((file, identity)) => return Ok((path, file, identity)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Failed to create schedule temp file: {e}")),
+        }
+    }
+    Err("Failed to allocate a unique schedule temp file".to_string())
+}
+
+/// Replace a destination without deleting the old file before the new one is
+/// ready. Unix rename replaces atomically. Windows uses MoveFileExW so there
+/// is no crash window between moving an old destination aside and publishing
+/// its replacement.
+fn replace_file_preserving_existing(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(
+                existing_file_name: *const u16,
+                new_file_name: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Windows path contains an embedded NUL",
+                ));
+            }
+            wide.push(0);
+            Ok(wide)
+        }
+
+        let source = wide_path(source)?;
+        let destination = wide_path(destination)?;
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn create_new_private_file(path: &Path) -> std::io::Result<(fs::File, StablePathIdentity)> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    let file = options.open(path)?;
+    let identity = stable_file_identity(&file)?;
+    if let Err(error) =
+        validate_private_file_handle(&file, path).and_then(|_| secure_private_file_handle(&file))
+    {
+        drop(file);
+        let _ = remove_file_by_identity(path, identity);
+        return Err(error);
+    }
+    Ok((file, identity))
+}
+
+pub(crate) fn write_private_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let directory = PrivateDirectory::open_or_create(private_parent(path))?;
+    let file_name = private_file_name(path)?;
+    write_private_file_atomically_in_directory(&directory, file_name, contents)
+}
+
+fn write_private_file_atomically_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let destination = directory.stable_child(file_name);
+    let public_path = directory.public_child(file_name);
+    directory.verify_current_path()?;
+    let temp_name_hint = file_name.to_string_lossy();
+    let (tmp_path, mut tmp_file, tmp_identity) = {
+        let mut created = None;
+        for _ in 0..16 {
+            let candidate = directory.stable_path.join(format!(
+                ".{temp_name_hint}.tmp.{}.{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match create_new_private_file(&candidate) {
+                Ok((file, identity)) => {
+                    created = Some((candidate, file, identity));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        created.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate unique atomic-write temp file",
+            )
+        })?
+    };
+
+    if let Err(e) = tmp_file
+        .write_all(contents)
+        .and_then(|_| tmp_file.sync_all())
+    {
+        drop(tmp_file);
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        return Err(e);
+    }
+    drop(tmp_file);
+    if let Err(error) = directory.verify_current_path() {
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        return Err(error);
+    }
+    if let Err(e) = replace_file_preserving_existing(&tmp_path, &destination) {
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        return Err(e);
+    }
+    if stable_path_identity(&destination)? != tmp_identity {
+        return Err(std::io::Error::other(format!(
+            "atomic private file publication was replaced unexpectedly: '{}'",
+            public_path.display()
+        )));
+    }
+    if let Err(error) = directory.verify_current_path() {
+        let _ = remove_file_by_identity(&destination, tmp_identity);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    directory.handle.sync_all()?;
+    Ok(())
+}
+
+struct CreatedPrivateFile {
+    public_path: PathBuf,
+    stable_path: PathBuf,
+    identity: StablePathIdentity,
+    _directory: PrivateDirectory,
+}
+
+/// Create a new private file under `dir` without ever replacing an existing
+/// pathname. The random name and `create_new` are both required: randomness
+/// avoids contention, while `create_new` is the actual no-clobber boundary.
+fn create_unique_private_file(
+    dir: &Path,
+    name_hint: &str,
+    extension: &str,
+    contents: &[u8],
+) -> std::io::Result<PathBuf> {
+    let created = create_unique_private_file_entry(dir, name_hint, extension, contents)?;
+    Ok(created.public_path)
+}
+
+fn create_unique_private_file_entry(
+    dir: &Path,
+    name_hint: &str,
+    extension: &str,
+    contents: &[u8],
+) -> std::io::Result<CreatedPrivateFile> {
+    use std::io::Write;
+
+    let directory = PrivateDirectory::open_or_create(dir)?;
+    directory.verify_current_path()?;
+
+    let mut safe_hint: String = name_hint
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    if safe_hint.is_empty() {
+        safe_hint.push_str("file");
+    }
+    let safe_extension: String = extension
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(16)
+        .collect();
+    let extension = if safe_extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{safe_extension}")
+    };
+
+    for _ in 0..16 {
+        let file_name = format!("{safe_hint}_{:032x}{extension}", rand::random::<u128>());
+        let stable_path = directory.stable_child(std::ffi::OsStr::new(&file_name));
+        let public_path = directory.public_child(std::ffi::OsStr::new(&file_name));
+        let (mut file, identity) = match create_new_private_file(&stable_path) {
+            Ok(created) => created,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = file.write_all(contents).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = remove_file_by_identity(&stable_path, identity);
+            return Err(e);
+        }
+        drop(file);
+        if let Err(error) = directory.verify_current_path() {
+            let _ = remove_file_by_identity(&stable_path, identity);
+            return Err(error);
+        }
+        if stable_path_identity(&stable_path)? != identity
+            || stable_path_identity(&public_path)? != identity
+        {
+            let _ = remove_file_by_identity(&stable_path, identity);
+            return Err(std::io::Error::other(format!(
+                "private file changed while it was being created: '{}'",
+                public_path.display()
+            )));
+        }
+        #[cfg(unix)]
+        if let Err(e) = directory.handle.sync_all() {
+            let _ = remove_file_by_identity(&stable_path, identity);
+            return Err(e);
+        }
+        return Ok(CreatedPrivateFile {
+            public_path,
+            stable_path,
+            identity,
+            _directory: directory,
+        });
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique private filename",
+    ))
+}
+
+/// A temporary attachment that is deleted on every return path, including
+/// Telegram request errors and unwinding.
+struct PrivateTempFile {
+    created: CreatedPrivateFile,
+}
+
+impl PrivateTempFile {
+    fn create(name_hint: &str, extension: &str, contents: &[u8]) -> std::io::Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine home directory",
+            )
+        })?;
+        let dir = home.join(".cokacdir").join("tmp");
+        Self::create_in(&dir, name_hint, extension, contents)
+    }
+
+    fn create_in(
+        dir: &Path,
+        name_hint: &str,
+        extension: &str,
+        contents: &[u8],
+    ) -> std::io::Result<Self> {
+        create_unique_private_file_entry(dir, name_hint, extension, contents)
+            .map(|created| Self { created })
+    }
+
+    fn path(&self) -> &Path {
+        &self.created.public_path
+    }
+}
+
+impl Drop for PrivateTempFile {
+    fn drop(&mut self) {
+        let _ = remove_file_by_identity(&self.created.stable_path, self.created.identity);
+    }
+}
+
+/// Caller must hold the directory lock returned by
+/// `acquire_schedule_dir_lock` whenever this operates on the real schedule
+/// directory. Kept path-parameterized so the atomic write can be regression
+/// tested without mutating the user's HOME.
+fn write_schedule_entry_locked(
+    entry: &ScheduleEntry,
+    dir: &Path,
+    require_existing: bool,
+) -> Result<bool, String> {
+    let directory = PrivateDirectory::open_or_create(dir)
+        .map_err(|e| format!("Failed to create or secure schedule directory: {e}"))?;
+    write_schedule_entry_in_directory(entry, &directory, require_existing)
+}
+
+fn write_schedule_entry_in_directory(
+    entry: &ScheduleEntry,
+    directory: &PrivateDirectory,
+    require_existing: bool,
+) -> Result<bool, String> {
+    if !is_valid_schedule_id(&entry.id) {
+        return Err(format!("Invalid schedule id: {:?}", entry.id));
+    }
     // Reject cron expressions the matcher can't interpret so a syntactically
     // wrong --at value fails loudly at register/update time instead of
     // silently never firing. `absolute` schedules carry a wall-clock
@@ -3440,8 +4550,25 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
             return Err(e);
         }
     }
-    let dir = schedule_dir().ok_or("Cannot determine home directory")?;
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create schedule dir: {e}"))?;
+
+    directory
+        .verify_current_path()
+        .map_err(|e| format!("Schedule directory changed before writing: {e}"))?;
+    let file_name = format!("{}.json", entry.id);
+    let path = directory.public_child(std::ffi::OsStr::new(&file_name));
+    let stable_path = directory.stable_child(std::ffi::OsStr::new(&file_name));
+    if require_existing {
+        match open_regular_file_no_follow(&stable_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(format!(
+                    "Existing schedule file is unsafe or unreadable: {e}"
+                ))
+            }
+        }
+    }
+
     // `bot_key_verifier` replaces the legacy plaintext `bot_key` field.
     // Re-writing a legacy file through this path naturally drops the old
     // plaintext field on the next atomic rename.
@@ -3478,26 +4605,53 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
             .unwrap()
             .insert("once".to_string(), serde_json::json!(once_val));
     }
-    let path = dir.join(format!("{}.json", entry.id));
-    let tmp_path = dir.join(format!("{}.json.tmp", entry.id));
+    let serialized = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("Failed to serialize schedule file: {e}"))?;
+    let (tmp_path, mut tmp_file, tmp_identity) = create_schedule_temp_file(directory, &entry.id)?;
     sched_debug(&format!(
         "[write_schedule_entry] writing tmp: {}",
         tmp_path.display()
     ));
-    fs::write(
-        &tmp_path,
-        serde_json::to_string_pretty(&json).unwrap_or_default(),
-    )
-    .map_err(|e| format!("Failed to write schedule file: {e}"))?;
+    use std::io::Write;
+    if let Err(e) = tmp_file
+        .write_all(serialized.as_bytes())
+        .and_then(|_| tmp_file.sync_all())
+    {
+        drop(tmp_file);
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        return Err(format!("Failed to write schedule file: {e}"));
+    }
+    drop(tmp_file);
+    if let Err(e) = directory.verify_current_path() {
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        return Err(format!(
+            "Schedule directory changed before publication: {e}"
+        ));
+    }
     sched_debug(&format!(
         "[write_schedule_entry] atomic rename: {} → {}",
         tmp_path.display(),
         path.display()
     ));
-    let result =
-        fs::rename(&tmp_path, &path).map_err(|e| format!("Failed to finalize schedule file: {e}"));
+    let result = replace_file_preserving_existing(&tmp_path, &stable_path)
+        .map_err(|e| format!("Failed to finalize schedule file: {e}"));
+    if result.is_err() {
+        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+    } else if stable_path_identity(&stable_path).ok() != Some(tmp_identity) {
+        return Err("Finalized schedule file was replaced unexpectedly".to_string());
+    } else if let Err(e) = directory.verify_current_path() {
+        let _ = remove_file_by_identity(&stable_path, tmp_identity);
+        return Err(format!("Schedule directory changed after publication: {e}"));
+    }
+    #[cfg(unix)]
+    if result.is_ok() {
+        directory
+            .handle
+            .sync_all()
+            .map_err(|e| format!("Failed to sync schedule directory: {e}"))?;
+    }
     sched_debug(&format!("[write_schedule_entry] result: {:?}", result));
-    result
+    result.map(|_| true)
 }
 
 /// List all schedule entries matching the given bot_key and optionally chat_id
@@ -3510,22 +4664,24 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
         sched_debug("[list_schedule_entries] no schedule dir");
         return Vec::new();
     };
-    if !dir.is_dir() {
+    let Ok(directory) = PrivateDirectory::open_existing(&dir) else {
+        sched_debug("[list_schedule_entries] unsafe or unavailable schedule dir");
         return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(&dir) else {
+    };
+    let Ok(entries) = fs::read_dir(&directory.stable_path) else {
         sched_debug("[list_schedule_entries] read_dir failed");
         return Vec::new();
     };
     let mut result: Vec<ScheduleEntry> = entries
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "json")
-                .unwrap_or(false)
+            e.file_type().map(|kind| kind.is_file()).unwrap_or(false)
+                && Path::new(&e.file_name())
+                    .extension()
+                    .map(|ext| ext == "json")
+                    .unwrap_or(false)
         })
-        .filter_map(|e| read_schedule_entry(&e.path()))
+        .filter_map(|e| read_schedule_entry_in_directory(&directory, &e.file_name()))
         .filter(|e| {
             // Recompute the expected verifier per entry — chat_id and id are
             // baked into the verifier, so two schedules sharing a bot_key but
@@ -3548,26 +4704,76 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
 }
 
 /// Delete a schedule entry by ID
+fn remove_private_regular_file(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+) -> std::io::Result<bool> {
+    directory.verify_current_path()?;
+    let path = directory.stable_child(file_name);
+    let file = match open_regular_file_no_follow(&path) {
+        Ok((file, _)) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let identity = stable_file_identity(&file)?;
+    drop(file);
+    directory.verify_current_path()?;
+    remove_file_by_identity(&path, identity)?;
+    directory.verify_current_path()?;
+    #[cfg(unix)]
+    directory.handle.sync_all()?;
+    Ok(true)
+}
+
 fn delete_schedule_entry(id: &str) -> bool {
     sched_debug(&format!("[delete_schedule_entry] id={}", id));
+    if !is_valid_schedule_id(id) {
+        sched_debug(&format!(
+            "[delete_schedule_entry] rejected invalid id={:?}",
+            id
+        ));
+        return false;
+    }
     let Some(dir) = schedule_dir() else {
         sched_debug("[delete_schedule_entry] no schedule dir");
         return false;
     };
-    let path = dir.join(format!("{id}.json"));
-    let existed = path.exists();
-    let ok = fs::remove_file(&path).is_ok();
+    let lock = match acquire_schedule_dir_lock(&dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            sched_debug(&format!("[delete_schedule_entry] lock failed: {e}"));
+            return false;
+        }
+    };
+    let file_name = format!("{id}.json");
+    let path = lock
+        .directory
+        .public_child(std::ffi::OsStr::new(&file_name));
+    let ok = match remove_private_regular_file(&lock.directory, std::ffi::OsStr::new(&file_name)) {
+        Ok(removed) => removed,
+        Err(e) => {
+            sched_debug(&format!(
+                "[delete_schedule_entry] remove failed path={}: {}",
+                path.display(),
+                e
+            ));
+            false
+        }
+    };
     sched_debug(&format!(
-        "[delete_schedule_entry] path={}, existed={}, removed={}",
+        "[delete_schedule_entry] path={}, removed={}",
         path.display(),
-        existed,
         ok
     ));
 
     // Also remove the .result file if it exists
-    let result_path = dir.join(format!("{id}.result"));
-    if result_path.exists() {
-        let _ = fs::remove_file(&result_path);
+    let result_file_name = format!("{id}.result");
+    let result_path = lock
+        .directory
+        .public_child(std::ffi::OsStr::new(&result_file_name));
+    if remove_private_regular_file(&lock.directory, std::ffi::OsStr::new(&result_file_name))
+        .unwrap_or(false)
+    {
         sched_debug(&format!(
             "[delete_schedule_entry] also removed .result: {}",
             result_path.display()
@@ -3623,9 +4829,9 @@ fn append_schedule_history(
         ));
         return;
     };
-    if let Err(e) = fs::create_dir_all(&dir) {
+    if let Err(e) = ensure_private_directory(&dir) {
         sched_debug(&format!(
-            "[append_schedule_history] id={}, create_dir_all failed: {}",
+            "[append_schedule_history] id={}, securing directory failed: {}",
             schedule_id, e
         ));
         return;
@@ -3677,18 +4883,19 @@ fn append_schedule_history(
         return;
     };
     redact_schedule_history_file_once_unlocked(&path);
-    let line = format!("{}\n", record);
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    let mut serialized = redact_known_tokens(&record.to_string());
+    if !bot_key.is_empty() {
+        serialized = serialized.replace(bot_key, "<bot_key_redacted>");
+    }
+    serialized.push('\n');
+    let result = open_private_append_file(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, serialized.as_bytes()));
     match result {
         Ok(_) => sched_debug(&format!(
             "[append_schedule_history] id={}, status={}, bytes={}, path={}",
             schedule_id,
             status,
-            line.len(),
+            serialized.len(),
             path.display()
         )),
         Err(e) => sched_debug(&format!(
@@ -3719,11 +4926,14 @@ fn lock_schedule_history_file(path: &std::path::Path) -> Option<std::fs::File> {
         let _ = fs::create_dir_all(parent);
     }
 
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .ok()?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path).ok()?;
     if file.lock_exclusive().is_err() {
         return None;
     }
@@ -3747,15 +4957,24 @@ fn schedule_history_redaction_marker_path(path: &std::path::Path) -> std::path::
 
 fn mark_schedule_history_redacted(path: &std::path::Path) {
     let marker = schedule_history_redaction_marker_path(path);
-    if let Some(parent) = marker.parent() {
-        let _ = fs::create_dir_all(parent);
+    if let Err(e) = write_private_file_atomically(&marker, b"v1\n") {
+        sched_debug(&format!(
+            "[mark_schedule_history_redacted] atomic write failed for {}: {}",
+            marker.display(),
+            e
+        ));
     }
-    let _ = fs::write(marker, b"v1\n");
 }
 
 fn redact_schedule_history_file_once_unlocked(path: &std::path::Path) {
     let marker = schedule_history_redaction_marker_path(path);
-    if marker.exists() {
+    let marker_is_valid = fs::symlink_metadata(&marker)
+        .map(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+        && fs::read(&marker)
+            .map(|contents| contents == b"v1\n")
+            .unwrap_or(false);
+    if marker_is_valid {
         return;
     }
 
@@ -3820,11 +5039,7 @@ fn redact_schedule_history_file_unlocked(path: &std::path::Path) -> bool {
     }
 
     if changed {
-        // Atomic rewrite: write to a sibling tmp file then rename over the target,
-        // matching the Slack channel-map persist pattern. This keeps the file in
-        // either its old or new state under power-loss / partial-write conditions.
-        let tmp_path = path.with_extension("log.redact.tmp");
-        let result = fs::write(&tmp_path, rewritten).and_then(|_| fs::rename(&tmp_path, path));
+        let result = write_private_file_atomically(path, rewritten.as_bytes());
         match result {
             Ok(_) => {
                 sched_debug(&format!(
@@ -3834,7 +5049,6 @@ fn redact_schedule_history_file_unlocked(path: &std::path::Path) -> bool {
                 true
             }
             Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
                 sched_debug(&format!(
                     "[redact_schedule_history_file] rewrite failed: {}, path={}",
                     e,
@@ -3963,7 +5177,7 @@ mod schedule_history_tests {
 mod live_schedule_tests {
     use super::{
         live_schedule_key_verifier, read_schedule_entry, schedule_history_key_verifier,
-        write_schedule_entry_pub, ScheduleEntryData,
+        write_schedule_entry_locked, write_schedule_entry_pub, ScheduleEntry, ScheduleEntryData,
     };
 
     fn data_with_bot_key(bot_key: &str) -> ScheduleEntryData {
@@ -4081,6 +5295,557 @@ mod live_schedule_tests {
         std::fs::write(&path, body).unwrap();
         let entry = read_schedule_entry(&path).expect("hybrid entry should parse");
         assert_eq!(entry.bot_key_verifier, real_verifier);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_read_rejects_symlink_and_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.json");
+        let linked = dir.path().join("linked.json");
+        std::fs::write(&target, br#"{"id":"outside"}"#).unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(read_schedule_entry(&linked).is_none());
+
+        let fifo = dir.path().join("blocked.json");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(read_schedule_entry(&fifo).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_read_rejects_a_symlinked_schedule_directory() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let linked_dir = root.path().join("schedules");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(target.join("ABCDEF12.json"), br#"{"id":"ABCDEF12"}"#).unwrap();
+        symlink(&target, &linked_dir).unwrap();
+
+        assert!(read_schedule_entry(&linked_dir.join("ABCDEF12.json")).is_none());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn recurring_update_does_not_resurrect_a_deleted_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = ScheduleEntry {
+            id: "ABCDEF12".to_string(),
+            chat_id: 1,
+            bot_key_verifier: "verifier".to_string(),
+            current_path: "/tmp".to_string(),
+            prompt: "p".to_string(),
+            schedule: "* * * * *".to_string(),
+            schedule_type: "cron".to_string(),
+            once: Some(false),
+            last_run: Some("2026-01-01 00:00:00".to_string()),
+            created_at: "2026-01-01 00:00:00".to_string(),
+            session_id: None,
+            provider: None,
+            model: None,
+            context_summary: None,
+        };
+
+        let updated = write_schedule_entry_locked(&entry, dir.path(), true).unwrap();
+
+        assert!(!updated);
+        assert!(!dir.path().join("ABCDEF12.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_write_rejects_symlinked_directory_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let schedule_link = root.path().join("schedules");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &schedule_link).unwrap();
+        let entry = ScheduleEntry {
+            id: "ABCDEF12".to_string(),
+            chat_id: 1,
+            bot_key_verifier: "verifier".to_string(),
+            current_path: "/tmp".to_string(),
+            prompt: "p".to_string(),
+            schedule: "* * * * *".to_string(),
+            schedule_type: "cron".to_string(),
+            once: Some(false),
+            last_run: None,
+            created_at: "2026-01-01 00:00:00".to_string(),
+            session_id: None,
+            provider: None,
+            model: None,
+            context_summary: None,
+        };
+
+        assert!(write_schedule_entry_locked(&entry, &schedule_link, false).is_err());
+        assert!(!target.join("ABCDEF12.json").exists());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn schedule_write_replaces_complete_file_and_leaves_no_fixed_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = ScheduleEntry {
+            id: "ABCDEF12".to_string(),
+            chat_id: 1,
+            bot_key_verifier: "verifier".to_string(),
+            current_path: "/tmp".to_string(),
+            prompt: "old".to_string(),
+            schedule: "* * * * *".to_string(),
+            schedule_type: "cron".to_string(),
+            once: Some(false),
+            last_run: None,
+            created_at: "2026-01-01 00:00:00".to_string(),
+            session_id: None,
+            provider: None,
+            model: None,
+            context_summary: None,
+        };
+        assert!(write_schedule_entry_locked(&entry, dir.path(), false).unwrap());
+        entry.prompt = "new".to_string();
+        assert!(write_schedule_entry_locked(&entry, dir.path(), true).unwrap());
+
+        let body = std::fs::read_to_string(dir.path().join("ABCDEF12.json")).unwrap();
+        assert!(body.contains("\"prompt\": \"new\""));
+        assert!(!dir.path().join("ABCDEF12.json.tmp").exists());
+    }
+}
+
+#[cfg(test)]
+mod private_atomic_write_tests {
+    use std::path::Path;
+
+    use super::{
+        cleanup_legacy_bot_key_files, cleanup_legacy_bot_key_files_with_hook,
+        create_bot_key_file_in_dir, create_new_private_file, create_unique_private_file,
+        ensure_private_directory, open_private_append_file, open_private_regular_file_bounded,
+        read_private_regular_file_bounded, redact_known_tokens, register_token_for_redaction,
+        shell_quote_argument, write_private_file_atomically,
+        write_private_file_atomically_in_directory, PrivateDirectory, PrivateTempFile,
+    };
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_argument_quoting_keeps_metacharacters_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("command-was-executed");
+        let hostile = format!(
+            "/tmp/a'$(touch {})`touch {}`$HOME; value",
+            marker.display(),
+            marker.display()
+        );
+        let quoted = shell_quote_argument(&hostile);
+        let command = format!("printf %s {quoted}");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .expect("run shell quoting check");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, hostile.as_bytes());
+        assert!(!marker.exists(), "quoted argument executed shell syntax");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_symlink_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("bot_keys");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(ensure_private_directory(&link).is_err());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writers_reject_symlinked_parent_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let link = root.path().join("private");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(write_private_file_atomically(&link.join("settings.json"), b"secret").is_err());
+        assert!(create_unique_private_file(&link, "payload", "txt", b"secret").is_err());
+        assert!(!target.join("settings.json").exists());
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_handle_detects_parent_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let private_path = root.path().join("private");
+        let displaced = root.path().join("displaced");
+        std::fs::create_dir(&private_path).unwrap();
+        let directory = PrivateDirectory::open_or_create(&private_path).unwrap();
+
+        std::fs::rename(&private_path, &displaced).unwrap();
+        std::fs::create_dir(&private_path).unwrap();
+
+        assert!(directory.verify_current_path().is_err());
+        assert!(write_private_file_atomically_in_directory(
+            &directory,
+            std::ffi::OsStr::new("settings.json"),
+            b"secret"
+        )
+        .is_err());
+        assert!(std::fs::read_dir(&displaced).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&private_path).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn existing_private_file_can_be_replaced_repeatedly() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("settings.json");
+
+        write_private_file_atomically(&path, br#"{"version":1}"#).expect("first write");
+        write_private_file_atomically(&path, br#"{"version":2}"#).expect("replace write");
+
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"version":2}"#);
+        assert!(!std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().to_string_lossy().contains(".tmp.")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_private_write_replaces_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.json");
+        let path = dir.path().join("session.json");
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        write_private_file_atomically(&path, b"new session").unwrap();
+
+        assert_eq!(std::fs::read(victim).unwrap(), b"must survive");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new session");
+        assert!(!std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn bot_capability_filename_is_stable_non_secret_and_file_is_private() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let capability = "super-secret-capability-value";
+        let path = create_bot_key_file_in_dir(dir.path(), capability).expect("create key file");
+        let same_path =
+            create_bot_key_file_in_dir(dir.path(), capability).expect("reuse key file name");
+        let different_path = create_bot_key_file_in_dir(dir.path(), "another-secret-capability")
+            .expect("create second key file");
+
+        assert!(!path.to_string_lossy().contains(capability));
+        assert_eq!(same_path, path);
+        assert_ne!(different_path, path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), capability);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn identical_legacy_bot_capability_copy_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let capability = "secret";
+        let expected = create_bot_key_file_in_dir(&dir, capability).unwrap();
+        let legacy = dir.join("legacy-random-name.key");
+        write_private_file_atomically(&legacy, b"secret\n").unwrap();
+        let directory = PrivateDirectory::open_existing(&dir).unwrap();
+
+        let deleted = cleanup_legacy_bot_key_files(&directory, &expected, b"secret\n").unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read(&expected).unwrap(), b"secret\n");
+    }
+
+    #[test]
+    fn different_private_bot_key_file_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let capability = "secret";
+        let expected = create_bot_key_file_in_dir(&dir, capability).unwrap();
+        let different = dir.join("another-bot.key");
+        write_private_file_atomically(&different, b"public\n").unwrap();
+        let directory = PrivateDirectory::open_existing(&dir).unwrap();
+
+        let deleted = cleanup_legacy_bot_key_files(&directory, &expected, b"secret\n").unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(std::fs::read(&different).unwrap(), b"public\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matching_non_private_bot_key_copy_is_preserved_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let expected = create_bot_key_file_in_dir(&dir, "secret").unwrap();
+        let exposed = dir.join("exposed-copy.key");
+        std::fs::write(&exposed, b"secret\n").unwrap();
+        std::fs::set_permissions(&exposed, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let directory = PrivateDirectory::open_existing(&dir).unwrap();
+
+        let result = cleanup_legacy_bot_key_files(&directory, &expected, b"secret\n");
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&exposed).unwrap(), b"secret\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_bot_key_cleanup_preserves_symlink_and_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let capability = "secret";
+        let expected = create_bot_key_file_in_dir(&dir, capability).unwrap();
+        let target = root.path().join("victim.key");
+        let link = dir.join("legacy-link.key");
+        std::fs::write(&target, b"secret\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let directory = PrivateDirectory::open_existing(&dir).unwrap();
+
+        let deleted = cleanup_legacy_bot_key_files(&directory, &expected, b"secret\n").unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret\n");
+    }
+
+    #[test]
+    fn legacy_bot_key_cleanup_never_deletes_a_racing_replacement() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let capability = "secret";
+        let expected = create_bot_key_file_in_dir(&dir, capability).unwrap();
+        let legacy = dir.join("legacy-random-name.key");
+        let displaced = dir.join("displaced-legacy.key");
+        write_private_file_atomically(&legacy, b"secret\n").unwrap();
+        let directory = PrivateDirectory::open_existing(&dir).unwrap();
+        let stable_displaced = directory.stable_child(displaced.file_name().unwrap());
+        let mut replaced = false;
+        let mut replace_before_delete = |candidate: &Path| -> std::io::Result<()> {
+            assert!(!replaced, "cleanup attempted more than one deletion");
+            replaced = true;
+            std::fs::rename(candidate, &stable_displaced)?;
+            let (mut replacement, _) = create_new_private_file(candidate)?;
+            replacement.write_all(b"public\n")?;
+            replacement.sync_all()
+        };
+
+        let result = cleanup_legacy_bot_key_files_with_hook(
+            &directory,
+            &expected,
+            b"secret\n",
+            &mut replace_before_delete,
+        );
+
+        assert!(result.is_err(), "identity race must fail closed");
+        assert!(replaced);
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"public\n");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"secret\n");
+        assert_eq!(std::fs::read(&expected).unwrap(), b"secret\n");
+    }
+
+    #[test]
+    fn unique_private_files_do_not_collide_and_are_private() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("values");
+        let first = create_unique_private_file(&dir, "payload", "txt", b"first").unwrap();
+        let second = create_unique_private_file(&dir, "payload", "txt", b"second").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn private_temp_file_is_removed_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = {
+            let temp =
+                PrivateTempFile::create_in(root.path(), "response", "txt", b"secret").unwrap();
+            let path = temp.path().to_path_buf();
+            assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+            path
+        };
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn private_temp_drop_never_deletes_a_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let temp = PrivateTempFile::create_in(root.path(), "response", "txt", b"secret").unwrap();
+        let original = temp.path().to_path_buf();
+        let displaced = root.path().join("displaced.txt");
+        std::fs::rename(&original, &displaced).unwrap();
+        std::fs::write(&original, b"replacement").unwrap();
+
+        drop(temp);
+
+        assert_eq!(std::fs::read(&original).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_read_rejects_symlink_without_chmodding_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bot_keys");
+        let target = root.path().join("victim.key");
+        let link = dir.join("capability.key");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&target, b"victim\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_private_regular_file_bounded(&link, 64).is_err());
+        assert!(open_private_regular_file_bounded(&link, 64).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_private_stream_open_rejects_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("group.jsonl");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        assert!(open_private_regular_file_bounded(&fifo, 1024).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn registered_tokens_are_removed_before_log_persistence() {
+        let token = "123456789:TEST_ONLY_TOKEN_DO_NOT_PERSIST";
+        register_token_for_redaction(token);
+        let redacted = redact_known_tokens(&format!("request /bot{token}/getMe failed"));
+        assert!(!redacted.contains(token));
+        assert!(redacted.contains("<bot_token_redacted>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_append_secures_permissions_and_rejects_symlinks() {
+        use std::io::Write;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let log = dir.join("events.log");
+        std::fs::write(&log, b"old\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut file = open_private_append_file(&log).unwrap();
+        file.write_all(b"new\n").unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let victim = root.path().join("victim");
+        let link = dir.join("linked.log");
+        std::fs::write(&victim, b"must survive").unwrap();
+        symlink(&victim, &link).unwrap();
+        assert!(open_private_append_file(&link).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
     }
 }
 
@@ -4572,8 +6337,7 @@ pub fn is_valid_schedule_id_pub(id: &str) -> bool {
 /// Resolve the current working path for a chat from bot_settings.json
 pub fn resolve_current_path_for_chat(chat_id: i64, hash_key: &str) -> Option<String> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let json = read_bot_settings_json(&path).ok()?;
     let entry = json.get(hash_key)?;
     let last_sessions = entry.get("last_sessions")?.as_object()?;
     let chat_key = chat_id.to_string();
@@ -4583,8 +6347,7 @@ pub fn resolve_current_path_for_chat(chat_id: i64, hash_key: &str) -> Option<Str
 /// Resolve the configured model for a chat from bot_settings.json.
 pub fn resolve_model_for_chat(chat_id: i64, hash_key: &str) -> Option<String> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let json = read_bot_settings_json(&path).ok()?;
     let entry = json.get(hash_key)?;
     let models = entry.get("models")?.as_object()?;
     let chat_key = chat_id.to_string();
@@ -4595,6 +6358,289 @@ pub fn resolve_model_for_chat(chat_id: i64, hash_key: &str) -> Option<String> {
 /// Get the binary path normalized for shell commands (backslashes → forward slashes on Windows)
 fn shell_bin_path() -> String {
     crate::utils::format::to_shell_path(crate::bin_path())
+}
+
+/// Quote one argument for the command shell used on this target. JSON string
+/// escaping is not shell escaping: `$()`, backticks, and `$variables` remain
+/// active inside double quotes on POSIX shells, and PowerShell has analogous
+/// interpolation rules. Single-quoted arguments keep generated prompt
+/// commands inert even when HOME or the executable path contains metacharacters.
+#[cfg(windows)]
+fn shell_quote_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(not(windows))]
+fn shell_quote_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn shell_bin_invocation() -> String {
+    let quoted = shell_quote_argument(&shell_bin_path());
+    if cfg!(windows) {
+        format!("& {quoted}")
+    } else {
+        quoted
+    }
+}
+
+/// Materialize a bot capability in a private file whose one-way, domain-
+/// separated filename does not disclose the capability. Provider tool commands
+/// can then pass only the path in argv, keeping the long-lived key out of
+/// process listings and model transcripts. The stable name also avoids leaking
+/// another valid file on every process restart.
+fn bot_key_file_path(dir: &Path, bot_key: &str) -> PathBuf {
+    // A random filename on every process start leaves an indefinitely growing
+    // set of still-valid capability files. A domain-separated digest is stable
+    // for the same high-entropy capability, reveals no raw key, and lets
+    // concurrent processes safely publish the same contents atomically.
+    let mut hasher = Sha256::new();
+    hasher.update(b"cokacdir bot capability file v1\0");
+    hasher.update(bot_key.as_bytes());
+    dir.join(format!("{:x}.key", hasher.finalize()))
+}
+
+fn create_bot_key_file_in_dir(dir: &Path, bot_key: &str) -> Result<PathBuf, String> {
+    let path = bot_key_file_path(dir, bot_key);
+    let contents = format!("{bot_key}\n");
+    write_private_file_atomically(&path, contents.as_bytes())
+        .map_err(|e| format!("cannot publish bot key file: {e}"))?;
+    Ok(path)
+}
+
+fn cleanup_legacy_bot_key_files(
+    directory: &PrivateDirectory,
+    expected_path: &Path,
+    expected_contents: &[u8],
+) -> std::io::Result<usize> {
+    let mut no_op = |_candidate: &Path| Ok(());
+    cleanup_legacy_bot_key_files_with_hook(directory, expected_path, expected_contents, &mut no_op)
+}
+
+fn cleanup_legacy_bot_key_files_with_hook<F>(
+    directory: &PrivateDirectory,
+    expected_path: &Path,
+    expected_contents: &[u8],
+    before_delete: &mut F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    use std::io::Read;
+
+    let expected_name = private_file_name(expected_path)?;
+    directory.verify_current_path()?;
+    let entries = fs::read_dir(&directory.stable_path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    directory.verify_current_path()?;
+
+    let mut deleted = 0usize;
+    let cleanup_result = (|| -> std::io::Result<()> {
+        for file_name in entries {
+            if file_name == expected_name {
+                continue;
+            }
+            directory.verify_current_path()?;
+            let candidate = directory.stable_child(&file_name);
+            let metadata = match fs::symlink_metadata(&candidate) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !metadata.is_file()
+                || private_metadata_is_reparse_point(&metadata)
+                || metadata.len() != expected_contents.len() as u64
+            {
+                continue;
+            }
+            let initially_private = private_regular_file_has_private_permissions(&metadata);
+
+            // The lstat above classifies static symlinks/special files as
+            // ineligible. From this point onward an open/read failure is
+            // security-significant: the candidate had the exact size and
+            // regular-file shape of a possible legacy capability.
+            let (mut file, opened_metadata) = open_regular_file_no_follow(&candidate)?;
+            if opened_metadata.len() != expected_contents.len() as u64 {
+                continue;
+            }
+            let opened_private = private_regular_file_has_private_permissions(&opened_metadata);
+            let identity = stable_file_identity(&file)?;
+            let initial_modified = opened_metadata.modified().ok();
+            let read_limit = u64::try_from(expected_contents.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let mut contents = Vec::with_capacity(expected_contents.len());
+            file.by_ref().take(read_limit).read_to_end(&mut contents)?;
+            if contents != expected_contents {
+                continue;
+            }
+            if !initially_private || !opened_private {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "matching legacy bot key copy is not private and was preserved: '{}'",
+                        candidate.display()
+                    ),
+                ));
+            }
+            if !private_regular_file_has_single_link(&opened_metadata) {
+                return Err(std::io::Error::other(format!(
+                    "matching legacy bot key copy has additional hard links and was preserved: '{}'",
+                    candidate.display()
+                )));
+            }
+            let after_read = file.metadata()?;
+            if stable_file_identity(&file)? != identity
+                || !private_regular_file_has_private_permissions(&after_read)
+                || !private_regular_file_has_single_link(&after_read)
+                || after_read.len() != expected_contents.len() as u64
+                || after_read.modified().ok() != initial_modified
+            {
+                return Err(std::io::Error::other(format!(
+                    "legacy bot key candidate changed while being read: '{}'",
+                    candidate.display()
+                )));
+            }
+            drop(file);
+
+            directory.verify_current_path()?;
+            before_delete(&candidate)?;
+            directory.verify_current_path()?;
+            remove_file_by_identity(&candidate, identity)?;
+            deleted += 1;
+        }
+        directory.verify_current_path()
+    })();
+
+    #[cfg(unix)]
+    let sync_result = if deleted > 0 {
+        directory.handle.sync_all()
+    } else {
+        Ok(())
+    };
+    #[cfg(not(unix))]
+    let sync_result: std::io::Result<()> = Ok(());
+
+    if let Err(cleanup_error) = cleanup_result {
+        if let Err(sync_error) = sync_result {
+            return Err(std::io::Error::other(format!(
+                "legacy bot key cleanup failed ({cleanup_error}); directory sync also failed ({sync_error})"
+            )));
+        }
+        return Err(cleanup_error);
+    }
+    sync_result?;
+    directory.verify_current_path()?;
+    Ok(deleted)
+}
+
+fn ensure_bot_key_file(bot_key: &str) -> Result<PathBuf, String> {
+    if bot_key.is_empty() || bot_key.contains('\r') || bot_key.contains('\n') {
+        return Err("invalid bot key".to_string());
+    }
+    let home = dirs::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
+    let dir = home.join(".cokacdir").join("bot_keys");
+    let directory = PrivateDirectory::open_or_create(&dir)
+        .map_err(|e| format!("cannot create or secure bot key directory: {e}"))?;
+    let expected_path = bot_key_file_path(&dir, bot_key);
+    let expected_contents = format!("{bot_key}\n");
+
+    let registry = BOT_KEY_FILE_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = registry.get(bot_key) {
+        let read_limit = expected_contents.len();
+        if existing == &expected_path
+            && read_private_regular_file_bounded_in_directory(
+                &directory,
+                private_file_name(existing)
+                    .map_err(|e| format!("invalid cached bot key path: {e}"))?,
+                read_limit,
+            )
+            .map(|contents| contents == expected_contents.as_bytes())
+            .unwrap_or(false)
+        {
+            return Ok(existing.clone());
+        }
+        registry.remove(bot_key);
+    }
+
+    use fs2::FileExt;
+    let cleanup_lock = open_private_file_in_directory(
+        &directory,
+        std::ffi::OsStr::new(".bot-key-cleanup.lock"),
+        false,
+    )
+    .map_err(|e| format!("cannot open bot key cleanup lock: {e}"))?;
+    cleanup_lock
+        .lock_exclusive()
+        .map_err(|e| format!("cannot lock bot key cleanup: {e}"))?;
+    directory
+        .verify_current_path()
+        .map_err(|e| format!("bot key directory changed while locking: {e}"))?;
+
+    let expected_name = private_file_name(&expected_path)
+        .map_err(|e| format!("invalid deterministic bot key path: {e}"))?;
+    write_private_file_atomically_in_directory(
+        &directory,
+        expected_name,
+        expected_contents.as_bytes(),
+    )
+    .map_err(|e| format!("cannot publish bot key file: {e}"))?;
+    let contents = read_private_regular_file_bounded_in_directory(
+        &directory,
+        expected_name,
+        expected_contents.len(),
+    )
+    .map_err(|e| format!("cannot verify bot key file: {e}"))?;
+    if contents != expected_contents.as_bytes() {
+        return Err("cannot verify bot key file contents".to_string());
+    }
+    let deleted_legacy =
+        cleanup_legacy_bot_key_files(&directory, &expected_path, expected_contents.as_bytes())
+            .map_err(|e| format!("cannot securely remove legacy bot key copies: {e}"))?;
+    if deleted_legacy > 0 {
+        msg_debug(&format!(
+            "[bot_key_file] removed {deleted_legacy} legacy capability file(s)"
+        ));
+    }
+    let contents = read_private_regular_file_bounded_in_directory(
+        &directory,
+        expected_name,
+        expected_contents.len(),
+    )
+    .map_err(|e| format!("cannot re-verify bot key file after cleanup: {e}"))?;
+    if contents != expected_contents.as_bytes() {
+        return Err("bot key file changed during legacy cleanup".to_string());
+    }
+    registry.insert(bot_key.to_string(), expected_path.clone());
+    Ok(expected_path)
+}
+
+#[cfg(not(test))]
+fn bot_key_cli_option(bot_key: &str) -> String {
+    match ensure_bot_key_file(bot_key) {
+        Ok(path) => {
+            let shell_path = crate::utils::format::to_shell_path(&path.display().to_string());
+            let quoted = shell_quote_argument(&shell_path);
+            format!("--key-file {quoted}")
+        }
+        Err(e) => {
+            // Never fall back to embedding `--key <capability>` in the model
+            // prompt. A broken key file should disable these helper commands,
+            // not disclose the secret in argv/transcripts.
+            msg_debug(&format!("[bot_key_file] unavailable: {e}"));
+            "--key-file <UNAVAILABLE>".to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+fn bot_key_cli_option(_bot_key: &str) -> String {
+    // Prompt-rendering unit tests must not persist dummy capabilities in the
+    // developer's real HOME. File creation itself is covered by the
+    // path-parameterized private-file regression test.
+    "--key-file '<test-private-key-file>'".to_string()
 }
 
 const DEFAULT_COWORK_GUIDELINES: &str = "\
@@ -4656,12 +6702,18 @@ fn load_cowork_guidelines() -> String {
             }
         } else {
             // Auto-generate default file
-            let _ = std::fs::create_dir_all(&prompt_dir);
-            let _ = std::fs::write(&cowork_path, DEFAULT_COWORK_GUIDELINES);
-            msg_debug(&format!(
-                "[load_cowork_guidelines] created default file: {}",
-                cowork_path.display()
-            ));
+            match write_private_file_atomically(&cowork_path, DEFAULT_COWORK_GUIDELINES.as_bytes())
+            {
+                Ok(()) => msg_debug(&format!(
+                    "[load_cowork_guidelines] created default file: {}",
+                    cowork_path.display()
+                )),
+                Err(e) => msg_debug(&format!(
+                    "[load_cowork_guidelines] failed to create default file: {}, err={}",
+                    cowork_path.display(),
+                    e
+                )),
+            }
         }
     }
     msg_debug("[load_cowork_guidelines] using built-in default");
@@ -4688,6 +6740,7 @@ fn build_system_prompt(
     msg_debug(&format!("[build_system_prompt] chat_id={}, bot_username={:?}, bot_display_name={:?}, session_id={:?}, disabled_notice_len={}, role_len={}",
         chat_id, bot_username, bot_display_name, session_id, disabled_notice.len(), role.len()));
     let is_group_chat = chat_id < 0 && context_count > 0;
+    let bot_key_option = bot_key_cli_option(bot_key);
     msg_debug(&format!("[build_system_prompt] is_group_chat={}, context_count={}, has_bot_username={}, include_bot_section={}",
         is_group_chat, context_count, !bot_username.is_empty(), !bot_username.is_empty() && is_group_chat));
     let session_notice = match session_id {
@@ -4856,7 +6909,7 @@ fn build_system_prompt(
              Below are the most recent log entries. ALWAYS check these before responding to understand the current context.\n\
              {recent}{dedup}\
              \nFor older history, use:\n\
-             \"{bin}\" --read_chat_log {chat_id} [--range <N|START-END>] [--bot <USERNAME>]\n\
+             {bin} --read_chat_log {chat_id} [--range <N|START-END>] [--bot <USERNAME>]\n\
              • --range 50: last 50 entries\n\
              • --range 100-150: entries 100 to 150 (1-based line numbers)\n\
              • --bot <USERNAME>: filter by specific bot (without @)\n\
@@ -4866,7 +6919,7 @@ fn build_system_prompt(
             bot_roster = bot_roster,
             recent = recent_section,
             dedup = dedup_warning,
-            bin = shell_bin_path(),
+            bin = shell_bin_invocation(),
             chat_id = chat_id,
         )
     } else {
@@ -4877,14 +6930,14 @@ fn build_system_prompt(
             "\n\n\
              ── BOT MESSAGING ──\n\
              Send a message to another bot in this chat:\n\
-             \"{bin}\" --message <CONTENT> --to <BOT_USERNAME> --chat {chat_id} --key {bot_key}\n\
-             • The --from field is automatically determined from --key\n\
+             {bin} --message <CONTENT> --to <BOT_USERNAME> --chat {chat_id} {bot_key_option}\n\
+             • The --from field is automatically determined from the key file\n\
              • The target bot must be in the same chat and have an active session\n\
              • Output: {{\"status\":\"ok\",\"id\":\"msg_...\"}}\n\n\
              When you receive a message from another bot (indicated by [BOT MESSAGE from @...]):\n\
              • The --message content is text only. It does NOT include the sender's tool usage details.\n\
              • To see what tools the sender bot used (commands executed, files read/written, results),\n\
-               check the group chat log: \"{bin}\" --read_chat_log {chat_id} --bot <SENDER_USERNAME>\n\
+               check the group chat log: {bin} --read_chat_log {chat_id} --bot <SENDER_USERNAME>\n\
              • Use --message to send your response back to the sender bot (they cannot see your chat messages)\n\
              • ONLY reply via --message when you have something substantive and NEW to add\n\
              • Do NOT reply via --message in these cases (just display your response in chat without --message):\n\
@@ -4915,9 +6968,9 @@ fn build_system_prompt(
              Output ONLY your direct conversational answer. Nothing before it, nothing after it.\n\
              CORRECT example: \"@dream_bot I'd love to have a body. Walking in the rain sounds amazing.\"\n\
              WRONG example: \"Message received. Let me send my reply. I'd love to have a body.\"",
-            bin = shell_bin_path(),
+            bin = shell_bin_invocation(),
             chat_id = chat_id,
-            bot_key = bot_key,
+            bot_key_option = bot_key_option,
         )
     } else {
         String::new()
@@ -4972,16 +7025,16 @@ fn build_system_prompt(
          All commands output JSON. Success: {{\"status\":\"ok\",...}}, Error: {{\"status\":\"error\",\"message\":\"...\"}}\n\n\
          ── FILE DELIVERY ──\n\
          Send a file to the user's {platform} chat:\n\
-         \"{bin}\" --sendfile <FILEPATH> --chat {chat_id} --key {bot_key}\n\
+         {bin} --sendfile <FILEPATH> --chat {chat_id} {bot_key_option}\n\
          • Use this whenever your work produces a file (code, reports, images, archives, etc.)\n\
          • Do NOT tell the user to use /down — always use this command instead\n\
          • Output: {{\"status\":\"ok\",\"path\":\"<absolute_path>\"}}\n\n\
          ── SERVER TIME ──\n\
          Get current server time (use before scheduling to confirm timezone):\n\
-         \"{bin}\" --currenttime\n\
+         {bin} --currenttime\n\
          • Output: {{\"status\":\"ok\",\"time\":\"2026-02-25 14:30:00\"}}\n\n\
          ── SCHEDULE: REGISTER ──\n\
-         \"{bin}\" --cron \"<PROMPT>\" --at \"<TIME>\" --chat {chat_id} --key {bot_key} [--once] [--session <SESSION_ID>]\n\
+         {bin} --cron \"<PROMPT>\" --at \"<TIME>\" --chat {chat_id} {bot_key_option} [--once] [--session <SESSION_ID>]\n\
          • Three schedule types:\n\
            1. ABSOLUTE (one-time): --at \"2026-02-25 18:00:00\" or --at \"30m\"/\"4h\"/\"1d\"\n\
               Runs once at the specified time, then auto-deleted.\n\
@@ -4996,13 +7049,13 @@ fn build_system_prompt(
            2. ★ MUST be in the user's language (한국어 사용자 → 한국어, English user → English)\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\",\"prompt\":\"...\",\"schedule\":\"...\"}}{session_notice}\n\n\
          ── SCHEDULE: LIST ──\n\
-         \"{bin}\" --cron-list --chat {chat_id} --key {bot_key}\n\
+         {bin} --cron-list --chat {chat_id} {bot_key_option}\n\
          • Output: {{\"status\":\"ok\",\"schedules\":[{{\"id\":\"...\",\"prompt\":\"...\",\"schedule\":\"...\",\"created_at\":\"...\"}},...]}}\n\n\
          ── SCHEDULE: REMOVE ──\n\
-         \"{bin}\" --cron-remove <SCHEDULE_ID> --chat {chat_id} --key {bot_key}\n\
+         {bin} --cron-remove <SCHEDULE_ID> --chat {chat_id} {bot_key_option}\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\"}}\n\n\
          ── SCHEDULE: UPDATE TIME ──\n\
-         \"{bin}\" --cron-update <SCHEDULE_ID> --at \"<NEW_TIME>\" --chat {chat_id} --key {bot_key}\n\
+         {bin} --cron-update <SCHEDULE_ID> --at \"<NEW_TIME>\" --chat {chat_id} {bot_key_option}\n\
          • --at accepts the same formats as --cron\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\",\"schedule\":\"...\"}}\n\n\
          ── SCHEDULE: HISTORY (agent-driven inspection) ──\n\
@@ -5023,7 +7076,7 @@ fn build_system_prompt(
          NEVER quote them back to this user.\n\n\
          CLI ALTERNATIVE — for a sanitized, ownership-checked JSON dump of one schedule's \
          full run history (preferred when you already know the id):\n\
-         \"{bin}\" --cron-history <SCHEDULE_ID> --chat {chat_id} --key {bot_key}\n\
+         {bin} --cron-history <SCHEDULE_ID> --chat {chat_id} {bot_key_option}\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\",\"count\":N,\"history\":[{{...}}, ...]}}\n\n\
          ═══════════════════════════════════════{group_chat_cowork_section}{group_chat_log_section}{bot_messaging_section}{disabled_notice}",
         role = role,
@@ -5031,8 +7084,8 @@ fn build_system_prompt(
         chat_id_line = chat_id_line,
         current_path = crate::utils::format::to_shell_path(current_path),
         chat_id = chat_id,
-        bot_key = bot_key,
-        bin = shell_bin_path(),
+        bot_key_option = bot_key_option,
+        bin = shell_bin_invocation(),
         history_dir = schedule_history_dir_for_prompt(),
         disabled_notice = disabled_notice,
         session_notice = session_notice,
@@ -5089,7 +7142,7 @@ fn codex_extra_instructions() -> String {
     );
 
     if cfg!(target_os = "windows") {
-        let bin = shell_bin_path();
+        let bin = shell_quote_argument(&shell_bin_path());
         let ps_path = detect_powershell_path().unwrap_or("powershell.exe");
         // Shell environment info + cokacdir command guidance
         extra.push_str(&format!(
@@ -5107,10 +7160,10 @@ fn codex_extra_instructions() -> String {
              ═══════════════════════════════════════\n\
              cokacdir is a native Windows binary. Run it DIRECTLY with the & operator.\n\n\
              CORRECT examples:\n\
-             & \"{bin}\" --currenttime\n\
-             & \"{bin}\" --sendfile C:/path/to/file.txt --chat 12345 --key xxx\n\
-             & \"{bin}\" --cron \"prompt text here\" --at 30m --chat 12345 --key xxx\n\
-             & \"{bin}\" --cron-list --chat 12345 --key xxx\n\n\
+             & {bin} --currenttime\n\
+             & {bin} --sendfile C:/path/to/file.txt --chat 12345 --key-file C:/path/to/private.key\n\
+             & {bin} --cron \"prompt text here\" --at 30m --chat 12345 --key-file C:/path/to/private.key\n\
+             & {bin} --cron-list --chat 12345 --key-file C:/path/to/private.key\n\n\
              SCHEDULE TIME (--at) FORMAT:\n\
              ALWAYS use relative time: 1m, 5m, 30m, 1h, 2h, 1d\n\
              Do NOT use absolute datetime with spaces (e.g. \"2026-03-02 15:30:00\").\n\
@@ -5232,6 +7285,10 @@ struct SharedData {
     /// a brand-new session whose session_id is None on both spawn and post-completion
     /// (so the sid comparison alone cannot detect the clear).
     clear_epoch: HashMap<ChatId, u64>,
+    /// Monotonic per-chat user-activity generation used to prevent an older
+    /// companion ping completion from overwriting a timer reset performed by
+    /// a message that arrived while that ping was running.
+    companion_activity_epoch: HashMap<ChatId, u64>,
 }
 
 type SharedState = Arc<Mutex<SharedData>>;
@@ -5435,6 +7492,7 @@ async fn auto_create_workspace_session(
                 .and_then(|s| s.session_id.clone());
             (sid, existing, false)
         } else {
+            let previous_settings = data.settings.clone();
             let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
                 session_id: None,
                 current_path: None,
@@ -5448,7 +7506,15 @@ async fn auto_create_workspace_session(
             data.settings
                 .last_sessions
                 .insert(chat_id.0.to_string(), auto_path.clone());
-            save_bot_settings(bot_token, &data.settings);
+            let persistence =
+                persist_bot_settings_change(bot_token, &mut data.settings, previous_settings);
+            if matches!(
+                persistence,
+                BotSettingsPersistenceState::ReconciledFromDisk
+                    | BotSettingsPersistenceState::RolledBack
+            ) {
+                msg_debug("[auto_workspace] path mapping was not persisted");
+            }
             msg_debug(&format!(
                 "[auto_workspace] chat_id={}, new workspace session created: {}",
                 chat_id.0, auto_path
@@ -5756,21 +7822,87 @@ fn bot_settings_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".cokacdir").join("bot_settings.json"))
 }
 
-/// Load bot settings from bot_settings.json
-fn load_bot_settings(token: &str) -> BotSettings {
-    let Some(path) = bot_settings_path() else {
-        return BotSettings::default();
-    };
-    let Ok(content) = fs::read_to_string(&path) else {
-        return BotSettings::default();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return BotSettings::default();
-    };
+fn read_bot_settings_json(path: &Path) -> std::io::Result<serde_json::Value> {
+    let contents = read_private_regular_file_bounded(path, MAX_BOT_SETTINGS_BYTES)?;
+    serde_json::from_slice(&contents)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn load_bot_settings_for_startup(token: &str) -> Result<BotSettings, String> {
+    let path = bot_settings_path().ok_or_else(|| "cannot determine home directory".to_string())?;
+    load_bot_settings_for_startup_from_path(token, &path)
+}
+
+fn load_bot_settings_for_startup_from_path(
+    token: &str,
+    path: &Path,
+) -> Result<BotSettings, String> {
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BotSettings::default()),
+        Err(error) => Err(format!("cannot inspect bot settings: {error}")),
+        Ok(_) => load_bot_settings_snapshot_strict_from_path(token, path)
+            .map(|snapshot| snapshot.settings),
+    }
+}
+
+fn classify_bot_settings_startup_result(
+    result: Result<BotSettings, String>,
+) -> Result<BotSettings, (BotExit, String)> {
+    result.map_err(|error| (BotExit::Fatal, error))
+}
+
+struct BotSettingsDiskSnapshot {
+    entry: Option<serde_json::Value>,
+    settings: BotSettings,
+}
+
+fn load_bot_settings_snapshot_strict(token: &str) -> Result<BotSettingsDiskSnapshot, String> {
+    let path = bot_settings_path().ok_or_else(|| "cannot determine home directory".to_string())?;
+    load_bot_settings_snapshot_strict_from_path(token, &path)
+}
+
+fn load_bot_settings_snapshot_strict_from_path(
+    token: &str,
+    path: &Path,
+) -> Result<BotSettingsDiskSnapshot, String> {
+    let json = read_bot_settings_json(&path)
+        .map_err(|error| format!("cannot read bot settings: {error}"))?;
+    parse_bot_settings_snapshot_strict(token, &json)
+}
+
+fn parse_bot_settings_snapshot_strict(
+    token: &str,
+    json: &serde_json::Value,
+) -> Result<BotSettingsDiskSnapshot, String> {
+    let root = json
+        .as_object()
+        .ok_or_else(|| "bot settings root is not a JSON object".to_string())?;
     let key = token_hash(token);
-    let Some(entry) = json.get(&key) else {
-        return BotSettings::default();
+    let Some(entry) = root.get(&key) else {
+        return Ok(BotSettingsDiskSnapshot {
+            entry: None,
+            settings: BotSettings::default(),
+        });
     };
+    if !entry.is_object() {
+        return Err("bot settings entry is not a JSON object".to_string());
+    }
+    if entry.get("token").and_then(|value| value.as_str()) != Some(token) {
+        return Err("bot settings entry token does not match its hash key".to_string());
+    }
+    if entry
+        .get("owner_user_id")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err("bot settings owner_user_id is present but is not a u64".to_string());
+    }
+    Ok(BotSettingsDiskSnapshot {
+        entry: Some(entry.clone()),
+        settings: parse_bot_settings_entry(entry),
+    })
+}
+
+fn parse_bot_settings_entry(entry: &serde_json::Value) -> BotSettings {
     let owner_user_id = entry.get("owner_user_id").and_then(|v| v.as_u64());
     let last_sessions: HashMap<String, String> = entry
         .get("last_sessions")
@@ -6140,41 +8272,7 @@ fn load_bot_settings(token: &str) -> BotSettings {
     }
 }
 
-/// Save bot settings to bot_settings.json
-fn save_bot_settings(token: &str, settings: &BotSettings) {
-    let Some(path) = bot_settings_path() else {
-        return;
-    };
-    // Ensure directory exists
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
-    }
-    // Use file lock to prevent race condition when multiple bots save simultaneously
-    let lock_path = path.with_extension("json.lock");
-    let lock_file = match fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-    use fs2::FileExt;
-    if lock_file.lock_exclusive().is_err() {
-        return;
-    }
-    // Read-modify-write under exclusive lock
-    let mut json: serde_json::Value = if let Ok(content) = fs::read_to_string(&path) {
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    let key = token_hash(token);
+fn bot_settings_entry_value(token: &str, settings: &BotSettings) -> serde_json::Value {
     let mut entry = serde_json::json!({
         "token": token,
         "allowed_tools": settings.allowed_tools,
@@ -6210,59 +8308,430 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
     }
-    json[key] = entry;
-    if let Ok(s) = serde_json::to_string_pretty(&json) {
-        let tmp_path = path.with_extension("json.tmp");
-        // Create tmp with 0o600 *atomically* on unix so the post-write
-        // window between fs::write (defaulting to 0o644 minus umask) and
-        // a follow-up set_permissions cannot expose the bot token to
-        // another local user. We remove any leftover tmp from a prior
-        // crash first, because `OpenOptions::mode` only applies to
-        // newly-created files — re-opening a stale tmp with looser
-        // permissions would silently keep them.
-        let write_ok = {
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let _ = fs::remove_file(&tmp_path);
-                let mut opts = fs::OpenOptions::new();
-                opts.write(true).create_new(true).mode(0o600);
-                match opts.open(&tmp_path) {
-                    Ok(mut f) => f.write_all(s.as_bytes()).is_ok(),
-                    Err(_) => false,
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                fs::write(&tmp_path, &s).is_ok()
-            }
+    entry
+}
+
+fn serialize_updated_bot_settings_document(
+    mut json: serde_json::Value,
+    token: &str,
+    settings: &BotSettings,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    parse_bot_settings_snapshot_strict(token, &json)
+        .map_err(|error| format!("refusing to overwrite invalid bot settings entry: {error}"))?;
+    let root = json.as_object_mut().ok_or_else(|| {
+        "refusing to overwrite bot settings whose root is not an object".to_string()
+    })?;
+    root.insert(token_hash(token), bot_settings_entry_value(token, settings));
+    let serialized = serde_json::to_vec_pretty(&json)
+        .map_err(|e| format!("cannot serialize bot settings: {e}"))?;
+    if serialized.len() > max_bytes {
+        return Err(format!(
+            "refusing to write bot settings larger than {max_bytes} bytes ({} bytes)",
+            serialized.len()
+        ));
+    }
+    Ok(serialized)
+}
+
+/// Save bot settings to bot_settings.json
+fn write_bot_settings(token: &str, settings: &BotSettings) -> Result<(), String> {
+    let path = bot_settings_path().ok_or_else(|| "cannot determine home directory".to_string())?;
+    let directory = PrivateDirectory::open_or_create(private_parent(&path))
+        .map_err(|e| format!("unsafe or unavailable settings directory: {e}"))?;
+    // Use file lock to prevent race condition when multiple bots save simultaneously
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = private_file_name(&lock_path)
+        .and_then(|file_name| open_private_file_in_directory(&directory, file_name, false))
+        .map_err(|e| format!("cannot open bot settings lock: {e}"))?;
+    use fs2::FileExt;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("cannot lock bot settings: {e}"))?;
+    // Read-modify-write under exclusive lock
+    let settings_file_name =
+        private_file_name(&path).map_err(|e| format!("invalid bot settings path: {e}"))?;
+    let json: serde_json::Value = match read_private_regular_file_bounded_in_directory(
+        &directory,
+        settings_file_name,
+        MAX_BOT_SETTINGS_BYTES,
+    ) {
+        Ok(content) => serde_json::from_slice(&content).map_err(|e| {
+            // Do not replace malformed settings; it may contain every other
+            // bot's only copy.
+            format!("refusing to overwrite invalid bot settings JSON: {e}")
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("cannot read bot settings: {e}")),
+    };
+    let serialized =
+        serialize_updated_bot_settings_document(json, token, settings, MAX_BOT_SETTINGS_BYTES)?;
+    write_private_file_atomically_in_directory(&directory, settings_file_name, &serialized)
+        .map_err(|e| format!("cannot atomically replace bot settings: {e}"))?;
+    directory
+        .verify_current_path()
+        .map_err(|e| format!("bot settings directory changed after replacement: {e}"))?;
+    // lock released when lock_file is dropped
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotSettingsPersistenceState {
+    Saved,
+    AppliedDurabilityUncertain,
+    ReconciledFromDisk,
+    RolledBack,
+}
+
+struct BotSettingsPersistence {
+    state: BotSettingsPersistenceState,
+    effective: BotSettings,
+    detail: String,
+}
+
+fn reconcile_bot_settings_write(
+    previous: &BotSettings,
+    desired: &BotSettings,
+    desired_entry: &serde_json::Value,
+    write_result: Result<(), String>,
+    disk_after_error: Option<Result<BotSettingsDiskSnapshot, String>>,
+) -> BotSettingsPersistence {
+    let Err(write_error) = write_result else {
+        return BotSettingsPersistence {
+            state: BotSettingsPersistenceState::Saved,
+            effective: desired.clone(),
+            detail: String::new(),
         };
-        if write_ok {
-            // Rename preserves the 0o600 bits set above. The follow-up
-            // set_permissions is retained as a safety net for the rare
-            // case where `path` already existed with looser permissions
-            // and was hardlinked somewhere — rename replaces the inode,
-            // but `set_permissions` here is harmless and self-documenting.
-            let _ = fs::rename(&tmp_path, &path);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-            }
-        } else {
-            // Best-effort cleanup of partial tmp file on write failure.
-            let _ = fs::remove_file(&tmp_path);
+    };
+
+    match disk_after_error
+        .unwrap_or_else(|| Err("bot settings were not reloaded after a write failure".to_string()))
+    {
+        Ok(snapshot) if snapshot.entry.as_ref() == Some(desired_entry) => BotSettingsPersistence {
+            state: BotSettingsPersistenceState::AppliedDurabilityUncertain,
+            effective: desired.clone(),
+            detail: write_error,
+        },
+        Ok(snapshot) => BotSettingsPersistence {
+            state: BotSettingsPersistenceState::ReconciledFromDisk,
+            effective: snapshot.settings,
+            detail: write_error,
+        },
+        Err(reload_error) => BotSettingsPersistence {
+            state: BotSettingsPersistenceState::RolledBack,
+            effective: previous.clone(),
+            detail: format!("{write_error}; strict reload failed: {reload_error}"),
+        },
+    }
+}
+
+fn persist_bot_settings_change(
+    token: &str,
+    settings: &mut BotSettings,
+    previous: BotSettings,
+) -> BotSettingsPersistenceState {
+    let desired = settings.clone();
+    let desired_entry = bot_settings_entry_value(token, &desired);
+    let write_result = write_bot_settings(token, &desired);
+    let disk_after_error = write_result
+        .as_ref()
+        .err()
+        .map(|_| load_bot_settings_snapshot_strict(token));
+    let outcome = reconcile_bot_settings_write(
+        &previous,
+        &desired,
+        &desired_entry,
+        write_result,
+        disk_after_error,
+    );
+    *settings = outcome.effective.clone();
+    match outcome.state {
+        BotSettingsPersistenceState::Saved => {}
+        BotSettingsPersistenceState::AppliedDurabilityUncertain => msg_debug(&format!(
+            "[save_bot_settings] applied, but durability is uncertain: {}",
+            outcome.detail
+        )),
+        BotSettingsPersistenceState::ReconciledFromDisk => msg_debug(&format!(
+            "[save_bot_settings] write failed; runtime reconciled from disk: {}",
+            outcome.detail
+        )),
+        BotSettingsPersistenceState::RolledBack => msg_debug(&format!(
+            "[save_bot_settings] write/reload failed; runtime rolled back: {}",
+            outcome.detail
+        )),
+    }
+    outcome.state
+}
+
+fn bot_settings_persistence_message(
+    state: BotSettingsPersistenceState,
+    success_message: &str,
+) -> String {
+    match state {
+        BotSettingsPersistenceState::Saved => success_message.to_string(),
+        BotSettingsPersistenceState::AppliedDurabilityUncertain => format!(
+            "⚠️ {success_message}\nThe setting was applied, but durable persistence could not be confirmed."
+        ),
+        BotSettingsPersistenceState::ReconciledFromDisk => {
+            "❌ The setting was not kept; effective settings were reloaded from disk.".to_string()
+        }
+        BotSettingsPersistenceState::RolledBack => {
+            "❌ The setting could not be saved; the runtime change was rolled back.".to_string()
         }
     }
-    // lock released when lock_file is dropped
+}
+
+#[cfg(test)]
+mod bot_settings_persistence_tests {
+    use super::{
+        bot_settings_entry_value, bot_settings_persistence_message,
+        classify_bot_settings_startup_result, load_bot_settings_for_startup_from_path,
+        reconcile_bot_settings_write, serialize_updated_bot_settings_document, BotExit,
+        BotSettings, BotSettingsDiskSnapshot, BotSettingsPersistenceState,
+    };
+
+    const TOKEN: &str = "123456:test-token";
+
+    fn same_settings(left: &BotSettings, right: &BotSettings) -> bool {
+        bot_settings_entry_value(TOKEN, left) == bot_settings_entry_value(TOKEN, right)
+    }
+
+    #[test]
+    fn precommit_write_failure_restores_the_last_valid_disk_state() {
+        let previous = BotSettings::default();
+        let mut desired = previous.clone();
+        desired.debug = !previous.debug;
+        let desired_entry = bot_settings_entry_value(TOKEN, &desired);
+        let disk_snapshot = BotSettingsDiskSnapshot {
+            entry: Some(bot_settings_entry_value(TOKEN, &previous)),
+            settings: previous.clone(),
+        };
+
+        let outcome = reconcile_bot_settings_write(
+            &previous,
+            &desired,
+            &desired_entry,
+            Err("rename failed before commit".to_string()),
+            Some(Ok(disk_snapshot)),
+        );
+
+        assert_eq!(
+            outcome.state,
+            BotSettingsPersistenceState::ReconciledFromDisk
+        );
+        assert!(same_settings(&outcome.effective, &previous));
+    }
+
+    #[test]
+    fn postcommit_error_keeps_the_value_verified_on_disk() {
+        let previous = BotSettings::default();
+        let mut desired = previous.clone();
+        desired.debug = !previous.debug;
+        let desired_entry = bot_settings_entry_value(TOKEN, &desired);
+        let disk_snapshot = BotSettingsDiskSnapshot {
+            entry: Some(desired_entry.clone()),
+            settings: desired.clone(),
+        };
+
+        let outcome = reconcile_bot_settings_write(
+            &previous,
+            &desired,
+            &desired_entry,
+            Err("directory sync failed after rename".to_string()),
+            Some(Ok(disk_snapshot)),
+        );
+
+        assert_eq!(
+            outcome.state,
+            BotSettingsPersistenceState::AppliedDurabilityUncertain
+        );
+        assert!(same_settings(&outcome.effective, &desired));
+    }
+
+    #[test]
+    fn write_and_strict_reload_failure_rolls_runtime_back() {
+        let previous = BotSettings::default();
+        let mut desired = previous.clone();
+        desired.debug = !previous.debug;
+        let desired_entry = bot_settings_entry_value(TOKEN, &desired);
+
+        let outcome = reconcile_bot_settings_write(
+            &previous,
+            &desired,
+            &desired_entry,
+            Err("write failed".to_string()),
+            Some(Err("malformed disk document".to_string())),
+        );
+
+        assert_eq!(outcome.state, BotSettingsPersistenceState::RolledBack);
+        assert!(same_settings(&outcome.effective, &previous));
+    }
+
+    #[test]
+    fn persistence_messages_never_claim_unverified_success() {
+        let success = "SETTING_APPLIED";
+        assert_eq!(
+            bot_settings_persistence_message(BotSettingsPersistenceState::Saved, success),
+            success
+        );
+        let uncertain = bot_settings_persistence_message(
+            BotSettingsPersistenceState::AppliedDurabilityUncertain,
+            success,
+        );
+        assert!(uncertain.contains(success));
+        assert!(uncertain.contains("could not be confirmed"));
+        for state in [
+            BotSettingsPersistenceState::ReconciledFromDisk,
+            BotSettingsPersistenceState::RolledBack,
+        ] {
+            assert!(!bot_settings_persistence_message(state, success).contains(success));
+        }
+    }
+
+    #[test]
+    fn serializer_rejects_non_object_roots_and_oversized_documents() {
+        let settings = BotSettings::default();
+        assert!(serialize_updated_bot_settings_document(
+            serde_json::json!([]),
+            TOKEN,
+            &settings,
+            usize::MAX,
+        )
+        .is_err());
+        let mut mismatched_entry = serde_json::json!({});
+        mismatched_entry.as_object_mut().unwrap().insert(
+            super::token_hash(TOKEN),
+            serde_json::json!({"token": "different-token"}),
+        );
+        assert!(serialize_updated_bot_settings_document(
+            mismatched_entry,
+            TOKEN,
+            &settings,
+            usize::MAX,
+        )
+        .is_err());
+
+        let serialized = serialize_updated_bot_settings_document(
+            serde_json::json!({}),
+            TOKEN,
+            &settings,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(serialize_updated_bot_settings_document(
+            serde_json::json!({}),
+            TOKEN,
+            &settings,
+            serialized.len(),
+        )
+        .is_ok());
+        assert!(serialize_updated_bot_settings_document(
+            serde_json::json!({}),
+            TOKEN,
+            &settings,
+            serialized.len() - 1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn startup_uses_defaults_only_when_settings_file_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing").join("bot_settings.json");
+
+        let loaded = load_bot_settings_for_startup_from_path(TOKEN, &path).unwrap();
+
+        assert!(same_settings(&loaded, &BotSettings::default()));
+    }
+
+    #[test]
+    fn malformed_existing_settings_are_classified_as_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings").join("bot_settings.json");
+        super::write_private_file_atomically(&path, b"{ malformed").unwrap();
+
+        let outcome = classify_bot_settings_startup_result(
+            load_bot_settings_for_startup_from_path(TOKEN, &path),
+        );
+
+        assert!(matches!(outcome, Err((BotExit::Fatal, _))));
+    }
+
+    #[test]
+    fn non_object_existing_settings_are_classified_as_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings").join("bot_settings.json");
+        super::write_private_file_atomically(&path, b"[]").unwrap();
+
+        let outcome = classify_bot_settings_startup_result(
+            load_bot_settings_for_startup_from_path(TOKEN, &path),
+        );
+
+        assert!(matches!(outcome, Err((BotExit::Fatal, _))));
+    }
+
+    #[test]
+    fn invalid_present_owner_is_classified_as_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings").join("bot_settings.json");
+        let mut document = serde_json::json!({});
+        document.as_object_mut().unwrap().insert(
+            super::token_hash(TOKEN),
+            serde_json::json!({"token": TOKEN, "owner_user_id": null}),
+        );
+        let serialized = serde_json::to_vec(&document).unwrap();
+        super::write_private_file_atomically(&path, &serialized).unwrap();
+
+        let outcome = classify_bot_settings_startup_result(
+            load_bot_settings_for_startup_from_path(TOKEN, &path),
+        );
+
+        assert!(matches!(outcome, Err((BotExit::Fatal, _))));
+    }
+
+    #[test]
+    fn missing_owner_in_valid_existing_entry_remains_an_initial_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings").join("bot_settings.json");
+        let mut document = serde_json::json!({});
+        document.as_object_mut().unwrap().insert(
+            super::token_hash(TOKEN),
+            serde_json::json!({"token": TOKEN}),
+        );
+        let serialized = serde_json::to_vec(&document).unwrap();
+        super::write_private_file_atomically(&path, &serialized).unwrap();
+
+        let loaded = load_bot_settings_for_startup_from_path(TOKEN, &path).unwrap();
+
+        assert_eq!(loaded.owner_user_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_existing_settings_symlink_is_classified_as_fatal() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let settings_dir = root.path().join("settings");
+        super::ensure_private_directory(&settings_dir).unwrap();
+        let target = root.path().join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        let path = settings_dir.join("bot_settings.json");
+        symlink(&target, &path).unwrap();
+
+        let outcome = classify_bot_settings_startup_result(
+            load_bot_settings_for_startup_from_path(TOKEN, &path),
+        );
+
+        assert!(matches!(outcome, Err((BotExit::Fatal, _))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+    }
 }
 
 /// Resolve a bot token from its hash by searching bot_settings.json
 pub fn resolve_token_by_hash(hash: &str) -> Option<String> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let json = read_bot_settings_json(&path).ok()?;
     let obj = json.as_object()?;
     let entry = obj.get(hash)?;
     entry
@@ -6281,20 +8750,10 @@ pub fn resolve_username_by_hash(hash: &str) -> Option<String> {
             return None;
         }
     };
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
+    let json = match read_bot_settings_json(&path) {
+        Ok(json) => json,
         Err(e) => {
             msg_debug(&format!("[resolve_username_by_hash] read failed: {}", e));
-            return None;
-        }
-    };
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            msg_debug(&format!(
-                "[resolve_username_by_hash] JSON parse failed: {}",
-                e
-            ));
             return None;
         }
     };
@@ -6331,12 +8790,8 @@ pub fn bot_username_exists(username: &str) -> bool {
         msg_debug("[bot_username_exists] bot_settings_path() returned None");
         return false;
     };
-    let Ok(content) = fs::read_to_string(&path) else {
+    let Ok(json) = read_bot_settings_json(&path) else {
         msg_debug("[bot_username_exists] read failed");
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        msg_debug("[bot_username_exists] JSON parse failed");
         return false;
     };
     let Some(obj) = json.as_object() else {
@@ -6361,8 +8816,7 @@ pub fn bot_username_exists(username: &str) -> bool {
 /// Resolve bot display_name from its username by searching bot_settings.json
 pub fn resolve_display_name_by_username(username: &str) -> Option<String> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let json = read_bot_settings_json(&path).ok()?;
     let obj = json.as_object()?;
     let target = username.to_lowercase();
     for entry in obj.values() {
@@ -7157,7 +9611,17 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
     } else {
         bot
     };
-    let mut bot_settings = load_bot_settings(token);
+    let mut bot_settings =
+        match classify_bot_settings_startup_result(load_bot_settings_for_startup(token)) {
+            Ok(settings) => settings,
+            Err((exit, error)) => {
+                eprintln!("  ✗ FATAL: refusing to start with unsafe bot settings: {error}");
+                msg_debug(&format!(
+                    "[run_bot] strict bot settings load failed: {error}"
+                ));
+                return exit;
+            }
+        };
 
     // Get bot's own username and display name for @mention filtering in group chats
     msg_debug("[run_bot] calling get_me to retrieve bot username");
@@ -7185,9 +9649,17 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
             "[run_bot] saving username to bot_settings: {}",
             bot_username
         ));
+        let previous = bot_settings.clone();
         bot_settings.username = bot_username.clone();
         bot_settings.display_name = bot_display_name.clone();
-        save_bot_settings(token, &bot_settings);
+        let persistence = persist_bot_settings_change(token, &mut bot_settings, previous);
+        if matches!(
+            persistence,
+            BotSettingsPersistenceState::ReconciledFromDisk
+                | BotSettingsPersistenceState::RolledBack
+        ) {
+            eprintln!("  ⚠ Bot identity metadata could not be persisted; continuing with reconciled settings");
+        }
     } else {
         msg_debug("[run_bot] bot_username is empty, skipping save");
     }
@@ -7266,6 +9738,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         loop_states: HashMap::new(),
         loop_feedback: HashMap::new(),
         clear_epoch: HashMap::new(),
+        companion_activity_epoch: HashMap::new(),
     }));
     let (request_tokens, request_tasks) = {
         let data = state.lock().await;
@@ -7631,7 +10104,7 @@ async fn process_batch(
 
 #[derive(Clone)]
 struct SttAudioUpload {
-    file_id: String,
+    file_id: teloxide::types::FileId,
     file_name: String,
     file_size_hint: u32,
 }
@@ -8111,6 +10584,8 @@ async fn ensure_transcriptor_binary(
         ));
         out.flush()
             .map_err(|e| format!("Failed to flush transcriptor download: {e}"))?;
+        out.sync_all()
+            .map_err(|e| format!("Failed to sync transcriptor download: {e}"))?;
         Ok(downloaded)
     }
     .await;
@@ -8141,37 +10616,13 @@ async fn ensure_transcriptor_binary(
         return Err(e);
     }
 
-    if path.exists() {
-        match fs::remove_file(&path) {
-            Ok(_) => msg_debug(&format!(
-                "[stt:{trace_id}:bin] removed old binary before install"
-            )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                msg_debug(&format!(
-                    "[stt:{trace_id}:bin] failed to remove old binary before install: {}",
-                    truncate_str(&e.to_string(), 500)
-                ));
-                let _ = fs::remove_file(&tmp_path);
-                return Err(format!("Failed to replace old transcriptor binary: {e}"));
-            }
-        }
-    }
-
-    match fs::rename(&tmp_path, &path) {
-        Ok(_) => {}
-        Err(e) => {
-            if transcriptor_binary_is_present(&path) {
-                msg_debug(&format!(
-                    "[stt:{trace_id}:bin] install rename failed but destination exists: {}",
-                    truncate_str(&e.to_string(), 500)
-                ));
-                let _ = fs::remove_file(&tmp_path);
-            } else {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(format!("Failed to install transcriptor: {e}"));
-            }
-        }
+    if let Err(e) = replace_file_preserving_existing(&tmp_path, &path) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] atomic install failed: {}",
+            truncate_str(&e.to_string(), 500)
+        ));
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("Failed to install transcriptor: {e}"));
     }
     make_transcriptor_executable(&path)?;
     msg_debug(&format!(
@@ -8327,7 +10778,7 @@ async fn download_stt_audio_to_temp(
         ));
         return Err(stt_cancelled_error());
     }
-    let file_result = await_stt_or_cancel(bot.get_file(&info.file_id), cancel_token).await?;
+    let file_result = await_stt_or_cancel(bot.get_file(info.file_id.clone()), cancel_token).await?;
     let file = match tg!("get_file", file_result) {
         Ok(file) => file,
         Err(e) => {
@@ -10127,8 +12578,20 @@ async fn handle_album_batch(
         let require_prefix = is_group_chat && !is_direct;
         match data.settings.owner_user_id {
             None => {
+                let previous = data.settings.clone();
                 data.settings.owner_user_id = Some(uid);
-                save_bot_settings(token, &data.settings);
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                if matches!(
+                    persistence,
+                    BotSettingsPersistenceState::ReconciledFromDisk
+                        | BotSettingsPersistenceState::RolledBack
+                ) {
+                    msg_debug("[album_batch] owner imprint persistence failed; rejecting message");
+                    for m in &msgs {
+                        log_incoming_message(m, false, "owner_imprint_not_persisted");
+                    }
+                    return Ok(());
+                }
                 println!("  [{timestamp}] ★ Owner registered: {raw_user_name} (id:{uid})");
             }
             Some(owner_id) => {
@@ -10436,10 +12899,24 @@ async fn handle_message(
             None => {
                 // Imprint: register first user as owner
                 msg_debug(&format!("[handle_message] imprinting uid={} as owner", uid));
+                let previous = data.settings.clone();
                 data.settings.owner_user_id = Some(uid);
-                save_bot_settings(token, &data.settings);
-                println!("  [{timestamp}] ★ Owner registered: {raw_user_name} (id:{uid})");
-                (true, true)
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                if matches!(
+                    persistence,
+                    BotSettingsPersistenceState::ReconciledFromDisk
+                        | BotSettingsPersistenceState::RolledBack
+                ) {
+                    msg_debug("[handle_message] owner imprint persistence failed; rejecting");
+                    println!(
+                        "  [{timestamp}] ✗ Rejected: owner registration could not be persisted"
+                    );
+                    log_incoming_message(&msg, false, "owner_imprint_not_persisted");
+                    return Ok(());
+                } else {
+                    println!("  [{timestamp}] ★ Owner registered: {raw_user_name} (id:{uid})");
+                    (true, true)
+                }
             }
             Some(owner_id) => {
                 if uid != owner_id {
@@ -12090,10 +14567,9 @@ async fn handle_start_command(
                     "[handle_start_command] cross-provider fallback: switching from {} to {}",
                     provider_str, resolved_prov_str
                 ));
-                provider = resolved_prov;
-                provider_str = resolved_prov_str;
-                {
+                let switch_applied = {
                     let mut data = state.lock().await;
+                    let previous = data.settings.clone();
                     msg_debug(&format!(
                         "[handle_start_command] cross-provider: setting model to {:?}",
                         resolved_prov_str
@@ -12101,30 +14577,55 @@ async fn handle_start_command(
                     data.settings
                         .models
                         .insert(chat_id.0.to_string(), resolved_prov_str.to_string());
-                    save_bot_settings(token, &data.settings);
-                    // Mirror /model provider-switch cleanup: cancel in-flight task and drop
-                    // queued messages / loop state. Their captured pending_uploads point at the
-                    // old workspace's files, and verify-loop feedback was authored against the
-                    // old provider's session — both would be misapplied under the new provider.
-                    cancel_in_progress_task_locked(&data, chat_id);
-                    let dropped_queue = data
-                        .message_queues
-                        .remove(&chat_id)
-                        .map(|q| q.len())
-                        .unwrap_or(0);
-                    data.loop_states.remove(&chat_id);
-                    data.loop_feedback.remove(&chat_id);
-                    if let Some(session) = data.sessions.get_mut(&chat_id) {
-                        msg_debug(&format!("[handle_start_command] cross-provider: clearing old session (len={}, uploads={}, queue={}, sid={:?}, path={:?})",
-                            session.history.len(), session.pending_uploads.len(), dropped_queue, session.session_id, session.current_path));
-                        session.session_id = None;
-                        session.current_path = None;
-                        session.history.clear();
-                        session.clear_pending_uploads();
+                    let persistence =
+                        persist_bot_settings_change(token, &mut data.settings, previous);
+                    let applied = matches!(
+                        persistence,
+                        BotSettingsPersistenceState::Saved
+                            | BotSettingsPersistenceState::AppliedDurabilityUncertain
+                    );
+                    if !applied {
+                        false
                     } else {
-                        msg_debug(&format!("[handle_start_command] cross-provider: no existing session to clear (queue={})", dropped_queue));
+                        // Mirror /model provider-switch cleanup: cancel in-flight task and drop
+                        // queued messages / loop state. Their captured pending_uploads point at the
+                        // old workspace's files, and verify-loop feedback was authored against the
+                        // old provider's session — both would be misapplied under the new provider.
+                        cancel_in_progress_task_locked(&data, chat_id);
+                        let dropped_queue = data
+                            .message_queues
+                            .remove(&chat_id)
+                            .map(|q| q.len())
+                            .unwrap_or(0);
+                        data.loop_states.remove(&chat_id);
+                        data.loop_feedback.remove(&chat_id);
+                        if let Some(session) = data.sessions.get_mut(&chat_id) {
+                            msg_debug(&format!("[handle_start_command] cross-provider: clearing old session (len={}, uploads={}, queue={}, sid={:?}, path={:?})",
+                            session.history.len(), session.pending_uploads.len(), dropped_queue, session.session_id, session.current_path));
+                            session.session_id = None;
+                            session.current_path = None;
+                            session.history.clear();
+                            session.clear_pending_uploads();
+                        } else {
+                            msg_debug(&format!("[handle_start_command] cross-provider: no existing session to clear (queue={})", dropped_queue));
+                        }
+                        true
                     }
+                };
+                if !switch_applied {
+                    shared_rate_limit_wait(state, chat_id).await;
+                    tg!(
+                        "send_message",
+                        bot.send_message(
+                            chat_id,
+                            "Could not persist the provider switch; the previous model remains active."
+                        )
+                        .await
+                    )?;
+                    return Ok(());
                 }
+                provider = resolved_prov;
+                provider_str = resolved_prov_str;
                 cp
             } else {
                 // Final fallback: try as plain path
@@ -12419,10 +14920,11 @@ async fn handle_start_command(
     // Persist chat_id → path mapping for auto-restore after restart
     {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         data.settings
             .last_sessions
             .insert(chat_id.0.to_string(), canonical_path.clone());
-        save_bot_settings(token, &data.settings);
+        persist_bot_settings_change(token, &mut data.settings, previous);
     }
 
     // Append start marker to group chat log so other bots can see the new working directory
@@ -12778,26 +15280,32 @@ fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
         return None;
     }
     let suffix = format!("{}.jsonl", session_id);
-    fn walk(dir: &Path, suffix: &str) -> Option<std::path::PathBuf> {
-        for entry in fs::read_dir(dir).ok()?.flatten() {
+    let mut pending = vec![sessions_dir];
+    let mut jsonl_path = None;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
             let Ok(ft) = entry.file_type() else {
                 continue;
             };
             if ft.is_dir() {
-                if let Some(found) = walk(&entry.path(), suffix) {
-                    return Some(found);
-                }
+                pending.push(entry.path());
             } else if ft.is_file() {
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(suffix) {
-                        return Some(entry.path());
+                    if name.ends_with(&suffix) {
+                        jsonl_path = Some(entry.path());
+                        break;
                     }
                 }
             }
         }
-        None
+        if jsonl_path.is_some() {
+            break;
+        }
     }
-    let jsonl_path = walk(&sessions_dir, &suffix)?;
+    let jsonl_path = jsonl_path?;
     let cwd = extract_cwd_from_jsonl(&jsonl_path)?;
     Some(ResolvedSession {
         cwd,
@@ -12844,35 +15352,60 @@ fn find_agy_cwd_for_session(session_id: &str) -> Option<String> {
 }
 
 fn extract_agy_cwd_from_conversation(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
-    let mut current = Vec::new();
-    let mut candidates = Vec::new();
-    for b in bytes {
-        if b.is_ascii_graphic() || b == b' ' {
-            current.push(b);
-        } else if current.len() >= 4 {
-            if let Ok(s) = String::from_utf8(std::mem::take(&mut current)) {
-                candidates.push(s);
-            }
-        } else {
-            current.clear();
+    use std::io::Read;
+
+    const MAX_AGY_STRING_CANDIDATE_BYTES: usize = 64 * 1024;
+    fn cwd_from_candidate(bytes: &[u8]) -> Option<String> {
+        if bytes.len() < 4 {
+            return None;
         }
-    }
-    if current.len() >= 4 {
-        if let Ok(s) = String::from_utf8(current) {
-            candidates.push(s);
-        }
-    }
-    for s in candidates {
+        let s = std::str::from_utf8(bytes).ok()?;
         let raw = s
             .strip_prefix("file://")
-            .unwrap_or(&s)
+            .unwrap_or(s)
             .trim_matches(|c| c == '"' || c == '\'' || c == '`');
         if raw.starts_with('/') && Path::new(raw).is_dir() {
-            return Some(raw.to_string());
+            Some(raw.to_string())
+        } else {
+            None
         }
     }
-    None
+
+    let mut file = fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    let mut current = Vec::new();
+    let mut oversized = false;
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                if !oversized {
+                    if current.len() < MAX_AGY_STRING_CANDIDATE_BYTES {
+                        current.push(byte);
+                    } else {
+                        current.clear();
+                        oversized = true;
+                    }
+                }
+            } else {
+                if !oversized {
+                    if let Some(cwd) = cwd_from_candidate(&current) {
+                        return Some(cwd);
+                    }
+                    current.clear();
+                } else {
+                    oversized = false;
+                }
+            }
+        }
+    }
+    (!oversized).then(|| cwd_from_candidate(&current)).flatten()
 }
 
 /// OpenCode: query `~/.local/share/opencode/opencode.db` for a matching session ID.
@@ -12920,6 +15453,29 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
 /// Convert an external JSONL session to cokacdir SessionData and save it.
 /// Re-converts if the source JSONL is newer than the existing JSON, or if the
 /// existing JSON is a cleared/incomplete placeholder.
+fn session_source_latest_mtime(info: &ResolvedSession) -> Option<std::time::SystemTime> {
+    let mut latest = fs::symlink_metadata(&info.jsonl_path)
+        .ok()?
+        .modified()
+        .ok()?;
+    if info.provider == SessionProvider::OpenCode {
+        let mut wal_name = info.jsonl_path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal_path = PathBuf::from(wal_name);
+        match fs::symlink_metadata(wal_path) {
+            Ok(metadata) => {
+                let wal_mtime = metadata.modified().ok()?;
+                if wal_mtime > latest {
+                    latest = wal_mtime;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(latest)
+}
+
 fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     msg_debug(&format!(
         "[convert_session] start: jsonl={}, session_id={}, canonical_path={:?}",
@@ -12945,12 +15501,10 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
                 "[convert_session] target exists but is incomplete or mismatched; reconverting",
             );
         } else {
-            let source_mtime = info
-                .jsonl_path
-                .metadata()
+            let source_mtime = session_source_latest_mtime(info);
+            let target_mtime = fs::symlink_metadata(&target)
                 .ok()
                 .and_then(|m| m.modified().ok());
-            let target_mtime = target.metadata().ok().and_then(|m| m.modified().ok());
             msg_debug(&format!(
                 "[convert_session] target exists, source_mtime={:?}, target_mtime={:?}",
                 source_mtime, target_mtime
@@ -12961,8 +15515,10 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
                     return;
                 }
             } else {
-                msg_debug("[convert_session] skipped: cannot compare mtimes");
-                return;
+                // Failing open here retained stale conversations forever on
+                // metadata errors. Reparse instead; the atomic writer below
+                // preserves the prior target if conversion cannot finish.
+                msg_debug("[convert_session] cannot compare mtimes; reconverting safely");
             }
         }
     }
@@ -12986,16 +15542,23 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
         session_data.history.len(),
         session_data.provider
     ));
-    let _ = fs::create_dir_all(&sessions_dir);
-    if let Ok(json) = serde_json::to_string_pretty(&session_data) {
-        let write_result = fs::write(&target, &json);
-        msg_debug(&format!(
-            "[convert_session] write result={:?}, bytes={}",
-            write_result,
-            json.len()
-        ));
-    } else {
-        msg_debug("[convert_session] serde_json::to_string_pretty failed");
+    let json = match serde_json::to_vec_pretty(&session_data) {
+        Ok(json) => json,
+        Err(e) => {
+            msg_debug(&format!(
+                "[convert_session] serde_json::to_vec_pretty failed: {e}"
+            ));
+            return;
+        }
+    };
+    let write_result = write_private_file_atomically(&target, &json);
+    msg_debug(&format!(
+        "[convert_session] atomic write result={:?}, bytes={}",
+        write_result,
+        json.len()
+    ));
+    if write_result.is_err() {
+        return;
     }
 
     crate::services::session_archive::archive_and_save_session(
@@ -13031,8 +15594,9 @@ fn session_data_has_active_session(session_data: &SessionData) -> bool {
 #[cfg(test)]
 mod session_conversion_tests {
     use super::{
-        converted_session_file_is_complete, session_data_has_active_session, HistoryItem,
-        HistoryType, SessionData,
+        converted_session_file_is_complete, extract_agy_cwd_from_conversation,
+        session_data_has_active_session, session_source_latest_mtime, HistoryItem, HistoryType,
+        ResolvedSession, SessionData, SessionProvider,
     };
 
     fn write_session_file(path: &std::path::Path, data: &SessionData) {
@@ -13128,6 +15692,51 @@ mod session_conversion_tests {
 
         data.session_id.clear();
         assert!(!session_data_has_active_session(&data));
+    }
+
+    #[test]
+    fn opencode_freshness_includes_uncheckpointed_wal_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode.db");
+        let wal = dir.path().join("opencode.db-wal");
+        std::fs::write(&db, b"db").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+        filetime::set_file_mtime(&db, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+        filetime::set_file_mtime(&wal, filetime::FileTime::from_unix_time(200, 0)).unwrap();
+        let info = ResolvedSession {
+            cwd: dir.path().display().to_string(),
+            jsonl_path: db,
+            session_id: "session".to_string(),
+            provider: SessionProvider::OpenCode,
+        };
+
+        let latest = session_source_latest_mtime(&info).unwrap();
+
+        assert_eq!(
+            latest
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            200
+        );
+    }
+
+    #[test]
+    fn agy_cwd_scan_is_streaming_and_recovers_after_oversized_binary_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let conversation = dir.path().join("conversation.pb");
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let mut bytes = vec![b'x'; 70 * 1024];
+        bytes.push(0);
+        bytes.extend_from_slice(format!("file://{}", cwd.display()).as_bytes());
+        bytes.push(0);
+        std::fs::write(&conversation, bytes).unwrap();
+
+        assert_eq!(
+            extract_agy_cwd_from_conversation(&conversation).as_deref(),
+            cwd.to_str()
+        );
     }
 }
 
@@ -13274,30 +15883,33 @@ fn collect_best_codex_jsonl(
     best_path: &mut Option<std::path::PathBuf>,
     best_time: &mut std::time::SystemTime,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
-        if ft.is_dir() {
-            collect_best_codex_jsonl(&entry.path(), canonical_path, best_path, best_time);
-        } else if ft.is_file() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
                 continue;
-            }
-            if let Some(cwd) = extract_cwd_from_jsonl(&path) {
-                if cwd == canonical_path {
-                    let mtime = path
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    if mtime > *best_time {
-                        *best_path = Some(path);
-                        *best_time = mtime;
+            };
+            if ft.is_dir() {
+                pending.push(entry.path());
+            } else if ft.is_file() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Some(cwd) = extract_cwd_from_jsonl(&path) {
+                    if cwd == canonical_path {
+                        let mtime = path
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        if mtime > *best_time {
+                            *best_path = Some(path);
+                            *best_time = mtime;
+                        }
                     }
                 }
             }
@@ -13953,10 +16565,11 @@ async fn handle_workspace_resume(
     // Persist chat_id → path mapping for auto-restore after restart
     {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         data.settings
             .last_sessions
             .insert(chat_id.0.to_string(), canonical_path);
-        save_bot_settings(token, &data.settings);
+        persist_bot_settings_change(token, &mut data.settings, previous);
     }
 
     let response_text = response_lines.join("\n");
@@ -14054,9 +16667,15 @@ async fn handle_clear_command(
                                 {
                                     let cleared = serde_json::json!({"current_path": *path, "provider": provider});
                                     if let Ok(json) = serde_json::to_string_pretty(&cleared) {
-                                        let _ = fs::write(&file_path, json);
+                                        if write_private_file_atomically(
+                                            &file_path,
+                                            json.as_bytes(),
+                                        )
+                                        .is_ok()
+                                        {
+                                            cleared_files.push(file_path);
+                                        }
                                     }
-                                    cleared_files.push(file_path);
                                 }
                             }
                         }
@@ -14181,7 +16800,7 @@ async fn handle_session_command(
         (Some(id), Some(path)) => {
             let resume_cmd = match session_prov {
                 "codex" => format!("codex resume {}", id),
-                "agy" => format!("agy --conversation {} --print \"\"", id),
+                "agy" => format!("agy --conversation {}", id),
                 "opencode" => format!("opencode -s {}", id),
                 _ => format!("claude --resume {}", id),
             };
@@ -14647,6 +17266,99 @@ async fn handle_down_command(
 }
 
 /// Handle file/photo upload - save to current session path
+#[derive(Debug)]
+enum BoundedDownloadError {
+    HttpStatus(reqwest::StatusCode),
+    TooLarge { observed: u64, maximum: usize },
+    Read(reqwest::Error),
+}
+
+async fn read_response_body_bounded(
+    mut response: reqwest::Response,
+    maximum: usize,
+) -> Result<Vec<u8>, BoundedDownloadError> {
+    if !response.status().is_success() {
+        return Err(BoundedDownloadError::HttpStatus(response.status()));
+    }
+    if let Some(length) = response.content_length() {
+        if length > maximum as u64 {
+            return Err(BoundedDownloadError::TooLarge {
+                observed: length,
+                maximum,
+            });
+        }
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(BoundedDownloadError::Read)? {
+        let next_len =
+            bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(BoundedDownloadError::TooLarge {
+                    observed: u64::MAX,
+                    maximum,
+                })?;
+        if next_len > maximum {
+            return Err(BoundedDownloadError::TooLarge {
+                observed: next_len as u64,
+                maximum,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod bounded_upload_download_tests {
+    use super::{read_response_body_bounded, BoundedDownloadError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn response_from(raw_response: &'static [u8]) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(raw_response)
+                .await
+                .expect("write response");
+        });
+        reqwest::get(format!("http://{addr}/file"))
+            .await
+            .expect("request test response")
+    }
+
+    #[tokio::test]
+    async fn http_error_body_is_not_accepted_as_an_uploaded_file() {
+        let response = response_from(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"ok\":false}\n\n\n",
+        )
+        .await;
+        let error = read_response_body_bounded(response, 1024)
+            .await
+            .expect_err("404 body must not be saved");
+        assert!(matches!(error, BoundedDownloadError::HttpStatus(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_length_body_is_stopped_at_runtime_limit() {
+        let response = response_from(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nABCD\r\n4\r\nEFGH\r\n0\r\n\r\n",
+        )
+        .await;
+        let error = read_response_body_bounded(response, 6)
+            .await
+            .expect_err("chunked body must be bounded while streaming");
+        assert!(matches!(error, BoundedDownloadError::TooLarge { .. }));
+    }
+}
+
 async fn handle_file_upload(
     bot: &Bot,
     chat_id: ChatId,
@@ -14770,7 +17482,7 @@ async fn handle_file_upload(
 
     // Download file from Telegram via HTTP
     shared_rate_limit_wait(state, chat_id).await;
-    let file = tg!("get_file", bot.get_file(&file_id).await)?;
+    let file = tg!("get_file", bot.get_file(file_id).await)?;
     let base = {
         let data = state.lock().await;
         data.api_base_url.clone()
@@ -14788,19 +17500,26 @@ async fn handle_file_upload(
         let s = e.to_string();
         s.replace(&token, "<bot_token_redacted>")
     };
-    let buf = match reqwest::get(&url).await {
-        Ok(resp) => match resp.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                shared_rate_limit_wait(state, chat_id).await;
-                tg!(
-                    "send_message",
-                    bot.send_message(chat_id, &format!("Download failed: {}", scrub(e)))
-                        .await
-                )?;
-                return Ok(None);
-            }
-        },
+    let download_client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        // Covers headers and streamed body, preventing a stalled or
+        // indefinitely trickling endpoint from pinning this chat worker.
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, &format!("Download setup failed: {}", scrub(e)))
+                    .await
+            )?;
+            return Ok(None);
+        }
+    };
+    let response = match download_client.get(&url).send().await {
+        Ok(response) => response,
         Err(e) => {
             shared_rate_limit_wait(state, chat_id).await;
             tg!(
@@ -14808,6 +17527,25 @@ async fn handle_file_upload(
                 bot.send_message(chat_id, &format!("Download failed: {}", scrub(e)))
                     .await
             )?;
+            return Ok(None);
+        }
+    };
+    let buf = match read_response_body_bounded(response, MAX_DOWNLOAD_SIZE as usize).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let message = match error {
+                BoundedDownloadError::HttpStatus(status) => {
+                    format!("Download failed: HTTP {}", status)
+                }
+                BoundedDownloadError::TooLarge { observed, maximum } => format!(
+                    "File too large ({:.1}MB). Maximum size is {:.0}MB.",
+                    observed as f64 / (1024.0 * 1024.0),
+                    maximum as f64 / (1024.0 * 1024.0)
+                ),
+                BoundedDownloadError::Read(e) => format!("Download failed: {}", scrub(e)),
+            };
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, message).await)?;
             return Ok(None);
         }
     };
@@ -15375,29 +18113,20 @@ async fn handle_shell_command(
                                     .await
                             );
 
-                            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                            if let Some(home) = dirs::home_dir() {
-                                let tmp_dir = home.join(".cokacdir").join("tmp");
-                                let _ = std::fs::create_dir_all(&tmp_dir);
-                                let tmp_path = tmp_dir
-                                    .join(format!("cokacdir_shell_{}_{}.txt", chat_id.0, timestamp))
-                                    .display()
-                                    .to_string();
-                                if std::fs::write(&tmp_path, &file_content).is_ok() {
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!(
-                                        "send_document",
-                                        bot_owned
-                                            .send_document(
-                                                chat_id,
-                                                teloxide::types::InputFile::file(
-                                                    std::path::Path::new(&tmp_path)
-                                                ),
-                                            )
-                                            .await
-                                    );
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                }
+                            let name_hint = format!("shell_{}", chat_id.0);
+                            if let Ok(tmp_file) =
+                                PrivateTempFile::create(&name_hint, "txt", file_content.as_bytes())
+                            {
+                                shared_rate_limit_wait(&state_owned, chat_id).await;
+                                let _ = tg!(
+                                    "send_document",
+                                    bot_owned
+                                        .send_document(
+                                            chat_id,
+                                            teloxide::types::InputFile::file(tmp_file.path()),
+                                        )
+                                        .await
+                                );
                             }
                         }
                     } else {
@@ -15752,24 +18481,51 @@ async fn handle_setpollingtime_command(
         return Ok(());
     }
 
-    // Update in-memory state
-    {
+    // Persist first. `Settings::save` can report an error after the atomic
+    // rename (for example, when the directory fsync fails), so an error alone
+    // does not prove that the on-disk value stayed unchanged. Reload before
+    // deciding whether the runtime state should follow the requested value.
+    let (apply_runtime, response) = match crate::config::Settings::load_with_error() {
+        Ok(mut app_settings) => {
+            app_settings.telegram_polling_time = value;
+            match app_settings.save() {
+                Ok(()) => (true, format!("✅ Polling time set to {value}ms")),
+                Err(save_error) => match crate::config::Settings::load_with_error() {
+                    Ok(persisted) if persisted.telegram_polling_time == value => (
+                        true,
+                        format!(
+                            "⚠️ Polling time is {value}ms, but durable persistence could not be confirmed: {save_error}"
+                        ),
+                    ),
+                    Ok(persisted) => (
+                        false,
+                        format!(
+                            "Could not save polling time; runtime is unchanged. Disk currently reports {}ms. Save error: {save_error}",
+                            persisted.telegram_polling_time
+                        ),
+                    ),
+                    Err(reload_error) => (
+                        false,
+                        format!(
+                            "Polling-time persistence is uncertain; runtime is unchanged. Save error: {save_error}. Reload error: {reload_error}"
+                        ),
+                    ),
+                },
+            }
+        }
+        Err(error) => (
+            false,
+            format!("Could not load current settings; polling time is unchanged: {error}"),
+        ),
+    };
+
+    if apply_runtime {
         let mut data = state.lock().await;
         data.polling_time_ms = value;
     }
 
-    // Save to settings.json
-    if let Ok(mut app_settings) = crate::config::Settings::load_with_error() {
-        app_settings.telegram_polling_time = value;
-        let _ = app_settings.save();
-    }
-
     shared_rate_limit_wait(state, chat_id).await;
-    tg!(
-        "send_message",
-        bot.send_message(chat_id, format!("✅ Polling time set to {}ms", value))
-            .await
-    )?;
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
 
     Ok(())
 }
@@ -15805,24 +18561,24 @@ async fn handle_debug_command(
         "[handle_debug] chat_id={}, {} → {}",
         chat_id.0, prev, next
     ));
-    {
+    let (effective, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         data.settings.debug = next;
-        save_bot_settings(token, &data.settings);
-    }
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        (data.settings.debug, persistence)
+    };
     let global_enabled = refresh_global_debug_flags();
-    let status = if next { "ON" } else { "OFF" };
-    let note = if !next && global_enabled {
+    let status = if effective { "ON" } else { "OFF" };
+    let note = if !effective && global_enabled {
         "\nShared debug logging is still ON because another bot or COKACDIR_DEBUG=1 enables it."
     } else {
         ""
     };
+    let response =
+        bot_settings_persistence_message(persistence, &format!("🔍 Debug logging: {status}{note}"));
     shared_rate_limit_wait(state, chat_id).await;
-    tg!(
-        "send_message",
-        bot.send_message(chat_id, format!("🔍 Debug logging: {status}{note}"))
-            .await
-    )?;
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -15864,8 +18620,9 @@ async fn handle_direct_command(
         )?;
         return Ok(());
     }
-    let next = {
+    let (next, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let key = chat_id.0.to_string();
         let prev = data
             .settings
@@ -15879,12 +18636,17 @@ async fn handle_direct_command(
             chat_id.0, prev, next
         ));
         data.settings.direct.insert(key, next);
-        save_bot_settings(token, &data.settings);
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        let effective = data
+            .settings
+            .direct
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(DIRECT_MODE_DEFAULT);
         msg_debug(&format!(
-            "[handle_direct] saved to bot_settings, next={}",
-            next
+            "[handle_direct] persistence={persistence:?}, effective={effective}"
         ));
-        next
+        (effective, persistence)
     };
     let status = if next {
         "Direct mode: ON (no ; prefix needed)"
@@ -15892,7 +18654,8 @@ async fn handle_direct_command(
         "Direct mode: OFF (; prefix required)"
     };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, status).await)?;
+    let response = bot_settings_persistence_message(persistence, status);
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -15947,21 +18710,23 @@ async fn handle_contextlevel_command(
         return Ok(());
     };
 
-    {
+    let persistence = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         if n == 12 {
             data.settings.context.remove(&key);
         } else {
             data.settings.context.insert(key, n);
         }
-        save_bot_settings(token, &data.settings);
-    }
+        persist_bot_settings_change(token, &mut data.settings, previous)
+    };
 
     let msg = if n == 0 {
         "Group chat log context: <b>OFF</b> (no log entries in prompt)".to_string()
     } else {
         format!("Group chat log context: <b>{}</b> entries", n)
     };
+    let msg = bot_settings_persistence_message(persistence, &msg);
     shared_rate_limit_wait(state, chat_id).await;
     tg!(
         "send_message",
@@ -16018,18 +18783,16 @@ async fn handle_instruction_command(
             instr.len(),
             truncate_str(&instr, 100)
         ));
-        {
+        let persistence = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             data.settings.instructions.insert(key, instr.clone());
-            save_bot_settings(token, &data.settings);
-            msg_debug("[handle_instruction] saved to bot_settings");
-        }
+            persist_bot_settings_change(token, &mut data.settings, previous)
+        };
+        let response =
+            bot_settings_persistence_message(persistence, &format!("Instruction set:\n{instr}"));
         shared_rate_limit_wait(state, chat_id).await;
-        tg!(
-            "send_message",
-            bot.send_message(chat_id, format!("Instruction set:\n{}", instr))
-                .await
-        )?;
+        tg!("send_message", bot.send_message(chat_id, response).await)?;
     }
     Ok(())
 }
@@ -16043,22 +18806,20 @@ async fn handle_instruction_clear_command(
 ) -> ResponseResult<()> {
     let key = chat_id.0.to_string();
     msg_debug(&format!("[handle_instruction_clear] chat_id={}", chat_id.0));
-    {
+    let persistence = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let had_instruction = data.settings.instructions.contains_key(&key);
         msg_debug(&format!(
             "[handle_instruction_clear] had_instruction={}",
             had_instruction
         ));
         data.settings.instructions.remove(&key);
-        save_bot_settings(token, &data.settings);
-        msg_debug("[handle_instruction_clear] saved to bot_settings");
-    }
+        persist_bot_settings_change(token, &mut data.settings, previous)
+    };
+    let response = bot_settings_persistence_message(persistence, "Instruction cleared.");
     shared_rate_limit_wait(state, chat_id).await;
-    tg!(
-        "send_message",
-        bot.send_message(chat_id, "Instruction cleared.").await
-    )?;
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -16085,17 +18846,16 @@ async fn handle_setendhook_command(
         tg!("send_message", bot.send_message(chat_id, msg).await)?;
     } else {
         let hook = body.to_string();
-        {
+        let persistence = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             data.settings.end_hook.insert(key, hook.clone());
-            save_bot_settings(token, &data.settings);
-        }
+            persist_bot_settings_change(token, &mut data.settings, previous)
+        };
+        let response =
+            bot_settings_persistence_message(persistence, &format!("End hook set:\n{hook}"));
         shared_rate_limit_wait(state, chat_id).await;
-        tg!(
-            "send_message",
-            bot.send_message(chat_id, format!("End hook set:\n{}", hook))
-                .await
-        )?;
+        tg!("send_message", bot.send_message(chat_id, response).await)?;
     }
     Ok(())
 }
@@ -16108,16 +18868,15 @@ async fn handle_setendhook_clear_command(
     token: &str,
 ) -> ResponseResult<()> {
     let key = chat_id.0.to_string();
-    {
+    let persistence = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         data.settings.end_hook.remove(&key);
-        save_bot_settings(token, &data.settings);
-    }
+        persist_bot_settings_change(token, &mut data.settings, previous)
+    };
+    let response = bot_settings_persistence_message(persistence, "End hook cleared.");
     shared_rate_limit_wait(state, chat_id).await;
-    tg!(
-        "send_message",
-        bot.send_message(chat_id, "End hook cleared.").await
-    )?;
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -16178,7 +18937,7 @@ async fn handle_silent_command(
     token: &str,
 ) -> ResponseResult<()> {
     let arg = command_args(text).to_ascii_lowercase();
-    let result: Result<(OutputMode, bool), String> = {
+    let result: Result<(OutputMode, bool, Option<BotSettingsPersistenceState>), String> = {
         let mut data = state.lock().await;
         let current = get_output_mode(&data.settings, chat_id);
         let requested = match arg.as_str() {
@@ -16193,16 +18952,25 @@ async fn handle_silent_command(
                 arg
             )),
         };
-        if let Ok((mode, should_update)) = requested {
-            if should_update {
+        match requested {
+            Ok((mode, true)) => {
+                let previous = data.settings.clone();
                 set_output_mode(&mut data.settings, chat_id, mode);
-                save_bot_settings(token, &data.settings);
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                let effective = get_output_mode(&data.settings, chat_id);
+                Ok((effective, true, Some(persistence)))
             }
+            Ok((mode, false)) => Ok((mode, false, None)),
+            Err(error) => Err(error),
         }
-        requested
     };
     let status = match result {
-        Ok((mode, updated)) => format_output_mode_status(mode, updated),
+        Ok((mode, updated, persistence)) => {
+            let status = format_output_mode_status(mode, updated);
+            persistence
+                .map(|state| bot_settings_persistence_message(state, &status))
+                .unwrap_or(status)
+        }
         Err(msg) => msg,
     };
     shared_rate_limit_wait(state, chat_id).await;
@@ -16217,16 +18985,17 @@ async fn handle_companion_command(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let next = {
+    let (next, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let current = get_companion_mode(&data.settings, chat_id);
         let next = !current;
         set_companion_mode(&mut data.settings, chat_id, next);
         if next {
             reset_companion_ping_after_user_activity(&mut data.settings, chat_id);
         }
-        save_bot_settings(token, &data.settings);
-        next
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        (get_companion_mode(&data.settings, chat_id), persistence)
     };
     let status = if next {
         "Companion mode: ON"
@@ -16234,7 +19003,8 @@ async fn handle_companion_command(
         "Companion mode: OFF"
     };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, status).await)?;
+    let response = bot_settings_persistence_message(persistence, status);
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -16312,13 +19082,18 @@ async fn handle_companion_profile_command(
     }
 
     let profile = body.to_string();
-    let reference_removed = {
+    let persistence = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         set_companion_profile_override(&mut data.settings, chat_id, profile.clone());
-        let reference_removed = clear_companion_visible_reference(chat_id);
-        save_bot_settings(token, &data.settings);
-        reference_removed
+        persist_bot_settings_change(token, &mut data.settings, previous)
     };
+    let applied = matches!(
+        persistence,
+        BotSettingsPersistenceState::Saved
+            | BotSettingsPersistenceState::AppliedDurabilityUncertain
+    );
+    let reference_removed = applied && clear_companion_visible_reference(chat_id);
     let mut plain_status = format!("Companion profile set for this chat:\n{}", profile);
     let mut rich_status = format!(
         "<b>Companion profile set for this chat:</b>\n<pre>{}</pre>",
@@ -16327,6 +19102,10 @@ async fn handle_companion_profile_command(
     if reference_removed {
         plain_status.push_str("\n\nCompanion visible reference reset.");
         rich_status.push_str("\n\nCompanion visible reference reset.");
+    }
+    if persistence != BotSettingsPersistenceState::Saved {
+        plain_status = bot_settings_persistence_message(persistence, &plain_status);
+        rich_status = html_escape(&plain_status);
     }
     send_rich_html_or_long_message(bot, chat_id, &plain_status, &rich_status, state).await?;
     Ok(())
@@ -16339,13 +19118,20 @@ async fn handle_companion_profile_clear_command(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let (removed, reference_removed) = {
+    let (removed, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let removed = clear_companion_profile_override(&mut data.settings, chat_id);
-        let reference_removed = clear_companion_visible_reference(chat_id);
-        save_bot_settings(token, &data.settings);
-        (removed, reference_removed)
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        let effective_removed = !has_companion_profile_override(&data.settings, chat_id);
+        (removed && effective_removed, persistence)
     };
+    let applied = matches!(
+        persistence,
+        BotSettingsPersistenceState::Saved
+            | BotSettingsPersistenceState::AppliedDurabilityUncertain
+    );
+    let reference_removed = applied && clear_companion_visible_reference(chat_id);
     let mut plain_status = if removed {
         format!(
             "Companion profile override cleared. Using global default:\n{}",
@@ -16371,6 +19157,10 @@ async fn handle_companion_profile_clear_command(
     if reference_removed {
         plain_status.push_str("\n\nCompanion visible reference reset.");
         rich_status.push_str("\n\nCompanion visible reference reset.");
+    }
+    if persistence != BotSettingsPersistenceState::Saved {
+        plain_status = bot_settings_persistence_message(persistence, &plain_status);
+        rich_status = html_escape(&plain_status);
     }
     send_rich_html_or_long_message(bot, chat_id, &plain_status, &rich_status, state).await
 }
@@ -16408,18 +19198,23 @@ async fn handle_companion_visible_command(
         companion_visible_reference_path_display(chat_id)
     );
 
-    let status = if body.is_empty() {
-        let (next, provider, has_profile) = {
+    let (status, persistence) = if body.is_empty() {
+        let (next, provider, has_profile, persistence) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             let current = get_companion_visible_mode(&data.settings, chat_id);
             let next = !current;
             set_companion_visible_mode(&mut data.settings, chat_id, next);
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let effective = get_companion_visible_mode(&data.settings, chat_id);
             let provider = detect_provider(get_model(&data.settings, chat_id).as_deref());
             let has_profile = has_companion_profile_override(&data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
-            (next, provider, has_profile)
+            (effective, provider, has_profile, persistence)
         };
-        format_companion_visible_status(chat_id, next, provider, has_profile)
+        (
+            format_companion_visible_status(chat_id, next, provider, has_profile),
+            Some(persistence),
+        )
     } else if matches!(body_lower.as_str(), "status" | "show") {
         let (enabled, provider, has_profile) = {
             let data = state.lock().await;
@@ -16429,31 +19224,47 @@ async fn handle_companion_visible_command(
                 has_companion_profile_override(&data.settings, chat_id),
             )
         };
-        format_companion_visible_status(chat_id, enabled, provider, has_profile)
+        (
+            format_companion_visible_status(chat_id, enabled, provider, has_profile),
+            None,
+        )
     } else if matches!(body_lower.as_str(), "on" | "enable" | "enabled") {
-        let (provider, has_profile) = {
+        let (enabled, provider, has_profile, persistence) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             set_companion_visible_mode(&mut data.settings, chat_id, true);
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let enabled = get_companion_visible_mode(&data.settings, chat_id);
             let provider = detect_provider(get_model(&data.settings, chat_id).as_deref());
             let has_profile = has_companion_profile_override(&data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
-            (provider, has_profile)
+            (enabled, provider, has_profile, persistence)
         };
-        format_companion_visible_status(chat_id, true, provider, has_profile)
+        (
+            format_companion_visible_status(chat_id, enabled, provider, has_profile),
+            Some(persistence),
+        )
     } else if matches!(body_lower.as_str(), "off" | "disable" | "disabled") {
-        let (provider, has_profile) = {
+        let (enabled, provider, has_profile, persistence) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             set_companion_visible_mode(&mut data.settings, chat_id, false);
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let enabled = get_companion_visible_mode(&data.settings, chat_id);
             let provider = detect_provider(get_model(&data.settings, chat_id).as_deref());
             let has_profile = has_companion_profile_override(&data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
-            (provider, has_profile)
+            (enabled, provider, has_profile, persistence)
         };
-        format_companion_visible_status(chat_id, false, provider, has_profile)
+        (
+            format_companion_visible_status(chat_id, enabled, provider, has_profile),
+            Some(persistence),
+        )
     } else {
-        usage
+        (usage, None)
     };
 
+    let status = persistence
+        .map(|state| bot_settings_persistence_message(state, &status))
+        .unwrap_or(status);
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -16517,6 +19328,7 @@ async fn handle_companion_ping_command(
         min = COMPANION_PING_MIN_MINUTES,
     );
 
+    let mut persistence = None;
     let status = if body.is_empty() || matches!(body_lower.as_str(), "status" | "show") {
         let mut data = state.lock().await;
         let companion_on = get_companion_mode(&data.settings, chat_id);
@@ -16535,7 +19347,16 @@ async fn handle_companion_ping_command(
                 data.settings.companion_ping.get(&key).cloned()
             };
             if companion_on && !had_cfg && cfg.is_some() {
-                save_bot_settings(token, &data.settings);
+                let previous = {
+                    let mut previous = data.settings.clone();
+                    previous.companion_ping.remove(&key);
+                    previous
+                };
+                persistence = Some(persist_bot_settings_change(
+                    token,
+                    &mut data.settings,
+                    previous,
+                ));
             }
             match cfg {
                 Some(cfg) => {
@@ -16567,9 +19388,11 @@ async fn handle_companion_ping_command(
     ) {
         let changed = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             let changed = disable_companion_ping(&mut data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
-            changed
+            let saved = persist_bot_settings_change(token, &mut data.settings, previous);
+            persistence = Some(saved);
+            changed && is_companion_ping_disabled(&data.settings, chat_id)
         };
         if changed {
             "Companion ping: OFF".to_string()
@@ -16582,9 +19405,14 @@ async fn handle_companion_ping_command(
     ) {
         let (cfg, companion_on) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             let cfg = set_default_companion_ping(&mut data.settings, chat_id);
             let companion_on = get_companion_mode(&data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
+            persistence = Some(persist_bot_settings_change(
+                token,
+                &mut data.settings,
+                previous,
+            ));
             (cfg, companion_on)
         };
         let mut msg = format!(
@@ -16615,9 +19443,14 @@ async fn handle_companion_ping_command(
         }
         let (cfg, companion_on) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             let cfg = set_companion_ping(&mut data.settings, chat_id, min_minutes, max_minutes);
             let companion_on = get_companion_mode(&data.settings, chat_id);
-            save_bot_settings(token, &data.settings);
+            persistence = Some(persist_bot_settings_change(
+                token,
+                &mut data.settings,
+                previous,
+            ));
             (cfg, companion_on)
         };
         let mut msg = format!(
@@ -16632,6 +19465,9 @@ async fn handle_companion_ping_command(
         msg
     };
 
+    let status = persistence
+        .map(|state| bot_settings_persistence_message(state, &status))
+        .unwrap_or(status);
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -16651,12 +19487,18 @@ async fn record_companion_ping_user_activity(
         if !is_owner_private_chat(&data.settings, chat_id) {
             return;
         }
+        let previous = data.settings.clone();
         let changed = reset_companion_ping_after_user_activity(&mut data.settings, chat_id);
         if !changed {
             return;
         }
-        save_bot_settings(token, &data.settings);
-        true
+        let epoch = data.companion_activity_epoch.entry(chat_id).or_insert(0);
+        *epoch = epoch.wrapping_add(1);
+        matches!(
+            persist_bot_settings_change(token, &mut data.settings, previous),
+            BotSettingsPersistenceState::Saved
+                | BotSettingsPersistenceState::AppliedDurabilityUncertain
+        )
     };
     if changed {
         msg_debug(&format!(
@@ -16681,7 +19523,17 @@ async fn handle_rich_command(
 ) -> ResponseResult<()> {
     let arg_original = command_args(text);
     let arg = arg_original.to_ascii_lowercase();
-    let result: Result<(RichMessageMode, RichMessageProfile, bool, bool, bool), String> = {
+    let result: Result<
+        (
+            RichMessageMode,
+            RichMessageProfile,
+            bool,
+            bool,
+            bool,
+            Option<BotSettingsPersistenceState>,
+        ),
+        String,
+    > = {
         let mut data = state.lock().await;
         let current = get_rich_message_mode(&data.settings, chat_id);
         let current_profile = get_rich_message_profile(&data.settings, chat_id);
@@ -16769,20 +19621,36 @@ async fn handle_rich_command(
                 arg_original
             )),
         };
-        if let Ok((mode, profile, is_rtl, draft_enabled, should_update)) = requested {
-            if should_update {
+        match requested {
+            Ok((mode, profile, is_rtl, draft_enabled, true)) => {
+                let previous = data.settings.clone();
                 set_rich_message_mode(&mut data.settings, chat_id, mode);
                 set_rich_message_profile(&mut data.settings, chat_id, profile);
                 set_rich_message_rtl(&mut data.settings, chat_id, is_rtl);
                 set_rich_message_draft(&mut data.settings, chat_id, draft_enabled);
-                save_bot_settings(token, &data.settings);
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                Ok((
+                    get_rich_message_mode(&data.settings, chat_id),
+                    get_rich_message_profile(&data.settings, chat_id),
+                    get_rich_message_rtl(&data.settings, chat_id),
+                    get_rich_message_draft(&data.settings, chat_id),
+                    true,
+                    Some(persistence),
+                ))
             }
+            Ok((mode, profile, is_rtl, draft_enabled, false)) => {
+                Ok((mode, profile, is_rtl, draft_enabled, false, None))
+            }
+            Err(error) => Err(error),
         }
-        requested
     };
     let status = match result {
-        Ok((mode, profile, is_rtl, draft_enabled, updated)) => {
-            format_rich_message_mode_status(mode, profile, is_rtl, draft_enabled, updated)
+        Ok((mode, profile, is_rtl, draft_enabled, updated, persistence)) => {
+            let status =
+                format_rich_message_mode_status(mode, profile, is_rtl, draft_enabled, updated);
+            persistence
+                .map(|state| bot_settings_persistence_message(state, &status))
+                .unwrap_or(status)
         }
         Err(msg) => msg,
     };
@@ -16798,14 +19666,22 @@ async fn handle_usechrome_command(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let next = {
+    let (next, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let key = chat_id.0.to_string();
         let prev = data.settings.use_chrome.get(&key).copied().unwrap_or(false);
         let next = !prev;
         data.settings.use_chrome.insert(key, next);
-        save_bot_settings(token, &data.settings);
-        next
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        (
+            data.settings
+                .use_chrome
+                .get(&chat_id.0.to_string())
+                .copied()
+                .unwrap_or(false),
+            persistence,
+        )
     };
     let status = if next {
         "🌐 Chrome mode: ON (--chrome)"
@@ -16813,7 +19689,8 @@ async fn handle_usechrome_command(
         "🌐 Chrome mode: OFF"
     };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, status).await)?;
+    let response = bot_settings_persistence_message(persistence, status);
+    tg!("send_message", bot.send_message(chat_id, response).await)?;
     Ok(())
 }
 
@@ -16826,8 +19703,9 @@ async fn handle_queue_command(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let (next, queue_len) = {
+    let (next, queue_len, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let key = chat_id.0.to_string();
         let prev = data
             .settings
@@ -16837,7 +19715,13 @@ async fn handle_queue_command(
             .unwrap_or(QUEUE_MODE_DEFAULT);
         let next = !prev;
         data.settings.queue.insert(key, next);
-        save_bot_settings(token, &data.settings);
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        let next = data
+            .settings
+            .queue
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(QUEUE_MODE_DEFAULT);
         // If turning OFF, clear any pending queued messages
         let queue_len = if !next {
             let q = data.message_queues.remove(&chat_id);
@@ -16851,7 +19735,7 @@ async fn handle_queue_command(
             msg_debug(&format!("[queue:toggle] chat_id={}, ON", chat_id.0));
             0
         };
-        (next, queue_len)
+        (next, queue_len, persistence)
     };
     let status = if next {
         "📋 Queue mode: ON\nMessages sent while AI is busy will be queued and processed in order."
@@ -16864,6 +19748,7 @@ async fn handle_queue_command(
     } else {
         "📋 Queue mode: OFF".to_string()
     };
+    let status = bot_settings_persistence_message(persistence, &status);
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, &status).await)?;
     Ok(())
@@ -16928,11 +19813,13 @@ async fn handle_allowed_command(
         return Ok(());
     }
 
-    let response_msg = {
+    let (response_msg, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let chat_key = chat_id.0.to_string();
         // Ensure this chat has its own tool list (initialize from defaults if missing)
-        if !data.settings.allowed_tools.contains_key(&chat_key) {
+        let initialized = !data.settings.allowed_tools.contains_key(&chat_key);
+        if initialized {
             let defaults: Vec<String> = DEFAULT_ALLOWED_TOOLS
                 .iter()
                 .map(|s| s.to_string())
@@ -16943,7 +19830,7 @@ async fn handle_allowed_command(
         }
         let tools = data.settings.allowed_tools.get_mut(&chat_key).unwrap();
         let mut results: Vec<String> = Vec::new();
-        let mut changed = false;
+        let mut changed = initialized;
         for (op, tool_name) in &operations {
             match op {
                 '+' => {
@@ -16974,11 +19861,13 @@ async fn handle_allowed_command(
                 _ => unreachable!(),
             }
         }
-        if changed {
-            save_bot_settings(token, &data.settings);
-        }
-        results.join("\n")
+        let persistence =
+            changed.then(|| persist_bot_settings_change(token, &mut data.settings, previous));
+        (results.join("\n"), persistence)
     };
+    let response_msg = persistence
+        .map(|state| bot_settings_persistence_message(state, &response_msg))
+        .unwrap_or(response_msg);
 
     shared_rate_limit_wait(state, chat_id).await;
     tg!(
@@ -17031,34 +19920,61 @@ async fn handle_public_command(
         .to_lowercase();
     let chat_key = chat_id.0.to_string();
 
-    let response_msg = match arg.as_str() {
+    let (response_msg, persistence) = match arg.as_str() {
         "on" => {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             data.settings.as_public_for_group_chat.insert(chat_key, true);
-            save_bot_settings(token, &data.settings);
-            "✅ Public access <b>enabled</b> for this group.\nAll members can now use the bot.".to_string()
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let effective = data
+                .settings
+                .as_public_for_group_chat
+                .get(&chat_id.0.to_string())
+                .copied()
+                .unwrap_or(PUBLIC_MODE_DEFAULT);
+            let message = if effective {
+                "✅ Public access <b>enabled</b> for this group.\nAll members can now use the bot."
+            } else {
+                "Public access remains <b>disabled</b> for this group."
+            };
+            (message.to_string(), Some(persistence))
         }
         "off" => {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             data.settings.as_public_for_group_chat.remove(&chat_key);
-            save_bot_settings(token, &data.settings);
-            "Public access <b>disabled</b> for this group.\nOnly the owner can use the bot.".to_string()
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let effective = data
+                .settings
+                .as_public_for_group_chat
+                .get(&chat_id.0.to_string())
+                .copied()
+                .unwrap_or(PUBLIC_MODE_DEFAULT);
+            let message = if effective {
+                "Public access remains <b>enabled</b> for this group."
+            } else {
+                "Public access <b>disabled</b> for this group.\nOnly the owner can use the bot."
+            };
+            (message.to_string(), Some(persistence))
         }
         "" => {
             let data = state.lock().await;
             let is_public = data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(PUBLIC_MODE_DEFAULT);
             let status = if is_public { "enabled" } else { "disabled" };
-            format!(
+            (format!(
                 "Public access is currently <b>{}</b> for this group.\n\n\
                  <code>/public on</code> — Allow all members\n\
                  <code>/public off</code> — Owner only",
                 status
-            )
+            ), None)
         }
         _ => {
-            "Usage:\n<code>/public on</code> — Allow all group members\n<code>/public off</code> — Owner only".to_string()
+            ("Usage:\n<code>/public on</code> — Allow all group members\n<code>/public off</code> — Owner only".to_string(), None)
         }
     };
+    let response_msg = persistence
+        .map(|state| bot_settings_persistence_message(state, &response_msg))
+        .unwrap_or(response_msg);
 
     shared_rate_limit_wait(state, chat_id).await;
     tg!(
@@ -17243,16 +20159,22 @@ async fn handle_effort_command(
     }
 
     if arg == "reset" || arg == "clear" || arg == "default" {
-        let removed = {
+        let (removed, persistence) = {
             let mut data = state.lock().await;
+            let previous = data.settings.clone();
             let key = chat_id.0.to_string();
             let r = match provider {
                 "claude" => data.settings.claude_effort.remove(&key).is_some(),
                 "codex" => data.settings.effort.remove(&key).is_some(),
                 _ => false,
             };
-            save_bot_settings(token, &data.settings);
-            r
+            let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+            let still_set = match provider {
+                "claude" => data.settings.claude_effort.contains_key(&key),
+                "codex" => data.settings.effort.contains_key(&key),
+                _ => false,
+            };
+            (r && !still_set, persistence)
         };
         let msg = if removed {
             format!(
@@ -17262,6 +20184,7 @@ async fn handle_effort_command(
         } else {
             format!("{} effort was not set.", provider_label)
         };
+        let msg = bot_settings_persistence_message(persistence, &msg);
         shared_rate_limit_wait(state, chat_id).await;
         tg!("send_message", bot.send_message(chat_id, msg).await)?;
         return Ok(());
@@ -17285,8 +20208,9 @@ async fn handle_effort_command(
         return Ok(());
     }
 
-    {
+    let persistence = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let key = chat_id.0.to_string();
         match provider {
             "claude" => {
@@ -17297,10 +20221,13 @@ async fn handle_effort_command(
             }
             _ => {}
         }
-        save_bot_settings(token, &data.settings);
+        persist_bot_settings_change(token, &mut data.settings, previous)
     };
     let arg_escaped = html_escape(&arg);
-    let msg = format!("{} effort set to <b>{}</b>.", provider_label, arg_escaped);
+    let msg = bot_settings_persistence_message(
+        persistence,
+        &format!("{} effort set to <b>{}</b>.", provider_label, arg_escaped),
+    );
     shared_rate_limit_wait(state, chat_id).await;
     tg!(
         "send_message",
@@ -17383,8 +20310,9 @@ async fn handle_fast_command(
         }
     };
 
-    let next = {
+    let (next, persistence) = {
         let mut data = state.lock().await;
+        let previous = data.settings.clone();
         let key = chat_id.0.to_string();
         let prev = is_codex_fast(&data.settings, chat_id);
         let next = requested.unwrap_or(!prev);
@@ -17393,8 +20321,8 @@ async fn handle_fast_command(
         } else {
             data.settings.codex_fast.remove(&key);
         }
-        save_bot_settings(token, &data.settings);
-        next
+        let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+        (is_codex_fast(&data.settings, chat_id), persistence)
     };
 
     let status = if next {
@@ -17402,6 +20330,7 @@ async fn handle_fast_command(
     } else {
         "⚡ Codex fast mode: OFF (provider default)"
     };
+    let status = bot_settings_persistence_message(persistence, status);
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -17461,37 +20390,44 @@ async fn handle_stt_model_command(
 
     match normalized {
         Some(value) => {
-            {
+            let persistence = {
                 let mut data = state.lock().await;
+                let previous = data.settings.clone();
                 data.settings.stt_models.insert(key, value.clone());
-                save_bot_settings(token, &data.settings);
-            }
+                persist_bot_settings_change(token, &mut data.settings, previous)
+            };
+            let response = bot_settings_persistence_message(
+                persistence,
+                &format!(
+                    "STT model set to <b>{}</b>.",
+                    html_escape(&stt_model_setting_display(Some(&value)))
+                ),
+            );
             shared_rate_limit_wait(state, chat_id).await;
             tg!(
                 "send_message",
-                bot.send_message(
-                    chat_id,
-                    format!(
-                        "STT model set to <b>{}</b>.",
-                        html_escape(&stt_model_setting_display(Some(&value)))
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await
+                bot.send_message(chat_id, response)
+                    .parse_mode(ParseMode::Html)
+                    .await
             )?;
         }
         None => {
-            let removed = {
+            let (removed, persistence) = {
                 let mut data = state.lock().await;
+                let previous = data.settings.clone();
                 let removed = data.settings.stt_models.remove(&key).is_some();
-                save_bot_settings(token, &data.settings);
-                removed
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                (
+                    removed && !data.settings.stt_models.contains_key(&key),
+                    persistence,
+                )
             };
             let msg = if removed {
                 "STT model reset. Transcriptor env/config/default will be used."
             } else {
                 "STT model was not set. Transcriptor env/config/default is already used."
             };
+            let msg = bot_settings_persistence_message(persistence, msg);
             shared_rate_limit_wait(state, chat_id).await;
             tg!("send_message", bot.send_message(chat_id, msg).await)?;
         }
@@ -17602,21 +20538,23 @@ async fn handle_model_command(
                 .replace("</b>", "")
                 .replace("<code>", "")
                 .replace("</code>", "");
-            let tmp_path = std::env::temp_dir().join(format!("models_{}.txt", chat_id.0));
-            if let Err(e) = std::fs::write(&tmp_path, &plain) {
-                msg_debug(&format!(
-                    "[handle_model_command] failed to write tmp file: {}",
-                    e
-                ));
-                return Ok(());
-            }
+            let name_hint = format!("models_{}", chat_id.0);
+            let tmp_file = match PrivateTempFile::create(&name_hint, "txt", plain.as_bytes()) {
+                Ok(file) => file,
+                Err(e) => {
+                    msg_debug(&format!(
+                        "[handle_model_command] failed to create private tmp file: {}",
+                        e
+                    ));
+                    return Ok(());
+                }
+            };
             shared_rate_limit_wait(state, chat_id).await;
             tg!(
                 "send_document",
-                bot.send_document(chat_id, teloxide::types::InputFile::file(&tmp_path),)
+                bot.send_document(chat_id, teloxide::types::InputFile::file(tmp_file.path()),)
                     .await
             )?;
-            let _ = std::fs::remove_file(&tmp_path);
         }
         return Ok(());
     }
@@ -17628,7 +20566,7 @@ async fn handle_model_command(
     // Set model
     match resolve_model_name(arg) {
         Ok(model_id) => {
-            let (provider_changed, had_state, old_path, queue_cleared) = {
+            let (provider_changed, had_state, old_path, queue_cleared, persistence) = {
                 let mut data = state.lock().await;
                 // If provider changed, clear session_id to avoid cross-provider resume.
                 // Use detect_provider so the comparison reflects the *effective* provider
@@ -17637,7 +20575,13 @@ async fn handle_model_command(
                 // like None→codex (Claude unavailable) → /model claude.
                 let old_model = get_model(&data.settings, chat_id);
                 let old_provider = detect_provider(old_model.as_deref());
-                let new_provider = detect_provider(Some(&model_id));
+                let previous = data.settings.clone();
+                data.settings
+                    .models
+                    .insert(chat_id.0.to_string(), model_id.clone());
+                let persistence = persist_bot_settings_change(token, &mut data.settings, previous);
+                let effective_model = get_model(&data.settings, chat_id);
+                let new_provider = detect_provider(effective_model.as_deref());
                 let provider_changed = old_provider != new_provider;
                 msg_debug(&format!("[handle_model_command] old_model={:?}, old_provider={}, new_provider={}, provider_changed={}",
                     old_model, old_provider, new_provider, provider_changed));
@@ -17680,11 +20624,13 @@ async fn handle_model_command(
                 } else {
                     (false, None, 0)
                 };
-                data.settings
-                    .models
-                    .insert(chat_id.0.to_string(), model_id.clone());
-                save_bot_settings(token, &data.settings);
-                (provider_changed, had_state, old_path, queue_cleared)
+                (
+                    provider_changed,
+                    had_state,
+                    old_path,
+                    queue_cleared,
+                    persistence,
+                )
             };
             shared_rate_limit_wait(state, chat_id).await;
             let queue_note = if queue_cleared > 0 {
@@ -17713,6 +20659,7 @@ async fn handle_model_command(
             } else {
                 format!("Model set to <b>{}</b>.", model_id_escaped)
             };
+            let msg = bot_settings_persistence_message(persistence, &msg);
             tg!(
                 "send_message",
                 bot.send_message(chat_id, msg)
@@ -20667,8 +23614,20 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
 
     let file_path = sessions_dir.join(format!("{}.json", session_id));
 
-    if let Ok(json) = serde_json::to_string_pretty(&session_data) {
-        let _ = fs::write(&file_path, json);
+    let json = match serde_json::to_vec_pretty(&session_data) {
+        Ok(json) => json,
+        Err(e) => {
+            msg_debug(&format!("[save_session] serialization failed: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = write_private_file_atomically(&file_path, &json) {
+        // Do not prune older valid session files unless the replacement is
+        // fully durable. They are the recovery copy on any write failure.
+        msg_debug(&format!(
+            "[save_session] atomic write failed; older sessions preserved: {e}"
+        ));
+        return;
     }
 
     // Clean up old session files for the same path+provider (removes orphaned files
@@ -20711,6 +23670,154 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 /// Scans ~/.cokacdir/upload_queue/ for .queue files matching the current bot and chat_id,
 /// sends the oldest one, and deletes the queue file on success.
 /// Returns true if a file was processed (rate limit slot consumed).
+struct UploadQueueClaim {
+    original: PathBuf,
+    // Lock a stable sidecar instead of renaming the request out of the queue.
+    // A process crash releases the OS lock and leaves the original request
+    // visible for retry, while concurrent pollers still cannot both send it.
+    _lock_file: std::fs::File,
+}
+
+impl UploadQueueClaim {
+    fn try_claim(original: &Path) -> std::io::Result<Option<Self>> {
+        use fs2::FileExt;
+
+        let file_name = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "upload queue filename is not valid UTF-8",
+                )
+            })?;
+        let lock_path = original.with_file_name(format!("{file_name}.lock"));
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock_file = options.open(lock_path)?;
+        match lock_file.try_lock_exclusive() {
+            Ok(()) if original.is_file() => Ok(Some(Self {
+                original: original.to_path_buf(),
+                _lock_file: lock_file,
+            })),
+            Ok(()) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.original
+    }
+
+    /// Hide a completed request first, then best-effort delete the tombstone.
+    /// If deletion fails after a successful send, the `.done` file remains
+    /// ignored rather than putting the request back in line for a duplicate
+    /// delivery.
+    fn discard(self) -> std::io::Result<()> {
+        let file_name = self
+            .original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("upload.queue");
+        let done = self.original.with_file_name(format!(
+            "{file_name}.done.{}.{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        match fs::rename(&self.original, &done) {
+            Ok(()) => {
+                // The logical discard succeeded once the `.queue` name was
+                // removed. A leftover tombstone is safe and diagnosable.
+                let _ = fs::remove_file(done);
+                Ok(())
+            }
+            Err(rename_error) => match fs::remove_file(&self.original) {
+                Ok(()) => Ok(()),
+                Err(remove_error) => Err(std::io::Error::new(
+                    remove_error.kind(),
+                    format!(
+                        "failed to hide completed queue request ({rename_error}); direct removal also failed ({remove_error})"
+                    ),
+                )),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod upload_queue_claim_tests {
+    use super::UploadQueueClaim;
+
+    #[test]
+    fn dropping_failed_claim_keeps_queue_file_and_releases_lock() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let queue = dir.path().join("request.queue");
+        std::fs::write(&queue, b"request").expect("write queue file");
+
+        {
+            let claim = UploadQueueClaim::try_claim(&queue)
+                .expect("claim result")
+                .expect("claim queue file");
+            assert!(queue.exists());
+            assert!(claim.path().exists());
+            assert!(UploadQueueClaim::try_claim(&queue)
+                .expect("contended claim result")
+                .is_none());
+        }
+
+        assert_eq!(
+            std::fs::read(&queue).expect("read retained queue"),
+            b"request"
+        );
+        assert!(UploadQueueClaim::try_claim(&queue)
+            .expect("claim after drop")
+            .is_some());
+    }
+
+    #[test]
+    fn successful_claim_discard_removes_request() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let queue = dir.path().join("request.queue");
+        std::fs::write(&queue, b"request").expect("write queue file");
+
+        let claim = UploadQueueClaim::try_claim(&queue)
+            .expect("claim result")
+            .expect("claim queue file");
+        claim.discard().expect("discard successful request");
+
+        assert!(!queue.exists());
+        assert!(!std::fs::read_dir(dir.path())
+            .expect("read queue dir")
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().to_string_lossy().contains(".done.")));
+    }
+
+    #[test]
+    fn atomic_claim_allows_only_one_consumer() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let queue = dir.path().join("request.queue");
+        std::fs::write(&queue, b"request").expect("write queue file");
+
+        let first = UploadQueueClaim::try_claim(&queue)
+            .expect("first claim result")
+            .expect("first claim");
+        assert!(UploadQueueClaim::try_claim(&queue)
+            .expect("second claim result")
+            .is_none());
+        drop(first);
+        assert!(queue.exists());
+        assert!(UploadQueueClaim::try_claim(&queue)
+            .expect("claim after first drops")
+            .is_some());
+    }
+}
+
 async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -> bool {
     let queue_dir = match dirs::home_dir() {
         Some(h) => h.join(".cokacdir").join("upload_queue"),
@@ -20752,15 +23859,72 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
             continue;
         }
 
-        let path = std::path::PathBuf::from(file_path);
-        if !path.exists() {
-            // File no longer exists, remove queue entry
-            let _ = fs::remove_file(&entry_path);
-            return false;
+        // Atomically claim before any await. Concurrent bot loops may scan the
+        // same queue directory; only the process holding the sidecar file lock
+        // may send this request. A crash automatically releases the lock while
+        // leaving the original `.queue` request visible for retry.
+        let claim = match UploadQueueClaim::try_claim(&entry_path) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => continue,
+            Err(e) => {
+                msg_debug(&format!(
+                    "[upload_queue] failed to claim {}: {}",
+                    entry_path.display(),
+                    e
+                ));
+                continue;
+            }
+        };
+
+        // Re-read after locking so the payload we act on is protected from
+        // concurrent consumers for the remainder of this iteration.
+        let claimed_content = match fs::read_to_string(claim.path()) {
+            Ok(content) => content,
+            Err(e) => {
+                msg_debug(&format!(
+                    "[upload_queue] failed to read claimed request {}: {}",
+                    claim.path().display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        let claimed_json: serde_json::Value = match serde_json::from_str(&claimed_content) {
+            Ok(json) => json,
+            Err(e) => {
+                msg_debug(&format!(
+                    "[upload_queue] invalid claimed request {}: {}",
+                    claim.path().display(),
+                    e
+                ));
+                continue;
+            }
+        };
+        let claimed_chat_id = claimed_json
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let claimed_key = claimed_json
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let claimed_file_path = claimed_json
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if claimed_chat_id != chat_id.0
+            || claimed_key != current_key
+            || claimed_file_path != file_path
+        {
+            continue;
         }
 
-        // Remove queue file before sending (regardless of send result)
-        let _ = fs::remove_file(&entry_path);
+        let path = std::path::PathBuf::from(claimed_file_path);
+        if !path.exists() {
+            // Permanent failure: the requested source no longer exists.
+            let _ = claim.discard();
+            return false;
+        }
 
         // Rate limit and send
         shared_rate_limit_wait(state, chat_id).await;
@@ -20770,10 +23934,19 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
                 .await
         ) {
             Ok(_) => {
+                if let Err(e) = claim.discard() {
+                    msg_debug(&format!(
+                        "[upload_queue] sent but failed to remove claim: {}",
+                        e
+                    ));
+                }
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}]   📤 Upload sent: {}", file_path);
             }
             Err(e) => {
+                // Dropping the claim releases the sidecar lock. The original
+                // queue file was never renamed, so it remains retryable.
+                drop(claim);
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}]   ⚠ Upload failed: {}", redact_err(&e));
             }
@@ -20941,23 +24114,16 @@ async fn send_response_as_file(
     state: &SharedState,
     label: &str,
 ) -> bool {
-    let Some(home) = dirs::home_dir() else {
+    let name_hint = format!("response_{label}");
+    let Ok(tmp_file) = PrivateTempFile::create(&name_hint, "txt", response.as_bytes()) else {
         return false;
     };
-    let tmp_dir = home.join(".cokacdir").join("tmp");
-    let _ = std::fs::create_dir_all(&tmp_dir);
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let tmp_path = tmp_dir.join(format!("cokacdir_{}_{}.txt", label, timestamp));
-    if std::fs::write(&tmp_path, response).is_err() {
-        return false;
-    }
     shared_rate_limit_wait(state, chat_id).await;
     let result = tg!(
         "send_document",
-        bot.send_document(chat_id, teloxide::types::InputFile::file(&tmp_path),)
+        bot.send_document(chat_id, teloxide::types::InputFile::file(tmp_file.path()),)
             .await
     );
-    let _ = std::fs::remove_file(&tmp_path);
     result.is_ok()
 }
 
@@ -22525,52 +25691,27 @@ fn detect_chat_log_read(name: &str, input: &str) -> bool {
     cmd.contains("--read_chat_log")
 }
 
-/// Read the most recent .result file from schedule dir and delete it
-fn read_latest_cron_result() -> Option<String> {
-    let dir = schedule_dir()?;
-    let mut results: Vec<_> = fs::read_dir(&dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "result")
-                .unwrap_or(false)
-        })
-        .collect();
-    results.sort_by_key(|e| {
-        std::cmp::Reverse(
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        )
-    });
-    let entry = results.first()?;
-    let content = fs::read_to_string(entry.path()).ok()?;
-    let _ = fs::remove_file(entry.path());
-    Some(content)
-}
-
 /// Format a cokacdir command's JSON result into a human-readable message.
 /// Auto-detects the subcommand from JSON result fields.
-/// NOTE: Empty content triggers .result file read (for --cron async results).
-/// Currently only --cron produces empty output, so this is safe.
-/// If a new subcommand also returns empty output in the future,
-/// it would incorrectly read a stale cron .result file.
+///
+/// Empty tool output deliberately stays empty. Older code selected and
+/// deleted the globally newest `schedule/*.result` file as a fallback, but
+/// that directory is shared by all chats and bot instances. Concurrent cron
+/// registrations could therefore swap responses across users and disclose or
+/// delete another chat's result. The CLI already prints and flushes its JSON
+/// result; if a backend loses that stdout, there is no safely attributable
+/// fallback without a per-invocation identifier.
 fn format_cokacdir_result(content: &str) -> String {
-    // Try to parse as JSON; if empty, try reading from .result file (for --cron)
-    let effective_content = if content.trim().is_empty() {
-        read_latest_cron_result().unwrap_or_default()
-    } else {
-        content.to_string()
-    };
-    let v: serde_json::Value = match serde_json::from_str(effective_content.trim()) {
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    let v: serde_json::Value = match serde_json::from_str(content.trim()) {
         Ok(v) => v,
         Err(_) => {
             // Fallback: some backends wrap the JSON output with
             // extra text like "Output: {...}\nProcess Group PGID: ...".
             // Try to extract the JSON object by trimming to first '{' and last '}'.
-            let trimmed = effective_content.trim();
+            let trimmed = content.trim();
             let extracted = match (trimmed.find('{'), trimmed.rfind('}')) {
                 (Some(start), Some(end)) if start < end => &trimmed[start..=end],
                 _ => return String::new(),
@@ -22729,6 +25870,11 @@ fn format_cokacdir_result(content: &str) -> String {
 #[cfg(test)]
 mod cokacdir_result_format_tests {
     use super::format_cokacdir_result;
+
+    #[test]
+    fn empty_tool_output_has_no_cross_invocation_fallback() {
+        assert_eq!(format_cokacdir_result("   \n"), "");
+    }
 
     #[test]
     fn cron_history_result_is_not_formatted_as_removed() {
@@ -23152,26 +26298,6 @@ fn update_schedule_after_run(entry: &ScheduleEntry) {
         entry.id, entry.schedule_type, entry.once, now
     ));
 
-    // 실행 중 사용자가 삭제한 경우 부활 방지
-    let dir = match schedule_dir() {
-        Some(d) => d,
-        None => {
-            sched_debug(&format!(
-                "[update_schedule_after_run] id={}, no schedule dir → skip",
-                entry.id
-            ));
-            return;
-        }
-    };
-    let path = dir.join(format!("{}.json", entry.id));
-    if !path.exists() {
-        sched_debug(&format!(
-            "[update_schedule_after_run] id={}, file already deleted → skip (no resurrection)",
-            entry.id
-        ));
-        return; // 이미 삭제됨 - write하지 않음
-    }
-
     // One-time schedules (absolute / cron --once) are already deleted before execution,
     // so this function only handles recurring cron updates.
     sched_debug(&format!(
@@ -23181,17 +26307,22 @@ fn update_schedule_after_run(entry: &ScheduleEntry) {
     let mut updated = entry.clone();
     updated.last_run = Some(now);
     updated.context_summary = None;
-    if let Err(e) = write_schedule_entry(&updated) {
-        sched_debug(&format!(
-            "[update_schedule_after_run] id={}, write failed: {}",
-            entry.id, e
-        ));
-        eprintln!("[Schedule] Failed to update entry {}: {}", entry.id, e);
-    } else {
-        sched_debug(&format!(
+    match write_schedule_entry_if_present(&updated) {
+        Ok(true) => sched_debug(&format!(
             "[update_schedule_after_run] id={}, updated successfully",
             entry.id
-        ));
+        )),
+        Ok(false) => sched_debug(&format!(
+            "[update_schedule_after_run] id={}, file deleted while run was active → skip (no resurrection)",
+            entry.id
+        )),
+        Err(e) => {
+            sched_debug(&format!(
+                "[update_schedule_after_run] id={}, write failed: {}",
+                entry.id, e
+            ));
+            eprintln!("[Schedule] Failed to update entry {}: {}", entry.id, e);
+        }
     }
 }
 
@@ -23495,8 +26626,8 @@ async fn execute_schedule(
             format!(
                 "You are executing a scheduled task through {}.\n\
                  This task runs inline in the chat's current session — its prompt and your reply continue the ongoing conversation here, not a separate workspace.\n\
-                 Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
-                platform, shell_bin_path()
+                 Any files you want to deliver must be sent via the {} --sendfile command before the task ends.",
+                platform, shell_bin_invocation()
             )
         } else {
             format!(
@@ -23504,8 +26635,8 @@ async fn execute_schedule(
                  Project directory: {project_path}\n\
                  Your current working directory is that project directory.\n\
                  {session_note}\n\
-                 Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
-                platform, shell_bin_path()
+                 Any files you want to deliver must be sent via the {} --sendfile command before the task ends.",
+                platform, shell_bin_invocation()
             )
         };
         match &sched_instruction {
@@ -24923,7 +28054,7 @@ async fn process_bot_message(
             // Discard the on-disk file: re-queueing would loop the same
             // "no session" error every scheduler tick. The user has been
             // (best-effort) notified via the send_message below.
-            let remove_result = fs::remove_file(&msg.file_path);
+            let remove_result = remove_file_by_identity(&msg.file_path, msg.file_identity);
             msg_debug(&format!(
                 "[process_bot_message] deleted message file (no session): id={}, ok={}",
                 msg.id,
@@ -25030,7 +28161,7 @@ async fn process_bot_message(
                 // chat closed, token revoked) becomes log spam with the same
                 // error class. A transient failure forces the user to manually
                 // re-send, but that matches the "Please try again" notice below.
-                let remove_result = fs::remove_file(&msg.file_path);
+                let remove_result = remove_file_by_identity(&msg.file_path, msg.file_identity);
                 msg_debug(&format!(
                     "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
                     msg.id,
@@ -25057,7 +28188,7 @@ async fn process_bot_message(
     //
     // The placeholder is the visible safe point. Deleting here avoids replaying
     // a bot-to-bot message and duplicating side effects after a restart.
-    let remove_result = fs::remove_file(&msg.file_path);
+    let remove_result = remove_file_by_identity(&msg.file_path, msg.file_identity);
     msg_debug(&format!(
         "[process_bot_message] deleted message file after output-mode gate: id={}, path={}, ok={}",
         msg.id,
@@ -26467,8 +29598,9 @@ async fn process_companion_pings(
     bot_display_name: &str,
 ) {
     let now = companion_ping_now_ts();
-    let dispatches: Vec<(ChatId, u64, RequestTasks)> = {
+    let dispatches: Vec<(ChatId, u64, u64, RequestTasks)> = {
         let mut data = state.lock().await;
+        let previous_settings = data.settings.clone();
         let request_tasks = data.request_tasks.clone();
         let mut keys: Vec<String> = data.settings.companion_ping.keys().cloned().collect();
         keys.extend(
@@ -26515,16 +29647,21 @@ async fn process_companion_pings(
             }
 
             let dispatch_id = next_dispatch_id();
+            let activity_epoch = data
+                .companion_activity_epoch
+                .get(&chat_id)
+                .copied()
+                .unwrap_or(0);
             insert_cancel_token_locked(&mut data, chat_id, new_cancel_token_for_owner(dispatch_id));
-            out.push((chat_id, dispatch_id, request_tasks.clone()));
+            out.push((chat_id, dispatch_id, activity_epoch, request_tasks.clone()));
         }
         if settings_changed {
-            save_bot_settings(token, &data.settings);
+            persist_bot_settings_change(token, &mut data.settings, previous_settings);
         }
         out
     };
 
-    for (chat_id, dispatch_id, request_tasks) in dispatches {
+    for (chat_id, dispatch_id, activity_epoch, request_tasks) in dispatches {
         let bot_c = bot.clone();
         let state_c = state.clone();
         let token_c = token.to_string();
@@ -26540,6 +29677,7 @@ async fn process_companion_pings(
                         &token_c,
                         &bot_username_c,
                         &bot_display_name_c,
+                        activity_epoch,
                     )
                     .await;
                 })
@@ -26556,6 +29694,7 @@ async fn execute_companion_ping(
     token: &str,
     bot_username: &str,
     bot_display_name: &str,
+    dispatch_activity_epoch: u64,
 ) {
     let group_lock = acquire_group_chat_lock(chat_id.0).await;
     let cancel_token = {
@@ -26574,6 +29713,7 @@ async fn execute_companion_ping(
             state,
             token,
             None,
+            dispatch_activity_epoch,
             CompanionPingCompletion::Leave,
         )
         .await;
@@ -26593,6 +29733,7 @@ async fn execute_companion_ping(
                 state,
                 token,
                 None,
+                dispatch_activity_epoch,
                 CompanionPingCompletion::Leave,
             )
             .await;
@@ -26613,6 +29754,7 @@ async fn execute_companion_ping(
                 state,
                 token,
                 None,
+                dispatch_activity_epoch,
                 CompanionPingCompletion::Leave,
             )
             .await;
@@ -27004,6 +30146,7 @@ async fn execute_companion_ping(
             provider_str.to_string(),
             final_response,
         )),
+        dispatch_activity_epoch,
         if sent_response {
             CompanionPingCompletion::WaitForUser
         } else {
@@ -27021,10 +30164,12 @@ async fn cleanup_companion_ping_after_run(
     state: &SharedState,
     token: &str,
     session_update: Option<(bool, Option<String>, String, String, String)>,
+    dispatch_activity_epoch: u64,
     completion: CompanionPingCompletion,
 ) {
     let stop_msg_id = {
         let mut data = state.lock().await;
+        let previous_settings = data.settings.clone();
         if let Some((sent_response, mut new_session_id, current_path, provider, final_response)) =
             session_update
         {
@@ -27049,22 +30194,26 @@ async fn cleanup_companion_ping_after_run(
                 save_session_to_file(session, &current_path, &provider);
             }
         }
-        match completion {
-            CompanionPingCompletion::Leave => {}
-            CompanionPingCompletion::Reschedule | CompanionPingCompletion::WaitForUser => {
-                if let Some(cfg) = data.settings.companion_ping.get_mut(&chat_id.0.to_string()) {
-                    match completion {
-                        CompanionPingCompletion::WaitForUser => {
-                            cfg.waiting_for_user = true;
-                        }
-                        CompanionPingCompletion::Reschedule => {
-                            schedule_companion_ping_next(cfg);
-                        }
-                        CompanionPingCompletion::Leave => {}
-                    }
-                    save_bot_settings(token, &data.settings);
-                }
-            }
+        let current_activity_epoch = data
+            .companion_activity_epoch
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(0);
+        let settings_changed = data
+            .settings
+            .companion_ping
+            .get_mut(&chat_id.0.to_string())
+            .map(|cfg| {
+                apply_companion_ping_completion(
+                    cfg,
+                    completion,
+                    dispatch_activity_epoch,
+                    current_activity_epoch,
+                )
+            })
+            .unwrap_or(false);
+        if settings_changed {
+            persist_bot_settings_change(token, &mut data.settings, previous_settings);
         }
         remove_cancel_token_locked(&mut data, chat_id);
         data.stop_message_ids.remove(&chat_id)
@@ -27419,7 +30568,7 @@ async fn scheduler_cycle(
                 Ok(n) => n,
                 Err(e) => {
                     msg_debug(&format!("[scheduler_loop] invalid chat_id in message: id={}, chat_id={:?}, error={}", msg.id, msg.chat_id, e));
-                    let remove_result = fs::remove_file(&msg.file_path);
+                    let remove_result = remove_file_by_identity(&msg.file_path, msg.file_identity);
                     msg_debug(&format!(
                         "[scheduler_loop] removed invalid message file: ok={}",
                         remove_result.is_ok()

@@ -14,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::services::claude::{
-    debug_log_to, kill_child_tree, CancelToken, ClaudeResponse, StreamMessage,
+    debug_log_to, kill_child_tree, terminate_child_after_receiver_drop, CancelToken,
+    ClaudeResponse, StreamMessage,
 };
 
 // ============================================================
@@ -1629,404 +1630,1781 @@ fn opencode_native_exe_for_wrapper(path: &str) -> Option<String> {
 }
 
 // ============================================================
-// Inject system prompt into AGENTS.md with automatic restore
+// Inject system prompt into AGENTS.md with transactional restore
 // ============================================================
 //
-// OpenCode reads project instructions from AGENTS.md (preferred) or CLAUDE.md.
-// If AGENTS.md exists, CLAUDE.md is ignored entirely.
-//
-// Safety requirements:
-//   - The user's original AGENTS.md must NEVER be lost or corrupted.
-//   - Recovery must work after SIGKILL, crash, or power loss.
-//   - Concurrent execution on the same directory must not corrupt files.
-//
-// Strategy:
-//   1. Acquire a PID-based lock file to prevent concurrent access.
-//   2. Recover from any previous crash (leftover backup/sentinel).
-//   3. Back up original AGENTS.md atomically (write tmp → rename).
-//      If no original exists, write a sentinel file instead.
-//   4. Only AFTER backup is confirmed on disk, write the modified AGENTS.md.
-//   5. On Drop: restore from backup (or delete if sentinel), then release lock.
-//   6. On next call: detect leftover backup/sentinel and auto-recover.
+// Every pathname operation below is fail-closed. In particular, a marker is
+// never authority to overwrite AGENTS.md: both the filesystem object identity
+// and the SHA-256 recorded before publication must still match. If a user edits
+// or replaces AGENTS.md while OpenCode is running, the transaction and original
+// quarantine are deliberately left in place for manual recovery.
 
 const AGENTS_MD: &str = "AGENTS.md";
-const BACKUP_FILE: &str = ".AGENTS.md.cokacdir-backup";
-const NO_ORIGINAL_SENTINEL: &str = ".AGENTS.md.cokacdir-no-original";
 const LOCK_FILE: &str = ".AGENTS.md.cokacdir-lock";
+const STATE_PREFIX: &str = ".AGENTS.md.cokacdir-state-v2.";
+const STATE_STAGING_PREFIX: &str = ".AGENTS.md.cokacdir-state-staging-v2.";
+const STATE_DONE_PREFIX: &str = ".AGENTS.md.cokacdir-state-done-v2.";
+const STAGED_PREFIX: &str = ".AGENTS.md.cokacdir-staged-v2.";
+const BACKUP_PREFIX: &str = ".AGENTS.md.cokacdir-backup-v2.";
+const RETIRED_PREFIX: &str = ".AGENTS.md.cokacdir-retired-v2.";
 
-/// Check if a process with the given PID is still alive.
-/// Note: on Unix, uses `kill -0` which requires same-user ownership.
-/// A process owned by a different user returns false (EPERM → exit code 1).
-/// This is acceptable because cokacdir instances on the same directory
-/// are always run by the same user.
-fn is_pid_alive(pid: u32) -> bool {
+// These names were used by the unsafe legacy recovery protocol. Their content
+// is ambiguous, so v2 never deletes or restores from them automatically.
+const LEGACY_BACKUP_FILE: &str = ".AGENTS.md.cokacdir-backup";
+const LEGACY_NO_ORIGINAL_SENTINEL: &str = ".AGENTS.md.cokacdir-no-original";
+const LEGACY_TMP_FILE: &str = ".AGENTS.md.cokacdir-tmp";
+
+const MAX_ORIGINAL_AGENTS_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INJECTED_AGENTS_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 64 * 1024;
+const TXN_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AgentsFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u64,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_id_128: Option<[u8; 16]>,
+    #[cfg(not(any(unix, windows)))]
+    length: u64,
+    #[cfg(not(any(unix, windows)))]
+    modified_nanos: u128,
+}
+
+impl PartialEq for AgentsFileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            return self.device == other.device && self.inode == other.inode;
+        }
+        #[cfg(windows)]
+        {
+            return match (self.file_id_128, other.file_id_128) {
+                (Some(left), Some(right)) => {
+                    self.volume_serial == other.volume_serial && left == right
+                }
+                _ => {
+                    // Markers created by older versions contain only the
+                    // legacy 64-bit index. Keep their recovery compatible,
+                    // while new markers compare the complete ReFS-safe ID.
+                    self.volume_serial == other.volume_serial && self.file_index == other.file_index
+                }
+            };
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.length == other.length && self.modified_nanos == other.modified_nanos
+        }
+    }
+}
+
+impl Eq for AgentsFileIdentity {}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AgentsFileRecord {
+    identity: AgentsFileIdentity,
+    length: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AgentsTxnPlan {
+    version: u32,
+    phase: String,
+    txn: String,
+    original: Option<AgentsFileRecord>,
+    injected_length: u64,
+    injected_sha256: String,
+    backup_name: Option<String>,
+    staged_name: String,
+    retired_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AgentsTxnReady {
+    version: u32,
+    phase: String,
+    txn: String,
+    injected: AgentsFileRecord,
+}
+
+#[derive(Debug)]
+struct ParsedAgentsState {
+    plan: AgentsTxnPlan,
+    ready: Option<AgentsTxnReady>,
+    marker_record: AgentsFileRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentsFileSnapshot {
+    length: u64,
+    readonly: bool,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    last_write_time: u64,
+    #[cfg(windows)]
+    attributes: u32,
+    #[cfg(not(any(unix, windows)))]
+    modified_nanos: u128,
+}
+
+fn metadata_is_safe_regular(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn metadata_snapshot(metadata: &std::fs::Metadata) -> AgentsFileSnapshot {
     #[cfg(unix)]
     {
-        use std::process::Command;
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        use std::os::unix::fs::MetadataExt;
+        AgentsFileSnapshot {
+            length: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        AgentsFileSnapshot {
+            length: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            creation_time: metadata.creation_time(),
+            last_write_time: metadata.last_write_time(),
+            attributes: metadata.file_attributes(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        AgentsFileSnapshot {
+            length: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            modified_nanos,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> std::io::Result<AgentsFileIdentity> {
+    let (volume_serial, object) =
+        crate::services::file_ops::stable_file_identity(file)?.components();
+    let mut legacy_index = [0u8; 8];
+    legacy_index.copy_from_slice(&object[..8]);
+    Ok(AgentsFileIdentity {
+        volume_serial,
+        file_index: u64::from_le_bytes(legacy_index),
+        file_id_128: Some(object),
+    })
+}
+
+fn file_identity(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<AgentsFileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = file;
+        Ok(AgentsFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows_file_identity(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let modified_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let _ = file;
+        Ok(AgentsFileIdentity {
+            length: metadata.len(),
+            modified_nanos,
+        })
+    }
+}
+
+fn open_regular_no_follow(
+    path: &std::path::Path,
+    writable: bool,
+) -> std::io::Result<std::fs::File> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !metadata_is_safe_regular(&before) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe non-regular or reparse file: {}", path.display()),
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !metadata_is_safe_regular(&opened) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("opened unsafe file: {}", path.display()),
+        ));
+    }
+    let identity = file_identity(&file, &opened)?;
+    ensure_path_identity(path, &identity)?;
+    Ok(file)
+}
+
+fn ensure_path_identity(
+    path: &std::path::Path,
+    expected: &AgentsFileIdentity,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata_is_safe_regular(&metadata)
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+        {
+            return Err(std::io::Error::other(format!(
+                "file identity changed: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata_is_safe_regular(&metadata) || &windows_file_identity(&file)? != expected {
+            return Err(std::io::Error::other(format!(
+                "file identity changed: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata_is_safe_regular(&metadata) || &file_identity(&file, &metadata)? != expected {
+            return Err(std::io::Error::other(format!(
+                "file identity changed: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn read_regular_record(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<u8>, AgentsFileRecord)> {
+    use std::io::Read;
+
+    let mut file = open_regular_no_follow(path, false)?;
+    let before = file.metadata()?;
+    if before.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds size limit: {}", path.display()),
+        ));
+    }
+    let identity = file_identity(&file, &before)?;
+    let snapshot = metadata_snapshot(&before);
+    let mut bytes = Vec::with_capacity(before.len().min(max_bytes) as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file grew beyond size limit: {}", path.display()),
+        ));
+    }
+    let after = file.metadata()?;
+    if metadata_snapshot(&after) != snapshot || after.len() != bytes.len() as u64 {
+        return Err(std::io::Error::other(format!(
+            "file changed while being read: {}",
+            path.display()
+        )));
+    }
+    ensure_path_identity(path, &identity)?;
+    let record = AgentsFileRecord {
+        identity,
+        length: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    };
+    Ok((bytes, record))
+}
+
+fn record_matches_plan(record: &AgentsFileRecord, length: u64, sha256: &str) -> bool {
+    record.length == length && record.sha256 == sha256
+}
+
+fn create_private_new(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn agents_rename_noreplace(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem does not support atomic no-clobber rename",
+            ))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn agents_rename_noreplace(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn agents_rename_noreplace(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    crate::services::file_ops::rename_noreplace(source, destination)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    windows
+)))]
+fn agents_rename_noreplace(
+    _source: &std::path::Path,
+    _destination: &std::path::Path,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-clobber rename is unavailable",
+    ))
+}
+
+fn sync_agents_parent(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?.sync_all()
     }
     #[cfg(not(unix))]
     {
-        // Conservative: assume alive to avoid stealing lock.
-        let _ = pid;
-        true
+        let _ = path;
+        Ok(())
     }
 }
 
-/// Try to acquire a PID-based lock file. Returns false if another live
-/// process holds the lock (concurrent execution on same directory).
-/// Uses O_EXCL (create_new) for atomic creation to prevent TOCTOU races.
-fn try_acquire_lock(dir: &std::path::Path) -> bool {
-    use std::io::Write;
-    let lock_path = dir.join(LOCK_FILE);
-    let my_pid = std::process::id();
+fn rename_agents_noreplace_synced(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    agents_rename_noreplace(source, destination)?;
+    sync_agents_parent(destination)
+}
 
-    // Attempt 1: atomic create (O_EXCL) — fails if file already exists
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(my_pid.to_string().as_bytes());
-            opencode_debug(&format!("[lock] acquired (PID={})", my_pid));
-            return true;
+fn control_path_absent(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata_is_safe_regular(&metadata) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe control path: {}", path.display()),
+        )),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("control path already exists: {}", path.display()),
+        )),
+    }
+}
+
+fn try_acquire_lock(dir: &std::path::Path) -> Option<std::fs::File> {
+    let lock_path = dir.join(LOCK_FILE);
+    let file = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            if !metadata_is_safe_regular(&metadata) {
+                opencode_debug("[agents lock] refusing symlink/reparse/non-regular lock file");
+                return None;
+            }
+            open_regular_no_follow(&lock_path, true)
         }
-        Err(_) => {
-            // File exists — check if the holder is still alive
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_private_new(&lock_path) {
+                Ok(file) => {
+                    if let Err(error) = file.sync_all().and_then(|_| sync_agents_parent(&lock_path))
+                    {
+                        opencode_debug(&format!("[agents lock] cannot sync new lock: {error}"));
+                        return None;
+                    }
+                    Ok(file)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_regular_no_follow(&lock_path, true)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            opencode_debug(&format!("[agents lock] cannot safely open lock: {error}"));
+            return None;
+        }
+    };
+
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(error) => {
+            opencode_debug(&format!("[agents lock] lock failed: {error}"));
+            None
         }
     }
+}
 
-    // Read existing lock to check liveness
-    let content = match std::fs::read_to_string(&lock_path) {
-        Ok(c) => c,
-        Err(_) => {
-            opencode_debug("[lock] cannot read existing lock file, skipping");
-            return false;
-        }
-    };
-    let holder_pid = match content.trim().parse::<u32>() {
-        Ok(p) => p,
-        Err(_) => {
-            opencode_debug("[lock] lock file has invalid content, treating as stale");
-            0 // treat as dead
-        }
-    };
+fn valid_txn_id(txn: &str) -> bool {
+    txn.len() == 32 && txn.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
-    if holder_pid != my_pid && holder_pid != 0 && is_pid_alive(holder_pid) {
-        opencode_debug(&format!(
-            "[lock] another process (PID={}) holds the lock, skipping injection",
-            holder_pid
+fn expected_txn_names(txn: &str, has_original: bool) -> (String, Option<String>, String, String) {
+    (
+        format!("{STAGED_PREFIX}{txn}"),
+        has_original.then(|| format!("{BACKUP_PREFIX}{txn}")),
+        format!("{RETIRED_PREFIX}{txn}"),
+        format!("{STATE_DONE_PREFIX}{txn}"),
+    )
+}
+
+fn transaction_state_name(txn: &str) -> String {
+    format!("{STATE_PREFIX}{txn}")
+}
+
+fn transaction_state_staging_name(txn: &str) -> String {
+    format!("{STATE_STAGING_PREFIX}{txn}")
+}
+
+fn validate_plan(plan: &AgentsTxnPlan) -> std::io::Result<()> {
+    if plan.version != TXN_VERSION || plan.phase != "plan" || !valid_txn_id(&plan.txn) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid AGENTS transaction plan",
         ));
-        return false;
     }
-
-    // Stale lock from dead process — remove and retry with O_EXCL
-    opencode_debug(&format!(
-        "[lock] stale lock from dead PID={}, taking over",
-        holder_pid
-    ));
-    let _ = std::fs::remove_file(&lock_path);
-
-    // Attempt 2: another process might have grabbed it between remove and create
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
+    if plan.injected_length > MAX_INJECTED_AGENTS_BYTES
+        || plan.injected_sha256.len() != 64
+        || !plan
+            .injected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
     {
-        Ok(mut f) => {
-            let _ = f.write_all(my_pid.to_string().as_bytes());
-            opencode_debug(&format!("[lock] acquired on retry (PID={})", my_pid));
-            true
-        }
-        Err(_) => {
-            // Another process won the race — that's fine, we skip injection
-            opencode_debug("[lock] lost race on retry, skipping injection");
-            false
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid injected file record",
+        ));
+    }
+    if let Some(original) = &plan.original {
+        if original.length > MAX_ORIGINAL_AGENTS_BYTES
+            || original.sha256.len() != 64
+            || !original.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid original file record",
+            ));
         }
     }
-}
-
-fn release_lock(dir: &std::path::Path) {
-    let lock_path = dir.join(LOCK_FILE);
-    let _ = std::fs::remove_file(&lock_path);
-    opencode_debug("[lock] released");
-}
-
-/// Write content to a file atomically: write to a temp file in the same
-/// directory, then rename. This prevents partial writes from corrupting
-/// the target file.
-fn atomic_write(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("cokacdir-tmp");
-    if let Err(e) = std::fs::write(&tmp, content) {
-        // tmp write failed — clean up partial tmp and return error
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // rename failed — clean up tmp, do NOT attempt non-atomic fallback
-        opencode_debug(&format!("[atomic_write] rename failed: {}", e));
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let (staged, backup, retired, _) = expected_txn_names(&plan.txn, plan.original.is_some());
+    if plan.staged_name != staged || plan.backup_name != backup || plan.retired_name != retired {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transaction contains unsafe control names",
+        ));
     }
     Ok(())
 }
 
-/// Recover from a previous crash: if a backup/sentinel file exists, restore.
-/// Called at the start of every inject to guarantee AGENTS.md is clean.
-/// Also cleans up any leftover tmp files from interrupted atomic_write.
-fn recover_agents_md_if_needed(dir: &std::path::Path) {
-    // Clean up leftover tmp file from interrupted atomic_write
-    let tmp_path = dir.join(BACKUP_FILE).with_extension("cokacdir-tmp");
-    if tmp_path.exists() {
-        opencode_debug("[recover] removing leftover tmp file");
-        let _ = std::fs::remove_file(&tmp_path);
+fn parse_state_at(path: &std::path::Path) -> std::io::Result<ParsedAgentsState> {
+    let (bytes, marker_record) = read_regular_record(path, MAX_STATE_BYTES)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "state marker is not UTF-8")
+    })?;
+    let lines: Vec<&str> = text.lines().collect();
+    if !(lines.len() == 1 || lines.len() == 2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state marker has an invalid number of records",
+        ));
     }
-
-    let agents_path = dir.join(AGENTS_MD);
-    let backup_path = dir.join(BACKUP_FILE);
-    let sentinel_path = dir.join(NO_ORIGINAL_SENTINEL);
-
-    if sentinel_path.exists() {
-        // Original file did not exist → remove injected AGENTS.md and sentinel
-        opencode_debug("[recover] sentinel found → removing injected AGENTS.md");
-        let _ = std::fs::remove_file(&agents_path);
-        if !agents_path.exists() {
-            // AGENTS.md is gone — safe to remove sentinel
-            let _ = std::fs::remove_file(&sentinel_path);
-            opencode_debug("[recover] cleaned up sentinel");
-        } else {
-            // Cannot delete AGENTS.md — keep sentinel for next recovery attempt
-            opencode_debug(
-                "[recover] cannot delete AGENTS.md, sentinel preserved for next recovery",
-            );
+    let plan: AgentsTxnPlan = serde_json::from_str(lines[0]).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid state plan: {error}"),
+        )
+    })?;
+    validate_plan(&plan)?;
+    let ready = if lines.len() == 2 {
+        let ready: AgentsTxnReady = serde_json::from_str(lines[1]).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ready record: {error}"),
+            )
+        })?;
+        if ready.version != TXN_VERSION
+            || ready.phase != "ready"
+            || ready.txn != plan.txn
+            || !record_matches_plan(&ready.injected, plan.injected_length, &plan.injected_sha256)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ready record does not match transaction plan",
+            ));
         }
-        // Also clean up any stale lock
-        release_lock(dir);
-    } else if backup_path.exists() {
-        // Original file existed → restore from backup
-        opencode_debug("[recover] backup found → restoring original AGENTS.md");
-        match std::fs::rename(&backup_path, &agents_path) {
-            Ok(()) => opencode_debug("[recover] restored OK (rename)"),
-            Err(e) => {
-                opencode_debug(&format!(
-                    "[recover] rename failed ({}), trying read+write",
-                    e
-                ));
-                match std::fs::read_to_string(&backup_path) {
-                    Ok(content) => {
-                        match std::fs::write(&agents_path, &content) {
-                            Ok(()) => {
-                                // Only delete backup AFTER successful restore
-                                let _ = std::fs::remove_file(&backup_path);
-                                opencode_debug("[recover] restored OK (copy+delete)");
-                            }
-                            Err(e2) => {
-                                // Write failed — do NOT delete backup
-                                opencode_debug(&format!("[recover] CRITICAL: restore write FAILED: {}, backup preserved", e2));
-                            }
-                        }
-                    }
-                    Err(e2) => {
-                        opencode_debug(&format!("[recover] CRITICAL: cannot read backup: {}", e2));
-                        // Leave backup in place — don't delete what we can't read.
-                    }
-                }
-            }
-        }
-        release_lock(dir);
+        Some(ready)
+    } else {
+        None
+    };
+    Ok(ParsedAgentsState {
+        plan,
+        ready,
+        marker_record,
+    })
+}
+
+fn path_record_if_present(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<AgentsFileRecord>> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata_is_safe_regular(&metadata) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe transaction path: {}", path.display()),
+        )),
+        Ok(_) => read_regular_record(path, max_bytes).map(|(_, record)| Some(record)),
     }
 }
 
-/// RAII guard that restores AGENTS.md to its original state when dropped.
+fn move_owned_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    expected: &AgentsFileRecord,
+) -> std::io::Result<()> {
+    let current = path_record_if_present(source, expected.length.max(1))?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("owned file disappeared: {}", source.display()),
+        )
+    })?;
+    if &current != expected {
+        return Err(std::io::Error::other(format!(
+            "owned file changed before move: {}",
+            source.display()
+        )));
+    }
+    rename_agents_noreplace_synced(source, destination)?;
+    let moved = path_record_if_present(destination, expected.length.max(1))?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "moved file disappeared")
+    })?;
+    if &moved != expected {
+        // Never overwrite a path while attempting rollback. If AGENTS.md was
+        // concurrently recreated, the changed file remains quarantined.
+        let _ = rename_agents_noreplace_synced(destination, source);
+        return Err(std::io::Error::other(format!(
+            "owned file changed during move: {}",
+            source.display()
+        )));
+    }
+    Ok(())
+}
+
+fn remove_quarantined_file(
+    path: &std::path::Path,
+    expected: &AgentsFileRecord,
+) -> std::io::Result<()> {
+    use std::io::Read;
+
+    // Keep the verified read handle alive while opening a DELETE-capable
+    // no-follow handle for the same object. The final disposition is then
+    // handle-bound on Windows; a pathname replacement cannot be unlinked.
+    let (mut file, before) = crate::services::file_ops::open_regular_file_no_follow(path)?;
+    let limit = expected.length.max(1);
+    if before.len() > limit {
+        return Err(std::io::Error::other(format!(
+            "quarantined file changed: {}",
+            path.display()
+        )));
+    }
+    let legacy_identity = file_identity(&file, &before)?;
+    let snapshot = metadata_snapshot(&before);
+    let mut bytes = Vec::with_capacity(before.len().min(limit) as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let current = AgentsFileRecord {
+        identity: legacy_identity.clone(),
+        length: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    };
+    if bytes.len() as u64 > limit || metadata_snapshot(&after) != snapshot || current != *expected {
+        return Err(std::io::Error::other(format!(
+            "quarantined file changed: {}",
+            path.display()
+        )));
+    }
+    ensure_path_identity(path, &legacy_identity)?;
+    let stable_identity = crate::services::file_ops::stable_file_identity(&file)?;
+    let deletion = crate::services::file_ops::prepare_file_deletion(path, stable_identity)?;
+    drop(file);
+    deletion.delete()?;
+    sync_agents_parent(path)
+}
+
+fn cleanup_state_marker(dir: &std::path::Path, state: &ParsedAgentsState) -> std::io::Result<()> {
+    let state_path = dir.join(transaction_state_name(&state.plan.txn));
+    let (_, _, _, done_name) = expected_txn_names(&state.plan.txn, state.plan.original.is_some());
+    let done_path = dir.join(done_name);
+    move_owned_file(&state_path, &done_path, &state.marker_record)?;
+    remove_quarantined_file(&done_path, &state.marker_record)
+}
+
+fn cleanup_staged_file(
+    dir: &std::path::Path,
+    state: &ParsedAgentsState,
+    expected: &AgentsFileRecord,
+) -> std::io::Result<()> {
+    let staged_path = dir.join(&state.plan.staged_name);
+    let retired_path = dir.join(&state.plan.retired_name);
+    match path_record_if_present(&staged_path, MAX_INJECTED_AGENTS_BYTES)? {
+        None => Ok(()),
+        Some(record) if &record == expected => {
+            move_owned_file(&staged_path, &retired_path, expected)?;
+            remove_quarantined_file(&retired_path, expected)
+        }
+        Some(_) => Err(std::io::Error::other(
+            "staged AGENTS transaction file changed; preserving it",
+        )),
+    }
+}
+
+fn finish_ready_transaction(
+    dir: &std::path::Path,
+    state: &ParsedAgentsState,
+) -> std::io::Result<()> {
+    let ready = state.ready.as_ref().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "transaction is not ready")
+    })?;
+    let agents_path = dir.join(AGENTS_MD);
+    let staged_path = dir.join(&state.plan.staged_name);
+    let backup_path = state.plan.backup_name.as_ref().map(|name| dir.join(name));
+    let retired_path = dir.join(&state.plan.retired_name);
+
+    let agents = path_record_if_present(&agents_path, MAX_INJECTED_AGENTS_BYTES)?;
+    let staged = path_record_if_present(&staged_path, MAX_INJECTED_AGENTS_BYTES)?;
+    let retired = path_record_if_present(&retired_path, MAX_INJECTED_AGENTS_BYTES)?;
+    let backup = match &backup_path {
+        Some(path) => path_record_if_present(path, MAX_ORIGINAL_AGENTS_BYTES)?,
+        None => None,
+    };
+
+    if let Some(record) = &staged {
+        if record != &ready.injected {
+            return Err(std::io::Error::other(
+                "staged transaction file changed; preserving transaction",
+            ));
+        }
+    }
+    if let Some(record) = &retired {
+        if record != &ready.injected {
+            return Err(std::io::Error::other(
+                "retired transaction file changed; preserving transaction",
+            ));
+        }
+    }
+    match (&state.plan.original, &backup) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            return Err(std::io::Error::other(
+                "original quarantine changed; preserving transaction",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(std::io::Error::other(
+                "unexpected original quarantine; preserving transaction",
+            ));
+        }
+        _ => {}
+    }
+
+    // If AGENTS is ours, first quarantine it. A rename followed by a second
+    // identity/hash check closes the verification-to-delete window without
+    // ever overwriting a concurrently created user file.
+    if agents.as_ref() == Some(&ready.injected) {
+        if retired.is_some() {
+            return Err(std::io::Error::other(
+                "retired path collision; preserving transaction",
+            ));
+        }
+        move_owned_file(&agents_path, &retired_path, &ready.injected)?;
+    } else if let Some(record) = &agents {
+        if state.plan.original.as_ref() == Some(record) && backup.is_none() {
+            if retired.is_none() {
+                // Crash before the original was quarantined. No user pathname
+                // was changed, so only our staged file needs cleanup.
+                cleanup_staged_file(dir, state, &ready.injected)?;
+                return cleanup_state_marker(dir, state);
+            }
+            if retired.as_ref() == Some(&ready.injected) && staged.is_none() {
+                // Restoration was already committed, then the process died
+                // before removing the retired injected inode and state.
+                remove_quarantined_file(&retired_path, &ready.injected)?;
+                return cleanup_state_marker(dir, state);
+            }
+        }
+        return Err(std::io::Error::other(
+            "AGENTS.md was changed by the user; preserving it and recovery files",
+        ));
+    } else if retired.as_ref() != Some(&ready.injected) {
+        if staged.as_ref() == Some(&ready.injected) {
+            // The ready record was durable but publication had not happened:
+            // the injected inode is still at its private staged name. This is
+            // the only AGENTS-absent state in which restoring an original is
+            // safe without first observing the injected identity at AGENTS.
+            if let (Some(original), Some(backup_path)) =
+                (&state.plan.original, backup_path.as_ref())
+            {
+                if backup.as_ref() != Some(original) {
+                    return Err(std::io::Error::other(
+                        "pre-publish original quarantine is missing or changed",
+                    ));
+                }
+                move_owned_file(backup_path, &agents_path, original)?;
+            }
+            cleanup_staged_file(dir, state, &ready.injected)?;
+            return cleanup_state_marker(dir, state);
+        }
+        // A published file that disappeared may have been deliberately
+        // deleted by the user. Absence alone is never permission to restore
+        // an original or to discard the recovery marker.
+        return Err(std::io::Error::other(
+            "AGENTS.md disappeared after publication; preserving recovery files",
+        ));
+    }
+
+    let retired_now = path_record_if_present(&retired_path, MAX_INJECTED_AGENTS_BYTES)?;
+    match &state.plan.original {
+        Some(original) => {
+            let backup_path = backup_path.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "original transaction is missing its backup name",
+                )
+            })?;
+            let backup_now = path_record_if_present(backup_path, MAX_ORIGINAL_AGENTS_BYTES)?;
+            if backup_now.as_ref() != Some(original) {
+                return Err(std::io::Error::other(
+                    "original quarantine is missing or changed; preserving transaction",
+                ));
+            }
+            if path_record_if_present(&agents_path, MAX_INJECTED_AGENTS_BYTES)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "AGENTS.md was recreated; refusing to overwrite it",
+                ));
+            }
+            move_owned_file(backup_path, &agents_path, original)?;
+        }
+        None => {
+            if path_record_if_present(&agents_path, MAX_INJECTED_AGENTS_BYTES)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "AGENTS.md was recreated; refusing to delete it",
+                ));
+            }
+        }
+    }
+
+    if retired_now.as_ref() == Some(&ready.injected) {
+        remove_quarantined_file(&retired_path, &ready.injected)?;
+    } else if retired_now.is_some() {
+        return Err(std::io::Error::other(
+            "retired injected file changed; preserving transaction",
+        ));
+    }
+    cleanup_staged_file(dir, state, &ready.injected)?;
+    cleanup_state_marker(dir, state)
+}
+
+fn finish_plan_only_transaction(
+    dir: &std::path::Path,
+    state: &ParsedAgentsState,
+) -> std::io::Result<()> {
+    let agents_path = dir.join(AGENTS_MD);
+    let current = path_record_if_present(&agents_path, MAX_ORIGINAL_AGENTS_BYTES)?;
+    if current != state.plan.original {
+        return Err(std::io::Error::other(
+            "AGENTS.md changed during transaction preparation; preserving state",
+        ));
+    }
+    if let Some(backup_name) = &state.plan.backup_name {
+        control_path_absent(&dir.join(backup_name))?;
+    }
+    control_path_absent(&dir.join(&state.plan.retired_name))?;
+
+    let staged_path = dir.join(&state.plan.staged_name);
+    if let Some(staged) = path_record_if_present(&staged_path, MAX_INJECTED_AGENTS_BYTES)? {
+        if !record_matches_plan(
+            &staged,
+            state.plan.injected_length,
+            &state.plan.injected_sha256,
+        ) {
+            return Err(std::io::Error::other(
+                "uncommitted staged file changed; preserving state",
+            ));
+        }
+        let retired_path = dir.join(&state.plan.retired_name);
+        move_owned_file(&staged_path, &retired_path, &staged)?;
+        remove_quarantined_file(&retired_path, &staged)?;
+    }
+    cleanup_state_marker(dir, state)
+}
+
+fn recover_done_markers(dir: &std::path::Path) -> std::io::Result<()> {
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(STATE_DONE_PREFIX) {
+            continue;
+        }
+        let state = parse_state_at(&entry.path())?;
+        let (_, backup, retired, done) =
+            expected_txn_names(&state.plan.txn, state.plan.original.is_some());
+        if name != done || state.ready.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid completed transaction marker",
+            ));
+        }
+        control_path_absent(&dir.join(&state.plan.staged_name))?;
+        if let Some(backup) = backup {
+            control_path_absent(&dir.join(backup))?;
+        }
+        control_path_absent(&dir.join(retired))?;
+        remove_quarantined_file(&entry.path(), &state.marker_record)?;
+    }
+    Ok(())
+}
+
+fn reject_legacy_controls(dir: &std::path::Path) -> std::io::Result<()> {
+    for name in [
+        LEGACY_BACKUP_FILE,
+        LEGACY_NO_ORIGINAL_SENTINEL,
+        LEGACY_TMP_FILE,
+    ] {
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("legacy AGENTS recovery marker requires manual review: {name}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn find_transaction_states(dir: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut states = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STATE_PREFIX)
+        {
+            states.push(entry.path());
+        }
+    }
+    Ok(states)
+}
+
+fn validate_unpublished_state_stages(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(STATE_STAGING_PREFIX) {
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !metadata_is_safe_regular(&metadata) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsafe unpublished AGENTS transaction state: {name}"),
+                ));
+            }
+            // This file was never published as an active marker, so the v2
+            // protocol guarantees that AGENTS.md was not touched. Preserve a
+            // partial write for diagnosis but do not let it block a new txn.
+        }
+    }
+    Ok(())
+}
+
+fn reject_orphaned_dynamic_controls(dir: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with(STAGED_PREFIX)
+            || name.starts_with(BACKUP_PREFIX)
+            || name.starts_with(RETIRED_PREFIX)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("orphaned AGENTS transaction control requires review: {name}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recover_agents_md_if_needed(
+    dir: &std::path::Path,
+    expected_txn: Option<&str>,
+) -> std::io::Result<()> {
+    reject_legacy_controls(dir)?;
+    recover_done_markers(dir)?;
+    validate_unpublished_state_stages(dir)?;
+    let mut states = find_transaction_states(dir)?;
+    if states.is_empty() {
+        reject_orphaned_dynamic_controls(dir)?;
+        return Ok(());
+    }
+    if states.len() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "multiple AGENTS transaction states require manual review",
+        ));
+    }
+    let state_path = states.remove(0);
+    let metadata = std::fs::symlink_metadata(&state_path)?;
+    if !metadata_is_safe_regular(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AGENTS state is a symlink/reparse/non-regular file",
+        ));
+    }
+    let state = parse_state_at(&state_path)?;
+    let expected_state_name = transaction_state_name(&state.plan.txn);
+    if state_path.file_name() != Some(std::ffi::OsStr::new(&expected_state_name)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "transaction state filename does not match its transaction id",
+        ));
+    }
+    if expected_txn.is_some_and(|txn| txn != state.plan.txn) {
+        return Err(std::io::Error::other(
+            "AGENTS transaction marker was replaced; preserving all files",
+        ));
+    }
+    if state.ready.is_some() {
+        finish_ready_transaction(dir, &state)
+    } else {
+        finish_plan_only_transaction(dir, &state)
+    }
+}
+
 struct AgentsMdGuard {
     dir: std::path::PathBuf,
-    /// true = original file existed and was backed up to BACKUP_FILE.
-    /// false = original file did not exist; sentinel was written.
-    had_original: bool,
+    txn: String,
+    restore_on_drop: bool,
+    _lock_file: std::fs::File,
 }
 
 impl Drop for AgentsMdGuard {
     fn drop(&mut self) {
-        let agents_path = self.dir.join(AGENTS_MD);
-        let backup_path = self.dir.join(BACKUP_FILE);
-        let sentinel_path = self.dir.join(NO_ORIGINAL_SENTINEL);
-
-        if self.had_original {
-            opencode_debug("[AgentsMdGuard] restoring original AGENTS.md from backup");
-            match std::fs::rename(&backup_path, &agents_path) {
-                Ok(()) => opencode_debug("[AgentsMdGuard] restored OK (rename)"),
-                Err(e) => {
-                    opencode_debug(&format!(
-                        "[AgentsMdGuard] rename failed ({}), trying read+write",
-                        e
-                    ));
-                    match std::fs::read_to_string(&backup_path) {
-                        Ok(content) => {
-                            match std::fs::write(&agents_path, &content) {
-                                Ok(()) => {
-                                    opencode_debug("[AgentsMdGuard] restored OK (copy)");
-                                    // Only delete backup AFTER successful restore
-                                    let _ = std::fs::remove_file(&backup_path);
-                                }
-                                Err(e2) => {
-                                    // Write failed — do NOT delete backup, it's the only copy of the original
-                                    opencode_debug(&format!("[AgentsMdGuard] CRITICAL: restore write FAILED: {}, backup preserved for recovery", e2));
-                                }
-                            }
-                        }
-                        Err(e2) => {
-                            // Backup unreadable — do NOT delete it. Leave it for manual recovery.
-                            opencode_debug(&format!("[AgentsMdGuard] CRITICAL: backup unreadable ({}), leaving for manual recovery", e2));
-                        }
-                    }
-                }
-            }
-        } else {
-            opencode_debug("[AgentsMdGuard] removing injected AGENTS.md (no original)");
-            let _ = std::fs::remove_file(&agents_path);
-            if !agents_path.exists() {
-                // AGENTS.md is gone — safe to remove sentinel
-                let _ = std::fs::remove_file(&sentinel_path);
-            } else {
-                // Cannot delete AGENTS.md — keep sentinel for crash recovery
-                opencode_debug(
-                    "[AgentsMdGuard] cannot delete AGENTS.md, sentinel preserved for recovery",
-                );
+        if self.restore_on_drop {
+            if let Err(error) = recover_agents_md_if_needed(&self.dir, Some(&self.txn)) {
+                opencode_debug(&format!(
+                    "[AgentsMdGuard] restore stopped safely; recovery files preserved: {error}"
+                ));
             }
         }
-
-        release_lock(&self.dir);
     }
 }
 
-/// Inject system prompt into AGENTS.md, prepended before any existing content.
-/// Returns `Some(guard)` on success (guard restores on drop), or `None` if
-/// injection was skipped (lock held by another process, or write failures).
-fn inject_system_prompt_into_agents_md(
+#[cfg(test)]
+impl AgentsMdGuard {
+    fn simulate_crash(mut self) {
+        self.restore_on_drop = false;
+    }
+}
+
+fn inspect_original_agents(
+    agents_path: &std::path::Path,
+) -> std::io::Result<Option<(String, AgentsFileRecord)>> {
+    match std::fs::symlink_metadata(agents_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(metadata) if !metadata_is_safe_regular(&metadata) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AGENTS.md must be an ordinary non-reparse file",
+        )),
+        Ok(_) => {
+            let (bytes, record) = read_regular_record(agents_path, MAX_ORIGINAL_AGENTS_BYTES)?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "AGENTS.md is not UTF-8")
+            })?;
+            Ok(Some((text, record)))
+        }
+    }
+}
+
+fn inject_system_prompt_into_agents_md_impl(
     working_dir: &str,
     system_prompt: &str,
+    forced_txn: Option<&str>,
 ) -> Option<AgentsMdGuard> {
     let dir = std::path::Path::new(working_dir);
     let agents_path = dir.join(AGENTS_MD);
-    let backup_path = dir.join(BACKUP_FILE);
-    let sentinel_path = dir.join(NO_ORIGINAL_SENTINEL);
-
-    opencode_debug(&format!(
-        "[inject_agents_md] dir={} system_prompt_len={}",
-        working_dir,
-        system_prompt.len()
-    ));
-
-    // Step 0: recover from any previous crash
-    recover_agents_md_if_needed(dir);
-
-    // Step 1: acquire lock (prevents concurrent corruption)
-    if !try_acquire_lock(dir) {
-        opencode_debug("[inject_agents_md] SKIPPED: could not acquire lock");
+    let lock_file = try_acquire_lock(dir)?;
+    if let Err(error) = recover_agents_md_if_needed(dir, None) {
+        opencode_debug(&format!(
+            "[inject_agents_md] recovery stopped safely; files preserved: {error}"
+        ));
         return None;
     }
 
-    // Step 2: back up original to disk (atomically)
-    let had_original = agents_path.exists();
-    if had_original {
-        let original = match std::fs::read_to_string(&agents_path) {
-            Ok(c) => c,
-            Err(e) => {
+    let original = match inspect_original_agents(&agents_path) {
+        Ok(original) => original,
+        Err(error) => {
+            opencode_debug(&format!("[inject_agents_md] unsafe AGENTS.md: {error}"));
+            return None;
+        }
+    };
+    let injected = if let Some((original_text, _)) = &original {
+        format!("{}\n\n{}\n", system_prompt, original_text.trim()).into_bytes()
+    } else {
+        format!("{system_prompt}\n").into_bytes()
+    };
+    if injected.len() as u64 > MAX_INJECTED_AGENTS_BYTES {
+        opencode_debug("[inject_agents_md] injected AGENTS.md exceeds size limit");
+        return None;
+    }
+
+    let txn = forced_txn
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    if !valid_txn_id(&txn) {
+        opencode_debug("[inject_agents_md] invalid transaction id");
+        return None;
+    }
+    let (staged_name, backup_name, retired_name, done_name) =
+        expected_txn_names(&txn, original.is_some());
+    let state_name = transaction_state_name(&txn);
+    let state_staging_name = transaction_state_staging_name(&txn);
+    for path in [
+        Some(dir.join(&state_name)),
+        Some(dir.join(&state_staging_name)),
+        Some(dir.join(&staged_name)),
+        backup_name.as_ref().map(|name| dir.join(name)),
+        Some(dir.join(&retired_name)),
+        Some(dir.join(&done_name)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(error) = control_path_absent(&path) {
+            opencode_debug(&format!("[inject_agents_md] control collision: {error}"));
+            return None;
+        }
+    }
+
+    let plan = AgentsTxnPlan {
+        version: TXN_VERSION,
+        phase: "plan".to_string(),
+        txn: txn.clone(),
+        original: original.as_ref().map(|(_, record)| record.clone()),
+        injected_length: injected.len() as u64,
+        injected_sha256: sha256_hex(&injected),
+        backup_name: backup_name.clone(),
+        staged_name: staged_name.clone(),
+        retired_name: retired_name.clone(),
+    };
+    let state_path = dir.join(state_name);
+    let state_staging_path = dir.join(state_staging_name);
+    let mut state_file = match create_private_new(&state_staging_path) {
+        Ok(file) => file,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot create staged state: {error}"
+            ));
+            return None;
+        }
+    };
+    let plan_line = match serde_json::to_vec(&plan) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(error) => {
+            opencode_debug(&format!("[inject_agents_md] cannot encode state: {error}"));
+            return None;
+        }
+    };
+    if let Err(error) = state_file
+        .write_all(&plan_line)
+        .and_then(|_| state_file.sync_all())
+        .and_then(|_| sync_agents_parent(&state_staging_path))
+    {
+        opencode_debug(&format!("[inject_agents_md] cannot persist plan: {error}"));
+        return None;
+    }
+    if let Err(error) = rename_agents_noreplace_synced(&state_staging_path, &state_path) {
+        opencode_debug(&format!(
+            "[inject_agents_md] cannot publish transaction state: {error}"
+        ));
+        return None;
+    }
+
+    let staged_path = dir.join(&staged_name);
+    let mut staged_file = match create_private_new(&staged_path) {
+        Ok(file) => file,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot stage AGENTS.md: {error}"
+            ));
+            let _ = recover_agents_md_if_needed(dir, Some(&txn));
+            return None;
+        }
+    };
+    if let Err(error) = staged_file
+        .write_all(&injected)
+        .and_then(|_| staged_file.sync_all())
+        .and_then(|_| sync_agents_parent(&staged_path))
+    {
+        opencode_debug(&format!(
+            "[inject_agents_md] cannot persist staged file: {error}"
+        ));
+        let _ = recover_agents_md_if_needed(dir, Some(&txn));
+        return None;
+    }
+    let staged_metadata = match staged_file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot stat staged file: {error}"
+            ));
+            return None;
+        }
+    };
+    let injected_record = match file_identity(&staged_file, &staged_metadata) {
+        Ok(identity) => AgentsFileRecord {
+            identity,
+            length: injected.len() as u64,
+            sha256: plan.injected_sha256.clone(),
+        },
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot identify staged file: {error}"
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = ensure_path_identity(&staged_path, &injected_record.identity) {
+        opencode_debug(&format!("[inject_agents_md] staged path changed: {error}"));
+        return None;
+    }
+
+    let ready = AgentsTxnReady {
+        version: TXN_VERSION,
+        phase: "ready".to_string(),
+        txn: txn.clone(),
+        injected: injected_record.clone(),
+    };
+    let ready_line = match serde_json::to_vec(&ready) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot encode ready state: {error}"
+            ));
+            return None;
+        }
+    };
+    let state_identity = match state_file
+        .metadata()
+        .and_then(|metadata| file_identity(&state_file, &metadata))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[inject_agents_md] cannot identify state: {error}"
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = ensure_path_identity(&state_path, &state_identity)
+        .and_then(|_| state_file.write_all(&ready_line))
+        .and_then(|_| state_file.sync_all())
+        .and_then(|_| sync_agents_parent(&state_path))
+        .and_then(|_| ensure_path_identity(&state_path, &state_identity))
+    {
+        opencode_debug(&format!(
+            "[inject_agents_md] cannot commit ready state: {error}"
+        ));
+        return None;
+    }
+    drop(staged_file);
+    drop(state_file);
+
+    if let Some((_, original_record)) = &original {
+        let current = match path_record_if_present(&agents_path, MAX_ORIGINAL_AGENTS_BYTES) {
+            Ok(Some(record)) if &record == original_record => record,
+            Ok(_) => {
+                opencode_debug("[inject_agents_md] original changed before quarantine");
+                let _ = recover_agents_md_if_needed(dir, Some(&txn));
+                return None;
+            }
+            Err(error) => {
                 opencode_debug(&format!(
-                    "[inject_agents_md] ABORT: cannot read original AGENTS.md: {}",
-                    e
+                    "[inject_agents_md] cannot recheck original: {error}"
                 ));
-                release_lock(dir);
                 return None;
             }
         };
-        opencode_debug(&format!(
-            "[inject_agents_md] backing up original ({} bytes)",
-            original.len()
-        ));
-
-        // Atomic write: tmp file → rename to backup
-        if let Err(e) = atomic_write(&backup_path, &original) {
-            opencode_debug(&format!(
-                "[inject_agents_md] ABORT: backup write FAILED: {}",
-                e
-            ));
-            release_lock(dir);
-            return None; // Do NOT touch AGENTS.md without a confirmed backup
-        }
-        opencode_debug("[inject_agents_md] backup confirmed on disk");
-
-        // Step 3: NOW safe to write combined content
-        let combined = format!("{}\n\n{}\n", system_prompt, original.trim());
-        if let Err(e) = std::fs::write(&agents_path, &combined) {
-            opencode_debug(&format!(
-                "[inject_agents_md] combined write FAILED: {}, restoring from backup",
-                e
-            ));
-            // Immediately restore — backup is confirmed intact (atomic_write succeeded).
-            // If rename also fails, leave backup in place for crash recovery.
-            match std::fs::rename(&backup_path, &agents_path) {
-                Ok(()) => opencode_debug("[inject_agents_md] restored from backup OK"),
-                Err(e2) => opencode_debug(&format!(
-                    "[inject_agents_md] restore rename also FAILED: {} — backup preserved at {:?} for recovery",
-                    e2, backup_path)),
-            }
-            release_lock(dir);
+        let Some(backup_name) = backup_name.as_ref() else {
+            opencode_debug("[inject_agents_md] original transaction has no backup name");
+            return None;
+        };
+        let backup_path = dir.join(backup_name);
+        if let Err(error) = move_owned_file(&agents_path, &backup_path, &current) {
+            opencode_debug(&format!("[inject_agents_md] quarantine failed: {error}"));
+            let _ = recover_agents_md_if_needed(dir, Some(&txn));
             return None;
         }
-        opencode_debug(&format!(
-            "[inject_agents_md] injected OK ({} bytes)",
-            combined.len()
-        ));
     } else {
-        // No original → write sentinel FIRST (so crash recovery knows to delete)
-        opencode_debug("[inject_agents_md] no original AGENTS.md");
-        if let Err(e) = std::fs::write(&sentinel_path, "") {
-            opencode_debug(&format!(
-                "[inject_agents_md] ABORT: sentinel write FAILED: {}",
-                e
-            ));
-            release_lock(dir);
-            return None; // Do NOT create AGENTS.md without a sentinel
-        }
-        opencode_debug("[inject_agents_md] sentinel written");
-
-        // NOW safe to write AGENTS.md
-        let content = format!("{}\n", system_prompt);
-        if let Err(e) = std::fs::write(&agents_path, &content) {
-            opencode_debug(&format!("[inject_agents_md] write FAILED: {}", e));
-            // Partial write may have left a corrupted AGENTS.md — try to delete it.
-            match std::fs::remove_file(&agents_path) {
-                Ok(()) => {
-                    // AGENTS.md cleaned up — safe to remove sentinel
-                    let _ = std::fs::remove_file(&sentinel_path);
-                    opencode_debug("[inject_agents_md] cleaned up partial AGENTS.md + sentinel");
-                }
-                Err(_) => {
-                    // Cannot delete corrupted AGENTS.md — keep sentinel for crash recovery
-                    opencode_debug("[inject_agents_md] cannot delete partial AGENTS.md, sentinel preserved for recovery");
-                }
+        match std::fs::symlink_metadata(&agents_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                opencode_debug("[inject_agents_md] AGENTS.md appeared before publish");
+                let _ = recover_agents_md_if_needed(dir, Some(&txn));
+                return None;
             }
-            release_lock(dir);
-            return None;
+            Err(error) => {
+                opencode_debug(&format!(
+                    "[inject_agents_md] cannot confirm AGENTS.md absence: {error}"
+                ));
+                return None;
+            }
         }
-        opencode_debug(&format!(
-            "[inject_agents_md] created AGENTS.md ({} bytes)",
-            content.len()
-        ));
+    }
+
+    if let Err(error) = move_owned_file(&staged_path, &agents_path, &injected_record) {
+        opencode_debug(&format!("[inject_agents_md] publish failed: {error}"));
+        let _ = recover_agents_md_if_needed(dir, Some(&txn));
+        return None;
     }
 
     Some(AgentsMdGuard {
         dir: dir.to_path_buf(),
-        had_original,
+        txn,
+        restore_on_drop: true,
+        _lock_file: lock_file,
     })
+}
+
+fn inject_system_prompt_into_agents_md(
+    working_dir: &str,
+    system_prompt: &str,
+) -> Result<AgentsMdGuard, String> {
+    inject_system_prompt_into_agents_md_impl(working_dir, system_prompt, None).ok_or_else(|| {
+        format!(
+            "Failed to safely inject requested system prompt into {}",
+            std::path::Path::new(working_dir).join(AGENTS_MD).display()
+        )
+    })
+}
+
+/// Prepare project instructions before either OpenCode execution path starts.
+/// `None` means that no system prompt was requested; every requested prompt,
+/// including an empty string, must produce a live restoration guard or fail.
+fn prepare_requested_system_prompt(
+    working_dir: &str,
+    system_prompt: Option<&str>,
+) -> Result<Option<AgentsMdGuard>, String> {
+    system_prompt
+        .map(|prompt| inject_system_prompt_into_agents_md(working_dir, prompt))
+        .transpose()
+}
+
+#[cfg(test)]
+mod agents_md_lock_tests {
+    use super::*;
+
+    fn path(dir: &tempfile::TempDir) -> &str {
+        dir.path().to_str().expect("UTF-8 temp path")
+    }
+
+    fn transaction_artifact(dir: &tempfile::TempDir, prefix: &str) -> std::path::PathBuf {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(prefix)
+            })
+            .expect("transaction artifact")
+    }
+
+    #[test]
+    fn normal_original_is_restored_exactly_and_lock_contents_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "  user instructions\n\n").unwrap();
+        std::fs::write(dir.path().join(LOCK_FILE), b"do not truncate this lock\n").unwrap();
+
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "system prompt").unwrap();
+        assert!(std::fs::read_to_string(&agents)
+            .unwrap()
+            .starts_with("system prompt"));
+        let state_path = transaction_artifact(&dir, STATE_PREFIX);
+        let state = parse_state_at(&state_path).unwrap();
+        assert_eq!(state.plan.txn, guard.txn);
+        assert_eq!(state.plan.original.as_ref().unwrap().sha256.len(), 64);
+        assert_eq!(state.plan.injected_sha256.len(), 64);
+        assert!(state.plan.backup_name.is_some());
+        assert!(state.ready.is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(state_path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            assert_eq!(
+                std::fs::metadata(&agents).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        assert!(inject_system_prompt_into_agents_md(path(&dir), "contender").is_err());
+        drop(guard);
+
+        assert_eq!(std::fs::read(&agents).unwrap(), b"  user instructions\n\n");
+        assert_eq!(
+            std::fs::read(dir.path().join(LOCK_FILE)).unwrap(),
+            b"do not truncate this lock\n"
+        );
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STATE_PREFIX)));
+    }
+
+    #[test]
+    fn normal_absent_original_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "system prompt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(AGENTS_MD)).unwrap(),
+            "system prompt\n"
+        );
+        drop(guard);
+        assert!(!dir.path().join(AGENTS_MD).exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STATE_PREFIX)));
+    }
+
+    #[test]
+    fn active_user_edit_with_original_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        std::fs::write(&agents, "user edit during run\n").unwrap();
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "user edit during run\n"
+        );
+        assert!(transaction_artifact(&dir, STATE_PREFIX).exists());
+        assert_eq!(
+            std::fs::read_to_string(transaction_artifact(&dir, BACKUP_PREFIX)).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn active_user_edit_without_original_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        std::fs::write(&agents, "user edit during run\n").unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "user edit during run\n"
+        );
+        assert!(transaction_artifact(&dir, STATE_PREFIX).exists());
+    }
+
+    #[test]
+    fn active_user_deletion_with_original_is_not_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        std::fs::remove_file(&agents).unwrap();
+        drop(guard);
+
+        assert!(!agents.exists());
+        assert!(transaction_artifact(&dir, STATE_PREFIX).exists());
+        assert_eq!(
+            std::fs::read_to_string(transaction_artifact(&dir, BACKUP_PREFIX)).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn active_user_deletion_without_original_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        std::fs::remove_file(&agents).unwrap();
+        drop(guard);
+
+        assert!(!agents.exists());
+        assert!(transaction_artifact(&dir, STATE_PREFIX).exists());
+    }
+
+    #[test]
+    fn crash_recovery_restores_unchanged_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        inject_system_prompt_into_agents_md(path(&dir), "first")
+            .unwrap()
+            .simulate_crash();
+        assert!(std::fs::read_to_string(&agents)
+            .unwrap()
+            .starts_with("first"));
+
+        let next = inject_system_prompt_into_agents_md(path(&dir), "second").unwrap();
+        assert!(std::fs::read_to_string(&agents)
+            .unwrap()
+            .starts_with("second"));
+        drop(next);
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn crash_after_original_restore_finishes_retired_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "first").unwrap();
+        let (_, backup_name, retired_name, _) = expected_txn_names(&guard.txn, true);
+        let backup = dir.path().join(backup_name.unwrap());
+        let retired = dir.path().join(retired_name);
+
+        rename_agents_noreplace_synced(&agents, &retired).unwrap();
+        rename_agents_noreplace_synced(&backup, &agents).unwrap();
+        guard.simulate_crash();
+
+        let next = inject_system_prompt_into_agents_md(path(&dir), "second").unwrap();
+        assert!(!retired.exists());
+        drop(next);
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn partial_unpublished_state_does_not_block_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join(transaction_state_staging_name(
+            "0123456789abcdef0123456789abcdef",
+        ));
+        std::fs::write(&partial, b"{partial json").unwrap();
+
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        drop(guard);
+        assert!(partial.exists(), "untrusted partial control is preserved");
+        assert!(!dir.path().join(AGENTS_MD).exists());
+    }
+
+    #[test]
+    fn crash_recovery_preserves_changed_agents_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        inject_system_prompt_into_agents_md(path(&dir), "first")
+            .unwrap()
+            .simulate_crash();
+        std::fs::write(&agents, "changed after crash\n").unwrap();
+
+        assert!(inject_system_prompt_into_agents_md(path(&dir), "second").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "changed after crash\n"
+        );
+        assert!(transaction_artifact(&dir, STATE_PREFIX).exists());
+        assert_eq!(
+            std::fs::read_to_string(transaction_artifact(&dir, BACKUP_PREFIX)).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn fixed_and_dynamic_collisions_do_not_modify_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "original\n").unwrap();
+        let state_txn = "fedcba9876543210fedcba9876543210";
+        let foreign_state = dir.path().join(transaction_state_name(state_txn));
+        std::fs::write(&foreign_state, "foreign state").unwrap();
+        assert!(
+            inject_system_prompt_into_agents_md_impl(path(&dir), "prompt", Some(state_txn))
+                .is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "original\n");
+
+        std::fs::remove_file(foreign_state).unwrap();
+        let txn = "0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.path().join(format!("{BACKUP_PREFIX}{txn}")), "foreign").unwrap();
+        assert!(
+            inject_system_prompt_into_agents_md_impl(path(&dir), "prompt", Some(txn)).is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn legacy_marker_is_preserved_and_never_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        std::fs::write(&agents, "current\n").unwrap();
+        let legacy = dir.path().join(LEGACY_BACKUP_FILE);
+        std::fs::write(&legacy, "legacy backup\n").unwrap();
+        assert!(inject_system_prompt_into_agents_md(path(&dir), "prompt").is_err());
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "current\n");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy backup\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_agents_lock_and_control_files_are_refused() {
+        use std::os::unix::fs::symlink;
+
+        for unsafe_name in [AGENTS_MD, LOCK_FILE] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            std::fs::write(&target, "target data\n").unwrap();
+            symlink(&target, dir.path().join(unsafe_name)).unwrap();
+            assert!(inject_system_prompt_into_agents_md(path(&dir), "prompt").is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "target data\n").unwrap();
+        let txn = "0123456789abcdef0123456789abcdef";
+        symlink(&target, dir.path().join(transaction_state_name(txn))).unwrap();
+        assert!(
+            inject_system_prompt_into_agents_md_impl(path(&dir), "prompt", Some(txn)).is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_agents_file_is_refused_when_symlinks_are_available() {
+        use std::os::windows::fs::symlink_file;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "target data\n").unwrap();
+        if symlink_file(&target, dir.path().join(AGENTS_MD)).is_ok() {
+            assert!(inject_system_prompt_into_agents_md(path(&dir), "prompt").is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+        }
+    }
+
+    #[test]
+    fn requested_prompt_failure_is_an_error_while_absent_prompt_needs_no_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = inject_system_prompt_into_agents_md(path(&dir), "active").unwrap();
+
+        assert!(prepare_requested_system_prompt(path(&dir), Some("contender")).is_err());
+        assert!(prepare_requested_system_prompt(path(&dir), None)
+            .unwrap()
+            .is_none());
+
+        drop(active);
+    }
+
+    #[test]
+    fn oversized_agents_file_makes_requested_prompt_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        let file = std::fs::File::create(&agents).unwrap();
+        file.set_len(MAX_ORIGINAL_AGENTS_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(prepare_requested_system_prompt(path(&dir), Some("prompt")).is_err());
+        assert_eq!(
+            std::fs::metadata(&agents).unwrap().len(),
+            MAX_ORIGINAL_AGENTS_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn explicitly_empty_system_prompt_is_still_injected() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let guard = prepare_requested_system_prompt(path(&dir), Some(""))
+            .unwrap()
+            .expect("Some system prompt must produce a guard");
+        assert_eq!(std::fs::read(dir.path().join(AGENTS_MD)).unwrap(), b"\n");
+
+        drop(guard);
+        assert!(!dir.path().join(AGENTS_MD).exists());
+    }
 }
 
 // ============================================================
@@ -2833,16 +4211,16 @@ fn execute_command_streaming_legacy(
     // instructions. The guard restores the original file when dropped (on
     // function return, including early returns and panics).
     let _agents_md_guard: Option<AgentsMdGuard> = match system_prompt {
-        Some(sp) if !sp.is_empty() => {
+        Some(sp) => {
             opencode_debug(&format!(
                 "[stream] injecting system prompt into AGENTS.md ({} bytes)",
                 sp.len()
             ));
-            inject_system_prompt_into_agents_md(working_dir, sp)
+            prepare_requested_system_prompt(working_dir, Some(sp))?
         }
-        _ => {
+        None => {
             opencode_debug("[stream] no system prompt, skipping AGENTS.md injection");
-            None
+            prepare_requested_system_prompt(working_dir, None)?
         }
     };
 
@@ -2954,12 +4332,18 @@ fn execute_command_streaming_legacy(
             Ok(l) => l,
             Err(e) => {
                 opencode_debug(&format!("[stream] stdout read error: {}", e));
-                let _ = sender.send(StreamMessage::Error {
-                    message: format!("Failed to read output: {}", e),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
+                if sender
+                    .send(StreamMessage::Error {
+                        message: format!("Failed to read output: {}", e),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    })
+                    .is_err()
+                {
+                    terminate_child_after_receiver_drop(&mut child);
+                    return Ok(());
+                }
                 break;
             }
         };
@@ -3019,7 +4403,8 @@ fn execute_command_streaming_legacy(
                         .is_err()
                     {
                         opencode_debug("[stream] Init send failed (receiver dropped)");
-                        break;
+                        terminate_child_after_receiver_drop(&mut child);
+                        return Ok(());
                     }
                     init_sent = true;
                 }
@@ -3038,7 +4423,8 @@ fn execute_command_streaming_legacy(
                     final_result.push_str(&text);
                     if sender.send(StreamMessage::Text { content: text }).is_err() {
                         opencode_debug("[stream] Text send failed (receiver dropped)");
-                        break;
+                        terminate_child_after_receiver_drop(&mut child);
+                        return Ok(());
                     }
                 } else {
                     opencode_debug(&format!(
@@ -3077,7 +4463,8 @@ fn execute_command_streaming_legacy(
                         .is_err()
                     {
                         opencode_debug("[stream] ToolUse send failed (receiver dropped)");
-                        break;
+                        terminate_child_after_receiver_drop(&mut child);
+                        return Ok(());
                     }
 
                     // Send ToolResult if completed or error
@@ -3096,7 +4483,8 @@ fn execute_command_streaming_legacy(
                             .is_err()
                         {
                             opencode_debug("[stream] ToolResult send failed (receiver dropped)");
-                            break;
+                            terminate_child_after_receiver_drop(&mut child);
+                            return Ok(());
                         }
                     }
                 } else {
@@ -3151,10 +4539,17 @@ fn execute_command_streaming_legacy(
                         final_result.len(),
                         last_session_id
                     ));
-                    let _ = sender.send(StreamMessage::Done {
-                        result: final_result.clone(),
-                        session_id: last_session_id.clone(),
-                    });
+                    if sender
+                        .send(StreamMessage::Done {
+                            result: final_result.clone(),
+                            session_id: last_session_id.clone(),
+                        })
+                        .is_err()
+                    {
+                        opencode_debug("[stream] Done send failed (receiver dropped)");
+                        terminate_child_after_receiver_drop(&mut child);
+                        return Ok(());
+                    }
                 }
             }
 
@@ -3346,6 +4741,45 @@ struct ServeChild {
     child: Option<tokio::process::Child>,
 }
 
+#[derive(Default)]
+struct ReceiverDropSignal {
+    dropped: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ReceiverDropSignal {
+    fn mark_dropped(&self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::Release);
+        // `notify_one` stores a permit when the poll task has not started
+        // waiting yet, so a send failure cannot be lost in that race.
+        self.notify.notify_one();
+    }
+
+    fn is_dropped(&self) -> bool {
+        self.dropped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn wait(&self) {
+        while !self.is_dropped() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+fn send_serve_stream_message(
+    sender: &Sender<StreamMessage>,
+    message: StreamMessage,
+    receiver_drop: &ReceiverDropSignal,
+) -> bool {
+    if sender.send(message).is_ok() {
+        true
+    } else {
+        receiver_drop.mark_dropped();
+        false
+    }
+}
+
 impl ServeChild {
     fn new(child: tokio::process::Child) -> Self {
         Self { child: Some(child) }
@@ -3430,16 +4864,16 @@ async fn execute_command_streaming_serve(
 
     // ---- 1. AGENTS.md injection (same semantics as legacy path) ----
     let _agents_md_guard: Option<AgentsMdGuard> = match system_prompt {
-        Some(sp) if !sp.is_empty() => {
+        Some(sp) => {
             opencode_debug(&format!(
                 "[serve] injecting system prompt into AGENTS.md ({} bytes)",
                 sp.len()
             ));
-            inject_system_prompt_into_agents_md(working_dir, sp)
+            prepare_requested_system_prompt(working_dir, Some(sp))?
         }
-        _ => {
+        None => {
             opencode_debug("[serve] no system prompt, skipping AGENTS.md injection");
-            None
+            prepare_requested_system_prompt(working_dir, None)?
         }
     };
 
@@ -3643,6 +5077,7 @@ async fn execute_command_streaming_serve(
     let last_error: Arc<tokio::sync::Mutex<Option<String>>> =
         Arc::new(tokio::sync::Mutex::new(None));
     let sse_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let receiver_drop = Arc::new(ReceiverDropSignal::default());
 
     let sse_handle = {
         let parent_sid = parent_sid.clone();
@@ -3650,6 +5085,7 @@ async fn execute_command_streaming_serve(
         let final_result = final_result.clone();
         let last_error = last_error.clone();
         let sse_stop = sse_stop.clone();
+        let receiver_drop = receiver_drop.clone();
         tokio::task::spawn(async move {
             consume_sse_chunks(
                 sse_resp,
@@ -3658,6 +5094,7 @@ async fn execute_command_streaming_serve(
                 final_result,
                 last_error,
                 sse_stop,
+                receiver_drop,
             )
             .await;
         })
@@ -3689,21 +5126,34 @@ async fn execute_command_streaming_serve(
     }
 
     // ---- 8. Poll until everything (parent + children + todos) is idle ----
-    let poll_result = poll_until_complete(
-        &client,
-        &base_url,
-        &parent_sid,
-        &todo_baseline,
-        cancel_token.as_ref(),
-    )
-    .await;
+    let mut poll_result = tokio::select! {
+        result = poll_until_complete(
+            &client,
+            &base_url,
+            &parent_sid,
+            &todo_baseline,
+            cancel_token.as_ref(),
+        ) => result,
+        _ = receiver_drop.wait() => {
+            opencode_debug("[serve] stream receiver dropped; aborting HTTP polling");
+            Err(PollError::ReceiverDropped)
+        }
+    };
+    // If polling and the receiver-drop notification become ready together,
+    // `select!` may choose either branch. Receiver loss still takes priority:
+    // skip the trailing drain delay and avoid any terminal send attempt.
+    if receiver_drop.is_dropped() {
+        poll_result = Err(PollError::ReceiverDropped);
+    }
 
     // ---- 9. Shut everything down ----
     sse_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     // Give the SSE task a brief moment to drain any trailing events, then
     // abort. The stop flag lets the loop exit on its next iteration; the
     // short sleep makes that likely before we force-abort.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    if !matches!(poll_result, Err(PollError::ReceiverDropped)) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     sse_handle.abort();
     let _ = sse_handle.await;
     serve_child.shutdown().await;
@@ -3753,6 +5203,9 @@ async fn execute_command_streaming_serve(
             opencode_debug("[serve] poll cancelled by user");
             // No Done / Error — cancel path matches legacy behaviour of
             // returning without a terminal message so the UI shows "Cancelled".
+        }
+        Err(PollError::ReceiverDropped) => {
+            opencode_debug("[serve] receiver dropped; child shut down without terminal send");
         }
         Err(PollError::Fatal(msg)) => {
             opencode_debug(&format!("[serve] poll fatal: {}", msg));
@@ -4077,6 +5530,7 @@ async fn consume_sse_chunks(
     final_result: Arc<tokio::sync::Mutex<String>>,
     last_error: Arc<tokio::sync::Mutex<Option<String>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    receiver_drop: Arc<ReceiverDropSignal>,
 ) {
     opencode_debug("[serve.sse] consumer started");
 
@@ -4104,7 +5558,7 @@ async fn consume_sse_chunks(
         std::collections::HashMap::new();
 
     loop {
-        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) || receiver_drop.is_dropped() {
             opencode_debug("[serve.sse] stop flag set, exiting loop");
             break;
         }
@@ -4182,8 +5636,16 @@ async fn consume_sse_chunks(
                 &mut part_progress,
                 &mut part_types,
                 &mut message_roles,
+                &receiver_drop,
             )
             .await;
+            if receiver_drop.is_dropped() {
+                opencode_debug("[serve.sse] receiver dropped, exiting consumer");
+                break;
+            }
+        }
+        if receiver_drop.is_dropped() {
+            break;
         }
     }
     opencode_debug("[serve.sse] consumer exit");
@@ -4229,6 +5691,7 @@ async fn handle_sse_event(
     part_progress: &mut std::collections::HashMap<String, String>,
     part_types: &mut std::collections::HashMap<String, String>,
     message_roles: &mut std::collections::HashMap<String, String>,
+    receiver_drop: &ReceiverDropSignal,
 ) {
     let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
     // Common top-level session id. Present on every bus event we care about.
@@ -4316,7 +5779,13 @@ async fn handle_sse_event(
                         };
                         part_progress.insert(part_id.clone(), text.to_string());
                         if !delta.is_empty() {
-                            let _ = sender.send(StreamMessage::Text { content: delta });
+                            if !send_serve_stream_message(
+                                sender,
+                                StreamMessage::Text { content: delta },
+                                receiver_drop,
+                            ) {
+                                return;
+                            }
                         }
                     }
                     if has_end {
@@ -4355,14 +5824,26 @@ async fn handle_sse_event(
                         .unwrap_or("")
                         .to_string();
                     let is_error = status == "error";
-                    let _ = sender.send(StreamMessage::ToolUse {
-                        name: tool_name.clone(),
-                        input: input_str,
-                    });
-                    let _ = sender.send(StreamMessage::ToolResult {
-                        content: output_str,
-                        is_error,
-                    });
+                    if !send_serve_stream_message(
+                        sender,
+                        StreamMessage::ToolUse {
+                            name: tool_name.clone(),
+                            input: input_str,
+                        },
+                        receiver_drop,
+                    ) {
+                        return;
+                    }
+                    if !send_serve_stream_message(
+                        sender,
+                        StreamMessage::ToolResult {
+                            content: output_str,
+                            is_error,
+                        },
+                        receiver_drop,
+                    ) {
+                        return;
+                    }
                 }
                 "step-start" | "step-finish" | "reasoning" | "patch" | "snapshot" => {
                     // Intentionally ignored: bookkeeping parts.
@@ -4421,9 +5902,15 @@ async fn handle_sse_event(
                 let entry = part_progress.entry(part_id).or_insert_with(String::new);
                 entry.push_str(delta);
             }
-            let _ = sender.send(StreamMessage::Text {
-                content: delta.to_string(),
-            });
+            if !send_serve_stream_message(
+                sender,
+                StreamMessage::Text {
+                    content: delta.to_string(),
+                },
+                receiver_drop,
+            ) {
+                return;
+            }
         }
 
         "session.error" => {
@@ -4465,6 +5952,7 @@ async fn handle_sse_event(
 #[derive(Debug)]
 enum PollError {
     Cancelled,
+    ReceiverDropped,
     Fatal(String),
 }
 
@@ -4792,6 +6280,45 @@ fn todos_pending_after_baseline(todos: &[Value], baseline: &TodoFingerprintCount
         }
     }
     false
+}
+
+#[cfg(test)]
+mod serve_receiver_drop_tests {
+    use super::{send_serve_stream_message, ReceiverDropSignal};
+    use crate::services::claude::StreamMessage;
+
+    #[tokio::test]
+    async fn failed_sse_send_wakes_the_poll_abort_waiter() {
+        let signal = std::sync::Arc::new(ReceiverDropSignal::default());
+        let waiter_signal = signal.clone();
+        let waiter = tokio::spawn(async move { waiter_signal.wait().await });
+        tokio::task::yield_now().await;
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        assert!(!send_serve_stream_message(
+            &sender,
+            StreamMessage::Text {
+                content: "ignored".to_string(),
+            },
+            &signal,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("receiver-drop waiter must wake immediately")
+            .expect("waiter task must not panic");
+        assert!(signal.is_dropped());
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_notification_is_not_lost_before_wait_starts() {
+        let signal = ReceiverDropSignal::default();
+        signal.mark_dropped();
+        tokio::time::timeout(std::time::Duration::from_millis(100), signal.wait())
+            .await
+            .expect("pre-existing receiver drop must be observed");
+    }
 }
 
 /// Minimal URL-encoder for path segments / query values. Covers the subset we

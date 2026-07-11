@@ -20,6 +20,7 @@ function App() {
         <Route path="/docs/:sectionId?" element={<DocsPage />} />
         <Route path="/macos" element={<Navigate to="/docs/install-macos" replace />} />
         <Route path="/ec2" element={<Navigate to="/docs/install-ec2" replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </>
   )

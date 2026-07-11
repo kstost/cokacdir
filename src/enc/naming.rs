@@ -159,7 +159,18 @@ pub fn group_enc_files(dir: &Path) -> Result<BTreeMap<String, Vec<EncFileInfo>>,
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        // `Path::is_file` follows symlinks.  Archive discovery must only
+        // accept directory entries that are themselves regular files; the
+        // actual open path performs the same check again without following
+        // links to close the discovery/open race.
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // Directory contents may change between read_dir and lstat.  A
+            // vanished entry is not a failure of the remaining archive set.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() {
             continue;
         }
         if let Some(info) = parse_enc_filename(&path) {
@@ -269,5 +280,20 @@ mod tests {
         assert!(parse_enc_filename(&td.join("_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
         // Non-alphanumeric key_prefix
         assert!(parse_enc_filename(&td.join("a+b_a1b2c3d4e5f6a7b8_aaaa.cokacenc")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_enc_files_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.cokacenc");
+        let archive_dir = temp_dir.path().join("archives");
+        std::fs::create_dir(&archive_dir).unwrap();
+        std::fs::write(&outside, b"not an archive").unwrap();
+        symlink(&outside, archive_dir.join("a1b2c3d4e5f6a7b8_aaaa.cokacenc")).unwrap();
+
+        assert!(group_enc_files(&archive_dir).unwrap().is_empty());
     }
 }

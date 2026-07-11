@@ -8,12 +8,15 @@ use ratatui::{
     Frame,
 };
 use ratatui_image::protocol::StatefulProtocol;
+use std::fs::OpenOptions;
+use std::io::BufReader;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::OnceLock;
 use std::thread;
 
 use super::{
-    app::{App, Dialog, DialogType, Screen},
+    app::{App, Screen},
     theme::Theme,
 };
 
@@ -21,6 +24,67 @@ use super::{
 struct ImageLoadResult {
     image: Option<DynamicImage>,
     error: Option<String>,
+}
+
+struct ImageLoadJob {
+    path: std::path::PathBuf,
+    result_tx: mpsc::Sender<ImageLoadResult>,
+}
+
+fn image_loader() -> &'static SyncSender<ImageLoadJob> {
+    static LOADER: OnceLock<SyncSender<ImageLoadJob>> = OnceLock::new();
+    LOADER.get_or_init(|| {
+        // One active decode plus one queued request. Image decoders cannot be
+        // interrupted reliably; a single bounded worker prevents rapid
+        // open/close cycles from creating an unbounded number of decoder
+        // threads and their large pixel buffers.
+        let (job_tx, job_rx) = mpsc::sync_channel::<ImageLoadJob>(1);
+        thread::spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let result = match decode_regular_image(&job.path) {
+                    Ok(image) => ImageLoadResult {
+                        image: Some(image),
+                        error: None,
+                    },
+                    Err(error) => ImageLoadResult {
+                        image: None,
+                        error: Some(error),
+                    },
+                };
+                let _ = job.result_tx.send(result);
+            }
+        });
+        job_tx
+    })
+}
+
+fn decode_regular_image(path: &Path) -> Result<DynamicImage, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Opening a FIFO for reading normally waits forever for a writer. Use a
+        // nonblocking handle, then reject everything except a regular file.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|e| format!("Failed to open image: {}", e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Failed to inspect image: {}", e))?;
+    if !metadata.is_file() {
+        return Err("Image path is not a regular file".to_string());
+    }
+
+    let reader = image::ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to detect image format: {}", e))?;
+    reader
+        .decode()
+        .map_err(|e| format!("Failed to load image: {}", e))
 }
 
 /// Check if terminal supports true color (24-bit RGB)
@@ -115,23 +179,23 @@ impl ImageViewerState {
         self.image = None;
         self.error = None;
 
-        let (tx, rx): (Sender<ImageLoadResult>, Receiver<ImageLoadResult>) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
 
-        let path = path.to_path_buf();
-        thread::spawn(move || {
-            let result = match image::open(&path) {
-                Ok(img) => ImageLoadResult {
-                    image: Some(img),
-                    error: None,
-                },
-                Err(e) => ImageLoadResult {
-                    image: None,
-                    error: Some(format!("Failed to load image: {}", e)),
-                },
+        let job = ImageLoadJob {
+            path: path.to_path_buf(),
+            result_tx: tx,
+        };
+        if let Err(error) = image_loader().try_send(job) {
+            let (job, message) = match error {
+                TrySendError::Full(job) => (job, "Image loader is busy"),
+                TrySendError::Disconnected(job) => (job, "Image loader stopped unexpectedly"),
             };
-            let _ = tx.send(result);
-        });
+            let _ = job.result_tx.send(ImageLoadResult {
+                image: None,
+                error: Some(message.to_string()),
+            });
+        }
     }
 
     /// Poll for image loading result
@@ -251,7 +315,10 @@ impl ImageViewerState {
 
     /// Load image at given index (async)
     fn load_image_at_index(&mut self, index: usize) -> bool {
-        if index >= self.image_list.len() {
+        // Replacing the receiver does not cancel the old decoder thread. Without
+        // this guard, holding next/previous can launch many full image decodes in
+        // parallel and exhaust memory even though only the newest result is used.
+        if self.is_loading || index >= self.image_list.len() {
             return false;
         }
 
@@ -291,8 +358,8 @@ impl ImageViewerState {
     }
 
     pub fn pan(&mut self, dx: i32, dy: i32) {
-        self.offset_x += dx;
-        self.offset_y += dy;
+        self.offset_x = self.offset_x.saturating_add(dx);
+        self.offset_y = self.offset_y.saturating_add(dy);
     }
 }
 
@@ -772,22 +839,80 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 }
             }
             ImageViewerAction::Delete => {
-                let filename = state
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file".to_string());
-                app.dialog = Some(Dialog {
-                    dialog_type: DialogType::Delete,
-                    input: String::new(),
-                    cursor_pos: 0,
-                    message: format!("Delete {}?", filename),
-                    completion: None,
-                    selected_button: 1,
-                    selection: None,
-                    use_md5: false,
-                });
+                app.show_delete_dialog();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unloaded_state(paths: Vec<std::path::PathBuf>) -> ImageViewerState {
+        ImageViewerState {
+            path: paths[0].clone(),
+            image: None,
+            error: None,
+            zoom: 1.0,
+            offset_x: 0,
+            offset_y: 0,
+            image_list: paths,
+            current_index: 0,
+            is_loading: true,
+            receiver: None,
+            inline_protocol: None,
+            use_inline: false,
+        }
+    }
+
+    #[test]
+    fn navigation_does_not_start_a_second_decode_while_loading() {
+        let mut state = unloaded_state(vec!["one.png".into(), "two.png".into()]);
+
+        assert!(!state.navigate_next());
+        assert_eq!(state.current_index, 0);
+        assert_eq!(state.path, std::path::PathBuf::from("one.png"));
+    }
+
+    #[test]
+    fn pan_saturates_instead_of_overflowing() {
+        let mut state = unloaded_state(vec!["one.png".into()]);
+        state.offset_x = i32::MAX;
+        state.offset_y = i32::MIN;
+
+        state.pan(1, -1);
+
+        assert_eq!(state.offset_x, i32::MAX);
+        assert_eq!(state.offset_y, i32::MIN);
+    }
+
+    #[test]
+    fn directory_with_image_extension_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("folder.png");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = decode_regular_image(&path).unwrap_err();
+
+        assert!(err.contains("regular file") || err.contains("open image"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_with_image_extension_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("pipe.png");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let started = std::time::Instant::now();
+        let err = decode_regular_image(&path).unwrap_err();
+
+        assert!(err.contains("regular file"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

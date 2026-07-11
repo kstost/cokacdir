@@ -76,7 +76,7 @@ export default function SessionManagement() {
           rows={[
             ['Claude', 'claude --resume <session_id>'],
             ['Codex', 'codex resume <session_id>'],
-            ['Agy', 'agy --conversation <session_id> --print ""'],
+            ['Agy', 'agy --conversation <session_id>'],
             ['OpenCode', 'opencode -s <session_id>'],
           ]}
         />

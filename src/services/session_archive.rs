@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub struct FullSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
     pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    source_fingerprint: Option<SourceFingerprint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,6 +55,46 @@ pub struct FullSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_meta: Option<Value>,
     pub messages: Vec<Message>,
+}
+
+/// The source state that produced an archive.  Comparing this exact record is
+/// safe in ways that comparing the archive's wall-clock mtime is not: an
+/// archive can be published after a source append and therefore have a newer
+/// mtime while still missing that append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceFingerprint {
+    main: FileFingerprint,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    wal: Option<FileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FileFingerprint {
+    size: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    device: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    inode: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    modified_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    modified_nanoseconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    changed_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    changed_nanoseconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    creation_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    last_write_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    volume_serial: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    file_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    file_id_128: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    modified_unix_nanos: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,8 +236,429 @@ pub struct Usage {
 // Entry point
 // =====================================================================
 
+const MAX_SESSION_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ARCHIVE_READ_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// The verifier deserializes the complete archive before rendering a 60 KiB
+// transcript, so its input cap must be much lower than the archival storage
+// cap to leave room for JSON strings and the normalized object graph.
+const MAX_VERIFICATION_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SOURCE_SNAPSHOT_ATTEMPTS: usize = 3;
+
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn metadata_is_real_regular_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && !metadata_is_reparse_point(metadata)
+}
+
+fn fingerprint_open_file(file: &fs::File) -> io::Result<FileFingerprint> {
+    let metadata = file.metadata()?;
+    if !metadata_is_real_regular_file(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session source is not a real regular file",
+        ));
+    }
+    if metadata.len() > MAX_SESSION_SOURCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session source exceeds the {} MiB safety limit",
+                MAX_SESSION_SOURCE_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+
+    let mut fingerprint = FileFingerprint {
+        size: metadata.len(),
+        device: None,
+        inode: None,
+        modified_seconds: None,
+        modified_nanoseconds: None,
+        changed_seconds: None,
+        changed_nanoseconds: None,
+        creation_time: None,
+        last_write_time: None,
+        volume_serial: None,
+        file_index: None,
+        file_id_128: None,
+        modified_unix_nanos: None,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fingerprint.device = Some(metadata.dev());
+        fingerprint.inode = Some(metadata.ino());
+        fingerprint.modified_seconds = Some(metadata.mtime());
+        fingerprint.modified_nanoseconds = Some(metadata.mtime_nsec());
+        fingerprint.changed_seconds = Some(metadata.ctime());
+        fingerprint.changed_nanoseconds = Some(metadata.ctime_nsec());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        fingerprint.creation_time = Some(metadata.creation_time());
+        fingerprint.last_write_time = Some(metadata.last_write_time());
+        let (volume_serial, object) =
+            crate::services::file_ops::stable_file_identity(file)?.components();
+        let mut legacy_index = [0u8; 8];
+        legacy_index.copy_from_slice(&object[..8]);
+        fingerprint.volume_serial = Some(volume_serial);
+        fingerprint.file_index = Some(u64::from_le_bytes(legacy_index));
+        fingerprint.file_id_128 = Some(hex::encode(object));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fingerprint.modified_unix_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+    }
+    Ok(fingerprint)
+}
+
+struct OpenedSource {
+    path: PathBuf,
+    file: fs::File,
+    fingerprint: FileFingerprint,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn open_source_file(path: &Path) -> io::Result<OpenedSource> {
+    let before = fs::symlink_metadata(path)?;
+    if !metadata_is_real_regular_file(&before) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a real regular file", path.display()),
+        ));
+    }
+    if before.len() > MAX_SESSION_SOURCE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {} MiB safety limit",
+                path.display(),
+                MAX_SESSION_SOURCE_BYTES / 1024 / 1024
+            ),
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let fingerprint = fingerprint_open_file(&file)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fingerprint.device != Some(before.dev()) || fingerprint.inode != Some(before.ino()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed while it was being opened", path.display()),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if before.file_attributes() & 0x0400 != 0
+            || fingerprint.size != before.file_size()
+            || fingerprint.creation_time != Some(before.creation_time())
+            || fingerprint.last_write_time != Some(before.last_write_time())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed while it was being opened", path.display()),
+            ));
+        }
+    }
+
+    Ok(OpenedSource {
+        path: path.to_path_buf(),
+        modified: file
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok()),
+        file,
+        fingerprint,
+    })
+}
+
+impl OpenedSource {
+    fn is_stable_and_current(&self) -> io::Result<bool> {
+        if fingerprint_open_file(&self.file)? != self.fingerprint {
+            return Ok(false);
+        }
+        match open_source_file(&self.path) {
+            Ok(current) => Ok(current.fingerprint == self.fingerprint),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_bounded(&self) -> io::Result<Vec<u8>> {
+        self.read_bounded_with_limit(MAX_SESSION_SOURCE_BYTES, "session source")
+    }
+
+    fn read_bounded_with_limit(&self, limit: u64, label: &str) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut reader = (&self.file).take(limit + 1);
+        reader.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} grew beyond the {} MiB safety limit",
+                    label,
+                    limit / 1024 / 1024
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+struct SourceSnapshot {
+    main: OpenedSource,
+    wal: Option<OpenedSource>,
+}
+
+impl SourceSnapshot {
+    fn open(provider: &str, source_path: &Path) -> io::Result<Self> {
+        let main = open_source_file(source_path)?;
+        let wal = if provider == "opencode" {
+            let mut wal_name = source_path.as_os_str().to_os_string();
+            wal_name.push("-wal");
+            let wal_path = PathBuf::from(wal_name);
+            match open_source_file(&wal_path) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        Ok(Self { main, wal })
+    }
+
+    fn fingerprint(&self) -> SourceFingerprint {
+        SourceFingerprint {
+            main: self.main.fingerprint.clone(),
+            wal: self.wal.as_ref().map(|wal| wal.fingerprint.clone()),
+        }
+    }
+
+    fn is_stable_and_current(&self, provider: &str) -> io::Result<bool> {
+        if !self.main.is_stable_and_current()? {
+            return Ok(false);
+        }
+        if provider != "opencode" {
+            return Ok(true);
+        }
+
+        let mut wal_name = self.main.path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal_path = PathBuf::from(wal_name);
+        match &self.wal {
+            Some(wal) => {
+                if !wal.is_stable_and_current()? {
+                    return Ok(false);
+                }
+            }
+            None => match fs::symlink_metadata(&wal_path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Ok(false),
+                Err(error) => return Err(error),
+            },
+        }
+        Ok(true)
+    }
+}
+
+struct SecureArchiveDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    handle: fs::File,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl SecureArchiveDir {
+    fn open(path: &Path) -> io::Result<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path)?,
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a real directory", path.display()),
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let handle = options.open(path)?;
+            let opened = handle.metadata()?;
+            if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} changed while it was being opened", path.display()),
+                ));
+            }
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+            return Ok(Self {
+                path: path.to_path_buf(),
+                device: opened.dev(),
+                inode: opened.ino(),
+                handle,
+            });
+        }
+
+        #[cfg(not(unix))]
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn validate_current(&self) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(&self.path)?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata_is_reparse_point(&metadata)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a real directory", self.path.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let mut options = fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let current = options.open(&self.path)?.metadata()?;
+            let held = self.handle.metadata()?;
+            if current.dev() != self.device
+                || current.ino() != self.inode
+                || held.dev() != self.device
+                || held.ino() != self.inode
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} changed during archive creation", self.path.display()),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn archive_sessions_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".cokacdir").join("ai_sessions_full"))
+}
+
+fn acquire_session_archive_lock(
+    out_dir: &SecureArchiveDir,
+    session_id: &str,
+) -> std::io::Result<fs::File> {
+    use fs2::FileExt;
+
+    #[cfg(unix)]
+    let lock = {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let name = CString::new(format!("{session_id}.json.lock")).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "session id contains a NUL")
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                out_dir.handle.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if !metadata_is_real_regular_file(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive lock is not a real regular file",
+            ));
+        }
+        file.set_permissions({
+            use std::os::unix::fs::PermissionsExt;
+            fs::Permissions::from_mode(0o600)
+        })?;
+        file
+    };
+    #[cfg(not(unix))]
+    let lock = {
+        let lock_path = out_dir.path.join(format!("{session_id}.json.lock"));
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options.open(lock_path)?;
+        if !metadata_is_real_regular_file(&file.metadata()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive lock is not a real regular file",
+            ));
+        }
+        file
+    };
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
 /// Load the full-fidelity archive for a session and render it as a compact
@@ -210,6 +673,15 @@ pub fn archive_sessions_dir() -> Option<PathBuf> {
 /// `session_id` is validated here so callers constructing the archive path
 /// cannot traverse outside `archive_sessions_dir()` via `../` injection.
 pub fn build_verification_transcript(session_id: &str) -> Result<String, String> {
+    let archive_dir =
+        archive_sessions_dir().ok_or_else(|| "Cannot locate archive dir".to_string())?;
+    build_verification_transcript_from_dir(session_id, &archive_dir)
+}
+
+fn build_verification_transcript_from_dir(
+    session_id: &str,
+    archive_dir: &Path,
+) -> Result<String, String> {
     const PER_BLOCK_LIMIT: usize = 2000;
     const TOTAL_LIMIT: usize = 60000;
     // Anchor the original user request at the top of the transcript even on
@@ -221,14 +693,44 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     if !is_valid_session_id(session_id) {
         return Err(format!("Invalid session_id: {:?}", session_id));
     }
-    let archive_dir =
-        archive_sessions_dir().ok_or_else(|| "Cannot locate archive dir".to_string())?;
-    let path = archive_dir.join(format!("{}.json", session_id));
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Archive not found at {}: {}", path.display(), e))?;
-    let archive_mtime = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
+    let archive_dir = SecureArchiveDir::open(archive_dir)
+        .map_err(|error| format!("Archive directory is unsafe: {error}"))?;
+    archive_dir
+        .validate_current()
+        .map_err(|error| format!("Archive directory changed before read: {error}"))?;
+    let path = archive_dir.path.join(format!("{session_id}.json"));
+    let opened = open_source_file(&path).map_err(|error| {
+        format!(
+            "Archive cannot be opened safely at {}: {error}",
+            path.display()
+        )
+    })?;
+    if opened.fingerprint.size > MAX_VERIFICATION_ARCHIVE_BYTES {
+        return Err(format!(
+            "Archive at {} exceeds the verifier's {} MiB safety limit",
+            path.display(),
+            MAX_VERIFICATION_ARCHIVE_BYTES / 1024 / 1024
+        ));
+    }
+    let raw_bytes = opened
+        .read_bounded_with_limit(MAX_VERIFICATION_ARCHIVE_BYTES, "verification archive")
+        .map_err(|error| format!("Failed to read archive {}: {error}", path.display()))?;
+    if !opened
+        .is_stable_and_current()
+        .map_err(|error| format!("Failed to recheck archive {}: {error}", path.display()))?
+    {
+        return Err(format!(
+            "Archive changed while it was being read: {}",
+            path.display()
+        ));
+    }
+    archive_dir
+        .validate_current()
+        .map_err(|error| format!("Archive directory changed during read: {error}"))?;
+    let raw = String::from_utf8(raw_bytes)
+        .map_err(|error| format!("Archive at {} is not valid UTF-8: {error}", path.display()))?;
+    let archive_mtime = opened
+        .modified
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
@@ -237,6 +739,15 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
         session_id, path.display(), raw.len(), short_sha(&raw), archive_mtime));
     let archive: FullSession =
         serde_json::from_str(&raw).map_err(|e| format!("Archive parse error: {}", e))?;
+    if !opened
+        .is_stable_and_current()
+        .map_err(|error| format!("Failed final archive check {}: {error}", path.display()))?
+    {
+        return Err(format!(
+            "Archive changed while it was being parsed: {}",
+            path.display()
+        ));
+    }
 
     // Render a single message into a chunk. Honors PER_BLOCK_LIMIT per content
     // block but NOT TOTAL_LIMIT — callers compose selected chunks within the
@@ -450,8 +961,99 @@ fn is_valid_session_id(s: &str) -> bool {
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
+#[derive(Deserialize)]
+struct ArchiveFingerprintOnly {
+    #[serde(default)]
+    source_fingerprint: Option<SourceFingerprint>,
+}
+
+fn existing_archive_fingerprint(path: &Path) -> Result<Option<SourceFingerprint>, String> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect existing archive {}: {}",
+                path.display(),
+                error
+            ))
+        }
+    };
+    if !metadata_is_real_regular_file(&before) {
+        return Err(format!(
+            "Existing archive is not a real regular file: {}",
+            path.display()
+        ));
+    }
+    if before.len() > MAX_ARCHIVE_READ_BYTES {
+        return Err(format!(
+            "Existing archive exceeds the {} MiB safety limit: {}",
+            MAX_ARCHIVE_READ_BYTES / 1024 / 1024,
+            path.display()
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        format!(
+            "Failed to open existing archive {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let opened = file.metadata().map_err(|error| {
+        format!(
+            "Failed to inspect opened archive {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    if !metadata_is_real_regular_file(&opened) || opened.len() != before.len() {
+        return Err(format!(
+            "Existing archive changed while it was being opened: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() {
+            return Err(format!(
+                "Existing archive changed while it was being opened: {}",
+                path.display()
+            ));
+        }
+    }
+
+    // Unknown/malformed legacy archives are regenerated only after a complete,
+    // stable source parse.  Deserializing just this field avoids retaining the
+    // potentially large messages array while still validating the full JSON.
+    match serde_json::from_reader::<_, ArchiveFingerprintOnly>(BufReader::new(file)) {
+        Ok(archive) => Ok(archive.source_fingerprint),
+        Err(error) => {
+            dbg(&format!(
+                "[archive] existing archive fingerprint unreadable; will regenerate safely: {}",
+                error
+            ));
+            Ok(None)
+        }
+    }
+}
+
 /// Entry point: convert the given source and write the normalized archive.
-/// Skips work if the target JSON is newer than the source.
+/// Skips work only when the archive records the exact current source state.
 pub fn archive_and_save_session(provider: &str, source_path: &Path, session_id: &str, cwd: &str) {
     dbg(&format!(
         "[archive] start: provider={}, source={}, id={}, cwd={}",
@@ -469,100 +1071,173 @@ pub fn archive_and_save_session(provider: &str, source_path: &Path, session_id: 
         dbg("[archive] archive_sessions_dir() returned None");
         return;
     };
-    let target = out_dir.join(format!("{}.json", session_id));
+    if let Err(error) =
+        archive_and_save_session_to_dir(provider, source_path, session_id, cwd, &out_dir, |_| {})
+    {
+        dbg(&format!(
+            "[archive] failed; previous archive preserved: {}",
+            error
+        ));
+    }
+}
 
-    // Skip if up-to-date. On uncertain mtime (permission error, etc.),
-    // fall through and regenerate rather than silently refusing to update.
-    // Track pre-regenerate size so the forensic log below can show a delta.
-    let prev_target_size = target.metadata().ok().map(|m| m.len()).unwrap_or(0);
-    let src_epoch = source_path
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let tgt_epoch = target
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if target.exists() {
-        let src_m = source_path.metadata().ok().and_then(|m| m.modified().ok());
-        let tgt_m = target.metadata().ok().and_then(|m| m.modified().ok());
-        if let (Some(s), Some(t)) = (src_m, tgt_m) {
-            if s <= t {
+fn archive_and_save_session_to_dir<F>(
+    provider: &str,
+    source_path: &Path,
+    session_id: &str,
+    cwd: &str,
+    out_dir: &Path,
+    mut after_parse: F,
+) -> Result<bool, String>
+where
+    F: FnMut(usize),
+{
+    if !is_valid_session_id(session_id) {
+        return Err(format!("Invalid session id: {session_id:?}"));
+    }
+    if !matches!(provider, "claude" | "codex" | "agy" | "gemini" | "opencode") {
+        return Err(format!("Unknown provider: {provider}"));
+    }
+
+    let out_dir = SecureArchiveDir::open(out_dir)
+        .map_err(|error| format!("Failed to secure archive directory: {error}"))?;
+    out_dir
+        .validate_current()
+        .map_err(|error| format!("Archive directory is unsafe: {error}"))?;
+    // Serialize every parse/publish for one session across threads and
+    // processes. The lock is acquired before source inspection, so a delayed
+    // older invocation cannot parse an old snapshot and publish after a newer
+    // invocation has completed.
+    let _archive_lock = acquire_session_archive_lock(&out_dir, session_id)
+        .map_err(|error| format!("Failed to acquire session archive lock: {error}"))?;
+    let target = out_dir.path.join(format!("{session_id}.json"));
+
+    for attempt in 0..MAX_SOURCE_SNAPSHOT_ATTEMPTS {
+        let source = SourceSnapshot::open(provider, source_path).map_err(|error| {
+            format!(
+                "Failed to open stable session source {}: {error}",
+                source_path.display()
+            )
+        })?;
+        let fingerprint = source.fingerprint();
+
+        if existing_archive_fingerprint(&target)? == Some(fingerprint.clone()) {
+            if source
+                .is_stable_and_current(provider)
+                .map_err(|error| format!("Failed to recheck session source: {error}"))?
+            {
                 dbg(&format!(
-                    "[loop-verify archive] SKIPPED sid={} src_mtime={} tgt_mtime={} tgt_size={} — \
-                     target is up-to-date (rollout has NOT grown since last refresh). \
-                     If this fires on consecutive /loop iterations with no turn in between, \
-                     the verifier will read the SAME transcript.",
-                    session_id, src_epoch, tgt_epoch, prev_target_size
+                    "[loop-verify archive] SKIPPED sid={} — exact source fingerprint matches",
+                    session_id
                 ));
-                return;
+                return Ok(false);
             }
+            if attempt + 1 < MAX_SOURCE_SNAPSHOT_ATTEMPTS {
+                continue;
+            }
+            return Err("Session source kept changing while checking the archive".to_string());
         }
+
+        let source_bytes = match provider {
+            "claude" | "codex" | "gemini" => Some(
+                source
+                    .main
+                    .read_bounded()
+                    .map_err(|error| format!("Failed to read session source: {error}"))?,
+            ),
+            _ => None,
+        };
+        let parse_result = match provider {
+            "claude" => parse_claude(
+                std::io::Cursor::new(source_bytes.as_deref().unwrap_or_default()),
+                source_path,
+                session_id,
+                cwd,
+            ),
+            "codex" => parse_codex(
+                std::io::Cursor::new(source_bytes.as_deref().unwrap_or_default()),
+                source_path,
+                session_id,
+                cwd,
+            ),
+            "agy" => parse_agy(source_path, &source.main.fingerprint, session_id, cwd),
+            "gemini" => parse_gemini(
+                source_bytes.as_deref().unwrap_or_default(),
+                source_path,
+                session_id,
+                cwd,
+            ),
+            "opencode" => parse_opencode(source_path, session_id, cwd),
+            _ => unreachable!(),
+        };
+        after_parse(attempt);
+
+        if !source
+            .is_stable_and_current(provider)
+            .map_err(|error| format!("Failed to recheck session source: {error}"))?
+        {
+            if attempt + 1 < MAX_SOURCE_SNAPSHOT_ATTEMPTS {
+                continue;
+            }
+            return Err("Session source kept changing while it was parsed".to_string());
+        }
+
+        let Some(mut session) = parse_result? else {
+            return Err("Session parser produced no archiveable records".to_string());
+        };
+        session.source_fingerprint = Some(fingerprint);
+        if session.updated_at.is_none() {
+            session.updated_at = source
+                .main
+                .modified
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| {
+                    chrono::DateTime::from_timestamp(
+                        i64::try_from(duration.as_secs()).ok()?,
+                        duration.subsec_nanos(),
+                    )
+                })
+                .map(|datetime| datetime.to_rfc3339());
+        }
+
+        let json = serde_json::to_vec_pretty(&session)
+            .map_err(|error| format!("Failed to serialize session archive: {error}"))?;
+        if !source
+            .is_stable_and_current(provider)
+            .map_err(|error| format!("Failed final session source check: {error}"))?
+        {
+            if attempt + 1 < MAX_SOURCE_SNAPSHOT_ATTEMPTS {
+                continue;
+            }
+            return Err("Session source changed before the archive could be published".to_string());
+        }
+        out_dir
+            .validate_current()
+            .map_err(|error| format!("Archive directory changed before publish: {error}"))?;
+
+        let prev_target_size = fs::symlink_metadata(&target)
+            .ok()
+            .filter(metadata_is_real_regular_file)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        crate::services::telegram::write_private_file_atomically(&target, &json)
+            .map_err(|error| format!("Failed to publish session archive: {error}"))?;
+        let new_size = json.len() as u64;
+        let delta = new_size as i128 - prev_target_size as i128;
+        dbg(&format!(
+            "[loop-verify archive] REGENERATED sid={} path={} new_size={} prev_size={} delta={:+} messages={} source_size={}",
+            session_id,
+            target.display(),
+            new_size,
+            prev_target_size,
+            delta,
+            session.messages.len(),
+            source.main.fingerprint.size
+        ));
+        return Ok(true);
     }
 
-    let result = match provider {
-        "claude" => parse_claude(source_path, session_id, cwd),
-        "codex" => parse_codex(source_path, session_id, cwd),
-        "agy" => parse_agy(source_path, session_id, cwd),
-        "gemini" => parse_gemini(source_path, session_id, cwd),
-        "opencode" => parse_opencode(source_path, session_id, cwd),
-        _ => {
-            dbg(&format!("[archive] unknown provider: {}", provider));
-            return;
-        }
-    };
-    let Some(mut session) = result else {
-        dbg("[archive] parser returned None");
-        return;
-    };
-
-    // Stamp updated_at from source mtime if not set
-    if session.updated_at.is_none() {
-        if let Ok(m) = source_path.metadata() {
-            if let Ok(t) = m.modified() {
-                if let Ok(dt) = t.duration_since(std::time::UNIX_EPOCH) {
-                    let secs = dt.as_secs() as i64;
-                    if let Some(naive) = chrono::DateTime::from_timestamp(secs, 0) {
-                        session.updated_at = Some(naive.to_rfc3339());
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = fs::create_dir_all(&out_dir);
-    match serde_json::to_string_pretty(&session) {
-        Ok(json) => {
-            // Atomic write: stage to <target>.tmp then rename, so a crash
-            // mid-write never leaves a half-written JSON file at the target.
-            let tmp = target.with_extension("json.tmp");
-            match fs::write(&tmp, &json) {
-                Ok(()) => {
-                    let r = fs::rename(&tmp, &target);
-                    let new_size = json.len() as u64;
-                    let delta: i64 = new_size as i64 - prev_target_size as i64;
-                    dbg(&format!(
-                        "[loop-verify archive] REGENERATED sid={} path={} new_size={} prev_size={} delta={:+} messages={} src_mtime={} rename={:?}",
-                        session_id, target.display(), new_size, prev_target_size,
-                        delta, session.messages.len(), src_epoch, r));
-                    if r.is_err() {
-                        let _ = fs::remove_file(&tmp);
-                    }
-                }
-                Err(e) => {
-                    dbg(&format!("[archive] tmp write failed: {}", e));
-                    let _ = fs::remove_file(&tmp);
-                }
-            }
-        }
-        Err(e) => dbg(&format!("[archive] serialize failed: {}", e)),
-    }
+    Err("Session source did not stabilize".to_string())
 }
 
 // =====================================================================
@@ -577,10 +1252,12 @@ pub fn archive_and_save_session(provider: &str, source_path: &Path, session_id: 
 ///
 /// `isSidechain: true` entries are PRESERVED here (unlike the UI summary)
 /// but tagged in `meta.is_sidechain` so consumers can filter them.
-fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-
+fn parse_claude<R: BufRead>(
+    reader: R,
+    path: &Path,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
     let mut messages: Vec<Message> = Vec::new();
     let mut created_at: Option<String> = None;
     let mut last_model: Option<String> = None;
@@ -588,10 +1265,26 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
     let mut session_meta: Option<Value> = None;
     let mut idx: u32 = 0;
 
-    for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!(
+                "Failed to read Claude JSONL line {} from {}: {}",
+                line_index + 1,
+                path.display(),
+                error
+            )
+        })?;
+        if line.trim().is_empty() {
             continue;
-        };
+        }
+        let val = serde_json::from_str::<Value>(&line).map_err(|error| {
+            format!(
+                "Malformed Claude JSONL line {} in {}: {}",
+                line_index + 1,
+                path.display(),
+                error
+            )
+        })?;
         let rec_type = val
             .get("type")
             .and_then(|v| v.as_str())
@@ -730,16 +1423,17 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
     }
 
     if messages.is_empty() && session_meta.is_none() {
-        return None;
+        return Ok(None);
     }
 
-    Some(FullSession {
+    Ok(Some(FullSession {
         session_id: session_id.to_string(),
         provider: "claude".into(),
         cwd: cwd.to_string(),
         created_at,
         updated_at: None,
         source_path: path.display().to_string(),
+        source_fingerprint: None,
         model: last_model,
         git: git_branch.map(|b| GitInfo {
             branch: Some(b),
@@ -747,7 +1441,7 @@ fn parse_claude(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
         }),
         session_meta,
         messages,
-    })
+    }))
 }
 
 /// Decode Claude `message.content`: either a plain string or an array of blocks.
@@ -844,10 +1538,12 @@ fn claude_parse_usage(u: &Value) -> Usage {
 /// - `response_item.custom_tool_call` / `custom_tool_call_output` → same as above
 /// - `response_item.reasoning` → thinking (encrypted_content preserved in raw)
 /// - `event_msg.token_count` → Usage on a meta message (kept as informational)
-fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-
+fn parse_codex<R: BufRead>(
+    reader: R,
+    path: &Path,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
     let mut messages: Vec<Message> = Vec::new();
     let mut session_meta_payload: Option<Value> = None;
     let mut created_at: Option<String> = None;
@@ -856,10 +1552,26 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
     let mut git: Option<GitInfo> = None;
     let mut idx: u32 = 0;
 
-    for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| {
+            format!(
+                "Failed to read Codex JSONL line {} from {}: {}",
+                line_index + 1,
+                path.display(),
+                error
+            )
+        })?;
+        if line.trim().is_empty() {
             continue;
-        };
+        }
+        let val = serde_json::from_str::<Value>(&line).map_err(|error| {
+            format!(
+                "Malformed Codex JSONL line {} in {}: {}",
+                line_index + 1,
+                path.display(),
+                error
+            )
+        })?;
         let outer_type = val
             .get("type")
             .and_then(|v| v.as_str())
@@ -1283,21 +1995,22 @@ fn parse_codex(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> 
     }
 
     if messages.is_empty() && session_meta_payload.is_none() {
-        return None;
+        return Ok(None);
     }
 
-    Some(FullSession {
+    Ok(Some(FullSession {
         session_id: session_id.to_string(),
         provider: "codex".into(),
         cwd: cwd.to_string(),
         created_at,
         updated_at: None,
         source_path: path.display().to_string(),
+        source_fingerprint: None,
         model: session_model,
         git,
         session_meta: session_meta_payload,
         messages,
-    })
+    }))
 }
 
 /// `response_item.message.content` is an array of blocks like
@@ -1389,10 +2102,20 @@ fn codex_extract_usage_from_token_count(p: &Value) -> Option<Usage> {
 /// response (result). We split it into a ContentBlock::ToolUse + a separate
 /// Message of role="tool" carrying ContentBlock::ToolResult so the normalized
 /// structure matches Claude/Codex.
-fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    let content = fs::read_to_string(path).ok()?;
-    let val: Value = serde_json::from_str(&content).ok()?;
-    let messages_val = val.get("messages")?.as_array()?;
+fn parse_gemini(
+    bytes: &[u8],
+    path: &Path,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|error| format!("Gemini session {} is not UTF-8: {error}", path.display()))?;
+    let val: Value = serde_json::from_str(content)
+        .map_err(|error| format!("Malformed Gemini session {}: {error}", path.display()))?;
+    let messages_val = val
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("Gemini session {} has no messages array", path.display()))?;
     let mut messages: Vec<Message> = Vec::new();
     let mut idx: u32 = 0;
     let session_id_val = val
@@ -1631,39 +2354,43 @@ fn parse_gemini(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession>
     }
 
     let effective_id = session_id_val.unwrap_or_else(|| session_id.to_string());
-    Some(FullSession {
+    Ok(Some(FullSession {
         session_id: effective_id,
         provider: "gemini".into(),
         cwd: cwd.to_string(),
         created_at,
         updated_at,
         source_path: path.display().to_string(),
+        source_fingerprint: None,
         model: session_model,
         git: None,
         session_meta,
         messages,
-    })
+    }))
 }
 
 // =====================================================================
 // Agy parser
 // =====================================================================
 
-fn parse_agy(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    if !path.is_file() {
-        return None;
-    }
+fn parse_agy(
+    path: &Path,
+    fingerprint: &FileFingerprint,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
     let meta = json!({
         "note": "Agy stores its full conversation in Antigravity CLI SQLite/protobuf data. cokacdir archives the external conversation metadata only.",
-        "source_size": path.metadata().ok().map(|m| m.len()),
+        "source_size": fingerprint.size,
     });
-    Some(FullSession {
+    Ok(Some(FullSession {
         session_id: session_id.to_string(),
         provider: "agy".into(),
         cwd: cwd.to_string(),
         created_at: None,
         updated_at: None,
         source_path: path.display().to_string(),
+        source_fingerprint: None,
         model: None,
         git: None,
         session_meta: Some(meta.clone()),
@@ -1681,7 +2408,7 @@ fn parse_agy(path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
             meta: BTreeMap::new(),
             raw: meta,
         }],
-    })
+    }))
 }
 
 /// Gemini tokens shape: `{input, output, cached, thoughts, tool, total}`.
@@ -1705,13 +2432,18 @@ fn gemini_parse_usage(t: &Value) -> Option<Usage> {
 /// for that session. Each part becomes one ContentBlock; parts are grouped
 /// under their parent message. Every column of message/part row is preserved
 /// in `raw`, so no info is lost.
-fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSession> {
-    if !db_path.is_file() {
-        return None;
-    }
-    let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()?;
+fn parse_opencode(
+    db_path: &Path,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
+    use rusqlite::OptionalExtension;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| format!("Failed to open OpenCode DB {}: {error}", db_path.display()))?;
 
     // Session-level metadata. Column list mirrors the full `session` schema
     // observed in opencode 1.3.x so new fields (parent_id, workspace_id,
@@ -1728,27 +2460,28 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
                 Ok(OCSession {
                     id: row.get(0)?,
                     project_id: row.get(1)?,
-                    parent_id: row.get(2).ok(),
+                    parent_id: row.get(2)?,
                     slug: row.get(3)?,
                     directory: row.get(4)?,
                     title: row.get(5)?,
                     version: row.get(6)?,
-                    share_url: row.get(7).ok(),
-                    summary_additions: row.get(8).ok(),
-                    summary_deletions: row.get(9).ok(),
-                    summary_files: row.get(10).ok(),
-                    summary_diffs: row.get(11).ok(),
-                    revert: row.get(12).ok(),
-                    permission: row.get(13).ok(),
+                    share_url: row.get(7)?,
+                    summary_additions: row.get(8)?,
+                    summary_deletions: row.get(9)?,
+                    summary_files: row.get(10)?,
+                    summary_diffs: row.get(11)?,
+                    revert: row.get(12)?,
+                    permission: row.get(13)?,
                     time_created: row.get(14)?,
                     time_updated: row.get(15)?,
-                    time_compacting: row.get(16).ok(),
-                    time_archived: row.get(17).ok(),
-                    workspace_id: row.get(18).ok(),
+                    time_compacting: row.get(16)?,
+                    time_archived: row.get(17)?,
+                    workspace_id: row.get(18)?,
                 })
             },
         )
-        .ok();
+        .optional()
+        .map_err(|error| format!("Failed to read OpenCode session row: {error}"))?;
 
     // Load all messages for the session
     let mut msg_stmt = conn
@@ -1756,14 +2489,14 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
             "SELECT id, time_created, time_updated, data \
          FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
         )
-        .ok()?;
+        .map_err(|error| format!("Failed to prepare OpenCode message query: {error}"))?;
     let msg_rows: Vec<(String, i64, i64, String)> = msg_stmt
         .query_map(rusqlite::params![session_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
-        .ok()?
-        .flatten()
-        .collect();
+        .map_err(|error| format!("Failed to query OpenCode messages: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Failed to read OpenCode message row: {error}"))?;
 
     // Load all parts for the session, grouped by message_id
     let mut part_stmt = conn
@@ -1771,14 +2504,14 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
             "SELECT id, message_id, time_created, time_updated, data \
          FROM part WHERE session_id = ?1 ORDER BY time_created ASC",
         )
-        .ok()?;
+        .map_err(|error| format!("Failed to prepare OpenCode part query: {error}"))?;
     let part_rows: Vec<(String, String, i64, i64, String)> = part_stmt
         .query_map(rusqlite::params![session_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })
-        .ok()?
-        .flatten()
-        .collect();
+        .map_err(|error| format!("Failed to query OpenCode parts: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Failed to read OpenCode part row: {error}"))?;
 
     let mut parts_by_msg: BTreeMap<String, Vec<(String, i64, i64, String)>> = BTreeMap::new();
     for (pid, mid, tc, tu, data) in part_rows {
@@ -1791,7 +2524,8 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
     let mut messages: Vec<Message> = Vec::new();
     let mut session_model: Option<String> = None;
     for (i, (msg_id, tc, _tu, data)) in msg_rows.iter().enumerate() {
-        let msg_data: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+        let msg_data: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Malformed OpenCode message row {msg_id}: {error}"))?;
         let role = msg_data
             .get("role")
             .and_then(|v| v.as_str())
@@ -1856,7 +2590,8 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         let mut total_usage: Option<Usage> = None;
         let mut stop_reason: Option<String> = None;
         for (pid, ptc, ptu, pdata) in &parts {
-            let part_json: Value = serde_json::from_str(pdata).unwrap_or(Value::Null);
+            let part_json: Value = serde_json::from_str(pdata)
+                .map_err(|error| format!("Malformed OpenCode part row {pid}: {error}"))?;
             raw_parts.push(json!({
                 "id": pid, "time_created": ptc, "time_updated": ptu,
                 "data": part_json.clone(),
@@ -2024,7 +2759,9 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
 
     let session_meta_val = session_row
         .as_ref()
-        .map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| format!("Failed to serialize OpenCode session row: {error}"))?;
     let created_at = session_row
         .as_ref()
         .and_then(|s| chrono::DateTime::from_timestamp_millis(s.time_created))
@@ -2034,18 +2771,23 @@ fn parse_opencode(db_path: &Path, session_id: &str, cwd: &str) -> Option<FullSes
         .and_then(|s| chrono::DateTime::from_timestamp_millis(s.time_updated))
         .map(|d| d.to_rfc3339());
 
-    Some(FullSession {
+    if session_row.is_none() && messages.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(FullSession {
         session_id: session_id.to_string(),
         provider: "opencode".into(),
         cwd: cwd.to_string(),
         created_at,
         updated_at,
         source_path: db_path.display().to_string(),
+        source_fingerprint: None,
         model: session_model,
         git: None,
         session_meta: session_meta_val,
         messages,
-    })
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2080,4 +2822,259 @@ struct OCSession {
     time_archived: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
+}
+
+#[cfg(test)]
+mod archive_publish_tests {
+    use super::{
+        acquire_session_archive_lock, archive_and_save_session_to_dir,
+        build_verification_transcript_from_dir, FullSession, SecureArchiveDir,
+        MAX_VERIFICATION_ARCHIVE_BYTES,
+    };
+
+    fn claude_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": { "content": text }
+        })
+        .to_string()
+    }
+
+    fn read_archive(path: &std::path::Path) -> FullSession {
+        serde_json::from_slice(&std::fs::read(path).expect("read archive")).expect("parse archive")
+    }
+
+    #[test]
+    fn same_session_updates_are_serialized_and_replace_existing_archive() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("ABC123.json");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let first_dir = dir.path().to_path_buf();
+        let first_target = target.clone();
+        let first = std::thread::spawn(move || {
+            let first_dir = SecureArchiveDir::open(&first_dir).expect("secure first archive dir");
+            let _lock = acquire_session_archive_lock(&first_dir, "ABC123")
+                .expect("acquire first archive lock");
+            acquired_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            crate::services::telegram::write_private_file_atomically(&first_target, b"old")
+                .expect("publish first archive");
+        });
+
+        acquired_rx.recv().unwrap();
+        let second_dir = dir.path().to_path_buf();
+        let second_target = target.clone();
+        let second = std::thread::spawn(move || {
+            let second_dir =
+                SecureArchiveDir::open(&second_dir).expect("secure second archive dir");
+            let _lock = acquire_session_archive_lock(&second_dir, "ABC123")
+                .expect("acquire second archive lock");
+            crate::services::telegram::write_private_file_atomically(&second_target, b"new")
+                .expect("publish second archive");
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!dir.path().join("ABC123.json.tmp").exists());
+    }
+
+    #[test]
+    fn malformed_middle_record_preserves_existing_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("session.jsonl");
+        let out = dir.path().join("archives");
+        let target = out.join("ABC123.json");
+        std::fs::write(
+            &source,
+            format!("{}\n{}\n", claude_line("first"), claude_line("second")),
+        )
+        .unwrap();
+        archive_and_save_session_to_dir("claude", &source, "ABC123", "/workspace", &out, |_| {})
+            .unwrap();
+        let previous = std::fs::read(&target).unwrap();
+
+        std::fs::write(
+            &source,
+            format!(
+                "{}\n{{malformed\n{}\n",
+                claude_line("first"),
+                claude_line("third")
+            ),
+        )
+        .unwrap();
+        let error = archive_and_save_session_to_dir(
+            "claude",
+            &source,
+            "ABC123",
+            "/workspace",
+            &out,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Malformed Claude JSONL line 2"));
+        assert_eq!(std::fs::read(&target).unwrap(), previous);
+    }
+
+    #[test]
+    fn source_growth_after_parse_is_retried_before_publish() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("session.jsonl");
+        let out = dir.path().join("archives");
+        let target = out.join("ABC123.json");
+        std::fs::write(&source, format!("{}\n", claude_line("first"))).unwrap();
+
+        let source_for_hook = source.clone();
+        archive_and_save_session_to_dir(
+            "claude",
+            &source,
+            "ABC123",
+            "/workspace",
+            &out,
+            move |attempt| {
+                if attempt == 0 {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&source_for_hook)
+                        .unwrap();
+                    writeln!(file, "{}", claude_line("second")).unwrap();
+                    file.sync_all().unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        let archive = read_archive(&target);
+        assert_eq!(archive.messages.len(), 2);
+        assert_eq!(
+            archive.messages[1].content[0].text.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn newer_archive_mtime_does_not_hide_changed_source_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("session.jsonl");
+        let out = dir.path().join("archives");
+        let target = out.join("ABC123.json");
+        std::fs::write(&source, format!("{}\n", claude_line("first"))).unwrap();
+        archive_and_save_session_to_dir("claude", &source, "ABC123", "/workspace", &out, |_| {})
+            .unwrap();
+
+        std::fs::write(
+            &source,
+            format!("{}\n{}\n", claude_line("first"), claude_line("second")),
+        )
+        .unwrap();
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::open(&target)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        assert!(
+            std::fs::metadata(&target).unwrap().modified().unwrap()
+                > std::fs::metadata(&source).unwrap().modified().unwrap()
+        );
+
+        assert!(archive_and_save_session_to_dir(
+            "claude",
+            &source,
+            "ABC123",
+            "/workspace",
+            &out,
+            |_| {},
+        )
+        .unwrap());
+        assert_eq!(read_archive(&target).messages.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_archive_directory_is_rejected_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("session.jsonl");
+        let victim = dir.path().join("victim");
+        let out = dir.path().join("archives");
+        std::fs::write(&source, format!("{}\n", claude_line("first"))).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&victim, &out).unwrap();
+
+        let error = archive_and_save_session_to_dir(
+            "claude",
+            &source,
+            "ABC123",
+            "/workspace",
+            &out,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not a real directory"));
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_rejects_symlink_archive_file_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("archives");
+        let outside = dir.path().join("outside.json");
+        std::fs::create_dir(&archives).unwrap();
+        std::fs::write(&outside, b"secret outside archive").unwrap();
+        symlink(&outside, archives.join("ABC123.json")).unwrap();
+
+        let error = build_verification_transcript_from_dir("ABC123", &archives).unwrap_err();
+        assert!(error.contains("cannot be opened safely"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret outside archive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_rejects_fifo_archive_without_opening_it() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("archives");
+        std::fs::create_dir(&archives).unwrap();
+        let fifo = archives.join("ABC123.json");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let error = build_verification_transcript_from_dir("ABC123", &archives).unwrap_err();
+        assert!(error.contains("cannot be opened safely"));
+    }
+
+    #[test]
+    fn verifier_rejects_oversized_sparse_archive_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("archives");
+        std::fs::create_dir(&archives).unwrap();
+        let archive = archives.join("ABC123.json");
+        let file = std::fs::File::create(&archive).unwrap();
+        file.set_len(MAX_VERIFICATION_ARCHIVE_BYTES + 1).unwrap();
+
+        let error = build_verification_transcript_from_dir("ABC123", &archives).unwrap_err();
+        assert!(error.contains("verifier's 128 MiB safety limit"));
+    }
 }
