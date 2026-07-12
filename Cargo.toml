@@ -1,6 +1,6 @@
 [package]
 name = "cokacdir"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "Telegram/Discord bot that runs Claude Code, Codex, Agy, and Opencode, with a multi-panel terminal file manager"
@@ -48,6 +48,7 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

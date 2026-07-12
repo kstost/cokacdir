@@ -468,7 +468,7 @@ impl AIScreenState {
         }
 
         if let Ok(json) = serde_json::to_string_pretty(&session_data) {
-            let _ = crate::services::telegram::write_private_file_atomically(
+            let _ = crate::services::telegram::write_ai_session_file_atomically(
                 &file_path,
                 json.as_bytes(),
             );
@@ -487,37 +487,26 @@ impl AIScreenState {
         // Find the most recently modified session file that matches current_path
         let mut matching_session: Option<(SessionData, std::time::SystemTime)> = None;
 
-        if let Ok(entries) = fs::read_dir(&sessions_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.extension().map(|e| e == "json").unwrap_or(false) {
-                    // Read and parse each session file
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
-                            // Only consider sessions with matching path (TUI is Claude-only; skip codex sessions)
-                            if session_data.current_path == current_path
-                                && (session_data.provider.is_empty()
-                                    || session_data.provider == "claude")
-                            {
-                                if let Ok(metadata) = path.metadata() {
-                                    if let Ok(modified) = metadata.modified() {
-                                        match &matching_session {
-                                            None => {
-                                                matching_session = Some((session_data, modified))
-                                            }
-                                            Some((_, latest_time)) if modified > *latest_time => {
-                                                matching_session = Some((session_data, modified));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
+        let _ = crate::services::telegram::visit_ai_session_json_files(
+            &sessions_dir,
+            |contents, modified| {
+                // Read and parse each session file from one shared-lock snapshot.
+                if let Ok(session_data) = serde_json::from_slice::<SessionData>(contents) {
+                    // Only consider sessions with matching path (TUI is Claude-only; skip codex sessions)
+                    if session_data.current_path == current_path
+                        && (session_data.provider.is_empty() || session_data.provider == "claude")
+                    {
+                        match &matching_session {
+                            None => matching_session = Some((session_data, modified)),
+                            Some((_, latest_time)) if modified > *latest_time => {
+                                matching_session = Some((session_data, modified));
                             }
+                            _ => {}
                         }
                     }
                 }
-            }
-        }
+            },
+        );
 
         let (session_data, _) = matching_session?;
 

@@ -60,7 +60,7 @@ fn open_private_directory(
     path: &std::path::Path,
 ) -> io::Result<(
     std::fs::File,
-    std::path::PathBuf,
+    crate::services::file_ops::DirectoryAccess,
     crate::services::file_ops::StablePathIdentity,
 )> {
     match std::fs::symlink_metadata(path) {
@@ -128,24 +128,13 @@ fn backup_unparseable_settings(path: &std::path::Path) -> io::Result<std::path::
             ));
         }
     }
-    let mut source_options = std::fs::OpenOptions::new();
-    source_options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        source_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        source_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let stable_source_path = stable_parent.join(
-        path.file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid settings path"))?,
-    );
-    let mut source = source_options.open(&stable_source_path)?;
+    let source_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid settings path"))?;
+    let mut source = stable_parent.open_file(
+        source_name,
+        crate::services::file_ops::DirectoryFileOptions::new().read(true),
+    )?;
     let source_opened = source.metadata()?;
     if !source_opened.is_file() {
         return Err(io::Error::new(
@@ -181,18 +170,17 @@ fn backup_unparseable_settings(path: &std::path::Path) -> io::Result<std::path::
             format!("{file_name}.bak.{:032x}", rand::random::<u128>())
         };
         let backup_path = parent.join(backup_name);
-        let stable_backup_path = stable_parent.join(backup_path.file_name().ok_or_else(|| {
+        let backup_name = backup_path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid settings backup path")
-        })?);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        })?;
 
-        let mut backup = match options.open(&stable_backup_path) {
+        let mut backup = match stable_parent.open_file(
+            backup_name,
+            crate::services::file_ops::DirectoryFileOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600),
+        ) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -202,7 +190,9 @@ fn backup_unparseable_settings(path: &std::path::Path) -> io::Result<std::path::
             Ok(identity) => identity,
             Err(error) => {
                 drop(backup);
-                let _ = std::fs::remove_file(&stable_backup_path);
+                if let Ok(identity) = stable_parent.child_identity(backup_name) {
+                    let _ = stable_parent.remove_file_if_identity(backup_name, identity);
+                }
                 return Err(error);
             }
         };
@@ -241,23 +231,17 @@ fn backup_unparseable_settings(path: &std::path::Path) -> io::Result<std::path::
         })();
         if let Err(e) = result {
             drop(backup);
-            let _ = crate::services::file_ops::remove_file_by_identity(
-                &stable_backup_path,
-                backup_identity,
-            );
+            let _ = stable_parent.remove_file_if_identity(backup_name, backup_identity);
             return Err(e);
         }
 
         drop(backup);
-        let published_identity = crate::services::file_ops::stable_path_identity(&backup_path);
+        let published_identity = stable_parent.child_identity(backup_name);
         let current_parent_identity = crate::services::file_ops::stable_path_identity(parent);
         if published_identity.as_ref().ok() != Some(&backup_identity)
             || current_parent_identity.as_ref().ok() != Some(&parent_identity)
         {
-            let _ = crate::services::file_ops::remove_file_by_identity(
-                &stable_backup_path,
-                backup_identity,
-            );
+            let _ = stable_parent.remove_file_if_identity(backup_name, backup_identity);
             return Err(published_identity
                 .err()
                 .or_else(|| current_parent_identity.err())
@@ -288,26 +272,26 @@ fn create_new_private_file_with(
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file has no name"))?;
     let (directory, stable_directory, directory_identity) = open_private_directory(parent)?;
-    let stable_path = stable_directory.join(file_name);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&stable_path)?;
+    let mut file = stable_directory.open_file(
+        file_name,
+        crate::services::file_ops::DirectoryFileOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600),
+    )?;
     let file_identity = match crate::services::file_ops::stable_file_identity(&file) {
         Ok(identity) => identity,
         Err(error) => {
             drop(file);
-            let _ = std::fs::remove_file(&stable_path);
+            if let Ok(identity) = stable_directory.child_identity(file_name) {
+                let _ = stable_directory.remove_file_if_identity(file_name, identity);
+            }
             return Err(error);
         }
     };
     if let Err(error) = write_contents(&mut file).and_then(|_| file.sync_all()) {
         drop(file);
-        let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, file_identity);
+        let _ = stable_directory.remove_file_if_identity(file_name, file_identity);
         return Err(error);
     }
     drop(file);
@@ -316,7 +300,7 @@ fn create_new_private_file_with(
     if published_identity.as_ref().ok() != Some(&file_identity)
         || current_directory_identity.as_ref().ok() != Some(&directory_identity)
     {
-        let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, file_identity);
+        let _ = stable_directory.remove_file_if_identity(file_name, file_identity);
         return Err(published_identity
             .err()
             .or_else(|| current_directory_identity.err())
@@ -3504,28 +3488,16 @@ fn write_shell_lastdir_output(path: &std::path::Path, last_dir: &str) -> io::Res
             "last-directory output is not a real regular file",
         ));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-
-    let stable_path = stable_parent.join(path.file_name().ok_or_else(|| {
+    let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "last-directory output has no name",
         )
-    })?);
-    let mut file = options.open(&stable_path)?;
+    })?;
+    let mut file = stable_parent.open_file(
+        file_name,
+        crate::services::file_ops::DirectoryFileOptions::new().write(true),
+    )?;
     let opened = file.metadata()?;
     if !opened.is_file() {
         return Err(io::Error::new(

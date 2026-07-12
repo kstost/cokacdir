@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,540 @@ use filetime::{self, FileTime};
 use sha2::{Digest, Sha256};
 
 use crate::utils::format::strip_unc_prefix;
+
+/// An open directory descriptor used as the namespace root for child access.
+///
+/// A pathname such as `/proc/self/fd/N/child` happens to work on Linux, but
+/// macOS' `/dev/fd/N` entries are not traversable directories. Keeping a
+/// duplicated descriptor here lets all Unix platforms use the actual `*at`
+/// system calls instead of pretending that a descriptor is a pathname.
+#[derive(Debug)]
+pub(crate) struct DirectoryAccess {
+    directory: File,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectoryFileOptions {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    create_new: bool,
+    pin_name: bool,
+    mode: u32,
+}
+
+impl Default for DirectoryFileOptions {
+    fn default() -> Self {
+        Self {
+            read: false,
+            write: false,
+            append: false,
+            create: false,
+            create_new: false,
+            pin_name: false,
+            mode: 0o600,
+        }
+    }
+}
+
+impl DirectoryFileOptions {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn read(mut self, value: bool) -> Self {
+        self.read = value;
+        self
+    }
+
+    pub(crate) fn write(mut self, value: bool) -> Self {
+        self.write = value;
+        self
+    }
+
+    pub(crate) fn append(mut self, value: bool) -> Self {
+        self.append = value;
+        self
+    }
+
+    pub(crate) fn create(mut self, value: bool) -> Self {
+        self.create = value;
+        self
+    }
+
+    pub(crate) fn create_new(mut self, value: bool) -> Self {
+        self.create_new = value;
+        self
+    }
+
+    pub(crate) fn pin_name(mut self, value: bool) -> Self {
+        self.pin_name = value;
+        self
+    }
+
+    pub(crate) fn mode(mut self, value: u32) -> Self {
+        self.mode = value;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectoryEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectoryEntryMetadata {
+    kind: DirectoryEntryKind,
+    len: u64,
+    mode: u32,
+    identity: StablePathIdentity,
+}
+
+pub(crate) struct DirectoryEntries {
+    #[cfg(unix)]
+    directory: rustix::fs::Dir,
+    #[cfg(not(unix))]
+    directory: fs::ReadDir,
+}
+
+impl Iterator for DirectoryEntries {
+    type Item = io::Result<OsString>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            loop {
+                let entry = match self.directory.next()? {
+                    Ok(entry) => entry,
+                    Err(error) => return Some(Err(io::Error::from(error))),
+                };
+                let bytes = entry.file_name().to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                return Some(Ok(OsString::from_vec(bytes.to_vec())));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.directory
+                .next()
+                .map(|entry| entry.map(|entry| entry.file_name()))
+        }
+    }
+}
+
+impl DirectoryEntryMetadata {
+    pub(crate) fn is_file(self) -> bool {
+        self.kind == DirectoryEntryKind::File
+    }
+
+    pub(crate) fn is_dir(self) -> bool {
+        self.kind == DirectoryEntryKind::Directory
+    }
+
+    pub(crate) fn is_symlink(self) -> bool {
+        self.kind == DirectoryEntryKind::Symlink
+    }
+
+    pub(crate) fn len(self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn mode(self) -> u32 {
+        self.mode
+    }
+
+    pub(crate) fn identity(self) -> StablePathIdentity {
+        self.identity
+    }
+}
+
+fn validate_directory_entry_name(name: &OsStr) -> io::Result<()> {
+    use std::path::Component;
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == name => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Directory-relative access requires one normal path component",
+        )),
+    }
+}
+
+impl DirectoryAccess {
+    fn new(directory: &File, path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            directory: directory.try_clone()?,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        &self.directory
+    }
+
+    pub(crate) fn open_file(
+        &self,
+        name: &OsStr,
+        options: DirectoryFileOptions,
+    ) -> io::Result<File> {
+        validate_directory_entry_name(name)?;
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{openat, Mode, OFlags};
+
+            let access = if options.read && (options.write || options.append) {
+                OFlags::RDWR
+            } else if options.write || options.append {
+                OFlags::WRONLY
+            } else {
+                OFlags::RDONLY
+            };
+            let _ = options.pin_name;
+            let mut flags = access | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            if options.append {
+                flags |= OFlags::APPEND;
+            }
+            if options.create || options.create_new {
+                flags |= OFlags::CREATE;
+            }
+            if options.create_new {
+                flags |= OFlags::EXCL;
+            }
+            let mode = Mode::from(options.mode as rustix::fs::RawMode);
+            return openat(&self.directory, name, flags, mode)
+                .map(File::from)
+                .map_err(io::Error::from);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut platform_options = OpenOptions::new();
+            platform_options
+                .read(options.read)
+                .write(options.write)
+                .append(options.append)
+                .create(options.create)
+                .create_new(options.create_new);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                platform_options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+                if options.pin_name {
+                    const FILE_SHARE_READ: u32 = 0x0000_0001;
+                    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+                    platform_options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+                }
+            }
+            platform_options.open(self.path.join(name))
+        }
+    }
+
+    pub(crate) fn open_regular_file(&self, name: &OsStr) -> io::Result<(File, fs::Metadata)> {
+        let file = self.open_file(name, DirectoryFileOptions::new().read(true))?;
+        let metadata = file.metadata()?;
+        #[cfg(windows)]
+        let is_reparse = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x0400 != 0
+        };
+        #[cfg(not(windows))]
+        let is_reparse = false;
+        if !metadata.is_file() || is_reparse {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Directory entry is not a real regular file",
+            ));
+        }
+        if stable_file_identity(&file)? != self.child_identity(name)? {
+            return Err(io::Error::other(
+                "Directory entry changed while the regular file was being opened",
+            ));
+        }
+        Ok((file, metadata))
+    }
+
+    pub(crate) fn open_directory(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<(File, DirectoryAccess, fs::Metadata)> {
+        validate_directory_entry_name(name)?;
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{openat, Mode, OFlags};
+
+            let owned = openat(
+                &self.directory,
+                name,
+                OFlags::RDONLY
+                    | OFlags::DIRECTORY
+                    | OFlags::NOFOLLOW
+                    | OFlags::CLOEXEC
+                    | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+            let file = File::from(owned);
+            let metadata = file.metadata()?;
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Directory entry is not a directory",
+                ));
+            }
+            let access = DirectoryAccess::new(&file, &self.path.join(name))?;
+            return Ok((file, access, metadata));
+        }
+
+        #[cfg(not(unix))]
+        {
+            open_directory_for_read(&self.path.join(name))
+        }
+    }
+
+    pub(crate) fn create_directory(&self, name: &OsStr, mode: u32) -> io::Result<()> {
+        validate_directory_entry_name(name)?;
+
+        #[cfg(unix)]
+        {
+            return rustix::fs::mkdirat(
+                &self.directory,
+                name,
+                rustix::fs::Mode::from(mode as rustix::fs::RawMode),
+            )
+            .map_err(io::Error::from);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            fs::create_dir(self.path.join(name))
+        }
+    }
+
+    pub(crate) fn create_private_directory(&self, label: &str) -> io::Result<OsString> {
+        let mut last_collision = None;
+        for _ in 0..128 {
+            let name = OsString::from(format!(
+                ".cokacdir-{}-{}-{:032x}",
+                label,
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            match self.create_directory(&name, 0o700) {
+                Ok(()) => return Ok(name),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_collision = Some(error)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_collision.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Unable to allocate a private directory entry",
+            )
+        }))
+    }
+
+    pub(crate) fn child_metadata(&self, name: &OsStr) -> io::Result<DirectoryEntryMetadata> {
+        validate_directory_entry_name(name)?;
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{statat, AtFlags, FileType};
+
+            let stat = statat(&self.directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)?;
+            let kind = match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => DirectoryEntryKind::File,
+                FileType::Directory => DirectoryEntryKind::Directory,
+                FileType::Symlink => DirectoryEntryKind::Symlink,
+                _ => DirectoryEntryKind::Other,
+            };
+            let mut object = [0u8; 16];
+            object[..8].copy_from_slice(&(stat.st_ino as u64).to_le_bytes());
+            return Ok(DirectoryEntryMetadata {
+                kind,
+                len: u64::try_from(stat.st_size).unwrap_or(0),
+                mode: stat.st_mode as u32,
+                identity: StablePathIdentity {
+                    namespace: stat.st_dev as u64,
+                    object,
+                },
+            });
+        }
+
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let metadata = fs::symlink_metadata(&path)?;
+            let kind = if metadata.file_type().is_symlink() {
+                DirectoryEntryKind::Symlink
+            } else if metadata.is_file() {
+                DirectoryEntryKind::File
+            } else if metadata.is_dir() {
+                DirectoryEntryKind::Directory
+            } else {
+                DirectoryEntryKind::Other
+            };
+            Ok(DirectoryEntryMetadata {
+                kind,
+                len: metadata.len(),
+                mode: 0,
+                identity: stable_path_identity(&path)?,
+            })
+        }
+    }
+
+    pub(crate) fn child_identity(&self, name: &OsStr) -> io::Result<StablePathIdentity> {
+        self.child_metadata(name)
+            .map(DirectoryEntryMetadata::identity)
+    }
+
+    pub(crate) fn entries(&self) -> io::Result<DirectoryEntries> {
+        #[cfg(unix)]
+        {
+            let directory = rustix::fs::Dir::read_from(&self.directory).map_err(io::Error::from)?;
+            return Ok(DirectoryEntries { directory });
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(DirectoryEntries {
+                directory: fs::read_dir(&self.path)?,
+            })
+        }
+    }
+
+    pub(crate) fn collect_entry_names(&self) -> io::Result<Vec<OsString>> {
+        self.entries()?.collect()
+    }
+
+    pub(crate) fn remove_file_if_identity(
+        &self,
+        name: &OsStr,
+        expected: StablePathIdentity,
+    ) -> io::Result<()> {
+        if self.child_identity(name)? != expected {
+            return Err(io::Error::other(
+                "Directory entry changed before verified deletion",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            return rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())
+                .map_err(io::Error::from);
+        }
+
+        #[cfg(not(unix))]
+        {
+            remove_file_by_identity(&self.path.join(name), expected)
+        }
+    }
+
+    pub(crate) fn remove_directory_if_identity(
+        &self,
+        name: &OsStr,
+        expected: StablePathIdentity,
+    ) -> io::Result<()> {
+        let metadata = self.child_metadata(name)?;
+        if metadata.identity() != expected || !metadata.is_dir() {
+            return Err(io::Error::other(
+                "Directory entry changed before verified directory removal",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            return rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::REMOVEDIR)
+                .map_err(io::Error::from);
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::remove_dir(self.path.join(name))
+        }
+    }
+
+    pub(crate) fn rename_replace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        validate_directory_entry_name(source)?;
+        validate_directory_entry_name(destination)?;
+
+        #[cfg(unix)]
+        {
+            return rustix::fs::renameat(&self.directory, source, &self.directory, destination)
+                .map_err(io::Error::from);
+        }
+
+        #[cfg(windows)]
+        {
+            return windows_replace_file(&self.path.join(source), &self.path.join(destination));
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::rename(self.path.join(source), self.path.join(destination))
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn read_link(&self, name: &OsStr) -> io::Result<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+
+        validate_directory_entry_name(name)?;
+        rustix::fs::readlinkat(&self.directory, name, Vec::new())
+            .map(|target| PathBuf::from(OsString::from_vec(target.into_bytes())))
+            .map_err(io::Error::from)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Preserve modification time and access time from source metadata to destination path.
 pub fn preserve_timestamps(dest: &Path, metadata: &fs::Metadata) -> io::Result<()> {
@@ -385,7 +920,7 @@ fn error_with_owned_stage_cleanup(failure: StagePublishFailure) -> io::Error {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct StablePathIdentity {
     namespace: u64,
     object: [u8; 16],
@@ -2853,8 +3388,9 @@ pub(crate) fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::
 }
 
 #[cfg(unix)]
-pub(crate) fn open_directory_for_read(path: &Path) -> io::Result<(File, PathBuf, fs::Metadata)> {
-    use std::os::fd::AsRawFd;
+pub(crate) fn open_directory_for_read(
+    path: &Path,
+) -> io::Result<(File, DirectoryAccess, fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = OpenOptions::new()
@@ -2868,15 +3404,14 @@ pub(crate) fn open_directory_for_read(path: &Path) -> io::Result<(File, PathBuf,
             "Source is not a directory",
         ));
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let stable_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let stable_path = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
-    Ok((file, stable_path, metadata))
+    let access = DirectoryAccess::new(&file, path)?;
+    Ok((file, access, metadata))
 }
 
 #[cfg(windows)]
-pub(crate) fn open_directory_for_read(path: &Path) -> io::Result<(File, PathBuf, fs::Metadata)> {
+pub(crate) fn open_directory_for_read(
+    path: &Path,
+) -> io::Result<(File, DirectoryAccess, fs::Metadata)> {
     use std::os::windows::fs::OpenOptionsExt;
 
     const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
@@ -2906,11 +3441,14 @@ pub(crate) fn open_directory_for_read(path: &Path) -> io::Result<(File, PathBuf,
         ));
     }
     let metadata = file.metadata()?;
-    Ok((file, path.to_path_buf(), metadata))
+    let access = DirectoryAccess::new(&file, path)?;
+    Ok((file, access, metadata))
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn open_directory_for_read(path: &Path) -> io::Result<(File, PathBuf, fs::Metadata)> {
+pub(crate) fn open_directory_for_read(
+    path: &Path,
+) -> io::Result<(File, DirectoryAccess, fs::Metadata)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
@@ -3112,6 +3650,76 @@ fn copy_symlink_to_new(
     }
 }
 
+fn copy_open_symlink_to_new(
+    access: &DirectoryAccess,
+    name: &OsStr,
+    source_display: &Path,
+    dest: &Path,
+    logical_destination: &Path,
+) -> io::Result<()> {
+    let before = access.child_metadata(name)?;
+    if !before.is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Source is no longer a symbolic link",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let target = access.read_link(name)?;
+        let after = access.child_metadata(name)?;
+        if after.identity() != before.identity() || !after.is_symlink() {
+            return Err(io::Error::other(format!(
+                "Source symlink changed while it was being copied: '{}'",
+                source_display.display()
+            )));
+        }
+
+        let target_path = if target.is_absolute() {
+            target.clone()
+        } else {
+            logical_destination
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&target)
+        };
+        let lexical = lexically_normalized_absolute(&target_path)?;
+        let lexical_text = lexical.to_string_lossy();
+        if target_is_sensitive(&lexical_text) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Symlink '{}' would point to sensitive system path: {}",
+                    logical_destination.display(),
+                    lexical_text
+                ),
+            ));
+        }
+        let resolved = resolve_existing_prefix(&lexical)?;
+        let resolved = resolved.to_string_lossy();
+        if target_is_sensitive(&resolved) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Symlink '{}' would resolve through an existing path component to sensitive system path: {}",
+                    logical_destination.display(),
+                    resolved
+                ),
+            ));
+        }
+        std::os::unix::fs::symlink(target, dest)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source_display, dest, logical_destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Copying symbolic links is not supported safely on this platform",
+        ))
+    }
+}
+
 /// Calculate total size of files to be copied/moved
 pub fn calculate_total_size(
     files: &[PathBuf],
@@ -3148,26 +3756,39 @@ pub fn calculate_total_size(
 
 /// Calculate total size and file count of a directory
 fn calculate_dir_size(path: &Path, cancel_flag: &Arc<AtomicBool>) -> io::Result<(u64, usize)> {
-    let mut total_size: u64 = 0;
-    let mut total_files: usize = 0;
-    let (_source_guard, stable_path, _) = open_directory_for_read(path)?;
+    let (source_guard, access, _) = open_directory_for_read(path)?;
+    drop(source_guard);
+    calculate_open_dir_size(path, &access, cancel_flag)
+}
 
-    for entry in fs::read_dir(&stable_path)? {
-        let entry = entry?;
+fn calculate_open_dir_size(
+    public_path: &Path,
+    access: &DirectoryAccess,
+    cancel_flag: &Arc<AtomicBool>,
+) -> io::Result<(u64, usize)> {
+    let mut total_size = 0u64;
+    let mut total_files = 0usize;
+    // Recurse only after the directory stream has been dropped. `entries()`
+    // owns a second descriptor on Unix; retaining one at every active stack
+    // frame halves the usable recursion depth and can exhaust macOS' process
+    // descriptor limit. Only child-directory names and identities survive this
+    // pass, which also detects replacement before deferred recursion.
+    let mut child_directories = Vec::new();
+
+    for name in access.entries()? {
+        let name = name?;
         if cancel_flag.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
         }
 
-        let entry_path = entry.path();
-        let metadata = fs::symlink_metadata(&entry_path)?;
+        let entry_path = public_path.join(&name);
+        let metadata = access.child_metadata(&name)?;
 
         if metadata.is_symlink() {
             // Symlinks count as 0 size
             total_files += 1;
         } else if metadata.is_dir() {
-            let (sub_size, sub_files) = calculate_dir_size(&entry_path, cancel_flag)?;
-            total_size += sub_size;
-            total_files += sub_files;
+            child_directories.push((name, metadata.identity()));
         } else if metadata.is_file() {
             total_size += metadata.len();
             total_files += 1;
@@ -3177,6 +3798,25 @@ fn calculate_dir_size(path: &Path, cancel_flag: &Arc<AtomicBool>) -> io::Result<
                 format!("Cannot copy special file: {}", entry_path.display()),
             ));
         }
+    }
+
+    for (name, expected_identity) in child_directories {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
+        }
+        let entry_path = public_path.join(&name);
+        let (child_guard, child_access, _) = access.open_directory(&name)?;
+        if stable_file_identity(&child_guard)? != expected_identity {
+            return Err(io::Error::other(format!(
+                "Source directory changed before traversal: '{}'",
+                entry_path.display()
+            )));
+        }
+        drop(child_guard);
+        let (sub_size, sub_files) =
+            calculate_open_dir_size(&entry_path, &child_access, cancel_flag)?;
+        total_size += sub_size;
+        total_files += sub_files;
     }
 
     Ok((total_size, total_files))
@@ -3192,7 +3832,7 @@ fn copy_regular_file_to_open_with_progress<F>(
     dest_file: &mut File,
     expected_source: Option<&PathAuthorization>,
     cancel_flag: &Arc<AtomicBool>,
-    mut progress_callback: F,
+    progress_callback: F,
 ) -> io::Result<(u64, [u8; 32])>
 where
     F: FnMut(u64, u64),
@@ -3209,6 +3849,27 @@ where
             )));
         }
     }
+    copy_open_regular_file_to_open_with_progress(
+        &mut src_file,
+        &metadata,
+        src,
+        dest_file,
+        cancel_flag,
+        progress_callback,
+    )
+}
+
+fn copy_open_regular_file_to_open_with_progress<F>(
+    src_file: &mut File,
+    metadata: &fs::Metadata,
+    source_display: &Path,
+    dest_file: &mut File,
+    cancel_flag: &Arc<AtomicBool>,
+    mut progress_callback: F,
+) -> io::Result<(u64, [u8; 32])>
+where
+    F: FnMut(u64, u64),
+{
     let total_size = metadata.len();
 
     // Check for cancellation before starting
@@ -3243,14 +3904,14 @@ where
     // being read. Publishing a mixed snapshot (and, for move, deleting the
     // newer source) would be data loss, so require its identity and content
     // metadata to remain stable for the whole read.
-    if !metadata_still_matches(&metadata, &src_file.metadata()?) {
+    if !metadata_still_matches(metadata, &src_file.metadata()?) {
         return Err(io::Error::other(format!(
             "Source changed while it was being copied: {}",
-            src.display()
+            source_display.display()
         )));
     }
 
-    preserve_file_metadata(dest_file, &metadata)?;
+    preserve_file_metadata(dest_file, metadata)?;
     dest_file.sync_all()?;
 
     Ok((copied, source_hasher.finalize().into()))
@@ -3329,6 +3990,42 @@ where
         src,
         &mut destination,
         None,
+        cancel_flag,
+        progress_callback,
+    )?;
+    if stable_path_identity(dest)? != expected {
+        return Err(io::Error::other(format!(
+            "Private-tree destination changed while it was being copied: '{}'",
+            dest.display()
+        )));
+    }
+    Ok(copied)
+}
+
+fn copy_open_regular_file_into_private_tree<F>(
+    src_file: &mut File,
+    source_metadata: &fs::Metadata,
+    source_display: &Path,
+    dest: &Path,
+    cancel_flag: &Arc<AtomicBool>,
+    progress_callback: F,
+) -> io::Result<u64>
+where
+    F: FnMut(u64, u64),
+{
+    let mut destination = create_new_destination_file(dest)?;
+    let expected = stable_file_identity(&destination)?;
+    if stable_path_identity(dest)? != expected {
+        return Err(io::Error::other(format!(
+            "Private-tree destination changed immediately after creation: '{}'",
+            dest.display()
+        )));
+    }
+    let (copied, _) = copy_open_regular_file_to_open_with_progress(
+        src_file,
+        source_metadata,
+        source_display,
+        &mut destination,
         cancel_flag,
         progress_callback,
     )?;
@@ -3571,6 +4268,7 @@ fn copy_dir_recursive_with_progress_detailed(
         &mut visited,
         0,
         true,
+        None,
     );
     match result {
         Ok(()) => {
@@ -3606,9 +4304,10 @@ fn copy_dir_recursive_with_progress_inner(
     completed_files: &mut usize,
     total_bytes: u64,
     total_files: usize,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<StablePathIdentity>,
     depth: usize,
     destination_already_created: bool,
+    opened_source: Option<(File, DirectoryAccess, fs::Metadata)>,
 ) -> io::Result<()> {
     // Guard against pathological recursion (e.g. circular symlinks).
     if depth > MAX_COPY_DEPTH {
@@ -3621,7 +4320,11 @@ fn copy_dir_recursive_with_progress_inner(
     // Hold an O_NOFOLLOW directory descriptor for the entire traversal on
     // Unix. Entries are addressed through that descriptor, so replacing a
     // source directory path with a symlink cannot redirect recursion.
-    let (source_guard, stable_src, src_metadata) = open_directory_for_read(src)?;
+    let (source_guard, source_access, src_metadata) = match opened_source {
+        Some(opened) => opened,
+        None => open_directory_for_read(src)?,
+    };
+    let source_identity = stable_file_identity(&source_guard)?;
     if let Some(expected) = expected_source {
         let current = path_identity(src)?;
         if !expected.matches_snapshot(&current)
@@ -3633,23 +4336,18 @@ fn copy_dir_recursive_with_progress_inner(
             )));
         }
     }
+    drop(source_guard);
 
-    // Detect symlink loops via canonicalised path. `visited` tracks only
-    // the *current recursion stack* (DFS path), not every directory ever
-    // seen — otherwise two siblings whose symlinks resolve to the same
-    // physical directory would be falsely reported as a cycle. We insert
-    // here and remove on exit (after the body, regardless of error).
-    let canonical_src = stable_src
-        .canonicalize()
-        .map(strip_unc_prefix)
-        .unwrap_or_else(|_| src.to_path_buf());
-    if visited.contains(&canonical_src) {
+    // Detect cycles by opened filesystem identity. `visited` tracks only the
+    // current DFS stack, not every directory ever seen, so sibling aliases do
+    // not produce false positives. Every exit removes the current identity.
+    if visited.contains(&source_identity) {
         return Err(io::Error::other(format!(
             "Circular symlink detected: {}",
             src.display()
         )));
     }
-    visited.insert(canonical_src.clone());
+    visited.insert(source_identity);
 
     // Run the body inside an IIFE so any early return (`?`, explicit
     // `return Err`) still goes through the `visited.remove` cleanup
@@ -3664,38 +4362,35 @@ fn copy_dir_recursive_with_progress_inner(
             create_private_directory(dest)?;
         }
 
-        for entry in fs::read_dir(&stable_src)? {
-            let entry = entry?;
-            let src_path = entry.path();
-            let dest_path = dest.join(entry.file_name());
-            let logical_dest_path = logical_destination.join(entry.file_name());
+        // Do not recurse while the Unix directory stream is alive: the stream
+        // owns an additional descriptor. Deferring only directory names keeps
+        // file-heavy directories streaming while avoiding two retained FDs per
+        // recursion level. Captured identities reject replacements before the
+        // deferred child is opened.
+        let mut child_directories = Vec::new();
+        for name in source_access.entries()? {
+            let name = name?;
+            let src_path = src.join(&name);
+            let dest_path = dest.join(&name);
+            let logical_dest_path = logical_destination.join(&name);
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
             }
 
-            let metadata = fs::symlink_metadata(&src_path)?;
+            let metadata = source_access.child_metadata(&name)?;
 
             if metadata.is_symlink() {
-                // Reject symlinks pointing to sensitive system paths
-                #[cfg(unix)]
-                if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
-                    let resolved_str = resolved.to_string_lossy();
-                    if target_is_sensitive(&resolved_str) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Symlink '{}' points to sensitive system path: {}",
-                                src_path.display(),
-                                resolved_str
-                            ),
-                        ));
-                    }
-                }
                 // Copy the link itself; never dereference it on platforms where
                 // that cannot be done safely and unambiguously.
-                copy_symlink_to_new(&src_path, &dest_path, &logical_dest_path, None)?;
+                copy_open_symlink_to_new(
+                    &source_access,
+                    &name,
+                    &src_path,
+                    &dest_path,
+                    &logical_dest_path,
+                )?;
 
                 *completed_files += 1;
                 let _ = progress_tx.send(ProgressMessage::TotalProgress(
@@ -3705,21 +4400,7 @@ fn copy_dir_recursive_with_progress_inner(
                     total_bytes,
                 ));
             } else if metadata.is_dir() {
-                copy_dir_recursive_with_progress_inner(
-                    &src_path,
-                    &dest_path,
-                    &logical_dest_path,
-                    None,
-                    cancel_flag,
-                    progress_tx,
-                    completed_bytes,
-                    completed_files,
-                    total_bytes,
-                    total_files,
-                    visited,
-                    depth + 1,
-                    false,
-                )?;
+                child_directories.push((name, metadata.identity()));
             } else if metadata.is_file() {
                 // Regular file - copy with progress
                 let filename = src_path
@@ -3729,10 +4410,13 @@ fn copy_dir_recursive_with_progress_inner(
 
                 let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
 
-                let file_size = metadata.len();
+                let (mut source_file, source_metadata) = source_access.open_regular_file(&name)?;
+                let file_size = source_metadata.len();
                 let file_completed_bytes = *completed_bytes;
 
-                let result = copy_regular_file_into_private_tree(
+                let result = copy_open_regular_file_into_private_tree(
+                    &mut source_file,
+                    &source_metadata,
                     &src_path,
                     &dest_path,
                     cancel_flag,
@@ -3775,11 +4459,43 @@ fn copy_dir_recursive_with_progress_inner(
             }
         }
 
+        for (name, expected_identity) in child_directories {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
+            }
+            let src_path = src.join(&name);
+            let dest_path = dest.join(&name);
+            let logical_dest_path = logical_destination.join(&name);
+            let opened_child = source_access.open_directory(&name)?;
+            if stable_file_identity(&opened_child.0)? != expected_identity {
+                return Err(io::Error::other(format!(
+                    "Source directory changed before it could be copied: '{}'",
+                    src_path.display()
+                )));
+            }
+            copy_dir_recursive_with_progress_inner(
+                &src_path,
+                &dest_path,
+                &logical_dest_path,
+                None,
+                cancel_flag,
+                progress_tx,
+                completed_bytes,
+                completed_files,
+                total_bytes,
+                total_files,
+                visited,
+                depth + 1,
+                false,
+                Some(opened_child),
+            )?;
+        }
+
         // Preserve metadata through the exact no-follow directory handle;
         // path-based chmod/utimes could be redirected after recursive copy.
         preserve_directory_metadata_no_follow(dest, &src_metadata)?;
         sync_parent(dest)?;
-        if !metadata_still_matches(&src_metadata, &source_guard.metadata()?) {
+        if !metadata_still_matches(&src_metadata, &source_access.file().metadata()?) {
             return Err(io::Error::other(format!(
                 "Source directory changed while it was being copied: '{}'",
                 src.display()
@@ -3789,7 +4505,7 @@ fn copy_dir_recursive_with_progress_inner(
         Ok(())
     })();
 
-    visited.remove(&canonical_src);
+    visited.remove(&source_identity);
     result
 }
 
@@ -4978,7 +5694,7 @@ pub fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
     }
     let partial = PartialStage::bind_directory(staging)?;
     let mut visited = HashSet::new();
-    match copy_dir_recursive_inner(src, &temp, dest, None, &mut visited, 0, true) {
+    match copy_dir_recursive_inner(src, &temp, dest, None, &mut visited, 0, true, None) {
         Ok(()) => {
             let stage = partial.seal()?;
             match stage.publish_noreplace(dest) {
@@ -5000,9 +5716,10 @@ fn copy_dir_recursive_inner(
     dest: &Path,
     logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<StablePathIdentity>,
     depth: usize,
     destination_already_created: bool,
+    opened_source: Option<(File, DirectoryAccess, fs::Metadata)>,
 ) -> io::Result<()> {
     // Check maximum depth to prevent stack overflow
     if depth > MAX_COPY_DEPTH {
@@ -5014,7 +5731,11 @@ fn copy_dir_recursive_inner(
 
     // Pin the source directory before enumerating it so a concurrent path
     // replacement cannot redirect the copy through a symlink.
-    let (source_guard, stable_src, src_metadata) = open_directory_for_read(src)?;
+    let (source_guard, source_access, src_metadata) = match opened_source {
+        Some(opened) => opened,
+        None => open_directory_for_read(src)?,
+    };
+    let source_identity = stable_file_identity(&source_guard)?;
     if let Some(expected) = expected_source {
         let current = path_identity(src)?;
         if !expected.matches_snapshot(&current)
@@ -5026,24 +5747,18 @@ fn copy_dir_recursive_inner(
             )));
         }
     }
+    drop(source_guard);
 
-    // Detect symlink loops via canonicalised path. `visited` tracks only
-    // the *current recursion stack* (DFS path), not every directory ever
-    // seen — otherwise two siblings whose canonical paths resolve to the
-    // same physical directory (bind mount, BTRFS subvolume, etc.) would
-    // be falsely reported as a cycle. We insert here and remove on exit
-    // (after the body, regardless of error).
-    let canonical_src = stable_src
-        .canonicalize()
-        .map(strip_unc_prefix)
-        .unwrap_or_else(|_| src.to_path_buf());
-    if visited.contains(&canonical_src) {
+    // Detect cycles by opened filesystem identity. `visited` tracks only the
+    // current DFS stack, not every directory ever seen, so sibling aliases do
+    // not produce false positives. Every exit removes the current identity.
+    if visited.contains(&source_identity) {
         return Err(io::Error::other(format!(
             "Circular symlink detected: {}",
             src.display()
         )));
     }
-    visited.insert(canonical_src.clone());
+    visited.insert(source_identity);
 
     // Run the body inside an IIFE so any early return (`?`, explicit
     // `return Err`) still goes through the `visited.remove` cleanup
@@ -5053,45 +5768,35 @@ fn copy_dir_recursive_inner(
             create_private_directory(dest)?;
         }
 
-        for entry in fs::read_dir(&stable_src)? {
-            let entry = entry?;
-            let src_path = entry.path();
-            let dest_path = dest.join(entry.file_name());
-            let logical_dest_path = logical_destination.join(entry.file_name());
+        // Close the per-directory enumeration descriptor before descending.
+        // Retaining only subdirectory names/identities preserves streaming for
+        // ordinary files without multiplying descriptors by recursion depth.
+        let mut child_directories = Vec::new();
+        for name in source_access.entries()? {
+            let name = name?;
+            let src_path = src.join(&name);
+            let dest_path = dest.join(&name);
+            let logical_dest_path = logical_destination.join(&name);
 
             // Get metadata without following symlinks
-            let metadata = fs::symlink_metadata(&src_path)?;
+            let metadata = source_access.child_metadata(&name)?;
 
             if metadata.is_symlink() {
-                // Reject symlinks pointing to sensitive system paths
-                #[cfg(unix)]
-                if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
-                    let resolved_str = resolved.to_string_lossy();
-                    if target_is_sensitive(&resolved_str) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Symlink '{}' points to sensitive system path: {}",
-                                src_path.display(),
-                                resolved_str
-                            ),
-                        ));
-                    }
-                }
-                copy_symlink_to_new(&src_path, &dest_path, &logical_dest_path, None)?;
-            } else if metadata.is_dir() {
-                copy_dir_recursive_inner(
+                copy_open_symlink_to_new(
+                    &source_access,
+                    &name,
                     &src_path,
                     &dest_path,
                     &logical_dest_path,
-                    None,
-                    visited,
-                    depth + 1,
-                    false,
                 )?;
+            } else if metadata.is_dir() {
+                child_directories.push((name, metadata.identity()));
             } else if metadata.is_file() {
                 let cancel_flag = Arc::new(AtomicBool::new(false));
-                copy_regular_file_into_private_tree(
+                let (mut source_file, source_metadata) = source_access.open_regular_file(&name)?;
+                copy_open_regular_file_into_private_tree(
+                    &mut source_file,
+                    &source_metadata,
                     &src_path,
                     &dest_path,
                     &cancel_flag,
@@ -5105,11 +5810,34 @@ fn copy_dir_recursive_inner(
             }
         }
 
+        for (name, expected_identity) in child_directories {
+            let src_path = src.join(&name);
+            let dest_path = dest.join(&name);
+            let logical_dest_path = logical_destination.join(&name);
+            let opened_child = source_access.open_directory(&name)?;
+            if stable_file_identity(&opened_child.0)? != expected_identity {
+                return Err(io::Error::other(format!(
+                    "Source directory changed before it could be copied: '{}'",
+                    src_path.display()
+                )));
+            }
+            copy_dir_recursive_inner(
+                &src_path,
+                &dest_path,
+                &logical_dest_path,
+                None,
+                visited,
+                depth + 1,
+                false,
+                Some(opened_child),
+            )?;
+        }
+
         // Preserve metadata through the exact no-follow directory handle;
         // path-based chmod/utimes could be redirected after recursive copy.
         preserve_directory_metadata_no_follow(dest, &src_metadata)?;
         sync_parent(dest)?;
-        if !metadata_still_matches(&src_metadata, &source_guard.metadata()?) {
+        if !metadata_still_matches(&src_metadata, &source_access.file().metadata()?) {
             return Err(io::Error::other(format!(
                 "Source directory changed while it was being copied: '{}'",
                 src.display()
@@ -5119,7 +5847,7 @@ fn copy_dir_recursive_inner(
         Ok(())
     })();
 
-    visited.remove(&canonical_src);
+    visited.remove(&source_identity);
     result
 }
 
@@ -5869,6 +6597,68 @@ mod tests {
     #[cfg(unix)]
     fn create_socket(path: &Path) -> std::os::unix::net::UnixListener {
         std::os::unix::net::UnixListener::bind(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_access_keeps_using_the_open_directory_after_path_replacement() {
+        let root = create_temp_dir();
+        let original = root.join("original");
+        let detached = root.join("detached");
+        let replacement = root.join("replacement");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+
+        let (_guard, access, _) = open_directory_for_read(&original).unwrap();
+        fs::rename(&original, &detached).unwrap();
+        std::os::unix::fs::symlink(&replacement, &original).unwrap();
+
+        let name = OsStr::new("created.txt");
+        let mut file = access
+            .open_file(
+                name,
+                DirectoryFileOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600),
+            )
+            .unwrap();
+        file.write_all(b"anchored").unwrap();
+        file.sync_all().unwrap();
+        let identity = stable_file_identity(&file).unwrap();
+        drop(file);
+
+        assert_eq!(fs::read(detached.join(name)).unwrap(), b"anchored");
+        assert!(!replacement.join(name).exists());
+        assert_eq!(access.child_identity(name).unwrap(), identity);
+        assert!(access
+            .entries()
+            .unwrap()
+            .any(|entry| entry.unwrap().as_os_str() == name));
+
+        access.remove_file_if_identity(name, identity).unwrap();
+        assert!(!detached.join(name).exists());
+        drop(access);
+        drop(_guard);
+        cleanup_temp_dir(&root);
+    }
+
+    #[test]
+    fn directory_access_rejects_nested_child_paths() {
+        let root = create_temp_dir();
+        let (_guard, access, _) = open_directory_for_read(&root).unwrap();
+
+        let error = access
+            .open_file(
+                OsStr::new("nested/file"),
+                DirectoryFileOptions::new().read(true),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        drop(access);
+        drop(_guard);
+        cleanup_temp_dir(&root);
     }
 
     fn completed_message(messages: &[ProgressMessage]) -> Option<(usize, usize)> {

@@ -1321,7 +1321,7 @@ fn persist_console_document_in(dir: &Path, data: &[u8], filename: &str) -> Resul
     let basename = validate_console_document_filename(filename)?;
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("Failed to create console document directory: {e}"))?;
-    let (directory, stable_directory, metadata) =
+    let (directory, directory_access, metadata) =
         crate::services::file_ops::open_directory_for_read(dir)
             .map_err(|e| format!("Failed to open console document directory: {e}"))?;
     let directory_identity = crate::services::file_ops::stable_file_identity(&directory)
@@ -1354,15 +1354,14 @@ fn persist_console_document_in(dir: &Path, data: &[u8], filename: &str) -> Resul
             basename.to_string_lossy()
         );
         let path = dir.join(&file_name);
-        let stable_path = stable_directory.join(&file_name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&stable_path) {
+        let name = std::ffi::OsStr::new(&file_name);
+        let mut file = match directory_access.open_file(
+            name,
+            crate::services::file_ops::DirectoryFileOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600),
+        ) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("Failed to create console document: {e}")),
@@ -1371,13 +1370,15 @@ fn persist_console_document_in(dir: &Path, data: &[u8], filename: &str) -> Resul
             Ok(identity) => identity,
             Err(error) => {
                 drop(file);
-                let _ = std::fs::remove_file(&stable_path);
+                if let Ok(identity) = directory_access.child_identity(name) {
+                    let _ = directory_access.remove_file_if_identity(name, identity);
+                }
                 return Err(format!("Failed to identify console document: {error}"));
             }
         };
         if let Err(e) = file.write_all(data).and_then(|_| file.sync_all()) {
             drop(file);
-            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            let _ = directory_access.remove_file_if_identity(name, identity);
             return Err(format!("Failed to save console document: {e}"));
         }
         drop(file);
@@ -1388,7 +1389,7 @@ fn persist_console_document_in(dir: &Path, data: &[u8], filename: &str) -> Resul
             .map(|current| current == directory_identity)
             .unwrap_or(false);
         if !path_matches || !directory_matches {
-            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            let _ = directory_access.remove_file_if_identity(name, identity);
             return Err("Console document path changed while the file was being saved".to_string());
         }
         #[cfg(unix)]

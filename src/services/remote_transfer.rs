@@ -9,10 +9,10 @@ use russh::{client, ChannelMsg, Disconnect};
 use tokio::runtime::Runtime;
 
 use crate::services::file_ops::{
-    copy_path_authorized, create_private_quarantine_directory, open_directory_for_read,
-    open_regular_file_no_follow, remove_file_by_identity, rename_noreplace, stable_file_identity,
-    stable_path_identity, verify_directory_authorization, verify_path_authorization,
-    DirectoryAuthorization, PathAuthorization, ProgressMessage, StablePathIdentity,
+    copy_path_authorized, open_directory_for_read, open_regular_file_no_follow,
+    remove_file_by_identity, rename_noreplace, stable_file_identity, stable_path_identity,
+    verify_directory_authorization, verify_path_authorization, DirectoryAuthorization,
+    PathAuthorization, ProgressMessage, StablePathIdentity,
 };
 use crate::services::remote::{
     expand_tilde, load_supported_secret_key, RemoteAuth, RemotePrivateDirectoryIdentity,
@@ -124,14 +124,14 @@ struct LocalStageDir {
 
 impl LocalStageDir {
     fn create(target: &Path) -> Result<Self, String> {
-        let (parent_guard, stable_parent_path, parent_metadata) = open_directory_for_read(target)
+        let (parent_guard, parent_access, parent_metadata) = open_directory_for_read(target)
             .map_err(|error| {
-            format!(
-                "Failed to open transfer staging parent '{}': {}",
-                target.display(),
-                error
-            )
-        })?;
+                format!(
+                    "Failed to open transfer staging parent '{}': {}",
+                    target.display(),
+                    error
+                )
+            })?;
         verify_local_staging_parent(target, &parent_metadata)?;
         let parent_identity = stable_file_identity(&parent_guard).map_err(|error| {
             format!(
@@ -141,19 +141,17 @@ impl LocalStageDir {
             )
         })?;
 
-        let stable_created = create_private_quarantine_directory(&stable_parent_path, "transfer")
+        let created_name = parent_access
+            .create_private_directory("transfer")
             .map_err(|error| {
-            format!(
-                "Failed to create private transfer staging directory in '{}': {}",
-                target.display(),
-                error
-            )
-        })?;
-        let result = (|| {
-            let name = stable_created.file_name().ok_or_else(|| {
-                "Private transfer staging directory has no final path component".to_string()
+                format!(
+                    "Failed to create private transfer staging directory in '{}': {}",
+                    target.display(),
+                    error
+                )
             })?;
-            let path = target.join(name);
+        let result = (|| {
+            let path = target.join(&created_name);
             if stable_path_identity(target).map_err(|error| {
                 format!(
                     "Failed to re-identify transfer staging parent '{}': {}",
@@ -167,8 +165,9 @@ impl LocalStageDir {
                     target.display()
                 ));
             }
-            let (directory_guard, _, stage_metadata) =
-                open_directory_for_read(&path).map_err(|error| {
+            let (directory_guard, _, stage_metadata) = parent_access
+                .open_directory(&created_name)
+                .map_err(|error| {
                     format!(
                         "Failed to open private transfer staging directory '{}': {}",
                         path.display(),
@@ -201,7 +200,9 @@ impl LocalStageDir {
         let (path, identity, directory_guard) = match result {
             Ok(created) => created,
             Err(error) => {
-                let _ = std::fs::remove_dir(&stable_created);
+                if let Ok(identity) = parent_access.child_identity(&created_name) {
+                    let _ = parent_access.remove_directory_if_identity(&created_name, identity);
+                }
                 return Err(error);
             }
         };
@@ -515,25 +516,82 @@ fn sync_local_entry_recursive(path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     if metadata.is_dir() {
-        let (directory, stable_path, _) = open_directory_for_read(path)?;
+        let (directory, access, _) = open_directory_for_read(path)?;
         let expected = stable_file_identity(&directory)?;
-        for entry in std::fs::read_dir(&stable_path)? {
-            sync_local_entry_recursive(&entry?.path())?;
-        }
-        #[cfg(unix)]
-        directory.sync_all()?;
-        if stable_path_identity(path)? != expected {
-            return Err(std::io::Error::other(format!(
-                "Local transfer staging directory changed during sync: '{}'",
-                path.display()
-            )));
-        }
-        return Ok(());
+        drop(directory);
+        return sync_open_local_directory_recursive(path, &access, expected);
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!("Cannot publish special local entry: '{}'", path.display()),
     ))
+}
+
+fn sync_open_local_directory_recursive(
+    public_path: &Path,
+    access: &crate::services::file_ops::DirectoryAccess,
+    expected: StablePathIdentity,
+) -> std::io::Result<()> {
+    // The Unix iterator owns a duplicate directory descriptor. Finish the
+    // current stream before recursion so deep trees retain only the pinned
+    // DirectoryAccess descriptor at each parent level. Child identities are
+    // retained with their names so deferred recursion rejects replacements.
+    let mut child_directories = Vec::new();
+    for name in access.entries()? {
+        let name = name?;
+        let child_path = public_path.join(&name);
+        let metadata = access.child_metadata(&name)?;
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            let (file, _) = access.open_regular_file(&name)?;
+            let child_identity = stable_file_identity(&file)?;
+            file.sync_all()?;
+            if access.child_identity(&name)? != child_identity {
+                return Err(std::io::Error::other(format!(
+                    "Local transfer staging file changed during sync: '{}'",
+                    child_path.display()
+                )));
+            }
+            continue;
+        }
+        if metadata.is_dir() {
+            child_directories.push((name, metadata.identity()));
+            continue;
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Cannot publish special local entry: '{}'",
+                child_path.display()
+            ),
+        ));
+    }
+    for (name, expected_identity) in child_directories {
+        let child_path = public_path.join(&name);
+        let (child_directory, child_access, _) = access.open_directory(&name)?;
+        let child_identity = stable_file_identity(&child_directory)?;
+        if child_identity != expected_identity {
+            return Err(std::io::Error::other(format!(
+                "Local transfer staging directory changed before sync: '{}'",
+                child_path.display()
+            )));
+        }
+        drop(child_directory);
+        sync_open_local_directory_recursive(&child_path, &child_access, child_identity)?;
+    }
+    #[cfg(unix)]
+    access.file().sync_all()?;
+    if stable_file_identity(access.file())? != expected
+        || stable_path_identity(public_path)? != expected
+    {
+        return Err(std::io::Error::other(format!(
+            "Local transfer staging directory changed during sync: '{}'",
+            public_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn publish_local_noreplace(
@@ -1082,7 +1140,7 @@ fn create_askpass_script_in_dir(
     content: &str,
 ) -> Result<(PathBuf, StablePathIdentity), String> {
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
-    let (directory, stable_directory, metadata) = open_directory_for_read(tmp_dir)
+    let (directory, directory_access, metadata) = open_directory_for_read(tmp_dir)
         .map_err(|error| format!("Failed to open private askpass directory: {error}"))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(format!(
@@ -1100,20 +1158,24 @@ fn create_askpass_script_in_dir(
     let nonce: u32 = rand::random();
     let file_name = format!("askpass_{}_{:08x}", std::process::id(), nonce);
     let script_path = tmp_dir.join(&file_name);
-    let stable_script_path = stable_directory.join(&file_name);
+    let file_name = std::ffi::OsStr::new(&file_name);
 
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&stable_script_path)
+    let mut file = directory_access
+        .open_file(
+            file_name,
+            crate::services::file_ops::DirectoryFileOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700),
+        )
         .map_err(|e| format!("Failed to create askpass script: {}", e))?;
     let identity = match stable_file_identity(&file) {
         Ok(identity) => identity,
         Err(error) => {
             drop(file);
-            let _ = std::fs::remove_file(&stable_script_path);
+            if let Ok(identity) = directory_access.child_identity(file_name) {
+                let _ = directory_access.remove_file_if_identity(file_name, identity);
+            }
             return Err(format!("Failed to identify askpass script: {error}"));
         }
     };
@@ -1122,14 +1184,14 @@ fn create_askpass_script_in_dir(
         .and_then(|_| file.sync_all());
     drop(file);
     if let Err(error) = write_result {
-        let _ = remove_file_by_identity(&stable_script_path, identity);
+        let _ = directory_access.remove_file_if_identity(file_name, identity);
         return Err(format!("Failed to write askpass script: {error}"));
     }
 
     let published_identity = match stable_path_identity(&script_path) {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = remove_file_by_identity(&stable_script_path, identity);
+            let _ = directory_access.remove_file_if_identity(file_name, identity);
             return Err(format!(
                 "Failed to bind askpass script to '{}': {error}",
                 script_path.display()
@@ -1137,7 +1199,7 @@ fn create_askpass_script_in_dir(
         }
     };
     if published_identity != identity {
-        let _ = remove_file_by_identity(&stable_script_path, identity);
+        let _ = directory_access.remove_file_if_identity(file_name, identity);
         return Err(format!(
             "Askpass directory changed while the private script was created: '{}'",
             tmp_dir.display()

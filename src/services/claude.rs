@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 pub(crate) struct PrivateTempFile {
     path: std::path::PathBuf,
-    stable_path: std::path::PathBuf,
+    file_name: std::ffi::OsString,
+    directory_access: crate::services::file_ops::DirectoryAccess,
     identity: crate::services::file_ops::StablePathIdentity,
     directory_path: std::path::PathBuf,
     directory_identity: crate::services::file_ops::StablePathIdentity,
@@ -40,8 +41,9 @@ impl PrivateTempFile {
 
 impl Drop for PrivateTempFile {
     fn drop(&mut self) {
-        let _ =
-            crate::services::file_ops::remove_file_by_identity(&self.stable_path, self.identity);
+        let _ = self
+            .directory_access
+            .remove_file_if_identity(&self.file_name, self.identity);
         drop(self.directory_guard.take());
     }
 }
@@ -55,7 +57,7 @@ pub(crate) fn create_private_temp_file(
     contents: &[u8],
 ) -> std::io::Result<PrivateTempFile> {
     std::fs::create_dir_all(dir)?;
-    let (directory_guard, stable_directory, metadata) =
+    let (directory_guard, directory_access, metadata) =
         crate::services::file_ops::open_directory_for_read(dir)?;
     let directory_identity = crate::services::file_ops::stable_file_identity(&directory_guard)?;
     if !metadata.file_type().is_dir()
@@ -80,15 +82,13 @@ pub(crate) fn create_private_temp_file(
     for _ in 0..32 {
         let file_name = format!("{}_{:032x}", prefix, rand::random::<u128>());
         let path = dir.join(&file_name);
-        let stable_path = stable_directory.join(&file_name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&stable_path) {
+        let mut file = match directory_access.open_file(
+            std::ffi::OsStr::new(&file_name),
+            crate::services::file_ops::DirectoryFileOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600),
+        ) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -97,13 +97,17 @@ pub(crate) fn create_private_temp_file(
             Ok(identity) => identity,
             Err(error) => {
                 drop(file);
-                let _ = std::fs::remove_file(&stable_path);
+                let name = std::ffi::OsStr::new(&file_name);
+                if let Ok(identity) = directory_access.child_identity(name) {
+                    let _ = directory_access.remove_file_if_identity(name, identity);
+                }
                 return Err(error);
             }
         };
         if let Err(e) = file.write_all(contents).and_then(|_| file.sync_all()) {
             drop(file);
-            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            let _ = directory_access
+                .remove_file_if_identity(std::ffi::OsStr::new(&file_name), identity);
             return Err(e);
         }
         drop(file);
@@ -112,7 +116,8 @@ pub(crate) fn create_private_temp_file(
         if published_identity.as_ref().ok() != Some(&identity)
             || current_directory_identity.as_ref().ok() != Some(&directory_identity)
         {
-            let _ = crate::services::file_ops::remove_file_by_identity(&stable_path, identity);
+            let _ = directory_access
+                .remove_file_if_identity(std::ffi::OsStr::new(&file_name), identity);
             return Err(published_identity
                 .err()
                 .or_else(|| current_directory_identity.err())
@@ -124,7 +129,8 @@ pub(crate) fn create_private_temp_file(
         }
         return Ok(PrivateTempFile {
             path: path.clone(),
-            stable_path,
+            file_name: file_name.into(),
+            directory_access,
             identity,
             directory_path: dir.to_path_buf(),
             directory_identity,

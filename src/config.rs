@@ -1,7 +1,9 @@
 use crate::keybindings::KeybindingsConfig;
+#[cfg(test)]
+use crate::services::file_ops::remove_file_by_identity;
 use crate::services::file_ops::{
-    open_directory_for_read, open_regular_file_no_follow, remove_file_by_identity,
-    stable_file_identity, stable_path_identity, StablePathIdentity,
+    open_directory_for_read, stable_file_identity, stable_path_identity, DirectoryAccess,
+    DirectoryFileOptions, StablePathIdentity,
 };
 use crate::services::remote::RemoteProfile;
 use crate::ui::theme::{Theme, DEFAULT_THEME_NAME};
@@ -39,11 +41,6 @@ impl std::fmt::Display for SettingsLoadError {
 
 impl std::error::Error for SettingsLoadError {}
 
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
-}
-
 #[cfg(windows)]
 fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -71,13 +68,13 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 
 /// A real config directory kept open for the entire operation.
 ///
-/// On Unix, `stable_path` is rooted at the open directory descriptor. On
-/// Windows, `open_directory_for_read` deliberately omits delete sharing, so
-/// the original directory name cannot be replaced while this value is alive.
+/// Child entries are always accessed relative to `access`, never by appending
+/// to a descriptor pseudo-path. The separately held handle also pins the
+/// directory name on Windows.
 #[derive(Debug)]
 struct PrivateDirectory {
     original_path: PathBuf,
-    stable_path: PathBuf,
+    access: DirectoryAccess,
     handle: fs::File,
     identity: StablePathIdentity,
 }
@@ -110,7 +107,7 @@ impl PrivateDirectory {
             ));
         }
         let before_identity = stable_path_identity(access_path)?;
-        let (handle, stable_path, opened) = open_directory_for_read(access_path)?;
+        let (handle, access, opened) = open_directory_for_read(access_path)?;
         let identity = stable_file_identity(&handle)?;
         if !opened.is_dir()
             || metadata_is_reparse_point(&opened)
@@ -131,7 +128,7 @@ impl PrivateDirectory {
 
         let directory = Self {
             original_path,
-            stable_path,
+            access,
             handle,
             identity,
         };
@@ -141,12 +138,14 @@ impl PrivateDirectory {
 
     fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
         self.validate_current()?;
-        let stable_path = self.child_path(name)?;
-        let original_path = self.original_path.join(name);
-        match fs::symlink_metadata(&stable_path) {
+        let original_path = self.child_path(name)?;
+        let component = original_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Config entry has no filename")
+        })?;
+        match self.access.child_metadata(component) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match create_private_directory(&stable_path) {
+                match self.access.create_directory(component, 0o700) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
@@ -154,7 +153,28 @@ impl PrivateDirectory {
             }
             Err(error) => return Err(error),
         }
-        let child = Self::open_paths(original_path, &stable_path)?;
+        let (handle, access, opened) = self.access.open_directory(component)?;
+        let identity = stable_file_identity(&handle)?;
+        if !opened.is_dir()
+            || metadata_is_reparse_point(&opened)
+            || stable_path_identity(&original_path)? != identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed while being opened", original_path.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        let child = Self {
+            original_path,
+            access,
+            handle,
+            identity,
+        };
         self.validate_current()?;
         child.validate_current()?;
         Ok(child)
@@ -172,7 +192,7 @@ impl PrivateDirectory {
                 "Config entry name must be one normal UTF-8 path component",
             ));
         }
-        Ok(self.stable_path.join(component))
+        Ok(self.original_path.join(component))
     }
 
     fn validate_current(&self) -> io::Result<()> {
@@ -217,7 +237,10 @@ impl PrivateDirectory {
 fn open_private_regular_file_in(directory: &PrivateDirectory, name: &str) -> io::Result<fs::File> {
     directory.validate_current()?;
     let path = directory.child_path(name)?;
-    let (file, metadata) = open_regular_file_no_follow(&path)?;
+    let component = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Config entry has no filename")
+    })?;
+    let (file, metadata) = directory.access.open_regular_file(component)?;
     let identity = stable_file_identity(&file)?;
     if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
         return Err(io::Error::new(
@@ -230,7 +253,9 @@ fn open_private_regular_file_in(directory: &PrivateDirectory, name: &str) -> io:
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    if stable_file_identity(&file)? != identity || stable_path_identity(&path)? != identity {
+    if stable_file_identity(&file)? != identity
+        || directory.access.child_identity(component)? != identity
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -243,6 +268,30 @@ fn open_private_regular_file_in(directory: &PrivateDirectory, name: &str) -> io:
     Ok(file)
 }
 
+fn cleanup_created_child(
+    directory: &PrivateDirectory,
+    name: &str,
+    identity: StablePathIdentity,
+    primary_error: io::Error,
+) -> io::Error {
+    let display_path = directory.original_path.join(name);
+    match directory
+        .access
+        .remove_file_if_identity(std::ffi::OsStr::new(name), identity)
+    {
+        Ok(()) => primary_error,
+        Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => primary_error,
+        Err(cleanup_error) => io::Error::new(
+            primary_error.kind(),
+            format!(
+                "{primary_error}; additionally could not safely clean up '{}': {cleanup_error}",
+                display_path.display()
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
 fn cleanup_created_file(
     path: &Path,
     identity: StablePathIdentity,
@@ -268,25 +317,22 @@ fn write_new_private_file_in(
 ) -> io::Result<()> {
     directory.validate_current()?;
     let path = directory.child_path(name)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(&path)?;
+    let component = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Config entry has no filename")
+    })?;
+    let mut file = directory.access.open_file(
+        component,
+        DirectoryFileOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600),
+    )?;
     let identity = stable_file_identity(&file)?;
-    if stable_path_identity(&path)? != identity {
+    if directory.access.child_identity(component)? != identity {
         drop(file);
-        return Err(cleanup_created_file(
-            &path,
+        return Err(cleanup_created_child(
+            directory,
+            name,
             identity,
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -301,14 +347,14 @@ fn write_new_private_file_in(
         .and_then(|_| directory.validate_current())
     {
         drop(file);
-        return Err(cleanup_created_file(&path, identity, error));
+        return Err(cleanup_created_child(directory, name, identity, error));
     }
     drop(file);
     #[cfg(unix)]
     directory.sync()?;
     match directory.validate_current() {
         Ok(()) => Ok(()),
-        Err(error) => Err(cleanup_created_file(&path, identity, error)),
+        Err(error) => Err(cleanup_created_child(directory, name, identity, error)),
     }
 }
 
@@ -318,8 +364,8 @@ fn ensure_private_regular_file_in(
     default_contents: &[u8],
 ) -> io::Result<()> {
     directory.validate_current()?;
-    let path = directory.child_path(name)?;
-    match fs::symlink_metadata(path) {
+    directory.child_path(name)?;
+    match directory.access.child_metadata(std::ffi::OsStr::new(name)) {
         Ok(_) => {
             open_private_regular_file_in(directory, name)?;
             Ok(())
@@ -335,38 +381,6 @@ fn ensure_private_regular_file_in(
             }
         }
         Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
@@ -592,8 +606,11 @@ impl Settings {
         )?;
 
         config_directory.validate_current()?;
-        let config_path = config_directory.child_path("settings.json")?;
-        match fs::symlink_metadata(config_path) {
+        config_directory.child_path("settings.json")?;
+        match config_directory
+            .access
+            .child_metadata(std::ffi::OsStr::new("settings.json"))
+        {
             Ok(_) => {
                 open_private_regular_file_in(&config_directory, "settings.json")?;
             }
@@ -641,11 +658,14 @@ impl Settings {
             .take(MAX_SETTINGS_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(SettingsLoadError::Read)?;
-        let config_path = config_directory
+        config_directory
             .child_path("settings.json")
             .map_err(SettingsLoadError::Read)?;
         if stable_file_identity(&file).map_err(SettingsLoadError::Read)? != settings_identity
-            || stable_path_identity(&config_path).map_err(SettingsLoadError::Read)?
+            || config_directory
+                .access
+                .child_identity(std::ffi::OsStr::new("settings.json"))
+                .map_err(SettingsLoadError::Read)?
                 != settings_identity
         {
             return Err(SettingsLoadError::Read(io::Error::new(
@@ -691,7 +711,7 @@ impl Settings {
         let config_path = config_directory.child_path("settings.json")?;
         let content = serde_json::to_string_pretty(self)?;
 
-        let (temp_path, mut temp_file, temp_identity) = (0..100)
+        let (temp_name, temp_path, mut temp_file, temp_identity) = (0..100)
             .find_map(|_| {
                 let mut random = [0u8; 8];
                 rand::thread_rng().fill_bytes(&mut random);
@@ -700,22 +720,15 @@ impl Settings {
                     Ok(path) => path,
                     Err(error) => return Some(Err(error)),
                 };
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-                    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-                }
-                match options.open(&path) {
+                match config_directory.access.open_file(
+                    std::ffi::OsStr::new(&name),
+                    DirectoryFileOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600),
+                ) {
                     Ok(file) => match stable_file_identity(&file) {
-                        Ok(identity) => Some(Ok((path, file, identity))),
+                        Ok(identity) => Some(Ok((name, path, file, identity))),
                         Err(error) => Some(Err(error)),
                     },
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
@@ -726,7 +739,11 @@ impl Settings {
             .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "No unique temp path"))?;
 
         let write_result = (|| -> io::Result<()> {
-            if stable_path_identity(&temp_path)? != temp_identity {
+            if config_directory
+                .access
+                .child_identity(std::ffi::OsStr::new(&temp_name))?
+                != temp_identity
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -739,7 +756,10 @@ impl Settings {
             temp_file.write_all(content.as_bytes())?;
             temp_file.sync_all()?;
             if stable_file_identity(&temp_file)? != temp_identity
-                || stable_path_identity(&temp_path)? != temp_identity
+                || config_directory
+                    .access
+                    .child_identity(std::ffi::OsStr::new(&temp_name))?
+                    != temp_identity
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -750,9 +770,15 @@ impl Settings {
                 ));
             }
             config_directory.validate_current()?;
-            atomic_replace(&temp_path, &config_path)?;
+            config_directory.access.rename_replace(
+                std::ffi::OsStr::new(&temp_name),
+                std::ffi::OsStr::new("settings.json"),
+            )?;
             if stable_file_identity(&temp_file)? != temp_identity
-                || stable_path_identity(&config_path)? != temp_identity
+                || config_directory
+                    .access
+                    .child_identity(std::ffi::OsStr::new("settings.json"))?
+                    != temp_identity
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -777,7 +803,12 @@ impl Settings {
                 drop(temp_file);
                 // If publication did not happen, remove only the exact temporary
                 // object we created. A concurrently substituted path is preserved.
-                Err(cleanup_created_file(&temp_path, temp_identity, error))
+                Err(cleanup_created_child(
+                    config_directory,
+                    &temp_name,
+                    temp_identity,
+                    error,
+                ))
             }
         }
     }

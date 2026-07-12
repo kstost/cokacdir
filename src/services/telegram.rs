@@ -15,7 +15,8 @@ use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_
 use crate::services::codex;
 use crate::services::file_ops::{
     open_directory_for_read, open_regular_file_no_follow, remove_file_by_identity,
-    stable_file_identity, stable_path_identity, StablePathIdentity,
+    stable_file_identity, stable_path_identity, DirectoryAccess, DirectoryFileOptions,
+    StablePathIdentity,
 };
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
@@ -76,7 +77,7 @@ fn redact_err(e: &impl std::fmt::Display) -> String {
 struct PrivateDirectory {
     handle: fs::File,
     original_path: PathBuf,
-    stable_path: PathBuf,
+    access: DirectoryAccess,
     identity: StablePathIdentity,
 }
 
@@ -90,7 +91,7 @@ impl PrivateDirectory {
     fn open_existing(dir: &Path) -> std::io::Result<Self> {
         let normalized = normalize_private_directory_path(dir);
         let dir = normalized.as_path();
-        let (handle, stable_path, _) = open_directory_for_read(dir)?;
+        let (handle, access, _) = open_directory_for_read(dir)?;
         let identity = stable_file_identity(&handle)?;
         if stable_path_identity(dir)? != identity {
             return Err(std::io::Error::other(format!(
@@ -108,7 +109,7 @@ impl PrivateDirectory {
         let directory = Self {
             handle,
             original_path: dir.to_path_buf(),
-            stable_path,
+            access,
             identity,
         };
         directory.verify_current_path()?;
@@ -123,10 +124,6 @@ impl PrivateDirectory {
             )));
         }
         Ok(())
-    }
-
-    fn stable_child(&self, file_name: &std::ffi::OsStr) -> PathBuf {
-        self.stable_path.join(file_name)
     }
 
     fn public_child(&self, file_name: &std::ffi::OsStr) -> PathBuf {
@@ -253,37 +250,24 @@ fn open_private_file_in_directory(
     append: bool,
 ) -> std::io::Result<fs::File> {
     directory.verify_current_path()?;
-    let stable_path = directory.stable_child(file_name);
-    let mut options = fs::OpenOptions::new();
-    options
-        .create(true)
-        .write(true)
-        .append(append)
-        .read(!append);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    let file = directory.access.open_file(
+        file_name,
+        DirectoryFileOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .read(!append)
+            .pin_name(!append)
+            .mode(0o600),
+    )?;
+    let display_path = directory.public_child(file_name);
+    validate_private_file_handle(&file, &display_path)?;
+    if stable_file_identity(&file)? != directory.access.child_identity(file_name)? {
+        return Err(std::io::Error::other(format!(
+            "private file changed while it was being opened: '{}'",
+            display_path.display()
+        )));
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        if !append {
-            // Keep a lock filename pinned while the advisory lock is held;
-            // otherwise another process could replace it and lock a different
-            // file, defeating the coordination boundary.
-            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        }
-    }
-
-    let file = options.open(&stable_path)?;
-    validate_private_file_handle(&file, &stable_path)?;
     secure_private_file_handle(&file)?;
     directory.verify_current_path()?;
     Ok(file)
@@ -308,8 +292,7 @@ fn open_private_regular_file_bounded_in_directory(
     max_bytes: usize,
 ) -> std::io::Result<fs::File> {
     directory.verify_current_path()?;
-    let stable_path = directory.stable_child(file_name);
-    let (file, _) = open_regular_file_no_follow(&stable_path)?;
+    let (file, _) = directory.access.open_regular_file(file_name)?;
     secure_private_file_handle(&file)?;
     let metadata = file.metadata()?;
     if metadata.len() > max_bytes as u64 {
@@ -2402,20 +2385,18 @@ fn copy_regular_file_atomically_private(
         ));
     }
     let directory = PrivateDirectory::open_or_create(private_parent(destination))?;
-    let destination = directory.stable_child(private_file_name(destination)?);
+    let destination_name = private_file_name(destination)?;
     directory.verify_current_path()?;
-    let name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("image");
+    let name = destination_name.to_str().unwrap_or("image");
 
     for _ in 0..32 {
-        let temp_path = directory.stable_path.join(format!(
+        let temp_name = format!(
             ".{name}.tmp.{}.{:032x}",
             std::process::id(),
             rand::random::<u128>()
-        ));
-        let (mut temp_file, temp_identity) = match create_new_private_file(&temp_path) {
+        );
+        let temp_name = std::ffi::OsStr::new(&temp_name);
+        let (mut temp_file, temp_identity) = match create_new_private_file(&directory, temp_name) {
             Ok(created) => created,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -2436,14 +2417,18 @@ fn copy_regular_file_atomically_private(
             temp_file.sync_all()?;
             drop(temp_file);
             directory.verify_current_path()?;
-            replace_file_preserving_existing(&temp_path, &destination)?;
-            if stable_path_identity(&destination)? != temp_identity {
+            directory
+                .access
+                .rename_replace(temp_name, destination_name)?;
+            if directory.access.child_identity(destination_name)? != temp_identity {
                 return Err(std::io::Error::other(
                     "companion image publication was replaced unexpectedly",
                 ));
             }
             if let Err(error) = directory.verify_current_path() {
-                let _ = remove_file_by_identity(&destination, temp_identity);
+                let _ = directory
+                    .access
+                    .remove_file_if_identity(destination_name, temp_identity);
                 return Err(error);
             }
             #[cfg(unix)]
@@ -2451,7 +2436,9 @@ fn copy_regular_file_atomically_private(
             Ok(true)
         })();
         if !matches!(copy_result, Ok(true)) {
-            let _ = remove_file_by_identity(&temp_path, temp_identity);
+            let _ = directory
+                .access
+                .remove_file_if_identity(temp_name, temp_identity);
         }
         return copy_result.map(|_| ());
     }
@@ -3783,11 +3770,7 @@ struct BotMessage {
 
 /// Read a single bot message from a JSON file
 fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
-    use std::io::Read;
-
-    msg_debug(&format!("[read_bot_message] reading: {}", path.display()));
-    const MAX_BOT_MESSAGE_BYTES: u64 = 1024 * 1024;
-    let (mut file, metadata) = match open_regular_file_no_follow(path) {
+    let (file, metadata) = match open_regular_file_no_follow(path) {
         Ok(opened) => opened,
         Err(e) => {
             msg_debug(&format!(
@@ -3798,6 +3781,37 @@ fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
             return None;
         }
     };
+    read_opened_bot_message(path, file, metadata)
+}
+
+fn read_bot_message_in_directory(
+    directory: &PrivateDirectory,
+    file_name: &std::ffi::OsStr,
+) -> Option<BotMessage> {
+    let path = directory.public_child(file_name);
+    let (file, metadata) = match directory.access.open_regular_file(file_name) {
+        Ok(opened) => opened,
+        Err(e) => {
+            msg_debug(&format!(
+                "[read_bot_message] safe relative open failed: {} (path={})",
+                e,
+                path.display()
+            ));
+            return None;
+        }
+    };
+    read_opened_bot_message(&path, file, metadata)
+}
+
+fn read_opened_bot_message(
+    path: &std::path::Path,
+    mut file: fs::File,
+    metadata: fs::Metadata,
+) -> Option<BotMessage> {
+    use std::io::Read;
+
+    msg_debug(&format!("[read_bot_message] reading: {}", path.display()));
+    const MAX_BOT_MESSAGE_BYTES: u64 = 1024 * 1024;
     if metadata.len() > MAX_BOT_MESSAGE_BYTES {
         msg_debug(&format!(
             "[read_bot_message] file exceeds 1 MiB (path={})",
@@ -3963,8 +3977,8 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
             return;
         }
     };
-    let entries = match fs::read_dir(&directory.stable_path) {
-        Ok(entries) => entries,
+    let entries = match directory.access.entries() {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
         Err(error) => {
             msg_debug(&format!(
                 "[check_message_timeouts] read_dir failed: {}: {}",
@@ -3978,12 +3992,12 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
     let now = chrono::Local::now();
     let mut scanned = 0u32;
     let mut timed_out = 0u32;
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
+    for entry in entries {
+        let path = directory.public_child(&entry);
         if !path.extension().map(|ext| ext == "json").unwrap_or(false) {
             continue;
         }
-        let Some(msg) = read_bot_message(&path) else {
+        let Some(msg) = read_bot_message_in_directory(&directory, &entry) else {
             continue;
         };
         if msg.from.to_lowercase() != my_username.to_lowercase() {
@@ -4008,9 +4022,11 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
                     ));
                     if elapsed.num_minutes() >= 30 {
                         // Delete the timed-out message
-                        let remove_result = directory
-                            .verify_current_path()
-                            .and_then(|_| remove_file_by_identity(&path, msg.file_identity));
+                        let remove_result = directory.verify_current_path().and_then(|_| {
+                            directory
+                                .access
+                                .remove_file_if_identity(&entry, msg.file_identity)
+                        });
                         msg_debug(&format!("[check_message_timeouts] deleted timed-out message: {} (to={}, remove_ok={})",
                             msg.id, msg.to, remove_result.is_ok()));
                         timed_out += 1;
@@ -4196,18 +4212,19 @@ fn acquire_schedule_dir_lock(dir: &Path) -> Result<ScheduleDirectoryLock, String
 fn create_schedule_temp_file(
     directory: &PrivateDirectory,
     id: &str,
-) -> Result<(PathBuf, fs::File, StablePathIdentity), String> {
+) -> Result<(std::ffi::OsString, PathBuf, fs::File, StablePathIdentity), String> {
     directory
         .verify_current_path()
         .map_err(|e| format!("Schedule directory changed before temp creation: {e}"))?;
     for _ in 0..16 {
-        let path = directory.stable_path.join(format!(
+        let name = format!(
             ".{id}.json.tmp.{}.{:016x}",
             std::process::id(),
             rand::random::<u64>()
-        ));
-        match create_new_private_file(&path) {
-            Ok((file, identity)) => return Ok((path, file, identity)),
+        );
+        let path = directory.public_child(std::ffi::OsStr::new(&name));
+        match create_new_private_file(directory, std::ffi::OsStr::new(&name)) {
+            Ok((file, identity)) => return Ok((name.into(), path, file, identity)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("Failed to create schedule temp file: {e}")),
         }
@@ -4270,30 +4287,32 @@ fn replace_file_preserving_existing(source: &Path, destination: &Path) -> std::i
     }
 }
 
-fn create_new_private_file(path: &Path) -> std::io::Result<(fs::File, StablePathIdentity)> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-
-    let file = options.open(path)?;
+fn create_new_private_file(
+    directory: &PrivateDirectory,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<(fs::File, StablePathIdentity)> {
+    let path = directory.public_child(name);
+    let file = directory.access.open_file(
+        name,
+        DirectoryFileOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600),
+    )?;
     let identity = stable_file_identity(&file)?;
-    if let Err(error) =
-        validate_private_file_handle(&file, path).and_then(|_| secure_private_file_handle(&file))
+    if let Err(error) = validate_private_file_handle(&file, &path)
+        .and_then(|_| {
+            if directory.access.child_identity(name)? != identity {
+                return Err(std::io::Error::other(
+                    "private file changed immediately after creation",
+                ));
+            }
+            Ok(())
+        })
+        .and_then(|_| secure_private_file_handle(&file))
     {
         drop(file);
-        let _ = remove_file_by_identity(path, identity);
+        let _ = directory.access.remove_file_if_identity(name, identity);
         return Err(error);
     }
     Ok((file, identity))
@@ -4312,21 +4331,20 @@ fn write_private_file_atomically_in_directory(
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let destination = directory.stable_child(file_name);
     let public_path = directory.public_child(file_name);
     directory.verify_current_path()?;
     let temp_name_hint = file_name.to_string_lossy();
-    let (tmp_path, mut tmp_file, tmp_identity) = {
+    let (tmp_name, mut tmp_file, tmp_identity) = {
         let mut created = None;
         for _ in 0..16 {
-            let candidate = directory.stable_path.join(format!(
+            let name = format!(
                 ".{temp_name_hint}.tmp.{}.{:016x}",
                 std::process::id(),
                 rand::random::<u64>()
-            ));
-            match create_new_private_file(&candidate) {
+            );
+            match create_new_private_file(directory, std::ffi::OsStr::new(&name)) {
                 Ok((file, identity)) => {
-                    created = Some((candidate, file, identity));
+                    created = Some((std::ffi::OsString::from(name), file, identity));
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -4346,26 +4364,34 @@ fn write_private_file_atomically_in_directory(
         .and_then(|_| tmp_file.sync_all())
     {
         drop(tmp_file);
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
         return Err(e);
     }
     drop(tmp_file);
     if let Err(error) = directory.verify_current_path() {
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
         return Err(error);
     }
-    if let Err(e) = replace_file_preserving_existing(&tmp_path, &destination) {
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+    if let Err(e) = directory.access.rename_replace(&tmp_name, file_name) {
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
         return Err(e);
     }
-    if stable_path_identity(&destination)? != tmp_identity {
+    if directory.access.child_identity(file_name)? != tmp_identity {
         return Err(std::io::Error::other(format!(
             "atomic private file publication was replaced unexpectedly: '{}'",
             public_path.display()
         )));
     }
     if let Err(error) = directory.verify_current_path() {
-        let _ = remove_file_by_identity(&destination, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(file_name, tmp_identity);
         return Err(error);
     }
     #[cfg(unix)]
@@ -4373,9 +4399,97 @@ fn write_private_file_atomically_in_directory(
     Ok(())
 }
 
+const AI_SESSION_LOCK_NAME: &str = ".ai-sessions.lock";
+
+fn lock_ai_session_directory(directory: &PrivateDirectory) -> std::io::Result<fs::File> {
+    use fs2::FileExt;
+
+    let lock_name = std::ffi::OsStr::new(AI_SESSION_LOCK_NAME);
+    let lock_file = open_private_file_in_directory(directory, lock_name, false)?;
+    let lock_identity = stable_file_identity(&lock_file)?;
+    lock_file.lock_exclusive()?;
+    // A process may have waited for the lock. Revalidate the pathname after
+    // acquisition so every cooperating process locked the same inode.
+    if directory.access.child_identity(lock_name)? != lock_identity {
+        return Err(std::io::Error::other(
+            "AI session lock file changed while waiting for it",
+        ));
+    }
+    directory.verify_current_path()?;
+    Ok(lock_file)
+}
+
+fn lock_ai_session_directory_shared(directory: &PrivateDirectory) -> std::io::Result<fs::File> {
+    use fs2::FileExt;
+
+    let lock_name = std::ffi::OsStr::new(AI_SESSION_LOCK_NAME);
+    let lock_file = open_private_file_in_directory(directory, lock_name, false)?;
+    let lock_identity = stable_file_identity(&lock_file)?;
+    lock_file.lock_shared()?;
+    if directory.access.child_identity(lock_name)? != lock_identity {
+        return Err(std::io::Error::other(
+            "AI session lock file changed while waiting for it",
+        ));
+    }
+    directory.verify_current_path()?;
+    Ok(lock_file)
+}
+
+/// Read a consistent snapshot of the AI session JSON set. Writers hold the
+/// exclusive form of this lock across publication and pruning, so readers
+/// cannot select an old file from the middle of that multi-file update.
+pub(crate) fn visit_ai_session_json_files<F>(
+    sessions_dir: &Path,
+    mut visitor: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&[u8], std::time::SystemTime),
+{
+    use std::io::Read;
+
+    let directory = PrivateDirectory::open_existing(sessions_dir)?;
+    let _lock = lock_ai_session_directory_shared(&directory)?;
+    for file_name in directory.access.entries()? {
+        let file_name = file_name?;
+        if Path::new(&file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let Ok((mut file, metadata)) = directory.access.open_regular_file(&file_name) else {
+            continue;
+        };
+        let mut contents = Vec::new();
+        if file.read_to_end(&mut contents).is_err() {
+            continue;
+        }
+        visitor(
+            &contents,
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        );
+    }
+    Ok(())
+}
+
+/// Atomically write one AI session file while participating in the same
+/// cross-process lock used by Telegram cleanup. The TUI and conversion paths
+/// use this too, so cleanup cannot delete a concurrently published session.
+pub(crate) fn write_ai_session_file_atomically(
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let directory = PrivateDirectory::open_or_create(private_parent(path))?;
+    let _lock = lock_ai_session_directory(&directory)?;
+    write_private_file_atomically_in_directory(&directory, private_file_name(path)?, contents)
+}
+
 struct CreatedPrivateFile {
     public_path: PathBuf,
-    stable_path: PathBuf,
+    file_name: std::ffi::OsString,
     identity: StablePathIdentity,
     _directory: PrivateDirectory,
 }
@@ -4431,27 +4545,27 @@ fn create_unique_private_file_entry(
 
     for _ in 0..16 {
         let file_name = format!("{safe_hint}_{:032x}{extension}", rand::random::<u128>());
-        let stable_path = directory.stable_child(std::ffi::OsStr::new(&file_name));
-        let public_path = directory.public_child(std::ffi::OsStr::new(&file_name));
-        let (mut file, identity) = match create_new_private_file(&stable_path) {
+        let name = std::ffi::OsStr::new(&file_name);
+        let public_path = directory.public_child(name);
+        let (mut file, identity) = match create_new_private_file(&directory, name) {
             Ok(created) => created,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
         if let Err(e) = file.write_all(contents).and_then(|_| file.sync_all()) {
             drop(file);
-            let _ = remove_file_by_identity(&stable_path, identity);
+            let _ = directory.access.remove_file_if_identity(name, identity);
             return Err(e);
         }
         drop(file);
         if let Err(error) = directory.verify_current_path() {
-            let _ = remove_file_by_identity(&stable_path, identity);
+            let _ = directory.access.remove_file_if_identity(name, identity);
             return Err(error);
         }
-        if stable_path_identity(&stable_path)? != identity
+        if directory.access.child_identity(name)? != identity
             || stable_path_identity(&public_path)? != identity
         {
-            let _ = remove_file_by_identity(&stable_path, identity);
+            let _ = directory.access.remove_file_if_identity(name, identity);
             return Err(std::io::Error::other(format!(
                 "private file changed while it was being created: '{}'",
                 public_path.display()
@@ -4459,12 +4573,12 @@ fn create_unique_private_file_entry(
         }
         #[cfg(unix)]
         if let Err(e) = directory.handle.sync_all() {
-            let _ = remove_file_by_identity(&stable_path, identity);
+            let _ = directory.access.remove_file_if_identity(name, identity);
             return Err(e);
         }
         return Ok(CreatedPrivateFile {
             public_path,
-            stable_path,
+            file_name: file_name.into(),
             identity,
             _directory: directory,
         });
@@ -4511,7 +4625,11 @@ impl PrivateTempFile {
 
 impl Drop for PrivateTempFile {
     fn drop(&mut self) {
-        let _ = remove_file_by_identity(&self.created.stable_path, self.created.identity);
+        let _ = self
+            .created
+            ._directory
+            .access
+            .remove_file_if_identity(&self.created.file_name, self.created.identity);
     }
 }
 
@@ -4555,10 +4673,10 @@ fn write_schedule_entry_in_directory(
         .verify_current_path()
         .map_err(|e| format!("Schedule directory changed before writing: {e}"))?;
     let file_name = format!("{}.json", entry.id);
-    let path = directory.public_child(std::ffi::OsStr::new(&file_name));
-    let stable_path = directory.stable_child(std::ffi::OsStr::new(&file_name));
+    let file_name_os = std::ffi::OsStr::new(&file_name);
+    let path = directory.public_child(file_name_os);
     if require_existing {
-        match open_regular_file_no_follow(&stable_path) {
+        match directory.access.open_regular_file(file_name_os) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => {
@@ -4607,7 +4725,8 @@ fn write_schedule_entry_in_directory(
     }
     let serialized = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize schedule file: {e}"))?;
-    let (tmp_path, mut tmp_file, tmp_identity) = create_schedule_temp_file(directory, &entry.id)?;
+    let (tmp_name, tmp_path, mut tmp_file, tmp_identity) =
+        create_schedule_temp_file(directory, &entry.id)?;
     sched_debug(&format!(
         "[write_schedule_entry] writing tmp: {}",
         tmp_path.display()
@@ -4618,12 +4737,16 @@ fn write_schedule_entry_in_directory(
         .and_then(|_| tmp_file.sync_all())
     {
         drop(tmp_file);
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
         return Err(format!("Failed to write schedule file: {e}"));
     }
     drop(tmp_file);
     if let Err(e) = directory.verify_current_path() {
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
         return Err(format!(
             "Schedule directory changed before publication: {e}"
         ));
@@ -4633,14 +4756,20 @@ fn write_schedule_entry_in_directory(
         tmp_path.display(),
         path.display()
     ));
-    let result = replace_file_preserving_existing(&tmp_path, &stable_path)
+    let result = directory
+        .access
+        .rename_replace(&tmp_name, file_name_os)
         .map_err(|e| format!("Failed to finalize schedule file: {e}"));
     if result.is_err() {
-        let _ = remove_file_by_identity(&tmp_path, tmp_identity);
-    } else if stable_path_identity(&stable_path).ok() != Some(tmp_identity) {
+        let _ = directory
+            .access
+            .remove_file_if_identity(&tmp_name, tmp_identity);
+    } else if directory.access.child_identity(file_name_os).ok() != Some(tmp_identity) {
         return Err("Finalized schedule file was replaced unexpectedly".to_string());
     } else if let Err(e) = directory.verify_current_path() {
-        let _ = remove_file_by_identity(&stable_path, tmp_identity);
+        let _ = directory
+            .access
+            .remove_file_if_identity(file_name_os, tmp_identity);
         return Err(format!("Schedule directory changed after publication: {e}"));
     }
     #[cfg(unix)]
@@ -4668,20 +4797,24 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
         sched_debug("[list_schedule_entries] unsafe or unavailable schedule dir");
         return Vec::new();
     };
-    let Ok(entries) = fs::read_dir(&directory.stable_path) else {
+    let Ok(entries) = directory.access.entries() else {
         sched_debug("[list_schedule_entries] read_dir failed");
         return Vec::new();
     };
     let mut result: Vec<ScheduleEntry> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|kind| kind.is_file()).unwrap_or(false)
-                && Path::new(&e.file_name())
+        .filter_map(Result::ok)
+        .filter(|name| {
+            directory
+                .access
+                .child_metadata(name)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+                && Path::new(name)
                     .extension()
                     .map(|ext| ext == "json")
                     .unwrap_or(false)
         })
-        .filter_map(|e| read_schedule_entry_in_directory(&directory, &e.file_name()))
+        .filter_map(|name| read_schedule_entry_in_directory(&directory, &name))
         .filter(|e| {
             // Recompute the expected verifier per entry — chat_id and id are
             // baked into the verifier, so two schedules sharing a bot_key but
@@ -4709,8 +4842,7 @@ fn remove_private_regular_file(
     file_name: &std::ffi::OsStr,
 ) -> std::io::Result<bool> {
     directory.verify_current_path()?;
-    let path = directory.stable_child(file_name);
-    let file = match open_regular_file_no_follow(&path) {
+    let file = match directory.access.open_regular_file(file_name) {
         Ok((file, _)) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
@@ -4718,7 +4850,9 @@ fn remove_private_regular_file(
     let identity = stable_file_identity(&file)?;
     drop(file);
     directory.verify_current_path()?;
-    remove_file_by_identity(&path, identity)?;
+    directory
+        .access
+        .remove_file_if_identity(file_name, identity)?;
     directory.verify_current_path()?;
     #[cfg(unix)]
     directory.handle.sync_all()?;
@@ -5689,13 +5823,13 @@ mod private_atomic_write_tests {
         let displaced = dir.join("displaced-legacy.key");
         write_private_file_atomically(&legacy, b"secret\n").unwrap();
         let directory = PrivateDirectory::open_existing(&dir).unwrap();
-        let stable_displaced = directory.stable_child(displaced.file_name().unwrap());
         let mut replaced = false;
         let mut replace_before_delete = |candidate: &Path| -> std::io::Result<()> {
             assert!(!replaced, "cleanup attempted more than one deletion");
             replaced = true;
-            std::fs::rename(candidate, &stable_displaced)?;
-            let (mut replacement, _) = create_new_private_file(candidate)?;
+            std::fs::rename(candidate, &displaced)?;
+            let (mut replacement, _) =
+                create_new_private_file(&directory, candidate.file_name().unwrap())?;
             replacement.write_all(b"public\n")?;
             replacement.sync_all()
         };
@@ -6430,9 +6564,7 @@ where
 
     let expected_name = private_file_name(expected_path)?;
     directory.verify_current_path()?;
-    let entries = fs::read_dir(&directory.stable_path)?
-        .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let entries = directory.access.collect_entry_names()?;
     directory.verify_current_path()?;
 
     let mut deleted = 0usize;
@@ -6442,25 +6574,25 @@ where
                 continue;
             }
             directory.verify_current_path()?;
-            let candidate = directory.stable_child(&file_name);
-            let metadata = match fs::symlink_metadata(&candidate) {
+            let candidate = directory.public_child(&file_name);
+            let metadata = match directory.access.child_metadata(&file_name) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            if !metadata.is_file()
-                || private_metadata_is_reparse_point(&metadata)
-                || metadata.len() != expected_contents.len() as u64
-            {
+            if !metadata.is_file() || metadata.len() != expected_contents.len() as u64 {
                 continue;
             }
-            let initially_private = private_regular_file_has_private_permissions(&metadata);
+            #[cfg(unix)]
+            let initially_private = metadata.mode() & 0o077 == 0;
+            #[cfg(not(unix))]
+            let initially_private = true;
 
             // The lstat above classifies static symlinks/special files as
             // ineligible. From this point onward an open/read failure is
             // security-significant: the candidate had the exact size and
             // regular-file shape of a possible legacy capability.
-            let (mut file, opened_metadata) = open_regular_file_no_follow(&candidate)?;
+            let (mut file, opened_metadata) = directory.access.open_regular_file(&file_name)?;
             if opened_metadata.len() != expected_contents.len() as u64 {
                 continue;
             }
@@ -6507,7 +6639,9 @@ where
             directory.verify_current_path()?;
             before_delete(&candidate)?;
             directory.verify_current_path()?;
-            remove_file_by_identity(&candidate, identity)?;
+            directory
+                .access
+                .remove_file_if_identity(&file_name, identity)?;
             deleted += 1;
         }
         directory.verify_current_path()
@@ -15551,7 +15685,7 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
             return;
         }
     };
-    let write_result = write_private_file_atomically(&target, &json);
+    let write_result = write_ai_session_file_atomically(&target, &json);
     msg_debug(&format!(
         "[convert_session] atomic write result={:?}, bytes={}",
         write_result,
@@ -16653,38 +16787,10 @@ async fn handle_clear_command(
     // Then keep only one and delete the rest.
     if let Some(ref path) = current_path {
         if let Some(sessions_dir) = crate::ui::ai_screen::ai_sessions_dir() {
-            let mut cleared_files: Vec<std::path::PathBuf> = Vec::new();
-            if let Ok(entries) = fs::read_dir(&sessions_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let file_path = entry.path();
-                    if file_path.extension().map(|e| e == "json").unwrap_or(false) {
-                        if let Ok(content) = fs::read_to_string(&file_path) {
-                            if let Ok(session_data) = serde_json::from_str::<SessionData>(&content)
-                            {
-                                if session_data.current_path == *path
-                                    && (session_data.provider.is_empty()
-                                        || session_data.provider == provider)
-                                {
-                                    let cleared = serde_json::json!({"current_path": *path, "provider": provider});
-                                    if let Ok(json) = serde_json::to_string_pretty(&cleared) {
-                                        if write_private_file_atomically(
-                                            &file_path,
-                                            json.as_bytes(),
-                                        )
-                                        .is_ok()
-                                        {
-                                            cleared_files.push(file_path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Keep the first cleared file, delete the rest
-            for file_path in cleared_files.iter().skip(1) {
-                let _ = fs::remove_file(file_path);
+            if let Err(error) = clear_ai_session_files(&sessions_dir, path, &provider) {
+                msg_debug(&format!(
+                    "[handle_clear] locked session-file cleanup failed: {error}"
+                ));
             }
         }
     }
@@ -23437,48 +23543,37 @@ fn load_existing_session(
     let mut file_count = 0u32;
     let mut path_mismatch_sample: Option<String> = None;
 
-    if let Ok(entries) = fs::read_dir(&sessions_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                file_count += 1;
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
-                        if session_data.current_path == current_path {
-                            // Provider filter: match exact provider, or allow empty (legacy files)
-                            if !session_data.provider.is_empty()
-                                && session_data.provider != provider
-                            {
-                                msg_debug(&format!("[load_session] skipped session_id={} (provider mismatch: {} != {})",
-                                    session_data.session_id, session_data.provider, provider));
-                                continue;
-                            }
-                            msg_debug(&format!("[load_session] found session_id={}, provider={}, history_len={}, stored_path={:?}",
-                                session_data.session_id, session_data.provider, session_data.history.len(), session_data.current_path));
-                            if let Ok(metadata) = path.metadata() {
-                                if let Ok(modified) = metadata.modified() {
-                                    let target = if !session_data.session_id.is_empty() {
-                                        &mut with_session_id
-                                    } else {
-                                        &mut without_session_id
-                                    };
-                                    match target {
-                                        None => *target = Some((session_data, modified)),
-                                        Some((_, latest_time)) if modified > *latest_time => {
-                                            *target = Some((session_data, modified));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        } else if path_mismatch_sample.is_none() {
-                            path_mismatch_sample = Some(session_data.current_path.clone());
-                        }
-                    }
+    let _ = visit_ai_session_json_files(&sessions_dir, |contents, modified| {
+        file_count += 1;
+        if let Ok(session_data) = serde_json::from_slice::<SessionData>(contents) {
+            if session_data.current_path == current_path {
+                // Provider filter: match exact provider, or allow empty (legacy files)
+                if !session_data.provider.is_empty() && session_data.provider != provider {
+                    msg_debug(&format!(
+                        "[load_session] skipped session_id={} (provider mismatch: {} != {})",
+                        session_data.session_id, session_data.provider, provider
+                    ));
+                    return;
                 }
+                msg_debug(&format!("[load_session] found session_id={}, provider={}, history_len={}, stored_path={:?}",
+                        session_data.session_id, session_data.provider, session_data.history.len(), session_data.current_path));
+                let target = if !session_data.session_id.is_empty() {
+                    &mut with_session_id
+                } else {
+                    &mut without_session_id
+                };
+                match target {
+                    None => *target = Some((session_data, modified)),
+                    Some((_, latest_time)) if modified > *latest_time => {
+                        *target = Some((session_data, modified));
+                    }
+                    _ => {}
+                }
+            } else if path_mismatch_sample.is_none() {
+                path_mismatch_sample = Some(session_data.current_path.clone());
             }
         }
-    }
+    });
 
     let matching_session = with_session_id.or(without_session_id);
 
@@ -23503,58 +23598,212 @@ fn load_existing_session(
     matching_session
 }
 
+struct AiSessionFileSnapshot {
+    file_name: std::ffi::OsString,
+    session_id: String,
+    current_path: String,
+    provider: String,
+    modified: std::time::SystemTime,
+    identity: StablePathIdentity,
+}
+
+fn collect_ai_session_file_snapshots(
+    directory: &PrivateDirectory,
+) -> std::io::Result<Vec<AiSessionFileSnapshot>> {
+    use std::io::Read;
+
+    let mut snapshots = Vec::new();
+    for file_name in directory.access.entries()? {
+        let file_name = file_name?;
+        if Path::new(&file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let Ok((mut file, metadata)) = directory.access.open_regular_file(&file_name) else {
+            continue;
+        };
+        let Ok(identity) = stable_file_identity(&file) else {
+            continue;
+        };
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            continue;
+        }
+        let Ok(data) = serde_json::from_str::<SessionData>(&contents) else {
+            continue;
+        };
+        snapshots.push(AiSessionFileSnapshot {
+            file_name,
+            session_id: data.session_id,
+            current_path: data.current_path,
+            provider: data.provider,
+            modified: metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            identity,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn remove_ai_session_snapshot_if_unchanged(
+    directory: &PrivateDirectory,
+    snapshot: &AiSessionFileSnapshot,
+) -> std::io::Result<bool> {
+    match directory.access.child_identity(&snapshot.file_name) {
+        Ok(identity) if identity == snapshot.identity => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    directory
+        .access
+        .remove_file_if_identity(&snapshot.file_name, snapshot.identity)?;
+    Ok(true)
+}
+
+fn sync_ai_session_deletions(directory: &PrivateDirectory, deleted: usize) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if deleted > 0 {
+        directory.handle.sync_all()?;
+    }
+    directory.verify_current_path()
+}
+
+fn prune_superseded_ai_sessions_locked(
+    directory: &PrivateDirectory,
+    keep_name: &std::ffi::OsStr,
+    current_path: &str,
+    provider: &str,
+) -> std::io::Result<usize> {
+    let mut deleted = 0usize;
+    for snapshot in collect_ai_session_file_snapshots(directory)? {
+        if snapshot.file_name.as_os_str() == keep_name {
+            continue;
+        }
+        if snapshot.current_path == current_path
+            && (snapshot.provider == provider || snapshot.provider.is_empty())
+            && remove_ai_session_snapshot_if_unchanged(directory, &snapshot)?
+        {
+            deleted += 1;
+        }
+    }
+    sync_ai_session_deletions(directory, deleted)?;
+    Ok(deleted)
+}
+
+fn write_and_prune_ai_session_file(
+    sessions_dir: &Path,
+    file_name: &std::ffi::OsStr,
+    contents: &[u8],
+    current_path: &str,
+    provider: &str,
+) -> std::io::Result<usize> {
+    let directory = PrivateDirectory::open_or_create(sessions_dir)?;
+    let _lock = lock_ai_session_directory(&directory)?;
+    write_private_file_atomically_in_directory(&directory, file_name, contents)?;
+    prune_superseded_ai_sessions_locked(&directory, file_name, current_path, provider)
+}
+
+fn cleanup_empty_ai_sessions_locked(
+    directory: &PrivateDirectory,
+    current_path: &str,
+    provider: &str,
+) -> std::io::Result<usize> {
+    let empty_files: Vec<_> = collect_ai_session_file_snapshots(directory)?
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot.current_path == current_path
+                && (snapshot.provider == provider || snapshot.provider.is_empty())
+                && snapshot.session_id.is_empty()
+        })
+        .collect();
+    let Some(latest_idx) = empty_files
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, snapshot)| snapshot.modified)
+        .map(|(index, _)| index)
+    else {
+        return Ok(0);
+    };
+
+    let mut deleted = 0usize;
+    for (index, snapshot) in empty_files.iter().enumerate() {
+        if index != latest_idx && remove_ai_session_snapshot_if_unchanged(directory, snapshot)? {
+            deleted += 1;
+        }
+    }
+    sync_ai_session_deletions(directory, deleted)?;
+    Ok(deleted)
+}
+
+fn clear_ai_session_files(
+    sessions_dir: &Path,
+    current_path: &str,
+    provider: &str,
+) -> std::io::Result<usize> {
+    let directory = PrivateDirectory::open_or_create(sessions_dir)?;
+    let _lock = lock_ai_session_directory(&directory)?;
+    let cleared = serde_json::to_vec_pretty(&serde_json::json!({
+        "current_path": current_path,
+        "provider": provider,
+    }))
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+    let mut published = Vec::new();
+    for snapshot in collect_ai_session_file_snapshots(&directory)? {
+        if snapshot.current_path != current_path
+            || (!snapshot.provider.is_empty() && snapshot.provider != provider)
+        {
+            continue;
+        }
+        // The snapshot was taken under the lock, but retain the identity check
+        // so a non-cooperating process cannot make /clear overwrite a different
+        // file that appeared at the same pathname.
+        if directory.access.child_identity(&snapshot.file_name).ok() != Some(snapshot.identity) {
+            continue;
+        }
+        write_private_file_atomically_in_directory(&directory, &snapshot.file_name, &cleared)?;
+        let published_identity = directory.access.child_identity(&snapshot.file_name)?;
+        published.push((snapshot.file_name, published_identity));
+    }
+
+    let mut deleted = 0usize;
+    for (file_name, identity) in published.iter().skip(1) {
+        match directory.access.child_identity(file_name) {
+            Ok(current) if current == *identity => {
+                directory
+                    .access
+                    .remove_file_if_identity(file_name, *identity)?;
+                deleted += 1;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    sync_ai_session_deletions(&directory, deleted)?;
+    Ok(published.len().saturating_sub(deleted))
+}
+
 /// Remove stale session files without session_id for the same current_path + provider.
-/// Called when no file with session_id exists for this path+provider.
-/// Keeps the most recently modified empty file (the one selected by load_existing_session)
-/// and deletes the rest.
+/// The cross-process lock covers selection and identity-checked deletion, so a
+/// concurrent TUI/bot save cannot turn a stale pathname into a new file between
+/// the read and remove operations.
 fn cleanup_session_files(current_path: &str, provider: &str) {
     let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
         return;
     };
-    let Ok(entries) = fs::read_dir(&sessions_dir) else {
-        return;
-    };
-
-    // Collect matching empty files with their modification time
-    let mut empty_files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(data) = serde_json::from_str::<SessionData>(&content) {
-                    if data.current_path == current_path
-                        && (data.provider == provider || data.provider.is_empty())
-                        && data.session_id.is_empty()
-                    {
-                        let modified = path
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                        empty_files.push((path, modified));
-                    }
-                }
-            }
-        }
-    }
-
-    if empty_files.len() <= 1 {
-        return;
-    }
-
-    // Find the latest modified one to keep
-    let latest_idx = empty_files
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, (_, t))| *t)
-        .map(|(i, _)| i)
-        .unwrap();
-
-    // Delete all except the latest
-    for (i, (path, _)) in empty_files.iter().enumerate() {
-        if i != latest_idx {
-            let _ = fs::remove_file(path);
-        }
+    let result = (|| -> std::io::Result<usize> {
+        let directory = PrivateDirectory::open_existing(&sessions_dir)?;
+        let _lock = lock_ai_session_directory(&directory)?;
+        cleanup_empty_ai_sessions_locked(&directory, current_path, provider)
+    })();
+    if let Err(error) = result {
+        msg_debug(&format!("[cleanup_session_files] cleanup failed: {error}"));
     }
 }
 
@@ -23574,11 +23823,6 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
         msg_debug("[save_session] skipped: ai_sessions_dir() returned None");
         return;
     };
-
-    if fs::create_dir_all(&sessions_dir).is_err() {
-        msg_debug("[save_session] skipped: create_dir_all failed");
-        return;
-    }
 
     // Filter out system messages
     let saveable_history: Vec<HistoryItem> = session
@@ -23621,35 +23865,129 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
             return;
         }
     };
-    if let Err(e) = write_private_file_atomically(&file_path, &json) {
-        // Do not prune older valid session files unless the replacement is
-        // fully durable. They are the recovery copy on any write failure.
-        msg_debug(&format!(
-            "[save_session] atomic write failed; older sessions preserved: {e}"
-        ));
+    let Ok(file_name) = private_file_name(&file_path) else {
+        msg_debug("[save_session] skipped: invalid session filename");
         return;
+    };
+    if let Err(e) =
+        write_and_prune_ai_session_file(&sessions_dir, file_name, &json, current_path, provider)
+    {
+        // Publication and pruning share one cross-process lock. If publication
+        // failed, older files remain recovery copies; if only cleanup failed,
+        // the new durable file remains and stale copies are harmless.
+        msg_debug(&format!(
+            "[save_session] locked write/cleanup failed; recovery copies preserved: {e}"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod ai_session_file_race_tests {
+    use std::ffi::OsString;
+    use std::sync::{Arc, Barrier};
+
+    use super::{clear_ai_session_files, write_and_prune_ai_session_file, SessionData};
+
+    fn session_json(session_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "session_id": session_id,
+            "history": [],
+            "current_path": "/workspace/shared",
+            "created_at": "2026-07-12 00:00:00",
+            "provider": "codex"
+        }))
+        .unwrap()
     }
 
-    // Clean up old session files for the same path+provider (removes orphaned files
-    // left by Codex's per-call thread_id rotation and /clear blocker files)
-    if let Ok(entries) = fs::read_dir(&sessions_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p == file_path {
-                continue;
-            }
-            if p.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(content) = fs::read_to_string(&p) {
-                    if let Ok(old) = serde_json::from_str::<SessionData>(&content) {
-                        if old.current_path == current_path
-                            && (old.provider == provider || old.provider.is_empty())
-                        {
-                            let _ = fs::remove_file(&p);
-                        }
-                    }
-                }
-            }
+    fn json_session_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_session_saves_leave_exactly_one_complete_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let directory = temp.path().to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let session_id = format!("session-{index}");
+                let file_name = OsString::from(format!("{session_id}.json"));
+                let json = session_json(&session_id);
+                barrier.wait();
+                write_and_prune_ai_session_file(
+                    &directory,
+                    &file_name,
+                    &json,
+                    "/workspace/shared",
+                    "codex",
+                )
+                .unwrap();
+            }));
         }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let files = json_session_files(temp.path());
+        assert_eq!(files.len(), 1);
+        let contents = std::fs::read(&files[0]).unwrap();
+        let data: SessionData = serde_json::from_slice(&contents).unwrap();
+        assert_eq!(data.current_path, "/workspace/shared");
+        assert_eq!(data.provider, "codex");
+        assert!(data.session_id.starts_with("session-"));
+    }
+
+    #[test]
+    fn clear_and_save_are_serialized_as_whole_file_set_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        write_and_prune_ai_session_file(
+            temp.path(),
+            std::ffi::OsStr::new("initial.json"),
+            &session_json("initial"),
+            "/workspace/shared",
+            "codex",
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let save_dir = temp.path().to_path_buf();
+        let save_barrier = Arc::clone(&barrier);
+        let saver = std::thread::spawn(move || {
+            save_barrier.wait();
+            write_and_prune_ai_session_file(
+                &save_dir,
+                std::ffi::OsStr::new("new.json"),
+                &session_json("new"),
+                "/workspace/shared",
+                "codex",
+            )
+            .unwrap();
+        });
+        let clear_dir = temp.path().to_path_buf();
+        let clear_barrier = Arc::clone(&barrier);
+        let clearer = std::thread::spawn(move || {
+            clear_barrier.wait();
+            clear_ai_session_files(&clear_dir, "/workspace/shared", "codex").unwrap();
+        });
+        barrier.wait();
+        saver.join().unwrap();
+        clearer.join().unwrap();
+
+        let files = json_session_files(temp.path());
+        assert_eq!(files.len(), 1);
+        let contents = std::fs::read(&files[0]).unwrap();
+        let data: SessionData = serde_json::from_slice(&contents).unwrap();
+        assert_eq!(data.current_path, "/workspace/shared");
+        assert_eq!(data.provider, "codex");
+        assert!(data.session_id.is_empty() || data.session_id == "new");
     }
 }
 
