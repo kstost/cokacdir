@@ -2,6 +2,10 @@
 
 This page records the behavior measured against the local Antigravity CLI and the assumptions used by cokacdir's Agy provider.
 
+For the full investigation, cross-platform design, implementation rationale,
+failure analysis, and validation record, see [Agy system-prompt cross-platform
+implementation](../devdoc/agy-system-prompt-cross-platform.md).
+
 Measured CLI version: `agy 1.1.1`.
 
 ## Invocation Contract
@@ -10,8 +14,9 @@ cokacdir gives Agy two separate inputs on every invocation:
 
 1. Only the current user request is written to the process's non-TTY stdin.
    The pipe is then closed so Agy sees EOF and starts the request.
-2. On Linux, the complete cokacdir system prompt is injected as a transient
-   system message by Agy's official `PreInvocation` hook.
+2. On Linux, macOS, and Windows, the complete cokacdir system prompt is
+   injected as a transient system message by Agy's official `PreInvocation`
+   hook.
 
 ```bash
 agy --print-timeout <duration> \
@@ -35,7 +40,7 @@ The plugin is inert for ordinary Agy processes: without cokacdir's per-process
 environment it consumes the hook input and returns an empty JSON object. During
 a cokacdir run, the hook starts the same cokacdir executable through a private
 internal entry point. The helper reads the complete system prompt from a
-random, owner-only file:
+random per-run file (mode `0600` on Unix):
 
 ```text
 ~/.cokacdir/tmp/agy_system_prompt_<random>
@@ -62,17 +67,50 @@ process tree when an invocation fails or stays incomplete for 30 seconds, and
 holds all Agy stdout until the child exits with every recorded invocation
 complete. An unverified response is discarded rather than forwarded.
 
-The prompt, ledger, and acknowledgement remain until the Agy child exits, then
-are removed on success, failure, cancellation, or unwinding. Each file is bound
-to its creation-time filesystem identity so cleanup cannot delete a replacement
-at the same pathname. Advisory locks distinguish live runs from crash residue;
-the next Agy run removes unlocked stale hook files. All runtime temporary files
-stay below `~/.cokacdir/tmp/`; cokacdir does not use `/tmp` as a fallback.
+The prompt, ledger, acknowledgement, and a small lease file remain until the
+Agy child exits, then are removed on success, failure, cancellation, or
+unwinding. The prompt, ledger, and lease are bound to their creation-time
+filesystem identities, and the acknowledgement is identity-verified before
+removal, so cleanup cannot delete a replacement at the same pathname. A shared
+lock on the separate lease distinguishes live runs from crash residue without
+locking the prompt or ledger that the hook child must read and write. The next
+Agy run removes stale hook files whose lease is no longer live. All runtime
+temporary files stay below `~/.cokacdir/tmp/`; cokacdir does not use `/tmp` as
+a fallback.
 
-This hook path is enabled only on Linux, where it was measured against Agy
-1.1.1. Agy hook execution is currently reported broken on Windows and not yet
-verified here on macOS, so those platforms retain the older compatibility
-transport that combines the system instructions and user request in stdin.
+This hook path is enabled on Linux, macOS, and Windows. Unix builds use the
+POSIX-shell wrapper and Windows builds use a `cmd.exe`-compatible wrapper; both
+record the same `start`/`ok`/`fail` ledger protocol. The behavior above was
+measured against Agy 1.1.1 on Linux. macOS and Windows now use the same
+separate-hook transport in the implementation rather than the older combined
+stdin fallback, but still require platform-specific live Agy coverage. In
+particular, [upstream reports of hook-dispatch failures on older Windows and
+macOS builds](https://github.com/google-antigravity/antigravity-cli/issues/222)
+remain open. cokacdir deliberately does not fall back to putting the system
+prompt in stdin: if Agy does not run and acknowledge the hook, cokacdir kills
+the invocation and discards its output. This keeps a resumed session from
+accumulating fallback copies of the system prompt.
+
+### Stored session data versus model context
+
+Agy's conversation database can retain historical records of the ephemeral
+step injected for earlier model calls. That storage history is not the same as
+the effective context sent to the model. In the measured Linux Agy 1.1.1
+session, SQLite retained four hook-injected system-step rows for four model
+invocations, while the normal transcript omitted those rows and each generation
+was paired with one newly injected ephemeral step. Under [Agy's documented
+"transient system message"
+contract](https://antigravity.google/docs/hooks#preinvocation), the historical
+rows are not replayed as additional system-message copies: each effective model
+context receives the current cokacdir prompt once. Agy does not expose the raw
+provider request body, so this conclusion is based on its documented contract
+plus the session and generation trace rather than a network-payload capture.
+
+macOS and Windows use the same Agy `injectSteps`/`ephemeralMessage` path and the
+same cokacdir transport; the operating-system-specific part is only the shell
+wrapper. That cross-platform equivalence follows from the shared Agy protocol
+and binary implementation, while direct session traces have so far been
+captured only on Linux.
 
 ## Model Handling
 

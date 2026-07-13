@@ -13,13 +13,13 @@ export default function AgyProvider() {
 
       <SubSection title={String(t('Invocation', '실행 방식'))}>
         <P>{t(
-          <>Only the current user request is written to non-TTY stdin. On Linux, the complete system prompt is injected separately as a transient system message through Agy's official <IC>PreInvocation</IC> hook.</>,
-          <>non-TTY stdin에는 현재 사용자 요청만 전달합니다. Linux에서는 전체 시스템 프롬프트를 Agy 공식 <IC>PreInvocation</IC> 훅을 통해 별도의 일시적 시스템 메시지로 주입합니다.</>
+          <>Only the current user request is written to non-TTY stdin. On Linux, macOS, and Windows, the complete system prompt is injected separately as a transient system message through Agy's official <IC>PreInvocation</IC> hook.</>,
+          <>non-TTY stdin에는 현재 사용자 요청만 전달합니다. Linux, macOS, Windows에서는 전체 시스템 프롬프트를 Agy 공식 <IC>PreInvocation</IC> 훅을 통해 별도의 일시적 시스템 메시지로 주입합니다.</>
         )}</P>
         <CodeBlock code={'agy --print-timeout <duration> --log-file ~/.cokacdir/tmp/<private-log> --dangerously-skip-permissions'} />
         <P>{t(
-          <>cokacdir installs one namespaced global Agy plugin under <IC>~/.gemini/config/plugins/</IC>. For each run, the full system prompt is stored in an owner-only <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> file and returned by the hook as an <IC>ephemeralMessage</IC>.</>,
-          <>cokacdir는 <IC>~/.gemini/config/plugins/</IC> 아래에 이름이 분리된 전역 Agy 플러그인 하나를 설치합니다. 실행마다 전체 시스템 프롬프트를 소유자 전용 <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> 파일에 두고 훅이 <IC>ephemeralMessage</IC>로 반환합니다.</>
+          <>cokacdir installs one namespaced global Agy plugin under <IC>~/.gemini/config/plugins/</IC>. For each run, the full system prompt is stored in a random private <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> file (mode 0600 on Unix) and returned by the hook as an <IC>ephemeralMessage</IC>.</>,
+          <>cokacdir는 <IC>~/.gemini/config/plugins/</IC> 아래에 이름이 분리된 전역 Agy 플러그인 하나를 설치합니다. 실행마다 전체 시스템 프롬프트를 임의 이름의 비공개 <IC>~/.cokacdir/tmp/agy_system_prompt_*</IC> 파일(Unix에서는 mode 0600)에 두고 훅이 <IC>ephemeralMessage</IC>로 반환합니다.</>
         )}</P>
         <P>{t(
           <>No <IC>--print</IC>, <IC>-p</IC>, or <IC>--prompt</IC> flag is used. Agy 1.1.1 reads piped stdin when prompt flags are absent; a flag prompt disables stdin prompt reading.</>,
@@ -30,13 +30,17 @@ export default function AgyProvider() {
           <>세션 재개 때도 현재의 전체 시스템 프롬프트를 새 파일에 담고 <IC>--conversation &lt;session_id&gt;</IC>를 사용합니다. <IC>--add-dir</IC>를 쓰지 않으므로 프로젝트, <IC>AGENTS.md</IC>, 실제 작업공간은 바뀌지 않습니다.</>
         )}</P>
         <P>{t(
-          <>Every hook call records a private start/success ledger entry. cokacdir buffers all Agy output until every entry is complete, terminates an incomplete hook after 30 seconds, and removes prompt files after exit. Locks let the next run safely remove files left by a crash without touching active runs.</>,
-          <>모든 훅 호출은 비공개 시작/성공 ledger를 기록합니다. cokacdir는 모든 항목이 완료될 때까지 Agy 출력을 보류하고, 30초 동안 완료되지 않은 훅은 종료하며, 종료 뒤 프롬프트 파일을 삭제합니다. 잠금으로 실행 중인 파일을 구분해 다음 실행에서 crash 잔여 파일도 안전하게 정리합니다.</>
+          <>Every hook call records a private start/success ledger entry. cokacdir buffers all Agy output until every entry is complete, terminates an incomplete hook after 30 seconds, and removes prompt files after exit. A separate shared lease lock lets the next run remove crash residue without locking files the hook must read or write.</>,
+          <>모든 훅 호출은 비공개 시작/성공 ledger를 기록합니다. cokacdir는 모든 항목이 완료될 때까지 Agy 출력을 보류하고, 30초 동안 완료되지 않은 훅은 종료하며, 종료 뒤 프롬프트 파일을 삭제합니다. 별도의 공유 lease 잠금으로 훅이 읽고 쓸 파일을 잠그지 않으면서 다음 실행에서 crash 잔여 파일을 안전하게 정리합니다.</>
+        )}</P>
+        <P>{t(
+          <>Agy's session database may retain historical ephemeral hook rows, but they are not replayed into later model contexts. In the measured Linux Agy 1.1.1 session, SQLite retained four rows for four invocations, the normal transcript omitted them, and each generation was paired with one current ephemeral step. Under Agy's documented transient-message contract, the effective model context receives the current cokacdir prompt once. Agy does not expose the raw provider request body.</>,
+          <>Agy 세션 데이터베이스에는 이전 ephemeral 훅 row가 남을 수 있지만 이후 모델 context에 다시 재생되지는 않습니다. Linux Agy 1.1.1 실측 세션에서는 네 번의 호출에 대한 row 네 개가 SQLite에 남았지만 일반 transcript에서는 제외되었고, 각 generation에는 현재 ephemeral step 하나가 연결되었습니다. Agy가 문서화한 transient-message 규약에 따라 유효 모델 context에는 현재 cokacdir 프롬프트가 한 번만 전달됩니다. Agy는 원시 provider 요청 본문을 노출하지 않습니다.</>
         )}</P>
         <InfoBox type="info">
           {t(
-            <>The hook transport is enabled only on verified Linux builds. Windows and macOS currently use the legacy combined-stdin fallback. The installed global plugin returns no injected message when cokacdir's private per-process environment is absent.</>,
-            <>훅 전송은 검증된 Linux 빌드에서만 활성화됩니다. Windows와 macOS는 현재 기존의 합성 stdin 방식으로 대체합니다. 설치된 전역 플러그인은 cokacdir의 실행별 비공개 환경이 없으면 아무 메시지도 주입하지 않습니다.</>
+            <>The hook transport is enabled on Linux, macOS, and Windows; Unix uses a POSIX-shell wrapper and Windows uses a cmd-compatible wrapper. Linux is the measured Agy 1.1.1 target, while macOS and Windows still need platform-specific live coverage. There is no combined-stdin fallback: if Agy does not acknowledge the hook, cokacdir discards the invocation. The installed global plugin returns no injected message when cokacdir's private per-process environment is absent.</>,
+            <>훅 전송은 Linux, macOS, Windows에서 활성화되며 Unix는 POSIX shell wrapper, Windows는 cmd 호환 wrapper를 사용합니다. Agy 1.1.1 실측 대상은 Linux이고 macOS와 Windows는 플랫폼별 실제 실행 검증이 아직 필요합니다. 합성 stdin fallback은 사용하지 않으며 Agy가 훅을 확인하지 않으면 cokacdir가 해당 실행을 폐기합니다. 설치된 전역 플러그인은 cokacdir의 실행별 비공개 환경이 없으면 아무 메시지도 주입하지 않습니다.</>
           )}
         </InfoBox>
       </SubSection>

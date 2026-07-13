@@ -31,6 +31,8 @@ static AGY_MODELS: OnceLock<Vec<String>> = OnceLock::new();
 
 const AGY_SYSTEM_PROMPT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const AGY_SYSTEM_PROMPT_PREFIX: &str = "agy_system_prompt";
+const AGY_HOOK_STATE_PREFIX: &str = "agy_hook_state";
+const AGY_HOOK_LEASE_PREFIX: &str = "agy_hook_lease";
 const AGY_HOOK_ENV_PROMPT_FILE: &str = "COKACDIR_AGY_SYSTEM_PROMPT_FILE";
 const AGY_HOOK_ENV_TOKEN: &str = "COKACDIR_AGY_SYSTEM_PROMPT_TOKEN";
 const AGY_HOOK_ENV_EXECUTABLE: &str = "COKACDIR_AGY_HOOK_EXECUTABLE";
@@ -348,7 +350,7 @@ fn stdout_absence_error_message(raw_stdout: &str) -> Option<String> {
     Some("Agy exited successfully but produced no stdout response.".to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(unix, windows)))]
 fn build_legacy_agy_stdin_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     match system_prompt.filter(|value| !value.trim().is_empty()) {
         Some(system) => format!(
@@ -523,9 +525,9 @@ enum AgyHookState {
     Failed,
 }
 
-fn open_and_lock_owned_temp_file(file: &PrivateTempFile) -> io::Result<std::fs::File> {
+fn open_and_lock_owned_temp_file_shared(file: &PrivateTempFile) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true);
+    options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -546,7 +548,12 @@ fn open_and_lock_owned_temp_file(file: &PrivateTempFile) -> io::Result<std::fs::
             file.path().display()
         )));
     }
-    fs2::FileExt::lock_exclusive(&opened)?;
+    // Keep the lease readable while it is live. Windows LockFileEx exclusive
+    // locks deny reads and writes through every other handle, so locking the
+    // prompt or ledger themselves would prevent the hook process from using
+    // them. A shared lock on a separate lease permits cleanup readers while an
+    // exclusive try-lock still distinguishes a live run from crash residue.
+    fs2::FileExt::lock_shared(&opened)?;
     Ok(opened)
 }
 
@@ -586,14 +593,22 @@ fn acquire_agy_temp_cleanup_lock(base: &Path) -> io::Result<std::fs::File> {
     Ok(lock)
 }
 
-fn try_lock_stale_agy_file(path: &Path) -> io::Result<Option<(std::fs::File, StablePathIdentity)>> {
+enum AgyTempFileLock {
+    MissingOrUnsafe,
+    Live(std::fs::File),
+    Stale(std::fs::File, StablePathIdentity),
+}
+
+fn inspect_agy_temp_file_lock(path: &Path) -> io::Result<AgyTempFileLock> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(AgyTempFileLock::MissingOrUnsafe);
+        }
         Err(error) => return Err(error),
     };
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Ok(None);
+        return Ok(AgyTempFileLock::MissingOrUnsafe);
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true);
@@ -608,15 +623,36 @@ fn try_lock_stale_agy_file(path: &Path) -> io::Result<Option<(std::fs::File, Sta
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(AgyTempFileLock::MissingOrUnsafe);
+        }
+        Err(error) => return Err(error),
+    };
     let identity = stable_file_identity(&file)?;
-    if stable_path_identity(path)? != identity {
-        return Ok(None);
+    let path_identity = match stable_path_identity(path) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(AgyTempFileLock::MissingOrUnsafe);
+        }
+        Err(error) => return Err(error),
+    };
+    if path_identity != identity {
+        return Ok(AgyTempFileLock::MissingOrUnsafe);
     }
     match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some((file, identity))),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Ok(()) => Ok(AgyTempFileLock::Stale(file, identity)),
+        Err(error) if agy_file_lock_is_contended(&error) => Ok(AgyTempFileLock::Live(file)),
         Err(error) => Err(error),
+    }
+}
+
+fn agy_file_lock_is_contended(error: &io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    match (error.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => error.kind() == expected.kind(),
     }
 }
 
@@ -625,40 +661,194 @@ fn remove_regular_file_if_present(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            let identity = stable_path_identity(path)?;
-            crate::services::file_ops::remove_file_by_identity(path, identity)
+            let identity = match stable_path_identity(path) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            match crate::services::file_ops::remove_file_by_identity(path, identity) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
         }
         Ok(_) => Ok(()),
     }
 }
 
-/// Remove hook files whose advisory locks were released by a crash. The
-/// caller holds the directory-wide cleanup lock, so another process cannot
-/// create an unlocked file in the scan/create gap.
+fn delete_locked_agy_temp_file(
+    path: &Path,
+    lock: std::fs::File,
+    identity: StablePathIdentity,
+) -> io::Result<()> {
+    let deletion = match crate::services::file_ops::prepare_file_deletion(path, identity) {
+        Ok(deletion) => deletion,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // Windows cannot commit the handle-bound deletion while this process still
+    // owns a byte-range lock through a second handle.
+    drop(lock);
+    match deletion.delete() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn remove_stale_agy_temp_file(path: &Path, remove_prompt_ack: bool) -> io::Result<()> {
+    let (lock, identity) = match inspect_agy_temp_file_lock(path)? {
+        AgyTempFileLock::Stale(lock, identity) => (lock, identity),
+        AgyTempFileLock::Live(_) | AgyTempFileLock::MissingOrUnsafe => return Ok(()),
+    };
+    if remove_prompt_ack {
+        remove_regular_file_if_present(&derived_hook_ack_path(path)?)?;
+    }
+    delete_locked_agy_temp_file(path, lock, identity)
+}
+
+fn agy_hook_lease_contents(prompt_path: &Path, state_path: &Path) -> io::Result<Vec<u8>> {
+    let prompt_name = prompt_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Agy prompt name"))?;
+    let state_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_random_agy_temp_name(name, AGY_HOOK_STATE_PREFIX))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Agy state name"))?;
+    Ok(format!("{prompt_name}\n{state_name}\n").into_bytes())
+}
+
+fn read_agy_hook_lease(
+    base: &Path,
+    lease_file: &mut std::fs::File,
+) -> io::Result<(PathBuf, PathBuf)> {
+    const MAX_LEASE_BYTES: usize = 512;
+
+    if lease_file.metadata()?.len() > MAX_LEASE_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy hook lease exceeds the allowed size",
+        ));
+    }
+    lease_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut contents = Vec::new();
+    Read::by_ref(lease_file)
+        .take(MAX_LEASE_BYTES as u64 + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() > MAX_LEASE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy hook lease exceeds the allowed size",
+        ));
+    }
+    let contents = std::str::from_utf8(&contents)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Agy hook lease"))?;
+    let mut lines = contents.lines();
+    let prompt_name = lines
+        .next()
+        .filter(|name| is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Agy hook lease prompt",
+            )
+        })?;
+    let state_name = lines
+        .next()
+        .filter(|name| is_random_agy_temp_name(name, AGY_HOOK_STATE_PREFIX))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Agy hook lease state",
+            )
+        })?;
+    if lines.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Agy hook lease contents",
+        ));
+    }
+    Ok((base.join(prompt_name), base.join(state_name)))
+}
+
+/// Remove hook files whose lease locks were released by a crash. The caller
+/// holds the directory-wide cleanup lock, so another process cannot create an
+/// unleased file in the scan/create gap. Legacy prompt/state locks are still
+/// honored so an older live cokacdir process is not disrupted during upgrade.
 fn cleanup_stale_agy_hook_files(base: &Path) -> io::Result<()> {
     verify_real_directory(base)?;
-    let entries: Vec<PathBuf> = std::fs::read_dir(base)?
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(base)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect();
+    entries.sort_unstable();
+
+    let mut live_files = std::collections::HashSet::<PathBuf>::new();
+
+    // First pass: discover every live mapping without deleting anything. The
+    // cleanup lock prevents a stale lease from becoming a newly live lease;
+    // an owner can only release a live lease while this scan is in progress.
+    for lease_path in &entries {
+        let Some(name) = lease_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_random_agy_temp_name(name, AGY_HOOK_LEASE_PREFIX) {
+            continue;
+        }
+
+        match inspect_agy_temp_file_lock(lease_path)? {
+            AgyTempFileLock::Live(mut lease_file) => {
+                let (prompt_path, state_path) = read_agy_hook_lease(base, &mut lease_file)?;
+                live_files.insert(prompt_path);
+                live_files.insert(state_path);
+            }
+            AgyTempFileLock::Stale(_, _) | AgyTempFileLock::MissingOrUnsafe => {}
+        }
+    }
+
+    // With the live mapping set complete, stale leases can now be removed
+    // without filename-order dependence. The per-file lock check also
+    // preserves live prompt/state files created by pre-lease cokacdir builds.
+    for lease_path in &entries {
+        let Some(name) = lease_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_random_agy_temp_name(name, AGY_HOOK_LEASE_PREFIX) {
+            continue;
+        }
+        let (mut lease_file, lease_identity) = match inspect_agy_temp_file_lock(lease_path)? {
+            AgyTempFileLock::Stale(lease_file, identity) => (lease_file, identity),
+            AgyTempFileLock::Live(_) | AgyTempFileLock::MissingOrUnsafe => continue,
+        };
+        let mapped_files = read_agy_hook_lease(base, &mut lease_file).ok();
+        if let Some((prompt_path, state_path)) = mapped_files {
+            if !live_files.contains(&prompt_path) {
+                remove_stale_agy_temp_file(&prompt_path, true)?;
+            }
+            if !live_files.contains(&state_path) {
+                remove_stale_agy_temp_file(&state_path, false)?;
+            }
+        }
+        delete_locked_agy_temp_file(lease_path, lease_file, lease_identity)?;
+    }
 
     for path in &entries {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if !is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX)
-            && !is_random_agy_temp_name(name, "agy_hook_state")
+            && !is_random_agy_temp_name(name, AGY_HOOK_STATE_PREFIX)
         {
             continue;
         }
-        let Some((_lock, identity)) = try_lock_stale_agy_file(path)? else {
+        if live_files.contains(path) {
             continue;
-        };
-        if is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX) {
-            let ack_path = derived_hook_ack_path(path)?;
-            remove_regular_file_if_present(&ack_path)?;
         }
-        crate::services::file_ops::remove_file_by_identity(path, identity)?;
+        remove_stale_agy_temp_file(
+            path,
+            is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX),
+        )?;
     }
 
     // A crash normally leaves the prompt beside its acknowledgement. This
@@ -681,10 +871,12 @@ fn cleanup_stale_agy_hook_files(base: &Path) -> io::Result<()> {
 }
 
 struct AgyHookPrompt {
+    // Field order is intentional: on Windows the lease lock handle must close
+    // before the lease guard attempts to delete its file.
+    _lease_lock: std::fs::File,
+    _lease_file: PrivateTempFile,
     prompt_file: PrivateTempFile,
     state_file: PrivateTempFile,
-    _prompt_lock: std::fs::File,
-    _state_lock: std::fs::File,
     state_identity: StablePathIdentity,
     ack_path: PathBuf,
     token: String,
@@ -703,14 +895,16 @@ impl AgyHookPrompt {
         }
         let prompt_file =
             create_private_temp_file(base, AGY_SYSTEM_PROMPT_PREFIX, system_prompt.as_bytes())?;
-        let prompt_lock = open_and_lock_owned_temp_file(&prompt_file)?;
         // The shell wrapper records a start/ok pair for every hook invocation
         // in this pre-created ledger. An unmatched start or explicit failure
         // means a successful first invocation cannot hide a failed second one
         // after a tool call.
-        let state_file = create_private_temp_file(base, "agy_hook_state", b"")?;
-        let state_lock = open_and_lock_owned_temp_file(&state_file)?;
+        let state_file = create_private_temp_file(base, AGY_HOOK_STATE_PREFIX, b"")?;
         let state_identity = stable_path_identity(state_file.path())?;
+        let lease_contents = agy_hook_lease_contents(prompt_file.path(), state_file.path())?;
+        let lease_file =
+            create_private_temp_file(base, AGY_HOOK_LEASE_PREFIX, &lease_contents)?;
+        let lease_lock = open_and_lock_owned_temp_file_shared(&lease_file)?;
         let ack_path = derived_hook_ack_path(prompt_file.path())?;
         match std::fs::symlink_metadata(&ack_path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -723,10 +917,10 @@ impl AgyHookPrompt {
             }
         }
         Ok(Self {
+            _lease_lock: lease_lock,
+            _lease_file: lease_file,
             prompt_file,
             state_file,
-            _prompt_lock: prompt_lock,
-            _state_lock: state_lock,
             state_identity,
             ack_path,
             token: format!("{:032x}", rand::random::<u128>()),
@@ -770,13 +964,16 @@ impl AgyHookPrompt {
                 starts += 1;
             } else if line == expected_ok {
                 successes += 1;
+                if successes > starts {
+                    return AgyHookState::Failed;
+                }
             } else if line == expected_fail {
                 return AgyHookState::Failed;
             } else {
                 return AgyHookState::Failed;
             }
         }
-        if starts == 0 || successes > starts {
+        if starts == 0 {
             AgyHookState::Failed
         } else if starts == successes {
             AgyHookState::Complete
@@ -785,17 +982,23 @@ impl AgyHookPrompt {
         }
     }
 
+    fn acknowledgement_identity(&self) -> Option<StablePathIdentity> {
+        let identity = stable_path_identity(&self.ack_path).ok()?;
+        let contents = read_small_regular_file(&self.ack_path, 128).ok()?;
+        (contents == self.token.as_bytes()
+            && stable_path_identity(&self.ack_path).ok() == Some(identity))
+        .then_some(identity)
+    }
+
     fn acknowledged(&self) -> bool {
-        read_small_regular_file(&self.ack_path, 128)
-            .map(|contents| contents == self.token.as_bytes())
-            .unwrap_or(false)
+        self.acknowledgement_identity().is_some()
     }
 }
 
 impl Drop for AgyHookPrompt {
     fn drop(&mut self) {
-        if self.acknowledged() {
-            let _ = std::fs::remove_file(&self.ack_path);
+        if let Some(identity) = self.acknowledgement_identity() {
+            let _ = crate::services::file_ops::remove_file_by_identity(&self.ack_path, identity);
         }
     }
 }
@@ -842,8 +1045,11 @@ fn agy_hook_command() -> String {
 #[cfg(windows)]
 fn agy_hook_command() -> String {
     format!(
-        "if not defined {} (more >nul & echo {{}}) else (\"%{}%\" {})",
-        AGY_HOOK_ENV_EXECUTABLE, AGY_HOOK_ENV_EXECUTABLE, AGY_HOOK_INTERNAL_ARG
+        "if not defined {exec} (more >nul & echo {{}}) else if not defined {state} (exit /b 125) else if not defined {token} (exit /b 125) else (>>\"%{state}%\" echo start %{token}% && \"%{exec}%\" {arg} && (>>\"%{state}%\" echo ok %{token}%) || (>>\"%{state}%\" echo fail %{token}% & exit /b 125))",
+        exec = AGY_HOOK_ENV_EXECUTABLE,
+        arg = AGY_HOOK_INTERNAL_ARG,
+        state = AGY_HOOK_ENV_STATE_FILE,
+        token = AGY_HOOK_ENV_TOKEN,
     )
 }
 
@@ -1017,16 +1223,6 @@ fn ensure_agy_hook_plugin() -> io::Result<PathBuf> {
 }
 
 fn write_hook_ack(path: &Path, token: &str) -> io::Result<()> {
-    if let Ok(existing) = read_small_regular_file(path, 128) {
-        if existing == token.as_bytes() {
-            return Ok(());
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "Agy hook acknowledgement belongs to a different invocation",
-        ));
-    }
-
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1034,7 +1230,35 @@ fn write_hook_ack(path: &Path, token: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {
+            // Separate model invocations (for example nested agents) may run
+            // this idempotent acknowledgement concurrently. The create-new
+            // winner can still be writing when another helper observes the
+            // pathname, so briefly wait for the complete token.
+            for _ in 0..1_000 {
+                match read_small_regular_file(path, 128) {
+                    Ok(existing) if existing == token.as_bytes() => return Ok(()),
+                    Ok(existing) if existing.len() < token.len() => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "Agy hook acknowledgement belongs to a different invocation",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(create_error);
+        }
+        Err(error) => return Err(error),
+    };
     file.write_all(token.as_bytes())?;
     file.sync_all()
 }
@@ -1065,10 +1289,19 @@ fn build_agy_hook_response(
                 "Agy hook input is missing invocationNum",
             )
         })?;
-    if input
+    let _initial_num_steps = input
+        .get("initialNumSteps")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Agy hook input is missing initialNumSteps",
+            )
+        })?;
+    if !input
         .get("conversationId")
         .and_then(Value::as_str)
-        .is_none()
+        .is_some_and(|conversation_id| !conversation_id.is_empty())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1136,7 +1369,7 @@ pub(crate) fn run_agy_pre_invocation_hook() -> io::Result<()> {
 }
 
 /// Ensures that every return path, including I/O errors and unwinding, reaps
-/// Agy before the per-invocation rule directory is allowed to disappear.
+/// Agy before the per-invocation hook files are allowed to disappear.
 struct ReapingAgyChild {
     child: std::process::Child,
     status: Option<std::process::ExitStatus>,
@@ -1934,19 +2167,19 @@ pub fn execute_command_streaming(
 
     let temp_dir = crate::utils::path::cokacdir_temp_dir()
         .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {}", e))?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(unix, windows))]
     let agy_hook_prompt = prepare_agy_hook_prompt(&temp_dir, system_prompt)
         .map_err(|e| format!("Failed to create private Agy system-prompt file: {}", e))?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(unix, windows)))]
     let agy_hook_prompt: Option<AgyHookPrompt> = None;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(unix, windows))]
     let stdin_prompt: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(prompt);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(unix, windows)))]
     let stdin_prompt: std::borrow::Cow<'_, str> =
         std::borrow::Cow::Owned(build_legacy_agy_stdin_prompt(prompt, system_prompt));
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(unix, windows))]
     let (hook_plugin, hook_executable) = if agy_hook_prompt.is_some() {
         let plugin = ensure_agy_hook_plugin()
             .map_err(|e| format!("Failed to configure the Agy system-prompt hook: {}", e))?;
@@ -1956,7 +2189,7 @@ pub fn execute_command_streaming(
     } else {
         (None, None)
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(unix, windows)))]
     let (hook_plugin, hook_executable): (Option<PathBuf>, Option<PathBuf>) = (None, None);
     let agy_log_guard = create_private_temp_file(&temp_dir, "agy_log", b"")
         .map_err(|e| format!("Failed to create private Agy log file: {}", e))?;
@@ -2024,11 +2257,10 @@ pub fn execute_command_streaming(
 
     // With no `--print`/`-p` flag, Agy treats non-TTY stdin as the complete
     // headless prompt. Closing the pipe is required so Agy sees EOF and starts
-    // the request. On Linux, cokacdir's system instructions are supplied as a
-    // transient system message by Agy's PreInvocation hook and stdin contains
-    // only the user's current message. Other platforms retain the prior
-    // composed-stdin transport until Agy's cross-platform hook execution is
-    // reliable.
+    // the request. On Unix and Windows, cokacdir's system instructions are
+    // supplied as a transient system message by Agy's PreInvocation hook and
+    // stdin contains only the user's current message. Unsupported target
+    // families retain the composed-stdin compatibility transport.
     let stdin_result = match child.take_stdin() {
         Some(mut stdin) => {
             let result = stdin.write_all(stdin_prompt.as_bytes());
@@ -2386,6 +2618,27 @@ mod tests {
     }
 
     #[test]
+    fn hook_response_requires_the_complete_pre_invocation_schema() {
+        let temp = crate::utils::path::cokacdir_temp_dir().unwrap();
+        let hook_prompt = prepare_agy_hook_prompt(&temp, Some("system prompt"))
+            .unwrap()
+            .unwrap();
+
+        for input in [
+            r#"{"initialNumSteps":1,"conversationId":"conversation"}"#,
+            r#"{"invocationNum":0,"conversationId":"conversation"}"#,
+            r#"{"invocationNum":0,"initialNumSteps":1,"conversationId":""}"#,
+        ] {
+            assert!(build_agy_hook_response(
+                input,
+                hook_prompt.prompt_path(),
+                hook_prompt.token(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn absent_or_blank_system_prompt_creates_no_hook_file() {
         let temp = tempfile::tempdir().unwrap();
         for prompt in [None, Some(""), Some(" \n\t ")] {
@@ -2403,6 +2656,7 @@ mod tests {
             .unwrap();
         let prompt_path = prompt.prompt_path().to_path_buf();
         let state_path = prompt.state_path().to_path_buf();
+        let lease_path = prompt._lease_file.path().to_path_buf();
         let ack_path = super::derived_hook_ack_path(&prompt_path).unwrap();
         write_hook_ack(&ack_path, prompt.token()).unwrap();
 
@@ -2411,11 +2665,41 @@ mod tests {
             "secret system instructions"
         );
         assert!(state_path.exists());
+        assert_eq!(
+            std::fs::read(&lease_path).unwrap(),
+            super::agy_hook_lease_contents(&prompt_path, &state_path).unwrap()
+        );
         assert!(ack_path.exists());
         drop(prompt);
         assert!(!prompt_path.exists());
         assert!(!state_path.exists());
+        assert!(!lease_path.exists());
         assert!(!ack_path.exists());
+    }
+
+    #[test]
+    fn hook_acknowledgement_is_idempotent_under_concurrent_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let ack_path = temp.path().join("hook.ack");
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut writers = Vec::new();
+
+        for _ in 0..16 {
+            let ack_path = ack_path.clone();
+            let token = token.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                write_hook_ack(&ack_path, &token)
+            }));
+        }
+
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let contents = std::fs::read(&ack_path).unwrap();
+        assert_eq!(contents.as_slice(), token.as_bytes());
     }
 
     #[cfg(unix)]
@@ -2427,22 +2711,16 @@ mod tests {
         let prompt = prepare_agy_hook_prompt(temp.path(), Some("secret instructions"))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            std::fs::metadata(prompt.prompt_path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(prompt.state_path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        for path in [
+            prompt.prompt_path(),
+            prompt.state_path(),
+            prompt._lease_file.path(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2495,42 +2773,167 @@ mod tests {
     }
 
     #[test]
-    fn stale_hook_cleanup_preserves_locked_runs_and_removes_crash_residue() {
+    fn hook_ledger_rejects_success_before_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt = prepare_agy_hook_prompt(temp.path(), Some("system instructions"))
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            prompt.state_path(),
+            format!("ok {}\nstart {}\n", prompt.token(), prompt.token()),
+        )
+        .unwrap();
+
+        assert_eq!(prompt.hook_state(), super::AgyHookState::Failed);
+    }
+
+    #[test]
+    fn stale_hook_cleanup_preserves_live_leases_and_removes_crash_residue() {
         let temp = tempfile::tempdir().unwrap();
         let active = prepare_agy_hook_prompt(temp.path(), Some("active instructions"))
             .unwrap()
             .unwrap();
         let active_prompt = active.prompt_path().to_path_buf();
         let active_state = active.state_path().to_path_buf();
+        let active_lease = active._lease_file.path().to_path_buf();
 
-        let stale_prompt = crate::services::claude::create_private_temp_file(
-            temp.path(),
+        let stale_prompt_path = temp.path().join(format!(
+            "{}_{}",
             super::AGY_SYSTEM_PROMPT_PREFIX,
-            b"stale secret",
-        )
-        .unwrap();
-        let stale_prompt_path = stale_prompt.path().to_path_buf();
+            "1".repeat(32)
+        ));
+        std::fs::write(&stale_prompt_path, b"stale secret").unwrap();
         let stale_ack = super::derived_hook_ack_path(&stale_prompt_path).unwrap();
         std::fs::write(&stale_ack, b"stale").unwrap();
-        std::mem::forget(stale_prompt);
 
-        let stale_state = crate::services::claude::create_private_temp_file(
-            temp.path(),
-            "agy_hook_state",
-            b"start stale",
-        )
-        .unwrap();
-        let stale_state_path = stale_state.path().to_path_buf();
-        std::mem::forget(stale_state);
+        let stale_state_path = temp.path().join(format!(
+            "{}_{}",
+            super::AGY_HOOK_STATE_PREFIX,
+            "2".repeat(32)
+        ));
+        std::fs::write(&stale_state_path, b"start stale").unwrap();
+        let stale_lease_contents =
+            super::agy_hook_lease_contents(&stale_prompt_path, &stale_state_path).unwrap();
+        let stale_lease_path = temp.path().join(format!(
+            "{}_{}",
+            super::AGY_HOOK_LEASE_PREFIX,
+            "3".repeat(32)
+        ));
+        std::fs::write(&stale_lease_path, stale_lease_contents).unwrap();
 
         let _cleanup_lock = super::acquire_agy_temp_cleanup_lock(temp.path()).unwrap();
         super::cleanup_stale_agy_hook_files(temp.path()).unwrap();
 
         assert!(active_prompt.exists());
         assert!(active_state.exists());
+        assert!(active_lease.exists());
         assert!(!stale_prompt_path.exists());
         assert!(!stale_ack.exists());
         assert!(!stale_state_path.exists());
+        assert!(!stale_lease_path.exists());
+    }
+
+    #[test]
+    fn stale_lease_cannot_remove_files_mapped_by_a_live_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = prepare_agy_hook_prompt(temp.path(), Some("active instructions"))
+            .unwrap()
+            .unwrap();
+        let active_prompt = active.prompt_path().to_path_buf();
+        let active_state = active.state_path().to_path_buf();
+        let active_lease = active._lease_file.path().to_path_buf();
+        let active_ack = super::derived_hook_ack_path(&active_prompt).unwrap();
+        write_hook_ack(&active_ack, active.token()).unwrap();
+
+        // This valid-looking stale lease sorts before every normally generated
+        // random lease and maliciously points at the active run's files.
+        let stale_lease = temp.path().join(format!(
+            "{}_{}",
+            super::AGY_HOOK_LEASE_PREFIX,
+            "0".repeat(32)
+        ));
+        assert_ne!(stale_lease, active_lease);
+        std::fs::write(
+            &stale_lease,
+            super::agy_hook_lease_contents(&active_prompt, &active_state).unwrap(),
+        )
+        .unwrap();
+
+        let _cleanup_lock = super::acquire_agy_temp_cleanup_lock(temp.path()).unwrap();
+        super::cleanup_stale_agy_hook_files(temp.path()).unwrap();
+
+        assert!(active_prompt.exists());
+        assert!(active_state.exists());
+        assert!(active_lease.exists());
+        assert!(active_ack.exists());
+        assert!(!stale_lease.exists());
+    }
+
+    #[test]
+    fn stale_cleanup_honors_legacy_prompt_and_state_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let prompt_path = temp.path().join(format!(
+            "{}_{}",
+            super::AGY_SYSTEM_PROMPT_PREFIX,
+            "4".repeat(32)
+        ));
+        let state_path = temp.path().join(format!(
+            "{}_{}",
+            super::AGY_HOOK_STATE_PREFIX,
+            "5".repeat(32)
+        ));
+        std::fs::write(&prompt_path, b"legacy prompt").unwrap();
+        std::fs::write(&state_path, b"legacy state").unwrap();
+        let ack_path = super::derived_hook_ack_path(&prompt_path).unwrap();
+        std::fs::write(&ack_path, b"legacy ack").unwrap();
+
+        let prompt_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&prompt_path)
+            .unwrap();
+        let state_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&state_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&prompt_lock).unwrap();
+        fs2::FileExt::lock_exclusive(&state_lock).unwrap();
+
+        let _cleanup_lock = super::acquire_agy_temp_cleanup_lock(temp.path()).unwrap();
+        super::cleanup_stale_agy_hook_files(temp.path()).unwrap();
+        assert!(prompt_path.exists());
+        assert!(state_path.exists());
+        assert!(ack_path.exists());
+
+        drop(prompt_lock);
+        drop(state_lock);
+        super::cleanup_stale_agy_hook_files(temp.path()).unwrap();
+        assert!(!prompt_path.exists());
+        assert!(!state_path.exists());
+        assert!(!ack_path.exists());
+    }
+
+    #[test]
+    fn platform_lock_contention_error_is_recognized() {
+        assert!(super::agy_file_lock_is_contended(&fs2::lock_contended_error()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hook_wrapper_contains_complete_ledger_protocol() {
+        let command = super::agy_hook_command();
+
+        assert!(command.contains(&format!(
+            "echo start %{}%",
+            super::AGY_HOOK_ENV_TOKEN
+        )));
+        assert!(command.contains(&format!("echo ok %{}%", super::AGY_HOOK_ENV_TOKEN)));
+        assert!(command.contains(&format!(
+            "echo fail %{}%",
+            super::AGY_HOOK_ENV_TOKEN
+        )));
+        assert!(command.contains("exit /b 125"));
     }
 
     #[test]
