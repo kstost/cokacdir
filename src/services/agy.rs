@@ -5,7 +5,7 @@
 //! cokacdir's shared `StreamMessage` contract from that stdout.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -21,6 +21,9 @@ use crate::services::claude::{
 use crate::services::file_ops::{
     open_directory_for_read, stable_file_identity, stable_path_identity, StablePathIdentity,
 };
+
+#[path = "agy_reserved_vfs.rs"]
+mod reserved_sqlite_vfs;
 
 static AGY_PATH: OnceLock<Option<String>> = OnceLock::new();
 static AGY_VERSION: OnceLock<Option<String>> = OnceLock::new();
@@ -1335,87 +1338,55 @@ fn clone_failure_with_safe_cleanup(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_fd_count_for_clone(expected: CloneFileIdentity) -> std::io::Result<usize> {
-    use std::os::unix::fs::MetadataExt;
-
-    let mut count = 0usize;
-    for entry in std::fs::read_dir("/proc/self/fd")? {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        if metadata.dev() == expected.device && metadata.ino() == expected.inode {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-#[allow(unsafe_code)]
-fn open_fd_count_for_clone(expected: CloneFileIdentity) -> std::io::Result<usize> {
-    // macOS does not provide a traversable `/dev/fd/N/...` namespace. Inspect
-    // the process descriptor table directly instead; this is done only while
-    // opening an Agy clone, and it never turns a descriptor into a pathname.
-    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    if limit < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let upper_bound = usize::try_from(limit)
-        .unwrap_or(usize::MAX)
-        .min(i32::MAX as usize);
-    let mut count = 0usize;
-    for raw_fd in 0..upper_bound {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(raw_fd as libc::c_int, stat.as_mut_ptr()) } != 0 {
-            continue;
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_dev as u64 == expected.device && stat.st_ino as u64 == expected.inode {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn sqlite_connection_matches_reserved_identity(
-    connection: &Connection,
-    expected: CloneFileIdentity,
-) -> bool {
-    use std::os::windows::io::BorrowedHandle;
-
-    let main = c"main";
-    let mut raw_handle: *mut std::ffi::c_void = std::ptr::null_mut();
-    let result = unsafe {
-        rusqlite::ffi::sqlite3_file_control(
-            connection.handle(),
-            main.as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_WIN32_GET_HANDLE,
-            (&mut raw_handle as *mut *mut std::ffi::c_void).cast(),
+fn backup_sqlite_into_connection(
+    source: &Connection,
+    destination: &mut Connection,
+    target: &Path,
+) -> Result<(), String> {
+    let backup = Backup::new(source, destination).map_err(|error| {
+        format!(
+            "Failed to start Agy conversation backup into {}: {}",
+            target.display(),
+            error
         )
-    };
-    if result != rusqlite::ffi::SQLITE_OK || raw_handle.is_null() {
-        return false;
+    })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+        match backup.step(100).map_err(|error| {
+            format!(
+                "Failed to back up Agy conversation into {}: {}",
+                target.display(),
+                error
+            )
+        })? {
+            rusqlite::backup::StepResult::Done => return Ok(()),
+            rusqlite::backup::StepResult::More => {}
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Timed out waiting to back up Agy conversation into {}",
+                        target.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                return Err(format!(
+                    "SQLite returned an unknown backup state for {}",
+                    target.display()
+                ))
+            }
+        }
     }
-    // SAFETY: SQLite returned this live handle for `connection`; this borrow
-    // is used only for the file-id query and does not close the handle.
-    let borrowed = unsafe { BorrowedHandle::borrow_raw(raw_handle.cast()) };
-    crate::services::file_ops::stable_windows_handle_identity(&borrowed)
-        .map(|identity| identity == expected)
-        .unwrap_or(false)
 }
 
-fn open_reserved_sqlite_destination(
+fn backup_sqlite_to_reserved_handle(
+    source: &Connection,
     reserved: &std::fs::File,
     target: &Path,
     reserved_identity: CloneFileIdentity,
-) -> Result<Connection, String> {
+) -> Result<(), String> {
     let held_identity = clone_file_identity(reserved).map_err(|error| {
         format!(
             "Failed to revalidate reserved Agy clone handle {}: {}",
@@ -1429,134 +1400,95 @@ fn open_reserved_sqlite_destination(
             target.display()
         ));
     }
-    #[cfg(unix)]
-    let matching_before = open_fd_count_for_clone(reserved_identity).map_err(|error| {
-        format!(
-            "Failed to inspect reserved Agy clone descriptor {}: {}",
-            target.display(),
-            error
-        )
-    })?;
 
-    // Open the ordinary target pathname, not /dev/fd. No SQLite operation is
-    // issued until the newly opened database handle is proven to reference the
-    // inode reserved above, so a pre-open rename/symlink swap cannot redirect
-    // backup writes.
-    let destination = Connection::open_with_flags(
-        target,
+    // SQLite's backup API accepts a connection, not an existing File. This
+    // one-shot VFS exposes only a duplicate of the no-clobber reservation, so
+    // SQLite streams pages to that inode without ever resolving `target`.
+    let registration = reserved_sqlite_vfs::Registration::register(reserved, reserved_identity)
+        .map_err(|error| {
+            format!(
+                "Failed to prepare reserved Agy clone {}: {}",
+                target.display(),
+                error
+            )
+        })?;
+    let mut destination = Connection::open_with_flags_and_vfs(
+        registration.filename(),
         OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        registration.name(),
     )
     .map_err(|error| {
         format!(
-            "Failed to open reserved Agy clone destination {}: {}",
+            "Failed to open reserved Agy clone {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    destination
+        .execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;")
+        .map_err(|error| {
+            format!(
+                "Failed to configure reserved Agy clone {}: {}",
+                target.display(),
+                error
+            )
+        })?;
+    backup_sqlite_into_connection(source, &mut destination, target)?;
+    drop(destination);
+    registration.unregister().map_err(|error| {
+        format!(
+            "Failed to release reserved Agy clone {}: {}",
             target.display(),
             error
         )
     })?;
 
-    #[cfg(unix)]
-    {
-        let matching_after = open_fd_count_for_clone(reserved_identity).map_err(|error| {
-            format!(
-                "Failed to verify SQLite Agy clone descriptor {}: {}",
-                target.display(),
-                error
-            )
-        })?;
-        if matching_after <= matching_before {
-            return Err(format!(
-                "SQLite destination is not the reserved Agy clone file: {}",
-                target.display()
-            ));
-        }
-    }
-    #[cfg(windows)]
-    if !sqlite_connection_matches_reserved_identity(&destination, reserved_identity) {
+    reserved
+        .sync_all()
+        .map_err(|error| format!("Failed to sync Agy clone {}: {}", target.display(), error))?;
+    let mut verification = reserved.try_clone().map_err(|error| {
+        format!(
+            "Failed to duplicate written Agy clone handle {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    verification.rewind().map_err(|error| {
+        format!(
+            "Failed to rewind written Agy clone {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    let mut header = [0u8; 16];
+    verification.read_exact(&mut header).map_err(|error| {
+        format!(
+            "Failed to read written Agy clone header {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    if &header != b"SQLite format 3\0" {
         return Err(format!(
-            "SQLite destination is not the reserved Agy clone file: {}",
+            "Agy backup did not produce a valid SQLite database: {}",
             target.display()
         ));
     }
-    if !clone_target_still_owned(target, reserved_identity).unwrap_or(false) {
+
+    let final_identity = clone_file_identity(&verification).map_err(|error| {
+        format!(
+            "Failed to revalidate written Agy clone handle {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    if final_identity != reserved_identity {
         return Err(format!(
-            "Agy clone target changed while opening SQLite destination: {}",
+            "Reserved Agy clone handle identity changed while writing: {}",
             target.display()
         ));
-    }
-
-    destination
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| {
-            format!(
-                "Failed to configure Agy clone destination timeout {}: {}",
-                target.display(),
-                error
-            )
-        })?;
-    // The destination is unpublished until the final identity check. Turning
-    // rollback journaling off prevents SQLite from reopening any `-journal`
-    // pathname after a concurrent rename; failure cleanup removes the partial
-    // reserved inode instead. `sync_all` below supplies final durability.
-    destination
-        .execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
-        .map_err(|error| {
-            format!(
-                "Failed to configure reserved Agy clone destination {}: {}",
-                target.display(),
-                error
-            )
-        })?;
-    Ok(destination)
-}
-
-fn backup_sqlite_into_connection(
-    source: &Connection,
-    destination: &mut Connection,
-    target: &Path,
-) -> Result<(), String> {
-    use rusqlite::backup::StepResult;
-
-    {
-        let backup = Backup::new(source, destination).map_err(|error| {
-            format!(
-                "Failed to initialize Agy backup {}: {}",
-                target.display(),
-                error
-            )
-        })?;
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match backup.step(100).map_err(|error| {
-                format!(
-                    "Failed to backup Agy conversation into {}: {}",
-                    target.display(),
-                    error
-                )
-            })? {
-                StepResult::Done => break,
-                StepResult::More => {}
-                StepResult::Busy | StepResult::Locked
-                    if std::time::Instant::now() < retry_deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                StepResult::Busy => {
-                    return Err(format!(
-                        "Agy clone source remained busy for 5 seconds: {}",
-                        target.display()
-                    ))
-                }
-                StepResult::Locked => {
-                    return Err(format!(
-                        "Agy clone source remained locked for 5 seconds: {}",
-                        target.display()
-                    ))
-                }
-                _ => return Err(format!("Unknown Agy backup state for {}", target.display())),
-            }
-        }
     }
     Ok(())
 }
@@ -1567,12 +1499,30 @@ fn backup_sqlite_to_reserved_file(
     target: &Path,
     reserved_identity: CloneFileIdentity,
 ) -> Result<(), String> {
-    let mut destination = open_reserved_sqlite_destination(reserved, target, reserved_identity)?;
-    backup_sqlite_into_connection(source, &mut destination, target)?;
-    drop(destination);
-    reserved
-        .sync_all()
-        .map_err(|error| format!("Failed to sync Agy clone {}: {}", target.display(), error))
+    let held_identity = clone_file_identity(reserved).map_err(|error| {
+        format!(
+            "Failed to revalidate reserved Agy clone handle {}: {}",
+            target.display(),
+            error
+        )
+    })?;
+    if held_identity != reserved_identity
+        || !clone_target_still_owned(target, reserved_identity).unwrap_or(false)
+    {
+        return Err(format!(
+            "Agy clone target changed before SQLite backup: {}",
+            target.display()
+        ));
+    }
+
+    backup_sqlite_to_reserved_handle(source, reserved, target, reserved_identity)?;
+    if !clone_target_still_owned(target, reserved_identity).unwrap_or(false) {
+        return Err(format!(
+            "Agy clone target changed while writing SQLite backup: {}",
+            target.display()
+        ));
+    }
+    Ok(())
 }
 
 fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String> {
@@ -1635,9 +1585,8 @@ fn copy_conversation_to_id(source: &Path, target_id: &str) -> Result<(), String>
             })?;
 
         // Reserve the randomly named destination with no-clobber semantics.
-        // The reservation stays open while SQLite's separately opened handle
-        // is verified against this inode, so a concurrent pathname replacement
-        // cannot redirect clone contents.
+        // SQLite writes only through this held handle via a one-shot VFS, so a
+        // concurrent pathname replacement cannot redirect clone contents.
         let mut reserve_options = std::fs::OpenOptions::new();
         reserve_options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -2374,10 +2323,10 @@ pub fn execute_command_streaming(
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_sqlite_into_connection, build_agy_command_args, build_agy_hook_response,
-        cleanup_owned_failed_clone, clone_file_identity, clone_target_still_owned,
-        copy_conversation_to_id, ensure_agy_hook_plugin_in, execute_command_streaming,
-        open_reserved_sqlite_destination, prepare_agy_hook_prompt, stdout_absence_error_message,
+        backup_sqlite_to_reserved_file, backup_sqlite_to_reserved_handle, build_agy_command_args,
+        build_agy_hook_response, cleanup_owned_failed_clone, clone_file_identity,
+        clone_target_still_owned, copy_conversation_to_id, ensure_agy_hook_plugin_in,
+        execute_command_streaming, prepare_agy_hook_prompt, stdout_absence_error_message,
         working_dir_cache_keys, write_hook_ack, AGY_HOOK_INTERNAL_ARG,
     };
 
@@ -2856,6 +2805,164 @@ mod tests {
     }
 
     #[test]
+    fn empty_sqlite_database_can_be_cloned() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("empty.db");
+        drop(rusqlite::Connection::open(&source).unwrap());
+        assert_eq!(std::fs::metadata(&source).unwrap().len(), 0);
+
+        copy_conversation_to_id(&source, "empty-clone").unwrap();
+
+        let clone = rusqlite::Connection::open(temp.path().join("empty-clone.db")).unwrap();
+        let integrity: String = clone
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert!(
+            std::fs::metadata(temp.path().join("empty-clone.db"))
+                .unwrap()
+                .len()
+                >= 512
+        );
+    }
+
+    #[test]
+    fn sqlite_clone_includes_uncheckpointed_wal_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("active.db");
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 CREATE TABLE messages(body TEXT); \
+                 INSERT INTO messages VALUES ('first'), ('second'), ('third');",
+            )
+            .unwrap();
+        let mut wal_path = source.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        assert!(
+            std::fs::metadata(std::path::PathBuf::from(wal_path))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        copy_conversation_to_id(&source, "active-clone").unwrap();
+
+        let clone = rusqlite::Connection::open(temp.path().join("active-clone.db")).unwrap();
+        let bodies: String = clone
+            .query_row(
+                "SELECT group_concat(body, ',') FROM (SELECT body FROM messages ORDER BY rowid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bodies, "first,second,third");
+        let integrity: String = clone
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        drop(writer);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("VmRSS must be present in /proc/self/status")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_sqlite_clone_streaming_memory_child() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("large.db");
+        let source_conn = rusqlite::Connection::open(&source).unwrap();
+        source_conn
+            .execute_batch(
+                "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; \
+                 CREATE TABLE payload(value BLOB);",
+            )
+            .unwrap();
+        const PAYLOAD_BYTES: i64 = 64 * 1024 * 1024;
+        source_conn
+            .execute("INSERT INTO payload VALUES (zeroblob(?1))", [PAYLOAD_BYTES])
+            .unwrap();
+        drop(source_conn);
+
+        let source_size = std::fs::metadata(&source).unwrap().len();
+        assert!(source_size >= PAYLOAD_BYTES as u64);
+        let baseline = current_rss_kib();
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let peak = std::sync::Arc::new(AtomicU64::new(baseline));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let monitor_running = running.clone();
+        let monitor_peak = peak.clone();
+        let monitor = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            while monitor_running.load(Ordering::Acquire) {
+                monitor_peak.fetch_max(current_rss_kib(), Ordering::AcqRel);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            monitor_peak.fetch_max(current_rss_kib(), Ordering::AcqRel);
+        });
+        ready_rx.recv().unwrap();
+
+        let result = copy_conversation_to_id(&source, "large-clone");
+        running.store(false, Ordering::Release);
+        monitor.join().unwrap();
+        result.unwrap();
+
+        let growth_kib = peak.load(Ordering::Acquire).saturating_sub(baseline);
+        let limit_kib = source_size / 2 / 1024;
+        assert!(
+            growth_kib < limit_kib,
+            "SQLite clone RSS grew by {growth_kib} KiB for a {source_size}-byte database; expected less than {limit_kib} KiB"
+        );
+        let clone = rusqlite::Connection::open(temp.path().join("large-clone.db")).unwrap();
+        let cloned_bytes: i64 = clone
+            .query_row("SELECT length(value) FROM payload", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cloned_bytes, PAYLOAD_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sqlite_clone_memory_stays_bounded() {
+        const CHILD_ENV: &str = "COKACDIR_AGY_SQLITE_MEMORY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            run_sqlite_clone_streaming_memory_child();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "services::agy::tests::sqlite_clone_memory_stays_bounded",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated memory regression test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn sqlite_clone_waits_for_a_transient_exclusive_writer() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source.db");
@@ -2927,15 +3034,10 @@ mod tests {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let reserved = options.open(&target).unwrap();
         let identity = clone_file_identity(&reserved).unwrap();
-        let mut destination =
-            open_reserved_sqlite_destination(&reserved, &target, identity).unwrap();
-
         std::fs::rename(&target, &recovery).unwrap();
         std::fs::write(&victim, b"must survive").unwrap();
         symlink(&victim, &target).unwrap();
-        backup_sqlite_into_connection(&source_conn, &mut destination, &target).unwrap();
-        drop(destination);
-        reserved.sync_all().unwrap();
+        backup_sqlite_to_reserved_handle(&source_conn, &reserved, &target, identity).unwrap();
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
         assert!(!clone_target_still_owned(&target, identity).unwrap_or(false));
@@ -2949,13 +3051,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sqlite_destination_rejects_path_swap_before_opening() {
+    fn sqlite_clone_rejects_path_swap_before_backup() {
         use std::os::unix::fs::{symlink, OpenOptionsExt};
 
         let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
         let target = temp.path().join("clone.db");
         let recovery = temp.path().join("clone-owned-recovery.db");
         let victim = temp.path().join("victim.db");
+        let source_conn = rusqlite::Connection::open(&source).unwrap();
+        source_conn
+            .execute_batch("CREATE TABLE messages(body TEXT); INSERT INTO messages VALUES ('ok');")
+            .unwrap();
         let mut options = std::fs::OpenOptions::new();
         options
             .read(true)
@@ -2973,11 +3080,9 @@ mod tests {
             .unwrap();
         symlink(&victim, &target).unwrap();
 
-        let error = match open_reserved_sqlite_destination(&reserved, &target, identity) {
-            Ok(_) => panic!("path-swapped SQLite destination was accepted"),
-            Err(error) => error,
-        };
-        assert!(error.contains("reserved Agy clone destination"));
+        let error =
+            backup_sqlite_to_reserved_file(&source_conn, &reserved, &target, identity).unwrap_err();
+        assert!(error.contains("changed before SQLite backup"));
         let victim = rusqlite::Connection::open(&victim).unwrap();
         let table_count: i64 = victim
             .query_row(

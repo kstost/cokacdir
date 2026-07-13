@@ -1606,10 +1606,6 @@ pub(crate) fn create_private_quarantine_directory(
     }))
 }
 
-fn create_delete_quarantine(parent: &Path) -> io::Result<PathBuf> {
-    create_private_quarantine_directory(parent, "delete")
-}
-
 struct PrivateStagingDirectory {
     path: PathBuf,
     stable: StablePathIdentity,
@@ -1976,106 +1972,6 @@ fn cleanup_private_staging_directory(
     }
     fs::remove_dir(&quarantine)?;
     sync_parent(staging)
-}
-
-fn restore_quarantined_path(
-    quarantined: &Path,
-    original: &Path,
-    quarantine_dir: &Path,
-    cause: io::Error,
-) -> io::Error {
-    match rename_noreplace(quarantined, original) {
-        Ok(()) => {
-            let _ = fs::remove_dir(quarantine_dir);
-            io::Error::new(cause.kind(), format!("{}; the source was restored", cause))
-        }
-        Err(restore_error) => io::Error::new(
-            cause.kind(),
-            format!(
-                "{}; automatic restore failed: {}. The source is preserved at '{}'",
-                cause,
-                restore_error,
-                quarantined.display()
-            ),
-        ),
-    }
-}
-
-fn delete_if_unchanged(path: &Path, expected: PathIdentity) -> io::Result<()> {
-    delete_if_unchanged_impl(path, expected, |_| {})
-}
-
-fn cross_filesystem_directory_move_error(path: &Path) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "Cross-filesystem directory move is disabled because a root identity cannot prove that every copied descendant stayed unchanged: '{}'",
-            path.display()
-        ),
-    )
-}
-
-fn delete_if_unchanged_impl<F>(
-    path: &Path,
-    expected: PathIdentity,
-    after_quarantine: F,
-) -> io::Result<()>
-where
-    F: FnOnce(&Path),
-{
-    if expected.is_directory {
-        return Err(cross_filesystem_directory_move_error(path));
-    }
-    if !path_identity(path)?.same_snapshot(&expected) {
-        return Err(io::Error::other(format!(
-            "Source changed while it was being copied; refusing to delete '{}'",
-            path.display()
-        )));
-    }
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let quarantine_dir = create_delete_quarantine(parent)?;
-    let quarantined = quarantine_dir.join("source");
-    if let Err(error) = rename_noreplace(path, &quarantined) {
-        let _ = fs::remove_dir(&quarantine_dir);
-        return Err(error);
-    }
-    after_quarantine(&quarantined);
-
-    let moved = match path_identity(&quarantined) {
-        Ok(identity) => identity,
-        Err(error) => {
-            return Err(restore_quarantined_path(
-                &quarantined,
-                path,
-                &quarantine_dir,
-                error,
-            ));
-        }
-    };
-    if !moved.matches_after_relocation(&expected) {
-        return Err(restore_quarantined_path(
-            &quarantined,
-            path,
-            &quarantine_dir,
-            io::Error::other("Source was replaced while being quarantined; refusing to delete it"),
-        ));
-    }
-    drop(moved);
-
-    let prepared = prepare_file_deletion(&quarantined, expected.stable);
-    drop(expected);
-    let deletion = prepared.and_then(PreparedFileDeletion::delete);
-    if let Err(error) = deletion {
-        return Err(restore_quarantined_path(
-            &quarantined,
-            path,
-            &quarantine_dir,
-            error,
-        ));
-    }
-    fs::remove_dir(&quarantine_dir)?;
-    sync_parent(path)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2853,6 +2749,7 @@ struct QuarantinedSource {
     original: PathBuf,
     directory: PrivateStagingDirectory,
     identity: PathIdentity,
+    verified_directory_digest: Option<[u8; 32]>,
 }
 
 impl QuarantinedSource {
@@ -2868,9 +2765,6 @@ impl QuarantinedSource {
     where
         F: FnOnce(&Path),
     {
-        if expected.is_directory {
-            return Err(cross_filesystem_directory_move_error(original));
-        }
         let current = path_identity(original)?;
         if !current.same_snapshot(&expected) {
             return Err(io::Error::other(format!(
@@ -2923,6 +2817,7 @@ impl QuarantinedSource {
             original: original.to_path_buf(),
             directory,
             identity: moved,
+            verified_directory_digest: None,
         })
     }
 
@@ -2932,14 +2827,53 @@ impl QuarantinedSource {
 
     fn verify_unchanged(&self) -> io::Result<()> {
         let current = path_identity(&self.path())?;
-        if current.same_snapshot(&self.identity) {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
+        if !current.same_snapshot(&self.identity) {
+            return Err(io::Error::other(format!(
                 "Isolated move source changed before destination publication: '{}'",
                 self.original.display()
-            )))
+            )));
         }
+        if let Some(expected_digest) = self.verified_directory_digest {
+            let current_digest = sha256_directory_tree_snapshot(&self.path(), &self.identity)?;
+            if current_digest != expected_digest {
+                return Err(io::Error::other(format!(
+                    "Isolated move source tree changed before destination publication: '{}'",
+                    self.original.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_verified_directory_copy(&mut self, stage: &OwnedStage) -> io::Result<()> {
+        if !self.identity.is_directory || !stage.identity.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Directory move verification requires two directories",
+            ));
+        }
+        let source_digest = sha256_directory_tree_snapshot(&self.path(), &self.identity)?;
+        let staged_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
+        if source_digest != staged_digest {
+            return Err(io::Error::other(
+                "Source directory changed after it was copied; destination was not published",
+            ));
+        }
+        self.verified_directory_digest = Some(source_digest);
+        Ok(())
+    }
+
+    fn verify_stage_matches(&self, stage: &OwnedStage) -> io::Result<()> {
+        stage.verify()?;
+        if let Some(expected_digest) = self.verified_directory_digest {
+            let current_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
+            if current_digest != expected_digest {
+                return Err(io::Error::other(
+                    "Verified directory staging changed before destination publication",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn restore(self, cause: io::Error) -> io::Error {
@@ -2948,6 +2882,7 @@ impl QuarantinedSource {
             original,
             directory,
             identity,
+            verified_directory_digest: _,
         } = self;
         let payload = directory.payload();
         let current = match path_identity(&payload) {
@@ -3025,6 +2960,7 @@ impl QuarantinedSource {
             original,
             directory,
             identity,
+            verified_directory_digest,
         } = self;
         let payload = directory.payload();
         let current = match path_identity(&payload) {
@@ -3042,6 +2978,23 @@ impl QuarantinedSource {
                 )]
             }
         };
+        if let Some(expected_digest) = verified_directory_digest {
+            match sha256_directory_tree_snapshot(&payload, &current) {
+                Ok(current_digest) if current_digest == expected_digest => {}
+                Ok(_) => {
+                    return vec![format!(
+                        "Destination was committed, but the isolated source tree changed and was preserved under '{}'",
+                        directory.path.display()
+                    )]
+                }
+                Err(error) => {
+                    return vec![format!(
+                        "Destination was committed, but the isolated source tree could not be reverified and was preserved under '{}': {}",
+                        directory.path.display(), error
+                    )]
+                }
+            }
+        }
         drop(identity);
 
         let mut warnings = Vec::new();
@@ -3084,7 +3037,10 @@ fn commit_cross_filesystem_move(
     mut warnings: Vec<String>,
     target_authorization: Option<&DirectoryAuthorization>,
 ) -> Result<Vec<String>, CrossFilesystemMoveFailure> {
-    if let Err(error) = source.verify_unchanged() {
+    if let Err(error) = source
+        .verify_unchanged()
+        .and_then(|()| source.verify_stage_matches(&stage))
+    {
         let error = match stage.cleanup() {
             Ok(()) => error,
             Err(cleanup_error) => io::Error::new(
@@ -3964,6 +3920,195 @@ fn verify_isolated_source_matches_copy(
         ));
     }
     Ok(())
+}
+
+fn update_tree_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn update_tree_digest_name(hasher: &mut Sha256, name: &OsStr) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        update_tree_digest_bytes(hasher, name.as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let bytes = name
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        update_tree_digest_bytes(hasher, &bytes);
+    }
+    #[cfg(not(any(unix, windows)))]
+    update_tree_digest_bytes(hasher, name.to_string_lossy().as_bytes());
+}
+
+fn tree_digest_permission_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn hash_open_directory_tree(
+    access: &DirectoryAccess,
+    display_path: &Path,
+    hasher: &mut Sha256,
+) -> io::Result<()> {
+    let directory_before = access.file().metadata()?;
+    hasher.update(b"directory\0");
+    hasher.update(tree_digest_permission_mode(&directory_before).to_le_bytes());
+
+    let mut names = access.collect_entry_names()?;
+    names.sort();
+    for name in &names {
+        let child_path = display_path.join(name);
+        let before = access.child_metadata(name)?;
+        update_tree_digest_name(hasher, name);
+
+        if before.is_file() {
+            hasher.update(b"file\0");
+            hasher.update(before.len().to_le_bytes());
+            hasher.update((before.mode() & 0o7777).to_le_bytes());
+            let (mut file, opened_metadata) = access.open_regular_file(name)?;
+            if stable_file_identity(&file)? != before.identity() {
+                return Err(io::Error::other(format!(
+                    "Directory tree entry changed before hashing: '{}'",
+                    child_path.display()
+                )));
+            }
+            let mut content_hasher = Sha256::new();
+            let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                content_hasher.update(&buffer[..read]);
+            }
+            let after = file.metadata()?;
+            let current = access.child_metadata(name)?;
+            if !metadata_still_matches(&opened_metadata, &after)
+                || stable_file_identity(&file)? != before.identity()
+                || current.identity() != before.identity()
+                || !current.is_file()
+                || current.len() != before.len()
+                || (current.mode() & 0o7777) != (before.mode() & 0o7777)
+            {
+                return Err(io::Error::other(format!(
+                    "Directory tree file changed while hashing: '{}'",
+                    child_path.display()
+                )));
+            }
+            hasher.update(content_hasher.finalize());
+        } else if before.is_dir() {
+            hasher.update(b"directory-entry\0");
+            hasher.update((before.mode() & 0o7777).to_le_bytes());
+            let (child_file, child_access, _) = access.open_directory(name)?;
+            if stable_file_identity(&child_file)? != before.identity() {
+                return Err(io::Error::other(format!(
+                    "Directory tree directory changed before hashing: '{}'",
+                    child_path.display()
+                )));
+            }
+            drop(child_file);
+            hash_open_directory_tree(&child_access, &child_path, hasher)?;
+            let current = access.child_metadata(name)?;
+            if current.identity() != before.identity()
+                || !current.is_dir()
+                || (current.mode() & 0o7777) != (before.mode() & 0o7777)
+            {
+                return Err(io::Error::other(format!(
+                    "Directory tree directory changed while hashing: '{}'",
+                    child_path.display()
+                )));
+            }
+        } else if before.is_symlink() {
+            hasher.update(b"symlink\0");
+            #[cfg(unix)]
+            {
+                let target = access.read_link(name)?;
+                update_tree_digest_name(hasher, target.as_os_str());
+                let current = access.child_metadata(name)?;
+                if current.identity() != before.identity() || !current.is_symlink() {
+                    return Err(io::Error::other(format!(
+                        "Directory tree symlink changed while hashing: '{}'",
+                        child_path.display()
+                    )));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "Safe symbolic-link verification is unavailable for '{}'",
+                        child_path.display()
+                    ),
+                ));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot verify special file in directory move: '{}'",
+                    child_path.display()
+                ),
+            ));
+        }
+    }
+
+    let mut names_after = access.collect_entry_names()?;
+    names_after.sort();
+    let directory_after = access.file().metadata()?;
+    if names_after != names || !metadata_still_matches(&directory_before, &directory_after) {
+        return Err(io::Error::other(format!(
+            "Directory tree changed while hashing: '{}'",
+            display_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn sha256_directory_tree_snapshot(path: &Path, expected: &PathIdentity) -> io::Result<[u8; 32]> {
+    if !expected.is_directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Directory tree verification requires a directory",
+        ));
+    }
+    let (directory, access, _) = open_directory_for_read(path)?;
+    if stable_file_identity(&directory)? != expected.stable
+        || !matches!(path_identity(path), Ok(current) if current.same_snapshot(expected))
+    {
+        return Err(io::Error::other(format!(
+            "Directory tree changed before verification: '{}'",
+            path.display()
+        )));
+    }
+    drop(directory);
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"cokacdir-directory-tree-v1\0");
+    hash_open_directory_tree(&access, path, &mut hasher)?;
+    if stable_file_identity(access.file())? != expected.stable
+        || !matches!(path_identity(path), Ok(current) if current.same_snapshot(expected))
+    {
+        return Err(io::Error::other(format!(
+            "Directory tree changed during verification: '{}'",
+            path.display()
+        )));
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Copy directly into an exclusively-created entry of a private tree.  The
@@ -5229,12 +5374,6 @@ pub fn move_files_with_progress(
                 }
                 continue;
             }
-            if source_identity.is_directory {
-                failure_count += 1;
-                let error = cross_filesystem_directory_move_error(&src);
-                let _ = progress_tx.send(ProgressMessage::Error(filename, error.to_string()));
-                continue;
-            }
             needs_copy.push((
                 src,
                 dest,
@@ -5293,44 +5432,23 @@ pub fn move_files_with_progress(
                 // Cross-device rename cannot publish directly. Unsupported
                 // no-replace primitives also use the safe copy/publish path.
                 if is_cross_device_error(&e) {
-                    if source_identity.is_directory {
-                        failure_count += 1;
-                        let error = cross_filesystem_directory_move_error(&src);
-                        let _ =
-                            progress_tx.send(ProgressMessage::Error(filename, error.to_string()));
-                    } else {
-                        needs_copy.push((
-                            src,
-                            dest,
-                            item_size,
-                            overwriting,
-                            source_identity,
-                            destination_identity,
-                        ));
-                    }
+                    needs_copy.push((
+                        src,
+                        dest,
+                        item_size,
+                        overwriting,
+                        source_identity,
+                        destination_identity,
+                    ));
                 } else if e.kind() == io::ErrorKind::Unsupported {
-                    if source_identity.is_directory {
-                        failure_count += 1;
-                        let error = io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!(
-                                "Directory move requires an atomic no-clobber rename for '{}': {}",
-                                src.display(),
-                                e
-                            ),
-                        );
-                        let _ =
-                            progress_tx.send(ProgressMessage::Error(filename, error.to_string()));
-                    } else {
-                        needs_copy.push((
-                            src,
-                            dest,
-                            item_size,
-                            overwriting,
-                            source_identity,
-                            destination_identity,
-                        ));
-                    }
+                    needs_copy.push((
+                        src,
+                        dest,
+                        item_size,
+                        overwriting,
+                        source_identity,
+                        destination_identity,
+                    ));
                 } else {
                     failure_count += 1;
                     let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
@@ -5429,38 +5547,51 @@ pub fn move_files_with_progress(
                 continue;
             }
             let copy_source_authorization = PathAuthorization::from_identity(&source_identity);
+            let source_is_directory = source_metadata.is_dir() && !source_metadata.is_symlink();
 
-            let copy_result: io::Result<(PublishedStage, Option<[u8; 32]>)> =
-                if source_metadata.is_dir() && !source_metadata.is_symlink() {
-                    Err(cross_filesystem_directory_move_error(&src))
-                } else if source_metadata.is_symlink() {
-                    copy_symlink_detailed(&src, &copy_dest, &dest, Some(&copy_source_authorization))
-                        .map(|published| (published, None))
-                } else if source_metadata.is_file() {
-                    let file_completed_bytes = completed_bytes;
+            let copy_result: io::Result<(PublishedStage, Option<[u8; 32]>)> = if source_is_directory
+            {
+                copy_dir_recursive_with_progress_detailed(
+                    &src,
+                    &copy_dest,
+                    &dest,
+                    Some(&copy_source_authorization),
+                    &cancel_flag,
+                    &progress_tx,
+                    &mut completed_bytes,
+                    &mut completed_files,
+                    total_bytes,
+                    total_files,
+                )
+                .map(|published| (published, None))
+            } else if source_metadata.is_symlink() {
+                copy_symlink_detailed(&src, &copy_dest, &dest, Some(&copy_source_authorization))
+                    .map(|published| (published, None))
+            } else if source_metadata.is_file() {
+                let file_completed_bytes = completed_bytes;
 
-                    copy_file_with_progress_detailed(
-                        &src,
-                        &copy_dest,
-                        Some(&copy_source_authorization),
-                        &cancel_flag,
-                        |copied, total| {
-                            let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                            let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                                completed_files,
-                                total_files,
-                                file_completed_bytes + copied,
-                                total_bytes,
-                            ));
-                        },
-                    )
-                    .map(|(_, published, source_sha256)| (published, Some(source_sha256)))
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Cannot move special file",
-                    ))
-                };
+                copy_file_with_progress_detailed(
+                    &src,
+                    &copy_dest,
+                    Some(&copy_source_authorization),
+                    &cancel_flag,
+                    |copied, total| {
+                        let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                        let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                            completed_files,
+                            total_files,
+                            file_completed_bytes + copied,
+                            total_bytes,
+                        ));
+                    },
+                )
+                .map(|(_, published, source_sha256)| (published, Some(source_sha256)))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cannot move special file",
+                ))
+            };
 
             match copy_result {
                 Ok((published, copied_source_sha256)) => {
@@ -5499,57 +5630,60 @@ pub fn move_files_with_progress(
                         break;
                     }
 
-                    let isolated_source = match QuarantinedSource::prepare(&src, source_identity) {
-                        Ok(source) => source,
-                        Err(error) => {
-                            let retry_unsafe = is_retry_unsafe(&error);
-                            let error = match stage.cleanup() {
-                                Ok(()) => error,
-                                Err(cleanup_error) => operation_error(
-                                    error.kind(),
-                                    format!(
-                                        "{}; destination staging cleanup also failed: {}",
-                                        error, cleanup_error
+                    let mut isolated_source =
+                        match QuarantinedSource::prepare(&src, source_identity) {
+                            Ok(source) => source,
+                            Err(error) => {
+                                let retry_unsafe = is_retry_unsafe(&error);
+                                let error = match stage.cleanup() {
+                                    Ok(()) => error,
+                                    Err(cleanup_error) => operation_error(
+                                        error.kind(),
+                                        format!(
+                                            "{}; destination staging cleanup also failed: {}",
+                                            error, cleanup_error
+                                        ),
+                                        retry_unsafe,
                                     ),
-                                    retry_unsafe,
-                                ),
-                            };
-                            failure_count += 1;
-                            let message = if is_retry_unsafe(&error) {
-                                ProgressMessage::TerminalError(filename, error.to_string())
-                            } else {
-                                ProgressMessage::Error(filename, error.to_string())
-                            };
-                            let _ = progress_tx.send(message);
-                            continue;
-                        }
-                    };
+                                };
+                                failure_count += 1;
+                                let message = if is_retry_unsafe(&error) {
+                                    ProgressMessage::TerminalError(filename, error.to_string())
+                                } else {
+                                    ProgressMessage::Error(filename, error.to_string())
+                                };
+                                let _ = progress_tx.send(message);
+                                continue;
+                            }
+                        };
 
-                    if let Some(copied_source_sha256) = copied_source_sha256 {
-                        if let Err(verify_error) = verify_isolated_source_matches_copy(
-                            &isolated_source,
-                            copied_source_sha256,
-                        ) {
-                            let error = match stage.cleanup() {
-                                Ok(()) => verify_error,
-                                Err(cleanup_error) => io::Error::new(
-                                    verify_error.kind(),
-                                    format!(
-                                        "{}; destination staging cleanup also failed: {}",
-                                        verify_error, cleanup_error
-                                    ),
+                    let source_verification = if source_is_directory {
+                        isolated_source.bind_verified_directory_copy(&stage)
+                    } else if let Some(copied_source_sha256) = copied_source_sha256 {
+                        verify_isolated_source_matches_copy(&isolated_source, copied_source_sha256)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(verify_error) = source_verification {
+                        let error = match stage.cleanup() {
+                            Ok(()) => verify_error,
+                            Err(cleanup_error) => io::Error::new(
+                                verify_error.kind(),
+                                format!(
+                                    "{}; destination staging cleanup also failed: {}",
+                                    verify_error, cleanup_error
                                 ),
-                            };
-                            let error = isolated_source.restore(error);
-                            failure_count += 1;
-                            let message = if is_retry_unsafe(&error) {
-                                ProgressMessage::TerminalError(filename, error.to_string())
-                            } else {
-                                ProgressMessage::Error(filename, error.to_string())
-                            };
-                            let _ = progress_tx.send(message);
-                            continue;
-                        }
+                            ),
+                        };
+                        let error = isolated_source.restore(error);
+                        failure_count += 1;
+                        let message = if is_retry_unsafe(&error) {
+                            ProgressMessage::TerminalError(filename, error.to_string())
+                        } else {
+                            ProgressMessage::Error(filename, error.to_string())
+                        };
+                        let _ = progress_tx.send(message);
+                        continue;
                     }
 
                     if cancel_flag.load(Ordering::Relaxed) {
@@ -5594,8 +5728,10 @@ pub fn move_files_with_progress(
                     ) {
                         Ok(warnings) => {
                             send_operation_warnings(&progress_tx, &filename, warnings);
-                            completed_bytes += item_size;
-                            completed_files += 1;
+                            if !source_is_directory {
+                                completed_bytes += item_size;
+                                completed_files += 1;
+                            }
                             success_count += 1;
                             let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
                         }
@@ -5679,6 +5815,15 @@ const MAX_COPY_DEPTH: usize = 256;
 
 /// Copy directory recursively with symlink loop detection
 pub fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
+    copy_dir_recursive_detailed(src, dest, dest, None).map(drop)
+}
+
+fn copy_dir_recursive_detailed(
+    src: &Path,
+    dest: &Path,
+    logical_destination: &Path,
+    expected_source: Option<&PathAuthorization>,
+) -> io::Result<PublishedStage> {
     let metadata = fs::symlink_metadata(src)?;
     if metadata.is_symlink() || !metadata.is_dir() {
         return Err(io::Error::new(
@@ -5694,11 +5839,20 @@ pub fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
     }
     let partial = PartialStage::bind_directory(staging)?;
     let mut visited = HashSet::new();
-    match copy_dir_recursive_inner(src, &temp, dest, None, &mut visited, 0, true, None) {
+    match copy_dir_recursive_inner(
+        src,
+        &temp,
+        logical_destination,
+        expected_source,
+        &mut visited,
+        0,
+        true,
+        None,
+    ) {
         Ok(()) => {
             let stage = partial.seal()?;
             match stage.publish_noreplace(dest) {
-                Ok(published) if published.identity.is_some() => Ok(()),
+                Ok(published) if published.identity.is_some() => Ok(published),
                 Ok(_) => Err(io::Error::other(format!(
                     "Directory publication at '{}' committed, but the destination no longer identifies the staged directory; inspect it manually",
                     dest.display()
@@ -5889,19 +6043,7 @@ pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
         Err(e) => {
             // If rename fails (cross-device), copy then delete
             if is_cross_device_error(&e) {
-                if identity.is_directory {
-                    return Err(cross_filesystem_directory_move_error(src));
-                }
                 move_file_via_verified_copy(src, dest, identity)
-            } else if e.kind() == io::ErrorKind::Unsupported && identity.is_directory {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "Directory move requires an atomic no-clobber rename for '{}': {}",
-                        src.display(),
-                        e
-                    ),
-                ))
             } else if e.kind() == io::ErrorKind::Unsupported {
                 move_file_via_verified_copy(src, dest, identity)
             } else {
@@ -5922,9 +6064,13 @@ fn move_file_via_verified_copy(
     )?;
     let copy_dest = staging.payload();
     let metadata = fs::symlink_metadata(src)?;
+    let source_is_directory = metadata.is_dir() && !metadata.is_symlink();
     let copy_source_authorization = PathAuthorization::from_identity(&source_identity);
     let published = if metadata.is_symlink() {
         copy_symlink_detailed(src, &copy_dest, dest, Some(&copy_source_authorization))
+            .map(|published| (published, None))
+    } else if source_is_directory {
+        copy_dir_recursive_detailed(src, &copy_dest, dest, Some(&copy_source_authorization))
             .map(|published| (published, None))
     } else if metadata.is_file() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -5951,7 +6097,7 @@ fn move_file_via_verified_copy(
         Err(error) => return Err(error_with_staging_cleanup(error, staging)),
     };
     let stage = OwnedStage::from_published(staging, identity)?;
-    let source = match QuarantinedSource::prepare(src, source_identity) {
+    let mut source = match QuarantinedSource::prepare(src, source_identity) {
         Ok(source) => source,
         Err(error) => {
             return Err(match stage.cleanup() {
@@ -5966,22 +6112,25 @@ fn move_file_via_verified_copy(
             })
         }
     };
-    if let Some(copied_source_sha256) = copied_source_sha256 {
-        if let Err(verify_error) =
-            verify_isolated_source_matches_copy(&source, copied_source_sha256)
-        {
-            let error = match stage.cleanup() {
-                Ok(()) => verify_error,
-                Err(cleanup_error) => io::Error::new(
-                    verify_error.kind(),
-                    format!(
-                        "{}; destination staging cleanup also failed: {}",
-                        verify_error, cleanup_error
-                    ),
+    let source_verification = if source_is_directory {
+        source.bind_verified_directory_copy(&stage)
+    } else if let Some(copied_source_sha256) = copied_source_sha256 {
+        verify_isolated_source_matches_copy(&source, copied_source_sha256)
+    } else {
+        Ok(())
+    };
+    if let Err(verify_error) = source_verification {
+        let error = match stage.cleanup() {
+            Ok(()) => verify_error,
+            Err(cleanup_error) => io::Error::new(
+                verify_error.kind(),
+                format!(
+                    "{}; destination staging cleanup also failed: {}",
+                    verify_error, cleanup_error
                 ),
-            };
-            return Err(source.restore(error));
-        }
+            ),
+        };
+        return Err(source.restore(error));
     }
     match commit_cross_filesystem_move(stage, dest, None, source, copy_warnings, None) {
         Ok(warnings) if warnings.is_empty() => Ok(()),
@@ -6600,6 +6749,38 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn create_cross_filesystem_test_dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+        let source = tempfile::Builder::new()
+            .prefix("cokacdir-cross-source-")
+            .tempdir()
+            .ok()?;
+        let source_namespace = stable_path_identity(source.path()).ok()?.namespace;
+        let mut candidates = Vec::new();
+        if let Some(candidate) = std::env::var_os("COKACDIR_CROSS_FILESYSTEM_TEST_DIR") {
+            candidates.push(PathBuf::from(candidate));
+        }
+        candidates.push(PathBuf::from("/dev/shm"));
+        if let Ok(current) = std::env::current_dir() {
+            candidates.push(current);
+        }
+        for candidate in candidates {
+            let Ok(target) = tempfile::Builder::new()
+                .prefix("cokacdir-cross-target-")
+                .tempdir_in(candidate)
+            else {
+                continue;
+            };
+            let Ok(target_identity) = stable_path_identity(target.path()) else {
+                continue;
+            };
+            if target_identity.namespace != source_namespace {
+                return Some((source, target));
+            }
+        }
+        None
+    }
+
+    #[cfg(unix)]
     #[test]
     fn directory_access_keeps_using_the_open_directory_after_path_replacement() {
         let root = create_temp_dir();
@@ -6851,45 +7032,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&dest).unwrap(), "racer");
         assert_eq!(fs::read_to_string(&staged).unwrap(), "new");
 
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[test]
-    fn quarantined_delete_rejects_a_same_metadata_replacement() {
-        let temp_dir = create_temp_dir();
-        let source = temp_dir.join("source");
-        let retained_original = temp_dir.join("retained-original");
-        fs::write(&source, b"same-size").unwrap();
-        let expected = path_identity(&source).unwrap();
-
-        let error = delete_if_unchanged_impl(&source, expected, |quarantined| {
-            fs::rename(quarantined, &retained_original).unwrap();
-            fs::write(quarantined, b"different").unwrap();
-            let original_metadata = fs::metadata(&retained_original).unwrap();
-            preserve_timestamps(quarantined, &original_metadata).unwrap();
-        })
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("replaced while being quarantined"));
-        assert_eq!(fs::read(&source).unwrap(), b"different");
-        assert_eq!(fs::read(&retained_original).unwrap(), b"same-size");
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[test]
-    fn copy_then_delete_refuses_a_directory_without_a_tree_snapshot() {
-        let temp_dir = create_temp_dir();
-        let source = temp_dir.join("source-directory");
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("child"), b"must survive").unwrap();
-        let expected = path_identity(&source).unwrap();
-
-        let error = delete_if_unchanged(&source, expected).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(fs::read(source.join("child")).unwrap(), b"must survive");
         cleanup_temp_dir(&temp_dir);
     }
 
@@ -7640,6 +7782,87 @@ mod tests {
                 .starts_with(".cokacdir-move-stage")
         }));
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_filesystem_directory_move_preserves_tree_and_removes_source() {
+        let Some((source_root, target_root)) = create_cross_filesystem_test_dirs() else {
+            return;
+        };
+        let source_dir = source_root.path().join("source");
+        let target_dir = target_root.path().join("target");
+        let source = source_dir.join("item");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(source.join("root.txt"), "root").unwrap();
+        fs::write(source.join("nested/child.txt"), "child").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        move_files_with_progress(
+            vec![PathBuf::from("item")],
+            &source_dir,
+            &target_dir,
+            HashMap::new(),
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(!source.exists());
+        let destination = target_dir.join("item");
+        assert_eq!(
+            fs::read_to_string(destination.join("root.txt")).unwrap(),
+            "root"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/child.txt")).unwrap(),
+            "child"
+        );
+        assert!(destination.join("empty").is_dir());
+    }
+
+    #[test]
+    fn directory_tree_snapshot_detects_same_length_descendant_rewrite() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        let child = source.join("nested/data");
+        fs::write(&child, b"original").unwrap();
+        let identity = path_identity(&source).unwrap();
+        let before = sha256_directory_tree_snapshot(&source, &identity).unwrap();
+
+        fs::write(&child, b"modified").unwrap();
+
+        let after = sha256_directory_tree_snapshot(&source, &identity).unwrap();
+        assert_ne!(before, after);
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unstructured_cross_filesystem_directory_move_uses_verified_copy() {
+        let Some((source_root, target_root)) = create_cross_filesystem_test_dirs() else {
+            return;
+        };
+        let source = source_root.path().join("item");
+        let destination = target_root.path().join("item");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/data"), "verified").unwrap();
+
+        move_file(&source, &destination).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/data")).unwrap(),
+            "verified"
+        );
     }
 
     #[cfg(unix)]

@@ -1640,7 +1640,9 @@ fn opencode_native_exe_for_wrapper(path: &str) -> Option<String> {
 // quarantine are deliberately left in place for manual recovery.
 
 const AGENTS_MD: &str = "AGENTS.md";
-const LOCK_FILE: &str = ".AGENTS.md.cokacdir-lock";
+#[cfg(test)]
+const LEGACY_WORKSPACE_LOCK_FILE: &str = ".AGENTS.md.cokacdir-lock";
+const LOCK_DIRECTORY: &str = "opencode-agent-locks";
 const STATE_PREFIX: &str = ".AGENTS.md.cokacdir-state-v2.";
 const STATE_STAGING_PREFIX: &str = ".AGENTS.md.cokacdir-state-staging-v2.";
 const STATE_DONE_PREFIX: &str = ".AGENTS.md.cokacdir-state-done-v2.";
@@ -2146,41 +2148,153 @@ fn control_path_absent(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-fn try_acquire_lock(dir: &std::path::Path) -> Option<std::fs::File> {
-    let lock_path = dir.join(LOCK_FILE);
-    let file = match std::fs::symlink_metadata(&lock_path) {
-        Ok(metadata) => {
-            if !metadata_is_safe_regular(&metadata) {
-                opencode_debug("[agents lock] refusing symlink/reparse/non-regular lock file");
-                return None;
-            }
-            open_regular_no_follow(&lock_path, true)
+fn default_agents_lock_root() -> Option<std::path::PathBuf> {
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|home| home.join(".cokacdir").join(LOCK_DIRECTORY))
+    }
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join(format!(
+            "cokacdir-{}-tests-{}",
+            LOCK_DIRECTORY,
+            std::process::id()
+        )))
+    }
+}
+
+fn agents_lock_name(dir: &std::path::Path) -> std::io::Result<std::ffi::OsString> {
+    let canonical = dir.canonicalize()?;
+    if !canonical.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("OpenCode workspace is not a directory: {}", dir.display()),
+        ));
+    }
+    let (namespace, object) =
+        crate::services::file_ops::stable_path_identity(&canonical)?.components();
+    Ok(format!("agents-{namespace:016x}-{}.lock", hex::encode(object)).into())
+}
+
+fn open_agents_lock_directory(
+    root: &std::path::Path,
+) -> std::io::Result<(std::fs::File, crate::services::file_ops::DirectoryAccess)> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "OpenCode lock root is not a real directory: {}",
+                    root.display()
+                ),
+            ))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match create_private_new(&lock_path) {
-                Ok(file) => {
-                    if let Err(error) = file.sync_all().and_then(|_| sync_agents_parent(&lock_path))
-                    {
-                        opencode_debug(&format!("[agents lock] cannot sync new lock: {error}"));
-                        return None;
-                    }
-                    Ok(file)
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    open_regular_no_follow(&lock_path, true)
-                }
-                Err(error) => Err(error),
-            }
+            std::fs::create_dir_all(root)?;
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    }
+    let (directory, access, metadata) = crate::services::file_ops::open_directory_for_read(root)?;
+    let identity = crate::services::file_ops::stable_file_identity(&directory)?;
+    if !metadata.is_dir() || identity != crate::services::file_ops::stable_path_identity(root)? {
+        return Err(std::io::Error::other(format!(
+            "OpenCode lock root changed while being opened: {}",
+            root.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    if crate::services::file_ops::stable_file_identity(&directory)? != identity
+        || crate::services::file_ops::stable_path_identity(root)? != identity
+    {
+        return Err(std::io::Error::other(format!(
+            "OpenCode lock root changed while it was being secured: {}",
+            root.display()
+        )));
+    }
+    Ok((directory, access))
+}
+
+fn try_acquire_lock_at(
+    dir: &std::path::Path,
+    lock_root: &std::path::Path,
+) -> Option<std::fs::File> {
+    let lock_name = match agents_lock_name(dir) {
+        Ok(name) => name,
+        Err(error) => {
+            opencode_debug(&format!("[agents lock] cannot identify workspace: {error}"));
+            return None;
+        }
     };
-    let file = match file {
+    let (directory, access) = match open_agents_lock_directory(lock_root) {
+        Ok(opened) => opened,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[agents lock] cannot open private lock root: {error}"
+            ));
+            return None;
+        }
+    };
+    let file = match access.open_file(
+        &lock_name,
+        crate::services::file_ops::DirectoryFileOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .pin_name(true)
+            .mode(0o600),
+    ) {
         Ok(file) => file,
         Err(error) => {
             opencode_debug(&format!("[agents lock] cannot safely open lock: {error}"));
             return None;
         }
     };
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata_is_safe_regular(&metadata) => metadata,
+        Ok(_) => {
+            opencode_debug("[agents lock] refusing non-regular private lock file");
+            return None;
+        }
+        Err(error) => {
+            opencode_debug(&format!(
+                "[agents lock] cannot inspect private lock: {error}"
+            ));
+            return None;
+        }
+    };
+    let identity = match crate::services::file_ops::stable_file_identity(&file) {
+        Ok(identity) => identity,
+        Err(error) => {
+            opencode_debug(&format!(
+                "[agents lock] cannot identify private lock: {error}"
+            ));
+            return None;
+        }
+    };
+    if access.child_identity(&lock_name).ok() != Some(identity) {
+        opencode_debug("[agents lock] private lock path changed while being opened");
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            opencode_debug(&format!(
+                "[agents lock] cannot secure private lock: {error}"
+            ));
+            return None;
+        }
+    }
+    let _ = metadata;
+    if let Err(error) = file.sync_all().and_then(|_| directory.sync_all()) {
+        opencode_debug(&format!("[agents lock] cannot sync private lock: {error}"));
+        return None;
+    }
 
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Some(file),
@@ -2190,6 +2304,11 @@ fn try_acquire_lock(dir: &std::path::Path) -> Option<std::fs::File> {
             None
         }
     }
+}
+
+fn try_acquire_lock(dir: &std::path::Path) -> Option<std::fs::File> {
+    let root = default_agents_lock_root()?;
+    try_acquire_lock_at(dir, &root)
 }
 
 fn valid_txn_id(txn: &str) -> bool {
@@ -3096,7 +3215,11 @@ mod agents_md_lock_tests {
         let dir = tempfile::tempdir().unwrap();
         let agents = dir.path().join(AGENTS_MD);
         std::fs::write(&agents, "  user instructions\n\n").unwrap();
-        std::fs::write(dir.path().join(LOCK_FILE), b"do not truncate this lock\n").unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_WORKSPACE_LOCK_FILE),
+            b"do not truncate this lock\n",
+        )
+        .unwrap();
 
         let guard = inject_system_prompt_into_agents_md(path(&dir), "system prompt").unwrap();
         assert!(std::fs::read_to_string(&agents)
@@ -3126,7 +3249,7 @@ mod agents_md_lock_tests {
 
         assert_eq!(std::fs::read(&agents).unwrap(), b"  user instructions\n\n");
         assert_eq!(
-            std::fs::read(dir.path().join(LOCK_FILE)).unwrap(),
+            std::fs::read(dir.path().join(LEGACY_WORKSPACE_LOCK_FILE)).unwrap(),
             b"do not truncate this lock\n"
         );
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
@@ -3146,6 +3269,7 @@ mod agents_md_lock_tests {
         );
         drop(guard);
         assert!(!dir.path().join(AGENTS_MD).exists());
+        assert!(!dir.path().join(LEGACY_WORKSPACE_LOCK_FILE).exists());
         assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()
@@ -3329,17 +3453,28 @@ mod agents_md_lock_tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_agents_lock_and_control_files_are_refused() {
+    fn symlink_agents_and_control_files_are_refused_without_touching_legacy_lock() {
         use std::os::unix::fs::symlink;
 
-        for unsafe_name in [AGENTS_MD, LOCK_FILE] {
-            let dir = tempfile::tempdir().unwrap();
-            let target = dir.path().join("target");
-            std::fs::write(&target, "target data\n").unwrap();
-            symlink(&target, dir.path().join(unsafe_name)).unwrap();
-            assert!(inject_system_prompt_into_agents_md(path(&dir), "prompt").is_err());
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "target data\n").unwrap();
+        symlink(&target, dir.path().join(AGENTS_MD)).unwrap();
+        assert!(inject_system_prompt_into_agents_md(path(&dir), "prompt").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "target data\n").unwrap();
+        let legacy_lock = dir.path().join(LEGACY_WORKSPACE_LOCK_FILE);
+        symlink(&target, &legacy_lock).unwrap();
+        let guard = inject_system_prompt_into_agents_md(path(&dir), "prompt").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+        assert!(std::fs::symlink_metadata(legacy_lock)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
@@ -3350,6 +3485,37 @@ mod agents_md_lock_tests {
             inject_system_prompt_into_agents_md_impl(path(&dir), "prompt", Some(txn)).is_none()
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "target data\n");
+    }
+
+    #[test]
+    fn workspace_lock_is_external_and_serializes_contenders() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lock_parent = tempfile::tempdir().unwrap();
+        let lock_root = lock_parent.path().join("locks");
+
+        let first = try_acquire_lock_at(workspace.path(), &lock_root).unwrap();
+        assert!(!workspace.path().join(LEGACY_WORKSPACE_LOCK_FILE).exists());
+        let lock_name = agents_lock_name(workspace.path()).unwrap();
+        assert!(lock_root.join(lock_name).is_file());
+        assert!(try_acquire_lock_at(workspace.path(), &lock_root).is_none());
+        drop(first);
+        assert!(try_acquire_lock_at(workspace.path(), &lock_root).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_external_lock_root_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let lock_parent = tempfile::tempdir().unwrap();
+        let real_root = lock_parent.path().join("real");
+        let linked_root = lock_parent.path().join("linked");
+        std::fs::create_dir(&real_root).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+
+        assert!(try_acquire_lock_at(workspace.path(), &linked_root).is_none());
+        assert!(std::fs::read_dir(real_root).unwrap().next().is_none());
     }
 
     #[cfg(windows)]
