@@ -2066,7 +2066,7 @@ pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,
     working_dir: &str,
-    _allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>, // compatibility only; allowed_tools is Claude-only
     model: Option<&str>,
 ) -> ClaudeResponse {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2130,7 +2130,7 @@ pub fn execute_command_streaming(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     system_prompt: Option<&str>,
-    _allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>, // compatibility only; allowed_tools is Claude-only
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     no_session_persistence: bool,

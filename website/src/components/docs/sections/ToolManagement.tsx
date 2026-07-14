@@ -6,15 +6,22 @@ export default function ToolManagement() {
   return (
     <div>
       <SectionTitle>{t('Tool Management', '도구 관리')}</SectionTitle>
-      <P>{t('Control which tools the AI can use per chat.', '채팅별로 AI가 사용할 수 있는 도구를 제어하세요.')}</P>
+      <P>{t('Control which tools Claude can use per chat.', '채팅별로 Claude가 사용할 수 있는 도구를 제어하세요.')}</P>
+
+      <InfoBox type="info">
+        {t(
+          <>This entire feature is Claude-only. <IC>/availabletools</IC>, <IC>/allowedtools</IC>, and <IC>/allowed</IC> are rejected with Codex, Agy, or OpenCode, and their agents keep their native/full permissions.</>,
+          <>이 기능 전체는 Claude 전용입니다. Codex, Agy 또는 OpenCode에서는 <IC>/availabletools</IC>, <IC>/allowedtools</IC>, <IC>/allowed</IC>가 거부되며 해당 에이전트는 자체 full 권한을 유지합니다.</>
+        )}
+      </InfoBox>
 
       <SubSection title={String(t('Commands', '명령어'))}>
         <CommandTable
           headers={[String(t('Command', '명령어')), String(t('Description', '설명'))]}
           rows={[
-            ['/availabletools', String(t('List all available tools (destructive tools marked with !!!)', '사용 가능한 모든 도구 목록 (위험한 도구는 !!!로 표시)'))],
-            ['/allowedtools', String(t('Show currently enabled tools for this chat', '현재 채팅에서 활성화된 도구 표시'))],
-            ['/allowed +Tool -Tool', String(t('Add or remove tools (case-insensitive)', '도구 추가 또는 제거 (대소문자 무관)'))],
+            ['/availabletools', String(t('List available Claude tools (Claude only)', '사용 가능한 Claude 도구 목록 (Claude 전용)'))],
+            ['/allowedtools', String(t('Show enabled Claude tools for this chat (Claude only)', '현재 채팅에서 활성화된 Claude 도구 표시 (Claude 전용)'))],
+            ['/allowed +Tool -Tool', String(t('Add or remove Claude tools (Claude only, case-insensitive)', 'Claude 도구 추가 또는 제거 (Claude 전용, 대소문자 무관)'))],
           ]}
         />
       </SubSection>

@@ -99,7 +99,7 @@ export default function AgyProvider() {
 
       <SubSection title={String(t('Limitations', '제한 사항'))}>
         <UL>
-          <li>{t(<><IC>/allowed</IC> tool restrictions do not constrain Agy; they are enforced only for Claude.</>, <><IC>/allowed</IC> 도구 제한은 Agy를 제약하지 않습니다. 현재 Claude에만 적용됩니다.</>)}</li>
+          <li>{t(<>The entire <IC>allowed_tools</IC> feature is Claude-only. <IC>/availabletools</IC>, <IC>/allowedtools</IC>, and <IC>/allowed</IC> are rejected for Agy and do not constrain it.</>, <><IC>allowed_tools</IC> 기능 전체는 Claude 전용입니다. Agy에서는 <IC>/availabletools</IC>, <IC>/allowedtools</IC>, <IC>/allowed</IC>가 거부되며 Agy를 제약하지 않습니다.</>)}</li>
           <li>{t(<><IC>/loop</IC> verification is rejected for Agy because no isolated no-tools verifier mode has been measured.</>, <><IC>/loop</IC> 검증은 Agy에서 거부됩니다. 격리된 no-tools verifier mode가 실측되지 않았기 때문입니다.</>)}</li>
           <li>{t('Agy conversation files live under ~/.gemini/antigravity-cli because that is the storage path used by Antigravity CLI.', 'Agy 대화 파일은 Antigravity CLI가 사용하는 저장 경로인 ~/.gemini/antigravity-cli 아래에 있습니다.')}</li>
           <li>{t('Agy treats hook errors as fail-open. The ledger and acknowledgement let cokacdir detect a hook that never started (or did not complete) and discard its output, but cannot prove that Agy applied an otherwise valid hook response or undo model/tool side effects that already happened.', 'Agy는 훅 오류를 fail-open으로 처리합니다. ledger와 acknowledgement를 통해 훅이 시작되지 않았거나 완료되지 않은 경우를 감지해 출력을 폐기하지만, Agy가 형식상 유효한 훅 응답을 실제로 적용했는지는 증명할 수 없고 이미 발생한 모델·도구 부작용도 되돌릴 수 없습니다.')}</li>

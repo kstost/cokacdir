@@ -1029,10 +1029,13 @@ pub fn clone_session_for_schedule(
 
 /// Execute a command using Codex CLI with streaming output.
 ///
-/// Parameters mirror `claude::execute_command_streaming` for consistency,
-/// but `allowed_tools` is ignored because Codex exec has no tool restriction
-/// support. `no_session_persistence` maps to `codex exec --ephemeral` for
-/// one-shot calls.
+/// Parameters mirror `claude::execute_command_streaming` for consistency.
+/// Codex agents intentionally run with full execution permissions in this
+/// application, so `allowed_tools` is compatibility metadata rather than a
+/// security boundary and is deliberately ignored here. The approval/sandbox
+/// bypass below is therefore expected product behavior, including for
+/// background companion work. `no_session_persistence` maps to
+/// `codex exec --ephemeral` for one-shot calls.
 ///
 /// When `session_id` is Some, uses `codex exec resume` to continue an existing
 /// session (Codex manages conversation history natively). When None, starts a
@@ -1043,7 +1046,7 @@ pub fn execute_command_streaming(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     system_prompt: Option<&str>,
-    _allowed_tools: Option<&[String]>, // ignored — Codex has no tool restriction
+    _allowed_tools: Option<&[String]>, // intentionally advisory: Codex runs with full permissions
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,                  // "codex:" prefix already stripped
     no_session_persistence: bool,         // true = pass `--ephemeral` on new sessions
@@ -1088,6 +1091,8 @@ pub fn execute_command_streaming(
             return Err(format!("Invalid session_id format: {}", sid));
         }
         codex_debug_log(&format!("Building RESUME args, session_id={}", sid));
+        // Full permissions are intentional for every Codex agent invocation;
+        // the bypass is not an accidental omission of the caller's tool list.
         // codex exec resume --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <session_id> -
         vec![
             "exec".to_string(),
@@ -1102,6 +1107,8 @@ pub fn execute_command_streaming(
             "Building NEW SESSION args, working_dir={}",
             working_dir
         ));
+        // Full permissions are intentional for every Codex agent invocation,
+        // including ephemeral/background workers.
         // codex exec --json [--ephemeral] --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -C <dir> -
         let mut args = vec![
             "exec".to_string(),

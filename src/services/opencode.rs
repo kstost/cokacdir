@@ -3927,7 +3927,7 @@ pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,
     working_dir: &str,
-    _allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>, // compatibility only; allowed_tools is Claude-only
     model: Option<&str>,
 ) -> ClaudeResponse {
     opencode_debug(&format!(
@@ -4254,6 +4254,10 @@ pub fn execute_command(
 /// Public entry point. Dispatches between the new SSE-based adapter (default)
 /// and the legacy `opencode run --format json` subprocess path.
 ///
+/// `allowed_tools` is accepted only for call-signature compatibility. The
+/// cokacdir allowlist belongs exclusively to Claude and never constrains
+/// OpenCode's native/full agent permissions.
+///
 /// Routing rules:
 /// - If env `COKACDIR_OPENCODE_LEGACY=1` is set, always use the legacy path.
 /// - If there is no tokio runtime available at the call site, fall back to
@@ -4267,7 +4271,7 @@ pub fn execute_command_streaming(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     system_prompt: Option<&str>,
-    allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     no_session_persistence: bool,
@@ -4292,7 +4296,7 @@ pub fn execute_command_streaming(
             working_dir,
             sender,
             system_prompt,
-            allowed_tools,
+            None,
             cancel_token,
             model,
             no_session_persistence,
@@ -4331,7 +4335,7 @@ pub fn execute_command_streaming(
                 working_dir,
                 sender,
                 system_prompt,
-                allowed_tools,
+                None,
                 cancel_token,
                 model,
                 no_session_persistence,
@@ -4349,7 +4353,7 @@ fn execute_command_streaming_legacy(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     system_prompt: Option<&str>,
-    _allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>, // compatibility only; allowed_tools is Claude-only
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,
     _no_session_persistence: bool,

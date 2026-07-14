@@ -1,10 +1,12 @@
 # How to Manage Tools
 
-Tools are the actions the AI agent can perform — running commands, reading files, editing code, searching the web, etc. You can control which tools are available per chat.
+Tools are the actions the AI agent can perform — running commands, reading files, editing code, searching the web, etc. The tool-management commands on this page control **Claude only**.
+
+> **Claude-only feature:** `/availabletools`, `/allowedtools`, and `/allowed` are available only while the active provider is Claude. They do not inspect, configure, or restrict Codex, Agy, or OpenCode.
 
 ---
 
-## /availabletools
+## /availabletools (Claude only)
 
 Lists all tools that can be enabled. Destructive tools are marked with `!!!`.
 
@@ -18,11 +20,11 @@ Edit !!! — Edit file contents
 Total: 20
 ```
 
-## /allowedtools
+## /allowedtools (Claude only)
 
 Shows the tools currently enabled for this chat.
 
-## /allowed
+## /allowed (Claude only)
 
 Add or remove tools from the allowed list.
 
@@ -42,4 +44,6 @@ Bash, Read, Edit, Write, Glob, Grep, Task, TaskOutput, TaskStop, WebFetch, WebSe
 
 ### Provider Restriction
 
-Tool permissions only apply when the active model is **Claude**. With Codex, Agy, or OpenCode selected, `/allowed` is rejected with `Tool permissions are not supported in this mode.` The other tool commands (`/availabletools`, `/allowedtools`) still work for inspection.
+The entire `allowed_tools` feature is **Claude-only**. With Codex, Agy, or OpenCode selected, all three commands (`/availabletools`, `/allowedtools`, and `/allowed`) are rejected with `Tool permissions are available only when the active provider is Claude.`
+
+For non-Claude providers, cokacdir does not pass this list as a tool restriction and does not add disabled-tool instructions to the system prompt. Those agents keep their native/full permissions. A saved Claude list remains stored while another provider is active and takes effect again only after switching back to Claude.

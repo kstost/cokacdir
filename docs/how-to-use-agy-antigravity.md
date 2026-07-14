@@ -220,7 +220,7 @@ These internal tool names are not emitted as structured stdout events in headles
 
 ## Current Provider Limitations
 
-- `/allowed` tool permissions are not enforced for Agy. The allowed-tools UI remains useful for Claude but does not constrain `agy`.
+- The entire `allowed_tools` feature is Claude-only. `/availabletools`, `/allowedtools`, and `/allowed` are rejected while Agy is active, and the saved Claude list is neither passed to Agy nor injected into its prompt. Agy retains its native/full permissions.
 - `/loop` verification is not enabled for Agy because there is no measured isolated no-tools verifier mode equivalent to Claude fork sessions, Codex ephemeral execution, or OpenCode forked plan agents.
 - Agy logs can contain benign internal errors even when stdout is successful. cokacdir only turns log summaries into user-visible errors when the process fails or when no visible stdout was produced.
 - Agy treats hook failures as fail-open. The ledger and acknowledgement let cokacdir detect a `PreInvocation` that never started (or did not complete) and discard its output, but cannot prove that Agy actually applied an otherwise valid hook response. They also cannot undo a model request or tool side effect Agy started before termination.

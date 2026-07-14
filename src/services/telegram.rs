@@ -1620,6 +1620,8 @@ fn parse_rich_message_mode(s: &str) -> Option<RichMessageMode> {
 /// Bot-level settings persisted to disk
 #[derive(Clone)]
 struct BotSettings {
+    /// Claude-only per-chat tool availability. Other providers intentionally
+    /// ignore this setting and use their native/full agent permissions.
     allowed_tools: HashMap<String, Vec<String>>,
     /// chat_id (string) → last working directory path
     last_sessions: HashMap<String, String>,
@@ -1721,8 +1723,22 @@ impl Default for BotSettings {
     }
 }
 
-/// Get allowed tools for a specific chat_id.
+const CLAUDE_ONLY_TOOL_PERMISSIONS_MESSAGE: &str =
+    "Tool permissions are available only when the active provider is Claude.";
+
+/// Whether the provider supports cokacdir's user-configurable `allowed_tools` list.
+///
+/// This is deliberately Claude-only. Codex, Agy, and OpenCode agents use their
+/// own native/full permissions and must not receive restrictions derived from
+/// this setting, either as adapter arguments or as system-prompt instructions.
+fn provider_supports_allowed_tools(provider: &str) -> bool {
+    provider == "claude"
+}
+
+/// Get the Claude-only allowed tools for a specific chat_id.
 /// Returns the chat-specific list if configured, otherwise DEFAULT_ALLOWED_TOOLS.
+/// The value remains persisted while another provider is active so switching
+/// back to Claude restores the chat's previous Claude tool configuration.
 fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
     let key = chat_id.0.to_string();
     settings
@@ -1735,6 +1751,60 @@ fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
                 .map(|s| s.to_string())
                 .collect()
         })
+}
+
+/// Build Claude's explanatory prompt notice for tools removed from `--tools`.
+/// Non-Claude providers always receive an empty notice: `allowed_tools` is not
+/// even a soft/prompt-based restriction for those providers.
+fn build_disabled_tools_notice(provider: &str, allowed_tools: &[String]) -> String {
+    if !provider_supports_allowed_tools(provider) {
+        return String::new();
+    }
+
+    let mut disabled: Vec<&str> = DEFAULT_ALLOWED_TOOLS
+        .iter()
+        .copied()
+        .filter(|default| !allowed_tools.iter().any(|allowed| allowed == *default))
+        .collect();
+    disabled.sort_unstable();
+
+    if disabled.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
+             You MUST NOT attempt to use these tools. \
+             If a user's request requires a disabled tool, do NOT proceed with the task. \
+             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
+             Suggest they re-enable it with: /allowed +ToolName",
+            disabled.join(", ")
+        )
+    }
+}
+
+#[cfg(test)]
+mod allowed_tools_provider_tests {
+    use super::{build_disabled_tools_notice, provider_supports_allowed_tools};
+
+    #[test]
+    fn allowed_tools_is_exclusively_supported_by_claude() {
+        assert!(provider_supports_allowed_tools("claude"));
+        for provider in ["codex", "agy", "opencode"] {
+            assert!(
+                !provider_supports_allowed_tools(provider),
+                "{provider} must not consume Claude's allowed_tools setting"
+            );
+        }
+    }
+
+    #[test]
+    fn non_claude_providers_receive_no_disabled_tools_prompt() {
+        let no_tools = Vec::new();
+        assert!(build_disabled_tools_notice("claude", &no_tools).contains("DISABLED TOOLS"));
+        for provider in ["codex", "agy", "opencode"] {
+            assert_eq!(build_disabled_tools_notice(provider, &no_tools), "");
+        }
+    }
 }
 
 /// Normalize a stored model setting.
@@ -9814,9 +9884,9 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("loop", "Repeat until task is fully completed"),
         teloxide::types::BotCommand::new("down", "Download file from server"),
         teloxide::types::BotCommand::new("public", "Toggle public access (group only)"),
-        teloxide::types::BotCommand::new("availabletools", "List all available tools"),
-        teloxide::types::BotCommand::new("allowedtools", "Show currently allowed tools"),
-        teloxide::types::BotCommand::new("allowed", "Add/remove tool (+name / -name)"),
+        teloxide::types::BotCommand::new("availabletools", "List Claude tools (Claude only)"),
+        teloxide::types::BotCommand::new("allowedtools", "Show allowed Claude tools (Claude only)"),
+        teloxide::types::BotCommand::new("allowed", "Change allowed Claude tools (Claude only)"),
         teloxide::types::BotCommand::new("setpollingtime", "Set API polling interval (ms)"),
         teloxide::types::BotCommand::new("model", "Set AI model"),
         teloxide::types::BotCommand::new("stt_model", "Set speech recognition model"),
@@ -13990,11 +14060,11 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /availabletools");
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
         {
-            let _m = get_model(&state.lock().await.settings, chat_id);
-            if detect_provider(_m.as_deref()) != "claude" {
+            let model = get_model(&state.lock().await.settings, chat_id);
+            if !provider_supports_allowed_tools(detect_provider(model.as_deref())) {
                 tg!(
                     "send_message",
-                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                    bot.send_message(chat_id, CLAUDE_ONLY_TOOL_PERMISSIONS_MESSAGE)
                         .await
                 )?;
             } else {
@@ -14005,11 +14075,11 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /allowedtools");
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
         {
-            let _m = get_model(&state.lock().await.settings, chat_id);
-            if detect_provider(_m.as_deref()) != "claude" {
+            let model = get_model(&state.lock().await.settings, chat_id);
+            if !provider_supports_allowed_tools(detect_provider(model.as_deref())) {
                 tg!(
                     "send_message",
-                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                    bot.send_message(chat_id, CLAUDE_ONLY_TOOL_PERMISSIONS_MESSAGE)
                         .await
                 )?;
             } else {
@@ -14276,11 +14346,11 @@ async fn handle_message(
             text.strip_prefix("/allowed").unwrap_or("").trim()
         );
         {
-            let _m = get_model(&state.lock().await.settings, chat_id);
-            if detect_provider(_m.as_deref()) != "claude" {
+            let model = get_model(&state.lock().await.settings, chat_id);
+            if !provider_supports_allowed_tools(detect_provider(model.as_deref())) {
                 tg!(
                     "send_message",
-                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                    bot.send_message(chat_id, CLAUDE_ONLY_TOOL_PERMISSIONS_MESSAGE)
                         .await
                 )?;
             } else {
@@ -14363,11 +14433,11 @@ Any other message is sent to Claude AI.
 AI can read, edit, and run commands in your session.
 
 <b>Tool Management</b>
-<code>/availabletools</code> — List all available tools
-<code>/allowedtools</code> — Show currently allowed tools
-<code>/allowed +name</code> — Add tool (e.g. <code>/allowed +Bash</code>)
-<code>/allowed -name</code> — Remove tool
-<code>/allowed +a -b +c</code> — Multiple at once
+<code>/availabletools</code> — List Claude tools (Claude only)
+<code>/allowedtools</code> — Show currently allowed Claude tools (Claude only)
+<code>/allowed +name</code> — Add Claude tool (Claude only; e.g. <code>/allowed +Bash</code>)
+<code>/allowed -name</code> — Remove Claude tool (Claude only)
+<code>/allowed +a -b +c</code> — Multiple at once (Claude only)
 
 <b>Group Chat</b>
 <code>;</code><i>message</i> — Send message to AI
@@ -18449,7 +18519,7 @@ async fn handle_envvars_command(
     Ok(())
 }
 
-/// Handle /availabletools command - show all available tools
+/// Handle the Claude-only /availabletools command.
 async fn handle_availabletools_command(
     bot: &Bot,
     chat_id: ChatId,
@@ -18485,7 +18555,7 @@ async fn handle_availabletools_command(
     Ok(())
 }
 
-/// Handle /allowedtools command - show current allowed tools list
+/// Handle the Claude-only /allowedtools command.
 async fn handle_allowedtools_command(
     bot: &Bot,
     chat_id: ChatId,
@@ -19860,7 +19930,7 @@ async fn handle_queue_command(
     Ok(())
 }
 
-/// Handle /allowed command - add/remove tools
+/// Handle the Claude-only /allowed command - add/remove Claude CLI tools.
 /// Usage: /allowed +toolname  (add)
 ///        /allowed -toolname  (remove)
 ///        /allowed +tool1 -tool2 +tool3  (multiple)
@@ -21511,28 +21581,9 @@ async fn handle_text_message(
         format!("{}\n\n{}", upload_context, sanitized_input)
     };
 
-    // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> =
-        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> =
-        allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools
-        .iter()
-        .filter(|t| !allowed_set.contains(**t))
-        .collect();
-    let disabled_notice = if disabled.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        format!(
-            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
-             You MUST NOT attempt to use these tools. \
-             If a user's request requires a disabled tool, do NOT proceed with the task. \
-             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
-             Suggest they re-enable it with: /allowed +ToolName",
-            names.join(", ")
-        )
-    };
+    // The per-chat allowed_tools setting and its prompt notice are Claude-only.
+    let disabled_notice =
+        build_disabled_tools_notice(detect_provider(model.as_deref()), &allowed_tools);
 
     // Build system prompt with sendfile and schedule instructions
     let bot_key_for_prompt = token_hash(bot.token());
@@ -21732,7 +21783,7 @@ async fn handle_text_message(
                     &current_path_clone,
                     tx.clone(),
                     Some(&system_prompt_owned),
-                    Some(&allowed_tools),
+                    None, // allowed_tools is Claude-only
                     Some(cancel_token_clone),
                     opencode_model,
                     false,
@@ -21748,7 +21799,7 @@ async fn handle_text_message(
                     &current_path_clone,
                     tx.clone(),
                     Some(&system_prompt_owned),
-                    Some(&allowed_tools),
+                    None, // allowed_tools is Claude-only
                     Some(cancel_token_clone),
                     agy_model,
                     false,
@@ -21802,7 +21853,7 @@ async fn handle_text_message(
                     &current_path_clone,
                     tx.clone(),
                     Some(&codex_system_prompt),
-                    Some(&allowed_tools),
+                    None, // Codex intentionally retains full permissions
                     Some(cancel_token_clone),
                     codex_model,
                     false,
@@ -25539,10 +25590,8 @@ async fn run_companion_visible_image_generation_ephemeral(
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let codex_model = model.as_deref().and_then(codex::strip_codex_prefix);
-        let allowed_tools: Vec<String> = ["Read", "Glob", "Grep"]
-            .iter()
-            .map(|tool| tool.to_string())
-            .collect();
+        // allowed_tools is a Claude-only feature. This Codex background agent
+        // intentionally retains full execution permissions.
         let codex_auto_send = codex::CodexAutoSendCtx {
             cokacdir_bin: crate::bin_path().to_string(),
             chat_id: chat_id.0,
@@ -25555,7 +25604,7 @@ async fn run_companion_visible_image_generation_ephemeral(
             &current_path,
             tx.clone(),
             Some(system_prompt),
-            Some(&allowed_tools),
+            None,
             Some(cancel_token_for_exec),
             codex_model,
             true,
@@ -26896,28 +26945,8 @@ async fn execute_schedule(
         Some(placeholder.id)
     };
 
-    // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> =
-        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> =
-        allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools
-        .iter()
-        .filter(|t| !allowed_set.contains(**t))
-        .collect();
-    let disabled_notice = if disabled.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        format!(
-            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
-             You MUST NOT attempt to use these tools. \
-             If a user's request requires a disabled tool, do NOT proceed with the task. \
-             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
-             Suggest they re-enable it with: /allowed +ToolName",
-            names.join(", ")
-        )
-    };
+    // Scheduled runs inherit the chat's allowed_tools only when using Claude.
+    let disabled_notice = build_disabled_tools_notice(provider, &allowed_tools);
 
     let bot_key = token_hash(token);
     let (
@@ -27139,7 +27168,7 @@ async fn execute_schedule(
                 &working_dir_for_exec,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 opencode_model,
                 false,
@@ -27157,7 +27186,7 @@ async fn execute_schedule(
                 &working_dir_for_exec,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 agy_model,
                 false,
@@ -27180,7 +27209,7 @@ async fn execute_schedule(
                 &working_dir_for_exec,
                 tx.clone(),
                 Some(&codex_system_prompt),
-                Some(&allowed_tools),
+                None, // Codex intentionally retains full permissions
                 Some(cancel_token_clone),
                 codex_model,
                 false,
@@ -28534,36 +28563,13 @@ async fn process_bot_message(
         remove_result.is_ok()
     ));
 
-    // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> =
-        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> =
-        allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools
-        .iter()
-        .filter(|t| !allowed_set.contains(**t))
-        .collect();
+    // Bot-to-bot turns must not impose Claude's allowed_tools on other providers.
+    let disabled_notice =
+        build_disabled_tools_notice(detect_provider(model.as_deref()), &allowed_tools);
     msg_debug(&format!(
-        "[process_bot_message] disabled_tools={}",
-        disabled.len()
+        "[process_bot_message] claude_disabled_tools_notice={}",
+        !disabled_notice.is_empty()
     ));
-    let disabled_notice = if disabled.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        msg_debug(&format!(
-            "[process_bot_message] disabled: [{}]",
-            names.join(", ")
-        ));
-        format!(
-            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
-             You MUST NOT attempt to use these tools. \
-             If a user's request requires a disabled tool, do NOT proceed with the task. \
-             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
-             Suggest they re-enable it with: /allowed +ToolName",
-            names.join(", ")
-        )
-    };
 
     // Build system prompt
     let bot_key = token_hash(token);
@@ -28651,7 +28657,7 @@ async fn process_bot_message(
                 &current_path_clone,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 opencode_model,
                 false,
@@ -28667,7 +28673,7 @@ async fn process_bot_message(
                 &current_path_clone,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 agy_model,
                 false,
@@ -28721,7 +28727,7 @@ async fn process_bot_message(
                 &current_path_clone,
                 tx.clone(),
                 Some(&codex_system_prompt),
-                Some(&allowed_tools),
+                None, // Codex intentionally retains full permissions
                 Some(cancel_token_clone),
                 codex_model,
                 false,
@@ -30233,6 +30239,8 @@ async fn execute_companion_ping(
     let current_path_clone = run.current_path.clone();
     let model_clone = run.model.clone();
     let cancel_token_clone = cancel_token.clone();
+    // This explicit tool set is enforced only by the Claude branch below.
+    // Codex, Agy, and OpenCode companion agents keep their native/full access.
     let allowed_tools: Vec<String> = ["Read", "Glob", "Grep", "WebSearch"]
         .iter()
         .map(|tool| tool.to_string())
@@ -30257,7 +30265,7 @@ async fn execute_companion_ping(
                 &current_path_clone,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 opencode_model,
                 false,
@@ -30271,7 +30279,7 @@ async fn execute_companion_ping(
                 &current_path_clone,
                 tx.clone(),
                 Some(&system_prompt_owned),
-                Some(&allowed_tools),
+                None, // allowed_tools is Claude-only
                 Some(cancel_token_clone),
                 agy_model,
                 false,
@@ -30292,7 +30300,7 @@ async fn execute_companion_ping(
                 &current_path_clone,
                 tx.clone(),
                 Some(&codex_system_prompt),
-                Some(&allowed_tools),
+                None, // Codex intentionally retains full permissions
                 Some(cancel_token_clone),
                 codex_model,
                 false,

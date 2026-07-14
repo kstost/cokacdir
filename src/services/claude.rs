@@ -697,7 +697,7 @@ fn is_valid_session_id(session_id: &str) -> bool {
         && session_id_regex().is_match(session_id)
 }
 
-/// Default allowed tools for Claude CLI
+/// Default tools for cokacdir's Claude-only `allowed_tools` feature.
 pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "Bash",
     "Read",
@@ -718,7 +718,9 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "TaskList",
 ];
 
-/// Execute a command using Claude CLI
+/// Execute a command using Claude CLI.
+/// `allowed_tools` is intentionally provider-specific and maps to Claude's
+/// `--tools` flag; non-Claude adapters do not consume this setting.
 pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,
@@ -1161,7 +1163,9 @@ pub fn is_ai_supported() -> bool {
     true
 }
 
-/// Execute a command using Claude CLI with streaming output
+/// Execute a command using Claude CLI with streaming output.
+/// `allowed_tools` is intentionally provider-specific and maps to Claude's
+/// `--tools` flag; non-Claude adapters do not consume this setting.
 /// If `system_prompt` is None, uses the default file manager system prompt.
 /// If `system_prompt` is Some(""), no system prompt is appended.
 pub fn execute_command_streaming(

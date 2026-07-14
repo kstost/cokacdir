@@ -70,9 +70,11 @@ For the measured Antigravity CLI integration contract, see [How cokacdir Uses An
 * Bot-to-bot messaging for multi-agent workflows
 * Output controls including `/silent`, Telegram Rich Messages, Codex fast tier, and Claude Chrome mode
 * Companion mode with optional owner-only proactive pings and Codex-generated visible companion images
-* File upload/download, tool management, debug logging
+* File upload/download, Claude-only tool management, debug logging
 
 **Commands:** `/start`, `/stop`, `/stopall`, `/clear`, `/help`, `/session`, `/pwd`, `/model`, `/stt_model`, `/effort`, `/fast`, `/down`, `/instruction`, `/instruction_clear`, `/allowed`, `/allowedtools`, `/availabletools`, `/queue`, `/contextlevel`, `/query`, `/loop`, `/setendhook`, `/setendhook_clear`, `/public`, `/direct`, `/setpollingtime`, `/debug`, `/envvars`, `/silent`, `/rich`, `/companion`, `/companion_profile`, `/companion_profile_clear`, `/companion_visible`, `/companion_ping`, `/usechrome`
+
+`/availabletools`, `/allowedtools`, and `/allowed` are Claude-only. Codex, Agy, and OpenCode do not consume the saved Claude tool list and retain their native/full agent permissions.
 
 ## Configuration
 
