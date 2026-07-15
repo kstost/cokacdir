@@ -1,10 +1,134 @@
 # Changelog — cokacdir
 
-## Unreleased
+## 0.8.7 — 2026-07-15
+
+- **The Claude model menu now uses stable aliases without version-specific descriptions.** `/model` lists `claude`, `claude:fable`, `claude:opus`, `claude:sonnet`, and `claude:haiku` in that order. The version-labelled Sonnet, Opus, and Haiku descriptions and the previously listed `sonnet[1m]` entry were removed so the installed Claude CLI remains responsible for resolving each alias.
+
+---
+
+## 0.8.6 — 2026-07-15
 
 - **Cross-volume cut/paste now uses a fast `Standard` verification policy by default.** Standard mode skips SHA-256 content hashing while retaining private staging, identity and metadata checks, destination durability syncs, atomic publication, rollback, and source deletion only after commit. Users can opt into the previous content-hashing behavior with `Cross-volume move: Strict` in the Settings dialog.
 
 - **File-operation progress now distinguishes transfer completion from operation completion.** The dialog shows syncing, strict verification, and finalization phases after bytes reach the destination, and the overall bar remains below 100% until the worker reports completion.
+
+---
+
+## 0.8.5 — 2026-07-14
+
+- **The saved `allowed_tools` list is now enforced exclusively by Claude.** `/availabletools`, `/allowedtools`, and `/allowed` reject Codex, Agy, and OpenCode instead of presenting or changing a list those providers do not consume. A chat's Claude list remains persisted while another provider is active and becomes effective again after switching back to Claude.
+
+- **Non-Claude providers retain their native full permissions across every execution path.** Normal chat, schedules, bot-to-bot turns, loops, and companion pings no longer receive Claude's tool list or the prompt notice describing disabled Claude tools. Provider adapters and user documentation now state this boundary explicitly.
+
+---
+
+## 0.8.4 — 2026-07-13
+
+- **Agy system-prompt delivery now uses the official `PreInvocation` hook on Linux, macOS, and Windows.** Only the current user request is written to Agy's non-TTY stdin; the complete current system prompt is returned separately as one transient `ephemeralMessage` for each model invocation. Unix uses a POSIX-shell wrapper and Windows uses a `cmd.exe`-compatible wrapper, with no combined-stdin fallback.
+
+- **The cross-platform hook lifecycle is fail-closed and crash-safe.** Per-run prompt, ledger, acknowledgement, and lease files are identity-checked; a shared lease distinguishes live executions from stale crash residue without blocking files the hook must access. cokacdir buffers Agy output until every `start` has a matching successful acknowledgement and discards the invocation if the hook fails or remains incomplete.
+
+- **Agy's stored ephemeral rows are now documented separately from effective model context.** Historical hook rows may remain in the SQLite conversation database, but they are not replayed as accumulated system prompts. The implementation record, user guide, and website explain the measured Linux behavior, the shared cross-platform transport, and the remaining live-validation limits on macOS and Windows.
+
+---
+
+## 0.8.3 — 2026-07-13
+
+- **Agy SQLite session cloning now writes through the already-reserved destination handle.** A one-shot SQLite VFS exposes the no-clobber file descriptor directly, avoiding any pathname reopen between reservation and backup. Clones include uncheckpointed WAL rows, support empty databases, keep memory bounded while copying large databases, validate the final SQLite header and identity, and never redirect writes after a symlink or rename race.
+
+- **Cross-filesystem directory moves now use a verified transactional copy path.** Directory trees are copied into private staging, synced, hashed with a deterministic tree digest, atomically published, and only then removed from the source filesystem. Structured file-manager moves and the lower-level `move_file` fallback both support directories while detecting same-length descendant rewrites before deletion.
+
+- **OpenCode's `AGENTS.md` transaction lock moved out of the user's workspace.** Locks now live in a private `~/.cokacdir/opencode-agent-locks` directory and are keyed by the canonical workspace identity. Concurrent prompt injections remain serialized without creating or modifying a lock file inside the project, and legacy workspace lock files are left untouched.
+
+---
+
+## 0.8.2 — 2026-07-12
+
+- **Private-directory operations are now descriptor-relative and portable across Unix platforms.** Configuration, temporary files, console documents, remote-transfer staging, bot queues, and recursive file operations use opened directory handles instead of constructing `/proc/self/fd` or `/dev/fd` child paths. Entry names are validated as single components, replacements are detected by identity, and cleanup removes only objects created by the current operation.
+
+- **Recursive copy and durability walks now bound descriptor usage and detect directory replacement.** Directory streams are closed before descending, child identities are retained for deferred recursion, cycles are rejected by filesystem identity, and macOS no longer depends on a traversable `/dev/fd` namespace. Remote staging and ordinary file operations use the same opened-directory rules.
+
+- **Agy clone publication was hardened across Linux, macOS, and Windows.** SQLite opens are proven to reference the pre-created no-clobber destination before backup begins, journal/WAL/SHM collisions are rejected, busy sources use bounded retry, and failed cleanup preserves any path that no longer names the owned clone.
+
+- **AI session JSON files now use cross-process locking and atomic set updates.** TUI saves, bot saves, restore scans, stale-session pruning, and `/clear` share the same lock and identity-checked file snapshots. A concurrent save can no longer be deleted by cleanup or leave several partially updated session records for one workspace/provider.
+
+---
+
+## 0.8.1 — 2026-07-12
+
+- **Security-sensitive filesystem state is now private, atomic, and identity-bound.** Settings, themes, environment overrides, provider temporary files, bot settings, schedules, session archives, companion images, upload queues, remote caches, and build artifacts reject symlinks/reparse points and special files where regular files or directories are required. Writes use no-clobber staging, durability syncs, atomic publication, bounded reads, and cleanup that cannot delete a pathname replacement.
+
+- **File copy, move, delete, rename, and duplicate removal were rebuilt around transactional authorization.** Sources and destinations are captured by filesystem identity, private stages are verified before publication, overwrite backups can be restored after failure, cross-volume source deletion happens only after commit, retry-unsafe partial moves are reported accurately, and duplicate deletion rechecks byte equality and quarantined identity immediately before removal.
+
+- **`.cokacenc` packing and unpacking received end-to-end integrity and lifecycle hardening.** Decryption is constant-memory and handles short reads correctly; malformed final blocks, unsafe split metadata, symlinked chunks, and racing plaintext destinations are rejected. Pack and unpack paths verify hashes and metadata, quarantine sources or encrypted chunks before deletion, roll back partial quarantines, and default the encryption dialog to integrity verification.
+
+- **Settings and chat-bot persistence now fail closed instead of silently replacing damaged state.** Unparseable TUI settings are copied to a new private recovery file without truncating an older backup, while unsafe settings paths and unrecoverable backup failures abort startup. Bot settings use verified read/write reconciliation, schedule files use locked atomic updates and capability verifiers instead of persisted raw bot keys, and session archives use bounded parsers, source fingerprints, locks, and atomic replacement.
+
+- **Bot tokens and internal authorization keys gained non-argv input paths.** `--ccserver-token-file` and `--ccserver-stdin` accept one bot configuration per line; internal commands accept `--key-file` or `--key-stdin`; legacy token arguments emit a process-listing warning; debug output redacts secret arguments. Secret files must be private regular files, Codex auto-send passes its key through stdin, and upload requests use unique private queue entries so identical paths do not overwrite each other.
+
+- **Agy 1.1.1 gained a separate Linux system-prompt transport.** The current user request is piped through stdin while a namespaced, normally inert `PreInvocation` plugin injects the complete system prompt from a private per-run file. A start/ok/fail ledger, acknowledgement, timeout, stale-file cleanup, child reaping, and output gating prevent unverified hook runs from reaching the user. Other platforms retained the compatibility stdin path until the cross-platform work in 0.8.4.
+
+- **Provider process and session handling is more defensive.** Dropped stream receivers terminate and reap Claude/Codex/OpenCode children; executable overrides must resolve to runnable files; Codex image discovery honors custom Codex homes; rollout and conversation scans are iterative and bounded; clone sources reject symlinks and incomplete records; provider session archives preserve a consistent full-fidelity snapshot under concurrent updates.
+
+- **OpenCode system-prompt injection now restores `AGENTS.md` transactionally.** The original file is quarantined and recorded with its identity, size, and SHA-256 before the injected prompt is published. Normal exit and crash recovery restore only an unchanged cokacdir-owned transaction; concurrent user edits, deletions, symlinks, legacy markers, and ambiguous recovery artifacts are preserved instead of being overwritten or trusted.
+
+- **Remote SSH/SFTP and archive handling were hardened.** The SSH stack was upgraded to `russh 0.62.2` and `russh-sftp 2.3.0`; Ed25519 and ECDSA private keys are supported while RSA private authentication keys are rejected. Remote cache names are derived from normalized endpoint/path identities, uploads use private transactional staging, tar creation and extraction use no-clobber publication and safe entry validation, and archive extraction strips special permission bits without following links.
+
+- **Build, install, and web publication paths are now transactional and reproducible.** Release builds use the committed lockfile, verify that tools actually produced binaries, preserve existing outputs after failed downloads or copies, safely extract tool archives, serialize concurrent web builds, publish content-hashed assets before `index.html`, and keep older assets for cached pages. Installers publish executable mode correctly and refuse non-binary or symlinked destinations.
+
+- **Networking dependencies and bundled-license handling were refreshed.** Telegram moved to teloxide 0.17, HTTP to reqwest 0.13, and Telegram/Discord networking to vendored native TLS. Linux release binaries bundle OpenSSL 3.6.3; its Apache-2.0 license is shipped with distribution artifacts, recorded in `THIRD_PARTY_NOTICES.md`, embedded in the executable, and available through the new `cokacdir --licenses` command.
+
+- **TUI and asynchronous operation recovery were tightened.** Cancelled or failed cut operations restore only safe remaining clipboard entries, remote saves distinguish committed warnings from failures, extension-handler substitution is quote-aware, tar and diff readers are bounded, adversarial large diffs avoid quadratic work, deep tree building is iterative, disconnected workers no longer trap screens, and settings-save failures are reported after terminal restoration with a non-zero exit.
+
+---
+
+## 0.7.6 — 2026-07-10
+
+- **The Codex model menu was refreshed for the current model families.** `/model` now lists `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`, replacing the older menu entries.
+
+- **`/effort` is now validated against the selected Codex model.** Sol and Terra accept through `ultra`, Luna accepts through `max`, and the other explicitly listed models expose their supported low-to-xhigh ranges and documented defaults. An incompatible saved override is retained for later model switches but omitted from the current CLI invocation.
+
+- **Codex completion verification now preserves the active model configuration.** `/loop` verification passes the selected model together with its compatible reasoning effort and fast service tier into the independent ephemeral verifier instead of silently falling back to the CLI's default model.
+
+---
+
+## 0.7.5 — 2026-07-07
+
+- **`/companion_prompt` now reports the prompt that is actually active.** When companion mode is off, it shows the mode as OFF and reports that no companion guidance is injected instead of rendering a prompt as though the feature were enabled.
+
+- **Visible companion image selection now survives missing or invalid response tags.** A valid tagged image remains preferred, but the ephemeral Codex worker falls back to the most recent allowed `GeneratedImage` or sendfile tool path when the model's XML tag is absent or points to a missing file.
+
+---
+
+## 0.7.4 — 2026-07-07
+
+- **Companion conversations became more time-aware, independent, and naturally concise.** The prompt includes the local date, time, offset, and daypart; encourages a stable point of view rather than automatic agreement; allows small conversational turns and natural follow-up questions; and keeps ordinary replies to one compact messenger-style bubble unless the user asks for a complete or detailed result.
+
+- **Visible companion generation now separates identity creation from scene creation.** If no reference exists, an ephemeral Codex worker first creates and persists a dedicated identity reference; a second ephemeral run then creates the current scene from that reference, profile, companion message, and time context. Later scenes reuse only the identity anchors rather than copying the reference composition.
+
+- **Companion image and message delivery received richer fallback handling.** Generated paths are restricted to allowed image roots, reference and latest images are persisted separately, Telegram can pair the final image with Rich Markdown text, and failed or cancelled image generation falls back to the already-generated text ping.
+
+---
+
+## 0.7.2 — 2026-07-05
+
+- **Companion-mode regression tests were restored after the initial feature landing.** The Rich Message test module now imports the companion prompt and owner-private-chat helpers it exercises, keeping the full test target compilable without changing runtime behavior.
+
+---
+
+## 0.7.1 — 2026-07-05
+
+- **Companion mode was added as a per-chat final-only conversation style.** `/companion` suppresses progress narration and intermediate tool output, keeps normal replies short and friend-like, and injects a configurable companion profile. `/companion_profile`, `/companion_profile_clear`, and the global `~/.cokacdir/prompt/companion.md` file provide chat-specific and shared personality control, with optional durable notes under `~/.cokacdir/memory/`.
+
+- **Owner-only proactive companion pings were introduced.** `/companion_ping` configures or disables a random inactivity interval for the owner's private chat, real user activity resets the timer, only one ping is sent before waiting for the owner again, and group/non-owner chats are excluded. Ping state, cancellation, queue interaction, and provider session writeback are isolated from normal user turns.
+
+- **Codex can generate optional visible companion images without mutating the chat session.** `/companion_visible` uses a separate ephemeral Codex execution when a chat-specific companion profile exists, records generated-image tool events instead of auto-sending immediately, persists a stable reference under `~/.cokacdir/companion/visible/<chat_id>/`, and sends the final image with the companion message when possible.
+
+- **Companion work now exposes typing state without progress messages.** Telegram refreshes its typing action while a companion request runs, Discord's bridge forwards the channel typing indicator, and Slack remains intentionally quiet because its current Socket Mode/Web API path has no equivalent typing operation.
+
+- **Codex ephemeral execution became an explicit provider capability.** New one-shot companion/image workers pass `codex exec --ephemeral`, reject attempts to combine ephemeral mode with resume, and can record generated image paths without invoking the normal sendfile delivery fallback.
+
+- **The Unix shell wrapper no longer changes directory after non-interactive commands.** Each interactive TUI run receives a private, per-invocation last-directory file, and the wrapper changes directory only after a successful run that wrote that file. Re-running the installer upgrades older wrappers, shares one marked canonical wrapper block with management tooling, and falls back safely when `$SHELL` is unset or unrecognized.
 
 ---
 

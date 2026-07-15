@@ -20654,11 +20654,11 @@ async fn handle_model_command(
         };
         if has_claude {
             msg.push_str("\n<b>Claude:</b>\n");
-            msg.push_str("<code>/model claude</code> — default\n");
-            msg.push_str("<code>/model claude:sonnet</code> — Sonnet 4.6\n");
-            msg.push_str("<code>/model claude:opus</code> — Opus 4.8\n");
-            msg.push_str("<code>/model claude:haiku</code> — Haiku 4.5\n");
-            msg.push_str("<code>/model claude:sonnet[1m]</code> — Sonnet 1M ctx\n");
+            msg.push_str("<code>/model claude</code>\n");
+            msg.push_str("<code>/model claude:fable</code>\n");
+            msg.push_str("<code>/model claude:opus</code>\n");
+            msg.push_str("<code>/model claude:sonnet</code>\n");
+            msg.push_str("<code>/model claude:haiku</code>\n");
         }
         if has_codex {
             msg.push_str("\n<b>Codex:</b>\n");
