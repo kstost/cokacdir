@@ -407,6 +407,19 @@ fn default_diff_compare_method() -> String {
     "content".to_string()
 }
 
+/// Content-verification policy for moves that must copy across filesystems.
+///
+/// Standard mode keeps the transactional staging, metadata checks, and
+/// durability syncs, but avoids rereading file contents solely to hash them.
+/// Strict mode opts into the more expensive SHA-256 verification passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossVolumeMoveVerification {
+    #[default]
+    Standard,
+    Strict,
+}
+
 fn default_encrypt_split_size() -> u64 {
     1800
 }
@@ -469,6 +482,9 @@ pub struct Settings {
     /// DIFF compare method: "content", "modified_time", "content_and_time"
     #[serde(default = "default_diff_compare_method")]
     pub diff_compare_method: String,
+    /// Verification policy for cross-volume cut/paste operations.
+    #[serde(default)]
+    pub cross_volume_move_verification: CrossVolumeMoveVerification,
     /// Remote server profiles for SSH/SFTP connections
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_profiles: Vec<RemoteProfile>,
@@ -546,6 +562,7 @@ impl Default for Settings {
             panels: vec![PanelSettings::default(), PanelSettings::default()],
             active_panel_index: 0,
             diff_compare_method: default_diff_compare_method(),
+            cross_volume_move_verification: CrossVolumeMoveVerification::default(),
             remote_profiles: Vec::new(),
             keybindings: KeybindingsConfig::default(),
             encrypt_split_size: default_encrypt_split_size(),
@@ -883,6 +900,10 @@ mod tests {
         assert_eq!(settings.panels[0].sort_order, "asc");
         assert_eq!(settings.active_panel_index, 0);
         assert_eq!(settings.theme.name, DEFAULT_THEME_NAME);
+        assert_eq!(
+            settings.cross_volume_move_verification,
+            CrossVolumeMoveVerification::Standard
+        );
     }
 
     #[test]
@@ -895,6 +916,25 @@ mod tests {
         let settings: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings.panels[0].start_path, Some(test_path));
         assert_eq!(settings.panels[0].sort_by, "name");
+        assert_eq!(
+            settings.cross_volume_move_verification,
+            CrossVolumeMoveVerification::Standard
+        );
+    }
+
+    #[test]
+    fn cross_volume_move_verification_round_trips() {
+        let mut settings = Settings::default();
+        settings.cross_volume_move_verification = CrossVolumeMoveVerification::Strict;
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""cross_volume_move_verification":"strict""#));
+
+        let decoded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.cross_volume_move_verification,
+            CrossVolumeMoveVerification::Strict
+        );
     }
 
     #[test]

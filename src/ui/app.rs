@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Instant, SystemTime};
 
-use crate::config::Settings;
+use crate::config::{CrossVolumeMoveVerification, Settings};
 use crate::keybindings::Keybindings;
-use crate::services::file_ops::{self, FileOperationResult, FileOperationType, ProgressMessage};
+use crate::services::file_ops::{
+    self, FileOperationPhase, FileOperationResult, FileOperationType, ProgressMessage,
+};
 use crate::services::remote::{
     self, ConnectionStatus, RemoteContext, RemoteProfile, SftpFileEntry,
 };
@@ -853,12 +855,15 @@ pub struct SettingsState {
     pub themes: Vec<String>,
     /// Currently selected theme index
     pub theme_index: usize,
-    /// Currently selected field row in settings dialog (0=theme, 1=diff method)
+    /// Currently selected field row in settings dialog
+    /// (0=theme, 1=diff method, 2=cross-volume move verification)
     pub selected_field: usize,
     /// Available diff compare methods
     pub diff_methods: Vec<String>,
     /// Currently selected diff method index
     pub diff_method_index: usize,
+    /// Verification policy previewed by the settings dialog.
+    pub cross_volume_move_verification: CrossVolumeMoveVerification,
 }
 
 impl SettingsState {
@@ -907,6 +912,7 @@ impl SettingsState {
             selected_field: 0,
             diff_methods,
             diff_method_index,
+            cross_volume_move_verification: settings.cross_volume_move_verification,
         }
     }
 
@@ -954,6 +960,20 @@ impl SettingsState {
                 self.diff_method_index - 1
             };
         }
+    }
+
+    pub fn current_move_verification(&self) -> &'static str {
+        match self.cross_volume_move_verification {
+            CrossVolumeMoveVerification::Standard => "Standard",
+            CrossVolumeMoveVerification::Strict => "Strict",
+        }
+    }
+
+    pub fn toggle_move_verification(&mut self) {
+        self.cross_volume_move_verification = match self.cross_volume_move_verification {
+            CrossVolumeMoveVerification::Standard => CrossVolumeMoveVerification::Strict,
+            CrossVolumeMoveVerification::Strict => CrossVolumeMoveVerification::Standard,
+        };
     }
 }
 
@@ -1340,6 +1360,13 @@ fn local_clipboard_authorization_map(
         .collect()
 }
 
+fn move_verification_policy(configured: CrossVolumeMoveVerification) -> file_ops::MoveVerification {
+    match configured {
+        CrossVolumeMoveVerification::Standard => file_ops::MoveVerification::Standard,
+        CrossVolumeMoveVerification::Strict => file_ops::MoveVerification::Strict,
+    }
+}
+
 /// File operation progress state for progress dialog
 pub struct FileOperationProgress {
     pub operation_type: FileOperationType,
@@ -1354,6 +1381,7 @@ pub struct FileOperationProgress {
     // Progress state
     pub current_file: String,
     pub current_file_progress: f64, // 0.0 ~ 1.0
+    pub phase: FileOperationPhase,
     pub total_files: usize,
     pub completed_files: usize,
     pub total_bytes: u64,
@@ -1398,6 +1426,7 @@ impl FileOperationProgress {
             preparing_message: String::new(),
             current_file: String::new(),
             current_file_progress: 0.0,
+            phase: FileOperationPhase::Copying,
             total_files: 0,
             completed_files: 0,
             total_bytes: 0,
@@ -1436,15 +1465,20 @@ impl FileOperationProgress {
                             ProgressMessage::PrepareComplete => {
                                 self.is_preparing = false;
                                 self.preparing_message.clear();
+                                self.phase = FileOperationPhase::Copying;
                             }
                             ProgressMessage::FileStarted(name) => {
                                 self.current_file = name;
                                 self.current_file_progress = 0.0;
+                                self.phase = FileOperationPhase::Copying;
                             }
                             ProgressMessage::FileProgress(copied, total) => {
                                 if total > 0 {
                                     self.current_file_progress = copied as f64 / total as f64;
                                 }
+                            }
+                            ProgressMessage::Phase(phase) => {
+                                self.phase = phase;
                             }
                             ProgressMessage::FileCompleted(name) => {
                                 self.current_file_progress = 1.0;
@@ -1525,12 +1559,21 @@ impl FileOperationProgress {
     /// Get overall progress as percentage (0.0 ~ 1.0)
     /// Incorporates partial progress of the currently transferring file
     pub fn overall_progress(&self) -> f64 {
-        if self.total_bytes > 0 {
+        let progress = if self.total_bytes > 0 {
             self.completed_bytes as f64 / self.total_bytes as f64
         } else if self.total_files > 0 {
             (self.completed_files as f64 + self.current_file_progress) / self.total_files as f64
         } else {
             0.0
+        };
+
+        // Reaching the byte total means transfer is complete, not necessarily
+        // that durability sync, verification, publication, and source cleanup
+        // have completed. Reserve 100% for the terminal Completed message.
+        if self.is_active && progress >= 1.0 {
+            0.99
+        } else {
+            progress
         }
     }
 }
@@ -2715,6 +2758,7 @@ impl App {
             // Update diff compare method
             let new_diff_method = state.current_diff_method().to_string();
             self.settings.diff_compare_method = new_diff_method;
+            self.settings.cross_volume_move_verification = state.cross_volume_move_verification;
 
             // Do not report success or retain an in-memory configuration that
             // could not be persisted. The dialog previews themes without
@@ -5783,6 +5827,8 @@ impl App {
         let source_path = clipboard.source_path.clone();
         let source_authorizations = local_clipboard_authorization_map(&clipboard);
         let source_directory_authorization = clipboard.source_directory_authorization.clone();
+        let move_verification =
+            move_verification_policy(self.settings.cross_volume_move_verification);
 
         // Start operation in background thread
         let clipboard_operation = clipboard.operation;
@@ -5811,6 +5857,7 @@ impl App {
                     Some(target_authorization),
                     source_authorizations,
                     source_directory_authorization,
+                    move_verification,
                     cancel_flag,
                     tx,
                 );
@@ -6210,6 +6257,8 @@ impl App {
         let source_root = local_clipboard_source_root(&clipboard).to_path_buf();
         let source_authorizations = local_clipboard_authorization_map(&clipboard);
         let source_directory_authorization = clipboard.source_directory_authorization.clone();
+        let move_verification =
+            move_verification_policy(self.settings.cross_volume_move_verification);
 
         // Conflict state records source paths using the panel's display path,
         // which may be a symlink or a non-normalized Windows spelling. The
@@ -6257,6 +6306,7 @@ impl App {
                     Some(target_authorization),
                     source_authorizations,
                     source_directory_authorization,
+                    move_verification,
                     cancel_flag,
                     tx,
                 );
@@ -9412,13 +9462,64 @@ mod tests {
         loaded.bookmarked_path = vec!["/persisted/bookmark".to_string()];
         loaded.telegram_polling_time = 9_000;
         loaded.diff_compare_method = "modified_time".to_string();
+        loaded.cross_volume_move_verification = CrossVolumeMoveVerification::Strict;
 
         app.apply_loaded_settings(loaded);
 
         assert_eq!(app.settings.bookmarked_path, ["/persisted/bookmark"]);
         assert_eq!(app.settings.telegram_polling_time, 9_000);
         assert_eq!(app.settings.diff_compare_method, "modified_time");
+        assert_eq!(
+            app.settings.cross_volume_move_verification,
+            CrossVolumeMoveVerification::Strict
+        );
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn settings_state_previews_cross_volume_verification_without_mutating_settings() {
+        let mut settings = Settings::default();
+        settings.cross_volume_move_verification = CrossVolumeMoveVerification::Strict;
+
+        let mut state = SettingsState::new(&settings);
+        assert_eq!(state.current_move_verification(), "Strict");
+        assert_eq!(
+            move_verification_policy(settings.cross_volume_move_verification),
+            file_ops::MoveVerification::Strict
+        );
+        state.toggle_move_verification();
+
+        assert_eq!(state.current_move_verification(), "Standard");
+        assert_eq!(
+            settings.cross_volume_move_verification,
+            CrossVolumeMoveVerification::Strict
+        );
+    }
+
+    #[test]
+    fn active_file_progress_reserves_one_hundred_percent_for_completion() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Move);
+        progress.is_active = true;
+        progress.total_bytes = 10;
+        progress.completed_bytes = 10;
+
+        assert_eq!(progress.overall_progress(), 0.99);
+
+        progress.is_active = false;
+        assert_eq!(progress.overall_progress(), 1.0);
+    }
+
+    #[test]
+    fn file_progress_tracks_post_copy_phase_messages() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Move);
+        let (tx, rx) = mpsc::channel();
+        progress.receiver = Some(rx);
+        progress.is_active = true;
+        tx.send(ProgressMessage::Phase(FileOperationPhase::Finalizing))
+            .unwrap();
+
+        assert!(progress.poll());
+        assert_eq!(progress.phase, FileOperationPhase::Finalizing);
     }
 
     #[test]

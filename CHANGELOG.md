@@ -1,5 +1,13 @@
 # Changelog — cokacdir
 
+## Unreleased
+
+- **Cross-volume cut/paste now uses a fast `Standard` verification policy by default.** Standard mode skips SHA-256 content hashing while retaining private staging, identity and metadata checks, destination durability syncs, atomic publication, rollback, and source deletion only after commit. Users can opt into the previous content-hashing behavior with `Cross-volume move: Strict` in the Settings dialog.
+
+- **File-operation progress now distinguishes transfer completion from operation completion.** The dialog shows syncing, strict verification, and finalization phases after bytes reach the destination, and the overall bar remains below 100% until the worker reports completion.
+
+---
+
 ## 0.6.41 — 2026-06-28
 
 - **Go to Path autocomplete now prioritizes what the user actually typed.** Path suggestions are ranked as exact, case-insensitive exact, prefix, substring, then subsequence matches, so inputs such as `/Users/kst/de` surface `Desktop/`, `develop/`, and `devnoda/` ahead of unrelated fuzzy matches, and `/V` surfaces `/Volumes/` before lower-quality root entries. Hidden entries are still available, but they are pushed behind visible entries unless the prefix itself starts with `.`.

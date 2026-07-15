@@ -80,6 +80,14 @@ For the measured Antigravity CLI integration contract, see [How cokacdir Uses An
 
 cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), switch schedules into inline chat-session mode (`COKAC_SCHEDULE_INLINE=1`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
 
+The file-manager Settings dialog includes **Cross-volume move** verification.
+The default `Standard` mode keeps private staging, source identity checks,
+durability syncs, atomic publication, and failure recovery, but does not reread
+contents for SHA-256 verification. `Strict` opts into content hashing and can be
+substantially slower for large files or directory trees. The persisted
+`~/.cokacdir/settings.json` value is `"cross_volume_move_verification":
+"standard"` or `"strict"`; missing values default to `standard`.
+
 ## Supported Platforms
 
 * macOS (Apple Silicon & Intel)

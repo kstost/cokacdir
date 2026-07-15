@@ -584,6 +584,44 @@ pub enum FileOperationType {
     Decrypt,
 }
 
+/// Content-verification policy for a move that falls back to copy-and-delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoveVerification {
+    /// Preserve transactional publication and metadata/identity checks without
+    /// rereading file contents for SHA-256 verification.
+    #[default]
+    Standard,
+    /// Rehash copied file contents or directory trees before deleting source data.
+    Strict,
+}
+
+impl MoveVerification {
+    fn hashes_content(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+/// User-visible phase after operation preparation has completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileOperationPhase {
+    #[default]
+    Copying,
+    Syncing,
+    Verifying,
+    Finalizing,
+}
+
+impl FileOperationPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Copying => "Copying",
+            Self::Syncing => "Syncing destination",
+            Self::Verifying => "Verifying contents",
+            Self::Finalizing => "Finalizing move",
+        }
+    }
+}
+
 /// Progress message for file operations
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields are used for debugging/logging, not always read
@@ -596,6 +634,8 @@ pub enum ProgressMessage {
     FileStarted(String),
     /// File progress (copied bytes, total bytes)
     FileProgress(u64, u64),
+    /// Current post-preparation operation phase.
+    Phase(FileOperationPhase),
     /// File completed (filename)
     FileCompleted(String),
     /// Total progress (completed files, total files, completed bytes, total bytes)
@@ -3787,9 +3827,10 @@ fn copy_regular_file_to_open_with_progress<F>(
     src: &Path,
     dest_file: &mut File,
     expected_source: Option<&PathAuthorization>,
+    verification: MoveVerification,
     cancel_flag: &Arc<AtomicBool>,
     progress_callback: F,
-) -> io::Result<(u64, [u8; 32])>
+) -> io::Result<(u64, Option<[u8; 32]>)>
 where
     F: FnMut(u64, u64),
 {
@@ -3810,6 +3851,7 @@ where
         &metadata,
         src,
         dest_file,
+        verification,
         cancel_flag,
         progress_callback,
     )
@@ -3820,9 +3862,10 @@ fn copy_open_regular_file_to_open_with_progress<F>(
     metadata: &fs::Metadata,
     source_display: &Path,
     dest_file: &mut File,
+    verification: MoveVerification,
     cancel_flag: &Arc<AtomicBool>,
     mut progress_callback: F,
-) -> io::Result<(u64, [u8; 32])>
+) -> io::Result<(u64, Option<[u8; 32]>)>
 where
     F: FnMut(u64, u64),
 {
@@ -3835,7 +3878,7 @@ where
 
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
     let mut copied: u64 = 0;
-    let mut source_hasher = Sha256::new();
+    let mut source_hasher = verification.hashes_content().then(Sha256::new);
 
     loop {
         // Check for cancellation
@@ -3849,7 +3892,9 @@ where
         }
 
         dest_file.write_all(&buffer[..bytes_read])?;
-        source_hasher.update(&buffer[..bytes_read]);
+        if let Some(hasher) = source_hasher.as_mut() {
+            hasher.update(&buffer[..bytes_read]);
+        }
         copied += bytes_read as u64;
 
         // Report progress
@@ -3870,7 +3915,7 @@ where
     preserve_file_metadata(dest_file, metadata)?;
     dest_file.sync_all()?;
 
-    Ok((copied, source_hasher.finalize().into()))
+    Ok((copied, source_hasher.map(|hasher| hasher.finalize().into())))
 }
 
 /// Hash a regular file through a no-follow handle while proving that both the
@@ -4135,6 +4180,7 @@ where
         src,
         &mut destination,
         None,
+        MoveVerification::Standard,
         cancel_flag,
         progress_callback,
     )?;
@@ -4171,6 +4217,7 @@ where
         source_metadata,
         source_display,
         &mut destination,
+        MoveVerification::Standard,
         cancel_flag,
         progress_callback,
     )?;
@@ -4192,8 +4239,15 @@ pub fn copy_file_with_progress<F>(
 where
     F: FnMut(u64, u64),
 {
-    copy_file_with_progress_detailed(src, dest, None, cancel_flag, progress_callback)
-        .map(|(copied, _published, _source_sha256)| copied)
+    copy_file_with_progress_detailed(
+        src,
+        dest,
+        None,
+        MoveVerification::Standard,
+        cancel_flag,
+        progress_callback,
+    )
+    .map(|(copied, _published, _source_sha256)| copied)
 }
 
 pub(crate) fn copy_file_with_progress_authorized<F>(
@@ -4210,6 +4264,7 @@ where
         src,
         dest,
         Some(expected_source),
+        MoveVerification::Standard,
         cancel_flag,
         progress_callback,
     )
@@ -4220,9 +4275,10 @@ fn copy_file_with_progress_detailed<F>(
     src: &Path,
     dest: &Path,
     expected_source: Option<&PathAuthorization>,
+    verification: MoveVerification,
     cancel_flag: &Arc<AtomicBool>,
     mut progress_callback: F,
-) -> io::Result<(u64, PublishedStage, [u8; 32])>
+) -> io::Result<(u64, PublishedStage, Option<[u8; 32]>)>
 where
     F: FnMut(u64, u64),
 {
@@ -4242,6 +4298,7 @@ where
         src,
         &mut destination,
         expected_source,
+        verification,
         cancel_flag,
         |copied, total| progress_callback(copied, total),
     );
@@ -4359,6 +4416,9 @@ pub(crate) fn copy_path_authorized(
             cancel_flag,
             |copied, total| {
                 let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                if total > 0 && copied >= total {
+                    let _ = progress_tx.send(ProgressMessage::Phase(FileOperationPhase::Syncing));
+                }
             },
         )
         .map(|(_, warnings)| warnings)
@@ -4573,6 +4633,10 @@ fn copy_dir_recursive_with_progress_inner(
                             file_completed_bytes + copied,
                             total_bytes,
                         ));
+                        if total > 0 && copied >= total {
+                            let _ = progress_tx
+                                .send(ProgressMessage::Phase(FileOperationPhase::Syncing));
+                        }
                     },
                 );
 
@@ -5005,6 +5069,7 @@ pub fn copy_files_with_progress(
                 &src,
                 &copy_dest,
                 source_authorization.as_ref(),
+                MoveVerification::Standard,
                 &cancel_flag,
                 |copied, total| {
                     let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
@@ -5014,6 +5079,10 @@ pub fn copy_files_with_progress(
                         file_completed_bytes + copied,
                         total_bytes,
                     ));
+                    if total > 0 && copied >= total {
+                        let _ =
+                            progress_tx.send(ProgressMessage::Phase(FileOperationPhase::Syncing));
+                    }
                 },
             ) {
                 Ok((_, warnings, _source_sha256)) => match finish_copied_item(
@@ -5103,6 +5172,7 @@ pub fn move_files_with_progress(
     target_authorization: Option<DirectoryAuthorization>,
     mut source_authorizations: HashMap<PathBuf, PathAuthorization>,
     source_directory_authorization: Option<DirectoryAuthorization>,
+    verification: MoveVerification,
     cancel_flag: Arc<AtomicBool>,
     progress_tx: Sender<ProgressMessage>,
 ) {
@@ -5574,6 +5644,7 @@ pub fn move_files_with_progress(
                     &src,
                     &copy_dest,
                     Some(&copy_source_authorization),
+                    verification,
                     &cancel_flag,
                     |copied, total| {
                         let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
@@ -5583,9 +5654,13 @@ pub fn move_files_with_progress(
                             file_completed_bytes + copied,
                             total_bytes,
                         ));
+                        if total > 0 && copied >= total {
+                            let _ = progress_tx
+                                .send(ProgressMessage::Phase(FileOperationPhase::Syncing));
+                        }
                     },
                 )
-                .map(|(_, published, source_sha256)| (published, Some(source_sha256)))
+                .map(|(_, published, source_sha256)| (published, source_sha256))
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -5595,6 +5670,8 @@ pub fn move_files_with_progress(
 
             match copy_result {
                 Ok((published, copied_source_sha256)) => {
+                    let _ =
+                        progress_tx.send(ProgressMessage::Phase(FileOperationPhase::Finalizing));
                     let staging = destination_staging
                         .take()
                         .expect("destination staging was created");
@@ -5657,7 +5734,13 @@ pub fn move_files_with_progress(
                             }
                         };
 
-                    let source_verification = if source_is_directory {
+                    if verification.hashes_content() {
+                        let _ =
+                            progress_tx.send(ProgressMessage::Phase(FileOperationPhase::Verifying));
+                    }
+                    let source_verification = if !verification.hashes_content() {
+                        Ok(())
+                    } else if source_is_directory {
                         isolated_source.bind_verified_directory_copy(&stage)
                     } else if let Some(copied_source_sha256) = copied_source_sha256 {
                         verify_isolated_source_matches_copy(&isolated_source, copied_source_sha256)
@@ -5718,6 +5801,8 @@ pub fn move_files_with_progress(
                     } else {
                         None
                     };
+                    let _ =
+                        progress_tx.send(ProgressMessage::Phase(FileOperationPhase::Finalizing));
                     match commit_cross_filesystem_move(
                         stage,
                         &dest,
@@ -6043,9 +6128,9 @@ pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
         Err(e) => {
             // If rename fails (cross-device), copy then delete
             if is_cross_device_error(&e) {
-                move_file_via_verified_copy(src, dest, identity)
+                move_file_via_copy(src, dest, identity)
             } else if e.kind() == io::ErrorKind::Unsupported {
-                move_file_via_verified_copy(src, dest, identity)
+                move_file_via_copy(src, dest, identity)
             } else {
                 Err(e)
             }
@@ -6053,11 +6138,8 @@ pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-fn move_file_via_verified_copy(
-    src: &Path,
-    dest: &Path,
-    source_identity: PathIdentity,
-) -> io::Result<()> {
+fn move_file_via_copy(src: &Path, dest: &Path, source_identity: PathIdentity) -> io::Result<()> {
+    let verification = MoveVerification::Standard;
     let staging = PrivateStagingDirectory::create(
         dest.parent().unwrap_or_else(|| Path::new(".")),
         "move-copy",
@@ -6078,10 +6160,11 @@ fn move_file_via_verified_copy(
             src,
             &copy_dest,
             Some(&copy_source_authorization),
+            MoveVerification::Standard,
             &cancel,
             |_, _| {},
         )
-        .map(|(_, published, source_sha256)| (published, Some(source_sha256)))
+        .map(|(_, published, source_sha256)| (published, source_sha256))
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -6112,7 +6195,9 @@ fn move_file_via_verified_copy(
             })
         }
     };
-    let source_verification = if source_is_directory {
+    let source_verification = if !verification.hashes_content() {
+        Ok(())
+    } else if source_is_directory {
         source.bind_verified_directory_copy(&stage)
     } else if let Some(copied_source_sha256) = copied_source_sha256 {
         verify_isolated_source_matches_copy(&source, copied_source_sha256)
@@ -7314,6 +7399,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -7379,6 +7465,7 @@ mod tests {
             Some(target_authorization),
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -7415,6 +7502,7 @@ mod tests {
             Some(authorization),
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -7545,6 +7633,7 @@ mod tests {
             None,
             HashMap::new(),
             Some(directory),
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             move_tx,
         );
@@ -7724,6 +7813,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             cancel_flag,
             tx,
         );
@@ -7765,6 +7855,7 @@ mod tests {
             None,
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -7809,12 +7900,17 @@ mod tests {
             None,
             HashMap::new(),
             None,
+            MoveVerification::Standard,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
 
         let messages: Vec<_> = rx.try_iter().collect();
         assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            ProgressMessage::Phase(FileOperationPhase::Verifying)
+        )));
         assert!(!source.exists());
         let destination = target_dir.join("item");
         assert_eq!(
@@ -7826,6 +7922,47 @@ mod tests {
             "child"
         );
         assert!(destination.join("empty").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_cross_filesystem_move_runs_content_verification() {
+        let Some((source_root, target_root)) = create_cross_filesystem_test_dirs() else {
+            return;
+        };
+        let source_dir = source_root.path().join("source");
+        let target_dir = target_root.path().join("target");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let source = source_dir.join("item");
+        fs::write(&source, "strictly verified").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        move_files_with_progress(
+            vec![PathBuf::from("item")],
+            &source_dir,
+            &target_dir,
+            HashMap::new(),
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            MoveVerification::Strict,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ProgressMessage::Phase(FileOperationPhase::Verifying)
+        )));
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target_dir.join("item")).unwrap(),
+            "strictly verified"
+        );
     }
 
     #[test]
@@ -7845,9 +7982,46 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
     }
 
+    #[test]
+    fn standard_file_copy_skips_sha256_while_strict_copy_produces_it() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        let standard_destination = temp_dir.join("standard");
+        let strict_destination = temp_dir.join("strict");
+        let contents = b"content that should only be hashed in strict mode";
+        fs::write(&source, contents).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (_, _, standard_digest) = copy_file_with_progress_detailed(
+            &source,
+            &standard_destination,
+            None,
+            MoveVerification::Standard,
+            &cancel,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(standard_digest.is_none());
+
+        let (_, _, strict_digest) = copy_file_with_progress_detailed(
+            &source,
+            &strict_destination,
+            None,
+            MoveVerification::Strict,
+            &cancel,
+            |_, _| {},
+        )
+        .unwrap();
+        let expected: [u8; 32] = Sha256::digest(contents).into();
+        assert_eq!(strict_digest, Some(expected));
+        assert_eq!(fs::read(&standard_destination).unwrap(), contents);
+        assert_eq!(fs::read(&strict_destination).unwrap(), contents);
+        cleanup_temp_dir(&temp_dir);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn unstructured_cross_filesystem_directory_move_uses_verified_copy() {
+    fn unstructured_cross_filesystem_directory_move_uses_transactional_copy() {
         let Some((source_root, target_root)) = create_cross_filesystem_test_dirs() else {
             return;
         };

@@ -15,7 +15,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::keybindings::GotoAction;
-use crate::services::file_ops::FileOperationType;
+use crate::services::file_ops::{FileOperationPhase, FileOperationType};
 use crate::utils::format::{safe_prefix, safe_suffix};
 
 use super::{
@@ -586,7 +586,7 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
             (60, 15, 15) // Exclude confirm dialog
         }
         DialogType::Settings => {
-            (42, 6, 6) // Settings dialog: width=42, height=6
+            (70, 8, 8) // Three settings rows, policy description, and help
         }
         DialogType::BinaryFileHandler => {
             // Dynamic height based on input display width
@@ -2075,6 +2075,46 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     ]);
     let file_bar_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(file_bar_line), file_bar_area);
+
+    // A full transfer bar does not imply the operation has committed. Show
+    // sync/verification/finalization explicitly instead of appearing frozen.
+    if matches!(
+        progress.operation_type,
+        FileOperationType::Copy | FileOperationType::Move
+    ) {
+        let phase_line = if progress.phase == FileOperationPhase::Copying {
+            Line::from(vec![
+                Span::styled(
+                    "Phase: ",
+                    Style::default().fg(theme.dialog.progress_label_text),
+                ),
+                Span::styled(
+                    progress.phase.label(),
+                    Style::default().fg(theme.dialog.progress_value_text),
+                ),
+            ])
+        } else {
+            let spinner_chars = ['|', '/', '-', '\\'];
+            let spinner_idx = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                / 100) as usize
+                % spinner_chars.len();
+            Line::from(vec![
+                Span::styled(
+                    format!("{} ", spinner_chars[spinner_idx]),
+                    Style::default().fg(theme.dialog.progress_bar_fill),
+                ),
+                Span::styled(
+                    progress.phase.label(),
+                    Style::default().fg(theme.dialog.progress_value_text),
+                ),
+            ])
+        };
+        let phase_area = Rect::new(inner.x + 1, inner.y + 2, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new(phase_line), phase_area);
+    }
 
     // Total progress info
     let total_info = if progress.operation_type == FileOperationType::Tar
@@ -4060,7 +4100,7 @@ fn handle_settings_dialog_input(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Down => {
             if let Some(ref mut state) = app.settings_state {
-                if state.selected_field < 1 {
+                if state.selected_field < 2 {
                     state.selected_field += 1;
                 }
             }
@@ -4076,6 +4116,9 @@ fn handle_settings_dialog_input(app: &mut App, code: KeyCode) -> bool {
                     1 => {
                         state.prev_diff_method();
                     }
+                    2 => {
+                        state.toggle_move_verification();
+                    }
                     _ => {}
                 }
             }
@@ -4090,6 +4133,9 @@ fn handle_settings_dialog_input(app: &mut App, code: KeyCode) -> bool {
                     }
                     1 => {
                         state.next_diff_method();
+                    }
+                    2 => {
+                        state.toggle_move_verification();
                     }
                     _ => {}
                 }
@@ -4323,6 +4369,40 @@ fn draw_settings_dialog(frame: &mut Frame, state: &SettingsState, area: Rect, th
                 .bg(theme.settings.value_bg),
         ),
     ]));
+
+    // Cross-volume move verification (row 2)
+    let verification_value = format!("< {} >", state.current_move_verification());
+    let verification_prompt = if state.selected_field == 2 {
+        "> "
+    } else {
+        "  "
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            verification_prompt,
+            Style::default().fg(theme.settings.prompt),
+        ),
+        Span::styled(
+            "Cross-volume move: ",
+            Style::default().fg(theme.settings.label_text),
+        ),
+        Span::styled(
+            verification_value,
+            Style::default()
+                .fg(theme.settings.value_text)
+                .bg(theme.settings.value_bg),
+        ),
+    ]));
+
+    let verification_help = if state.current_move_verification() == "Strict" {
+        "  Strict rereads contents with SHA-256 and may be much slower."
+    } else {
+        "  Standard skips content hashes; staging and durability checks remain."
+    };
+    lines.push(Line::from(Span::styled(
+        verification_help,
+        Style::default().fg(theme.settings.help_text),
+    )));
 
     lines.push(Line::from(""));
 
@@ -5265,6 +5345,34 @@ mod tests {
         handle_dialog_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         assert!(app.dialog.is_none());
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn settings_dialog_can_select_strict_cross_volume_verification() {
+        let temp_dir = create_temp_test_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.show_settings_dialog();
+
+        handle_settings_dialog_input(&mut app, KeyCode::Down);
+        handle_settings_dialog_input(&mut app, KeyCode::Down);
+        assert_eq!(app.settings_state.as_ref().unwrap().selected_field, 2);
+
+        handle_settings_dialog_input(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.settings_state
+                .as_ref()
+                .unwrap()
+                .cross_volume_move_verification,
+            crate::config::CrossVolumeMoveVerification::Strict
+        );
+
+        handle_settings_dialog_input(&mut app, KeyCode::Esc);
+        assert!(app.settings_state.is_none());
+        assert_eq!(
+            app.settings.cross_volume_move_verification,
+            crate::config::CrossVolumeMoveVerification::Standard
+        );
         cleanup_temp_test_dir(&temp_dir);
     }
 
