@@ -116,7 +116,7 @@ Discards the current session and prepares for a fresh start. The working directo
 
 ### Persistent Memory Is a Separate Layer
 
-If `/usememory` is ON, the fresh provider session created after `/clear` can still search relevant records from earlier completed conversations in the same bot and chat. This is intentional: session history supports exact provider continuation, while persistent memory supports selective recall across sessions.
+If `/usememory` is ON, the fresh provider session created after `/clear` can still search relevant records from the shared `~/.cokacdir/memory_store`, including conversations contributed by other bots and chats. This is intentional: session history supports exact provider continuation, while persistent memory supports selective recall across the shared long-term corpus.
 
 Turning `/usememory` OFF stops later storage and retrieval guidance but still does not delete existing records. See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) for the full lifecycle and privacy implications.
 

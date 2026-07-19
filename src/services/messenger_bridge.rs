@@ -29,6 +29,9 @@ use tokio::sync::{mpsc, Mutex};
 /// Bot identity information (returned by getMe)
 pub struct BotInfo {
     pub id: i64,
+    /// Authenticated, platform-qualified identity used for settings migration.
+    /// This contains no bot-token secret.
+    pub settings_identity: String,
     pub username: String,
     pub first_name: String,
 }
@@ -986,6 +989,7 @@ mod rich_message_fallback_tests {
             backend: Arc::new(ConsoleBackend::new()),
             bot_info: BotInfo {
                 id: 1,
+                settings_identity: "console:1".to_string(),
                 username: "bridge-test".to_string(),
                 first_name: "Bridge Test".to_string(),
             },
@@ -1034,6 +1038,7 @@ mod rich_message_fallback_tests {
             backend: Arc::new(ConsoleBackend::new()),
             bot_info: BotInfo {
                 id: 1,
+                settings_identity: "console:1".to_string(),
                 username: "bridge-test".to_string(),
                 first_name: "Bridge Test".to_string(),
             },
@@ -1411,6 +1416,7 @@ impl MessengerBackend for ConsoleBackend {
     async fn init(&mut self) -> Result<BotInfo, String> {
         Ok(BotInfo {
             id: 100,
+            settings_identity: "console:100".to_string(),
             username: "console_bot".to_string(),
             first_name: "ConsoleBot".to_string(),
         })
@@ -2004,6 +2010,7 @@ impl MessengerBackend for DiscordBackend {
 
         Ok(BotInfo {
             id: user.id.get() as i64,
+            settings_identity: format!("discord:{}", user.id.get()),
             username: user.name.clone(),
             first_name: user.name.clone(),
         })
@@ -2624,8 +2631,8 @@ fn load_slack_channel_map(path: &std::path::Path) -> Option<HashMap<i64, String>
 mod slack_tests {
     use super::{
         extract_slack_complete_upload_ts, load_slack_channel_map,
-        normalize_slack_text_for_telegram, slack_chat_id, telegram_html_to_slack_mrkdwn,
-        SlackState,
+        normalize_slack_text_for_telegram, slack_chat_id, slack_settings_identity,
+        telegram_html_to_slack_mrkdwn, SlackState,
     };
 
     #[test]
@@ -2705,6 +2712,14 @@ mod slack_tests {
         assert!(slack_chat_id("D0123456789") > 0);
         assert!(slack_chat_id("C0123456789") < 0);
         assert!(slack_chat_id("G0123456789") < 0);
+    }
+
+    #[test]
+    fn settings_identity_includes_workspace_and_bot_user() {
+        let first = slack_settings_identity("T111", "U999");
+        assert_eq!(first, "slack:T111:U999");
+        assert_ne!(first, slack_settings_identity("T222", "U999"));
+        assert_ne!(first, slack_settings_identity("T111", "U888"));
     }
 
     #[test]
@@ -2806,6 +2821,10 @@ fn slack_id_hash(s: &str) -> i64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     (h & 0x7FFFFFFFFFFFFFFF) as i64
+}
+
+fn slack_settings_identity(team_id: &str, user_id: &str) -> String {
+    format!("slack:{team_id}:{user_id}")
 }
 
 /// Convert Slack channel ID string to Telegram-compatible chat_id (i64).
@@ -3129,6 +3148,7 @@ impl MessengerBackend for SlackBackend {
             .map_err(|e| format!("Slack auth.test failed: {}", e))?;
 
         let user_id_str = auth_resp.user_id.to_string();
+        let team_id_str = auth_resp.team_id.to_string();
         let bot_id_str = auth_resp.bot_id.as_ref().map(|b| b.to_string());
         let username = auth_resp
             .user
@@ -3152,6 +3172,7 @@ impl MessengerBackend for SlackBackend {
 
         Ok(BotInfo {
             id: slack_id_hash(&user_id_str),
+            settings_identity: slack_settings_identity(&team_id_str, &user_id_str),
             username: username.clone(),
             first_name: username,
         })
@@ -3968,13 +3989,18 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
     // used to mask this leak by tearing down the runtime).
     let backend_aborter = backend_handle.abort_handle();
 
-    // Generate a stable bridge token for telegram.rs settings storage.
-    // Hash the real token to avoid exposing it in URL paths and debug logs.
+    // Generate a deterministic per-credential proxy token for telegram.rs.
+    // Hash the real token to avoid exposing it in URL paths and debug logs;
+    // settings continuity across credential rotation uses `settings_identity`.
     let token_discriminator = args
         .first()
         .map(|t| crate::services::telegram::token_hash(t))
         .unwrap_or_else(|| "default".to_string());
     let bridge_token = format!("bridge_{}_{}", backend_name, token_discriminator);
+    // Unlike the bridge token, this identity is stable across secret-token
+    // rotation and contains no credential material. `backend.init()` has
+    // already authenticated the remote bot and supplied its platform identity.
+    let settings_identity = bot_info.settings_identity.clone();
 
     // Proxy state
     let state = Arc::new(ProxyState {
@@ -4016,7 +4042,11 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
     // process-exit decision is deferred to `main` so a sibling bot in
     // a multi-bot run is not killed by one backend's death.
     let exit = tokio::select! {
-        bot_exit = crate::services::telegram::run_bot(&bridge_token, Some(&api_url)) => {
+        bot_exit = crate::services::telegram::run_bot_with_settings_identity(
+            &bridge_token,
+            Some(&api_url),
+            Some(&settings_identity),
+        ) => {
             // Bot exited. Forward `BotExit::Fatal` (revoked token,
             // persistent `Conflict`) as `BridgeExit::Fatal` so the
             // outermost caller surfaces a non-zero process exit and the

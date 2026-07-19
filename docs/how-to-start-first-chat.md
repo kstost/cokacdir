@@ -22,8 +22,8 @@ Type `/pwd` to see the current working directory path.
 
 Type `/clear` to discard the current session and start a new one. The previous session is not deleted — it is abandoned, and a fresh session begins.
 
-## Optional Persistent Memory
+## Persistent Memory
 
-Provider sessions normally carry the active conversation. If you want selective recall to survive `/clear`, session changes, provider changes, and working-directory changes, use the owner-only `/usememory` toggle for that chat. It is OFF by default and stores eligible completed User/final Assistant pairs as private plain-text records; it does not store tool execution details.
+Provider sessions normally carry the active conversation. Persistent memory is ON by default for every bot + chat pair without an explicit setting. It stores eligible completed User/final Assistant pairs as private plain-text records and lets enabled runs search the shared `memory_store` across `/clear`, session changes, provider changes, working-directory changes, bots, and chats; it does not store tool execution details. Use the owner-only `/usememory` toggle before a turn runs if you want to turn this storage and lookup OFF for that bot + chat pair.
 
-See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) before enabling it, especially the plain-text retention and privacy sections.
+See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md), especially the default-ON behavior, plain-text retention, and privacy sections.

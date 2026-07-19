@@ -147,15 +147,15 @@ Persistent memory is separate from the recent shared log controlled by `/context
 @mybot /usememory
 ```
 
-`/usememory` is owner-only and toggles memory for that specific bot + group-chat pair. Public access does not allow ordinary group members to change it.
+`/usememory` is owner-only and toggles memory execution for that specific bot + group-chat setting. It defaults to ON when no explicit value is saved, including for existing settings after upgrade. Public access does not allow ordinary group members to change it. The underlying `~/.cokacdir/memory_store` corpus is shared across every bot and chat running under the same OS account. An owner who does not want group turns retained must run `/usememory` before those turns are handled so the setting becomes OFF.
 
 When ON:
 
 - eligible User requests handled by that bot and their successfully delivered final Assistant answers are stored as immutable plain-text records;
-- the bot may search those older records only when they are relevant;
+- the bot may search relevant records contributed by any bot or chat in the shared store;
 - records survive provider-session changes, `/clear`, working-directory changes, and model switches;
-- scheduled tasks, bot-to-bot messages, and proactive Companion pings may read the group memory but do not create User/Assistant records;
-- another bot in the same group has a different memory scope and does not automatically share these records.
+- scheduled tasks, bot-to-bot messages, and proactive Companion pings may read the shared memory but do not create User/Assistant records;
+- another bot with `/usememory` enabled can search these records, including from a different chat. Paths and display names are attribution hints rather than proof that a record belongs to the current speaker.
 
 Because several people can contribute to one group scope, a record can include an optional `user_label`. This is only a display-name hint: names can collide or change, so the Agent is instructed not to assign an old preference, identity, or private fact to the current speaker without reliable current context.
 
@@ -164,9 +164,9 @@ Because several people can contribute to one group scope, a record can include a
 | Feature | Scope | Delivery to the Agent | Typical lifetime | Multi-bot sharing |
 |---|---|---|---|---|
 | `/contextlevel` | Recent group log | Last N entries are inserted into every applicable prompt | Bounded recent context | Designed to expose recent activity from multiple bots |
-| `/usememory` | One bot + one group chat | Exact root and search rules are provided; records are read only on demand | Indefinite until files are deliberately removed | No; each bot has an isolated scope |
+| `/usememory` | Shared `memory_store` for the OS account; ON/OFF setting remains per bot + chat | Shared root and search rules are provided; records are read only on demand | Indefinite until files are deliberately removed | Yes; all enabled bots and chats can search the corpus |
 
-Turning `/usememory` OFF stops new storage and removes lookup guidance from later runs, but does not delete the existing group records. The store is unencrypted plain text protected by local owner-only filesystem permissions, so enabling it in a public group should be treated as an explicit long-term retention choice for participants' handled messages.
+Turning `/usememory` OFF for that bot + group-chat pair stops its new storage and removes lookup guidance from its later runs, but does not delete existing group records or affect another bot's setting. The store is unencrypted plain text protected by local owner-only filesystem permissions. Because memory defaults to ON, operators of public groups should review this retention behavior and explicitly turn it OFF before handled messages if long-term shared storage is not appropriate.
 
 See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) for exact record contents, search behavior, privacy boundaries, and limitations.
 

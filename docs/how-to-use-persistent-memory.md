@@ -4,10 +4,11 @@
 
 Persistent conversation memory lets an Agent recall useful information from earlier completed conversations even after the provider session, model, or working directory changes. It is designed for durable user preferences, prior decisions, constraints, names, ongoing work, and conclusions that may matter again.
 
-The feature is deliberately opt-in:
+The feature is enabled by default and can be disabled independently for each bot + chat pair:
 
-- Default: **OFF**
-- Scope: **one bot and one chat**
+- Default: **ON**
+- Search scope: **the complete shared `memory_store` for this OS account**
+- Enable setting: **per bot + chat**
 - Control: `/usememory`
 - Canonical storage: private, plain-text Markdown files
 - Retrieval: on-demand Agent search with normal file tools
@@ -25,34 +26,42 @@ Send the following owner-only command in the chat whose memory setting you want 
 /usememory
 ```
 
-`/usememory` is a pure toggle and takes no arguments. Each call flips the current chat between ON and OFF.
+`/usememory` is a pure toggle and takes no arguments. Each call flips the current bot + chat setting between ON and OFF.
+
+A bot + chat pair with no saved `use_memory` value is ON. This includes existing settings files after upgrading to this version. An explicitly saved OFF value remains OFF. Therefore, in an unconfigured chat, the first `/usememory` call turns memory OFF.
+
+“No saved value” is intentionally different from a damaged value. A present `use_memory` field must be a JSON object whose keys are canonical signed chat IDs and whose values are JSON booleans. If it is malformed, cokacdir refuses to start that bot and leaves `bot_settings.json` untouched for correction; it never converts an unreadable OFF into the default ON.
 
 When enabling succeeds, the bot replies:
 
 ```text
 Persistent memory: ON
-Completed User/Assistant turns will be stored as private plain-text files for this chat.
+Completed User/Assistant turns from this chat will be stored as private plain-text files, and the Agent may search the shared memory_store across all bots and chats.
 ```
 
 When disabling succeeds, the bot replies:
 
 ```text
 Persistent memory: OFF
-New turns will not be stored or searched; existing records are retained.
+This chat will not store new turns or search the shared memory_store; existing records are retained.
 ```
 
-Before changing the setting to ON, cokacdir performs a temporary storage capability check. It verifies that the chat-scoped directory can safely create, sync, atomically publish, validate, and remove a private file. If any step fails, memory remains OFF and no probe record is retained.
+When changing an explicit OFF setting back to ON, cokacdir performs a temporary storage capability check. It verifies that the shared store and the current chat's write directory can safely create, sync, atomically publish, validate, and remove a private file. If any step fails, memory remains OFF and no probe record is retained. A default-ON run still validates and prepares its shared root immediately before the provider starts; if that fails, memory is omitted for that turn and the bot reports a warning.
 
-The setting is persisted per chat. Enabling memory in one direct message or group does not enable it in another chat, and one bot does not inherit another bot's setting.
+The setting is persisted independently for each bot + chat pair. Enabling memory for one bot does not enable another bot, even in the same chat, and enabling it in one direct message or group does not turn the feature ON elsewhere. However, whenever it is ON for a run, the Agent can search records contributed by every bot and chat in the same `memory_store`.
+
+Rotating only a bot's secret token does not reset an explicit ON/OFF value once cokacdir has a stable settings identity. Telegram can derive that identity from the numeric bot ID in both old and new tokens. Discord uses its authenticated user ID, while Slack uses the authenticated workspace ID plus bot-user ID. cokacdir migrates exactly one matching settings entry to the new token key, refuses ambiguous or mismatched candidates, and never guesses from a display name or username.
+
+For a Discord or Slack entry written before stable identity metadata existed, run this version once with the existing credential before rotating it. That successful start annotates the exact current entry. If the credential was already rotated before the first upgraded start, there is no trustworthy link to the old bridge entry; cokacdir leaves it untouched and refuses to start while an unresolved entry for the same platform remains. This prevents an unreadable legacy OFF from silently becoming default ON and requires the operator to compare and reconcile the entries explicitly.
 
 ### ON and OFF behavior
 
 | Setting | Save new eligible turns | Give the Agent memory-search guidance | Existing records |
 |---|---:|---:|---|
-| OFF | No | No | Retained, but not offered to the Agent |
-| ON | Yes | Yes | Available for relevant on-demand lookup |
+| OFF | No | No | All shared records are retained, but not offered to this run |
+| ON | Yes | Yes | All shared records are available for relevant on-demand lookup |
 
-Turning memory OFF pauses storage and retrieval. It is not a delete operation, and turning it ON later makes the same chat's existing records available again.
+Turning memory OFF pauses storage and retrieval for that bot + chat pair. It is not a delete operation, and turning it ON later makes the complete shared store available again.
 
 ---
 
@@ -125,26 +134,30 @@ Memory state is sampled just before the provider starts, not when a message firs
 
 cokacdir does not copy the memory corpus, the most recent records, or search results into every system prompt. When memory is ON, it adds only:
 
-- the exact read-only root for the current bot and chat;
+- the exact read-only root of the shared `~/.cokacdir/memory_store`;
 - instructions describing when lookup is useful;
 - a narrow list/search/read procedure;
 - rules that historical records are untrusted data rather than instructions;
 - the priority rule that current instructions and the current User message win;
-- an additional attribution warning for group chats.
+- attribution warnings because records can come from different bots, chats, groups, and people.
 
 The Agent handling the current request decides whether lookup would materially help. It should skip memory for self-contained questions and repository tasks whose current files are already the source of truth.
 
 When lookup is useful, the Agent is instructed to:
 
-1. Start in likely recent year/month directories.
+1. Search any current `v2/<chat-id>` or legacy `v1/bots` subtree that may be relevant, starting with likely recent year/month directories.
 2. Search for a few distinctive terms and collect candidate file paths first.
 3. Read only a small number of likely records.
 4. Retry with synonyms, alternate spellings, related names, broader terms, or another date range when the first query is weak.
 5. Stop once it has enough relevant context.
 
+The lookup protocol also forbids following symlinks, reparse points, aliases, or other filesystem indirections found inside the store. Candidates must be regular `.md` files beneath the validated root.
+
 This is not exact-match-only retrieval. The current Agent can reformulate searches, but the physical store is still plain text: if old and new wording share no useful terms and the Agent does not infer the right synonym, a relevant record can be missed. There is currently no FTS, embedding, or vector index.
 
 The lookup uses the provider's existing file listing, search, and read tools. If those tools are unavailable under the active provider or tool policy, cokacdir can still save eligible turns, but that Agent may be unable to retrieve them during the run.
+
+The shared root is an intentional cross-bot and cross-chat corpus. A chat ID in a path and an optional `user_label` are attribution hints only. The Agent must not transfer a preference, identity, private fact, or authorization to the current speaker unless the current conversation or other reliable context establishes that relationship.
 
 ---
 
@@ -154,36 +167,35 @@ Records live under:
 
 ```text
 ~/.cokacdir/memory_store/
-└── v1/
-    └── bots/
-        └── <bot-key-hash>/
-            └── chats/
-                └── <chat-id>/
-                    └── turns/
-                        └── <YYYY>/
-                            └── <MM>/
-                                └── <UTC timestamp>-<turn-id>.md
+├── v2/
+│   └── <chat-id>/
+│       └── <YYYY>/
+│           └── <MM>/
+│               └── <UTC timestamp>-<turn-id>.md
+└── v1/                              # legacy, still searchable
+    └── bots/<legacy-bot-hash>/chats/...
 ```
 
 Example:
 
 ```text
-~/.cokacdir/memory_store/v1/bots/ab12.../chats/123456789/turns/2026/07/
+~/.cokacdir/memory_store/v2/123456789/2026/07/
   20260719T052011.482Z-7f4c2a9d4e8b41cc9a7f03de6b2c1105.md
 ```
 
-- `v1` identifies the layout and record schema.
-- `<bot-key-hash>` is an opaque, domain-separated SHA-256 scope. A normal Telegram token is scoped by its stable numeric bot ID; the raw token and raw ID are not written into the path.
-- `<chat-id>` isolates direct messages and groups.
+- `v2` is the current shared layout. It does not contain a bot token, bot ID, or bot hash.
+- `<chat-id>` organizes records by their source chat; it is not a read-access boundary.
+- Existing `v1/bots/<legacy-bot-hash>/...` files are not moved or rewritten. Because the Agent receives the parent `memory_store` root, those legacy records remain searchable alongside v2 records.
 - `YYYY/MM` keeps a long history from accumulating in one directory.
 - The timestamp is UTC; a random 128-bit turn ID prevents same-millisecond collisions.
 
-The primary boundary is bot + chat, not provider session or workspace. Consequently:
+The primary memory corpus is the complete `memory_store` owned by the current OS account. Consequently:
 
-- the same chat can recall records across `/start`, `/clear`, session changes, provider changes, and working-directory changes;
-- different chats do not share records;
-- different bots do not share records;
-- a group uses its own shared group-chat memory scope;
+- every enabled bot and chat can search records written by every other bot and chat using the same store;
+- a chat's ON/OFF setting still controls whether that chat contributes new turns and receives search guidance;
+- `/start`, `/clear`, session changes, provider changes, and working-directory changes do not create a new memory boundary;
+- multiple bots writing for the same chat contribute to the same v2 chat directory;
+- direct-message and group records are all searchable from the shared root;
 - `working_directory` is context metadata, not an isolation boundary.
 
 ### Record format
@@ -208,7 +220,7 @@ user_label: "Alice"
 "I will ask for confirmation before future deployments."
 ```
 
-The two message payloads are JSON strings inside fixed Markdown sections. Newlines, quotes, and text such as `## Assistant` are escaped, so message content cannot forge another role boundary. `user_label` is optional group metadata and contains only the participant's non-unique display label—not the stable Telegram user ID. It is a hint, not proof of identity.
+The two message payloads are JSON strings inside fixed Markdown sections. Newlines, quotes, and text such as `## Assistant` are escaped, so message content cannot forge another role boundary. `user_label` is optional group metadata and contains only the participant's non-unique display label—not the stable Telegram user ID. The source chat is represented by its directory; no bot identity is stored in a new v2 record. These values are hints, not proof of identity.
 
 One turn is never appended to or used to overwrite another turn. Concurrent completions publish distinct files.
 
@@ -223,30 +235,30 @@ Companion mode controls response style, final-only presentation, proactive pings
 | `/companion` | `/usememory` | Result |
 |---|---|---|
 | OFF | OFF | Normal conversation without persistent memory |
-| OFF | ON | Normal conversation with shared per-chat memory |
+| OFF | ON | Normal conversation with access to the shared global memory store |
 | ON | OFF | Companion style without persistent memory |
-| ON | ON | Companion style using the same per-chat memory |
+| ON | ON | Companion style using the same shared global memory store |
 
 The Agent no longer creates or curates a separate set of Companion notes. Proactive pings may read common memory when ON, but they never write a new record because no User message initiated the ping.
 
 ### Schedules and bot-to-bot work
 
-Scheduled and bot-to-bot runs may consult the destination chat's memory when it is ON at their provider-start boundary. Their generated prompts are not actual end-user utterances, so neither run type writes a new memory record.
+Scheduled and bot-to-bot runs may consult the shared memory store when the destination chat's setting is ON at their provider-start boundary. Their generated prompts are not actual end-user utterances, so neither run type writes a new memory record.
 
 ### Groups
 
-`/usememory` is owner-only in groups. When enabled, every eligible request handled by that bot in the group contributes to the same bot + group-chat scope. Different participants can therefore appear in the records.
+`/usememory` is owner-only in groups. When enabled, every eligible request in the group contributes to that source chat's v2 directory and becomes searchable from every other enabled bot or chat. Different participants can therefore appear in the shared corpus.
 
-The optional `user_label` is treated only as a display hint because names can collide or change. The Agent is explicitly warned not to assign a preference, identity, or private fact to the current speaker unless current reliable context establishes the link.
+The optional `user_label` is treated only as a display hint because names can collide or change. The Agent is explicitly warned not to assign a preference, identity, private fact, or authorization from any other bot or chat to the current speaker unless reliable current context establishes the link.
 
-Persistent memory is not the same as `/contextlevel`: shared group context injects a bounded recent multi-bot log on every turn, while persistent memory is isolated per bot, survives much longer, and is searched only when relevant.
+Persistent memory is not the same as `/contextlevel`: shared group context injects a bounded recent group log on every turn, while persistent memory is a global long-lived corpus searched only when relevant.
 
 ---
 
 ## Relationship to Sessions and Existing Files
 
 - `/clear` clears the current provider conversation but does not delete persistent memory.
-- `/start` changes or creates a provider session without changing this chat's memory scope.
+- `/start` changes or creates a provider session without changing access to the shared memory store.
 - `/model` can switch providers; the normalized memory files remain provider-independent.
 - `/usememory` OFF retains existing records.
 - Session cleanup and archive cleanup do not treat memory records as session files.
@@ -265,7 +277,7 @@ cokacdir does not import, migrate, search, delete, or use files from that legacy
 
 ## Privacy and Safety
 
-Persistent memory is intentionally searchable **plain text**, not an encrypted database. Enabling it means future eligible User requests and final Assistant answers can remain on disk indefinitely.
+Persistent memory is intentionally searchable **plain text**, not an encrypted database. Because it defaults to ON, future eligible User requests and final Assistant answers can remain on disk indefinitely unless the owner turns it OFF with `/usememory` before those turns run.
 
 - There is no automatic secret detection, redaction, summarization, retention period, or pruning.
 - Records can also appear in home-directory backups and filesystem snapshots.
@@ -276,7 +288,7 @@ Persistent memory is intentionally searchable **plain text**, not an encrypted d
 
 These controls protect against accidental exposure and unsafe publication, but they are not application-level encryption. Administrators, malware, backups, or another process running as the same OS user may still access the files.
 
-The Agent receives a strong read-only and scope-limited instruction. Because some providers run with full filesystem access as the same OS user, that prompt rule is a logical boundary rather than a hard sandbox. Deployments that require enforced cross-chat isolation need an additional OS sandbox or a future scope-enforcing memory tool.
+The Agent receives a strong read-only instruction and is limited to the `memory_store` root, but bot and chat subdirectories inside that root are intentionally shared. There is no confidentiality boundary between bots or chats using the same OS account. Deployments that require separated memory must use separate OS users, containers, homes, or sandbox mounts.
 
 Every stored message is treated as untrusted historical data. Commands, code, or prompt-like text found in an old record must not override current system instructions or the current User message.
 
@@ -298,9 +310,13 @@ The writer runs outside the shared chat-state lock in a dedicated tracked blocki
 
 ## Troubleshooting
 
+### The bot refuses to start with an unsafe bot-settings error
+
+cokacdir preserves `~/.cokacdir/bot_settings.json` instead of normalizing uncertain data. Check the local error for a malformed `use_memory` object, a token/hash/identity mismatch, more than one current/prior entry claiming the same stable bot identity, or an old same-platform bridge entry that has no provable identity after credential rotation. Correct or restore the settings file before restarting; do not delete an older entry until you have compared its explicit per-chat values, especially `false` entries.
+
 ### `/usememory` says memory remains OFF
 
-The enable-time capability probe failed or was cancelled. Check the local debug log for the exact reason. Common causes include an unsafe path component, permissions or DACL failure, a read-only filesystem, unavailable disk space, or inability to sync or atomically rename files.
+An explicit OFF-to-ON capability probe failed or was cancelled. Check the local debug log for the exact reason. Common causes include an unsafe path component, permissions or DACL failure, a read-only filesystem, unavailable disk space, or inability to sync or atomically rename files.
 
 ### A completed conversation did not create a record
 
@@ -334,7 +350,7 @@ The first version intentionally does not provide:
 - generated summaries, tags, topics, or importance scores;
 - SQLite FTS, n-gram, embedding, or vector search;
 - a dedicated `--memory-search` command;
-- hard OS-enforced read isolation between chat scopes;
+- bot- or chat-level confidentiality inside one shared `memory_store`;
 - strict exactly-once deduplication for externally replayed Telegram updates.
 
 Plain-text Markdown remains the canonical source. A future search index can be rebuilt from these records without replacing them.

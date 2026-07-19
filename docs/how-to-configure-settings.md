@@ -61,7 +61,7 @@ Telegram shows typing indicators while the agent works. Discord receives typing 
 
 ## /usememory
 
-Toggles persistent conversation memory for the current bot and chat. Default: **OFF**.
+Toggles persistent conversation memory execution for the current bot and chat. The ON/OFF setting is local to that bot + chat, while the underlying corpus is shared by all bots and chats under the same OS account. Default: **ON**. A missing setting is treated as ON, including after upgrading an existing settings file; an explicitly saved OFF remains OFF.
 
 ```text
 /usememory
@@ -69,10 +69,16 @@ Toggles persistent conversation memory for the current bot and chat. Default: **
 
 This is an owner-only pure toggle with no status or mode argument. Each call changes the effective state:
 
-- **ON** — Eligible completed User/Assistant turns are stored as private plain-text Markdown files. The Agent receives the exact current-chat memory root plus read-only, on-demand search instructions.
+- **ON** — Eligible completed User/Assistant turns are stored as private plain-text Markdown files. The Agent receives the shared `~/.cokacdir/memory_store` root plus read-only, on-demand search instructions and may search records from every bot and chat.
 - **OFF** — New turns are not stored, memory guidance is omitted from new Agent runs, and existing records remain on disk.
 
-Enabling is fail-closed. Before saving ON, cokacdir verifies that the scoped store can privately create, sync, atomically publish, identity-check, and remove a probe file. A failed probe leaves the setting OFF.
+For a bot + chat pair without an explicit setting, the first `/usememory` call changes the default ON state to OFF.
+
+Explicit re-enabling is fail-closed. Before changing OFF to ON, cokacdir verifies that the shared store and current chat's write destination can privately create, sync, atomically publish, identity-check, and remove a probe file. A failed probe leaves the setting OFF. Default-ON provider runs separately validate and prepare the root before use.
+
+The implicit ON default applies only when `use_memory` or the current chat key is absent. If a present `use_memory` field is not an object, a chat key is not a canonical signed integer, or a value is not a JSON boolean, cokacdir refuses to start that bot and preserves the file for correction instead of silently treating the damaged value as ON.
+
+An explicitly saved value follows the same bot when its secret token is rotated. Telegram uses the numeric bot ID embedded in the token, Discord uses the authenticated Discord user ID, and Slack uses both the authenticated workspace ID and bot-user ID. Settings are never selected by display name or username, and an ambiguous or mismatched identity stops startup rather than copying another bot's settings. A Discord/Slack entry created before this metadata existed must first be started once with its existing credential; if the credential was already rotated before that upgraded start, cokacdir cannot prove which legacy entry belongs to it and refuses to start while an unresolved same-platform entry remains.
 
 Memory records contain only the canonical User request and successfully delivered terminal Assistant answer plus minimal metadata. Tool calls, tool results, reasoning, progress events, system prompts, diagnostics, failed runs, schedules, bot-to-bot messages, and proactive pings are not written as conversation turns.
 

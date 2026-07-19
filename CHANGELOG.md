@@ -1,5 +1,15 @@
 # Changelog — cokacdir
 
+## 0.8.9 — 2026-07-20
+
+- **Persistent conversation memory now defaults to ON and uses one shared corpus across bots and chats.** Any bot + chat pair without an explicit `use_memory` value—including existing settings after upgrade—stores eligible turns and receives shared-memory search guidance by default; an explicitly saved OFF value remains OFF, and `/usememory` toggles the setting. When active for a run, only a non-empty User message and the successfully completed canonical Assistant answer are written as one immutable plain-text Markdown record, while the Agent may search relevant records contributed by every bot and chat under the same OS account. System prompts, reasoning, tool calls, tool results, progress events, task notifications, diagnostics, and failed or cancelled turns still have no storage representation.
+
+- **Memory settings now survive bot-token secret rotation without crossing bot identities.** Settings entries keep a stable, non-secret identity (Telegram's numeric bot ID, Discord's authenticated user ID, or Slack's workspace + bot-user ID); an exact single identity match is migrated to the new token key and stale keys for that bot are removed. Ambiguous matches, identity mismatches, and malformed present `use_memory` data are fatal startup errors instead of silently becoming default ON. Missing `use_memory` remains the only implicit-default case. A legacy bridge entry must be started once with its existing credential so this new stable identity can be recorded; if that credential was already rotated, cokacdir neither guesses by username nor starts with default ON while an unresolved same-platform entry remains.
+
+- **The shared-memory layout is compact and remains backward-searchable.** New records are written under `~/.cokacdir/memory_store/v2/<chat-id>/` without a bot token, bot ID, bot hash, or redundant `chats/turns` namespaces. The system prompt receives the shared read-only `memory_store` root and a narrow, iterative search protocol, so current v2 records and existing v1 bot-scoped records remain available without migration. Records are treated as untrusted historical data, cross-context attribution requires reliable current context, and the current user message always takes priority.
+
+---
+
 ## 0.8.8 — 2026-07-19
 
 - **Telegram voice requests now wait for an explicit transcription decision.** After speech-to-text completes, the bot shows the transcript with `이 내용으로 실행` and `취소` inline buttons instead of immediately invoking the Agent. The confirmation has no timeout, only the user who sent the audio can decide it, and the buttons are removed after the decision so a stale callback cannot run the request again.
