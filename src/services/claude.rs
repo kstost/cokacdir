@@ -487,7 +487,14 @@ pub enum StreamMessage {
         status: String,
         summary: String,
     },
-    /// Completion
+    /// Canonical terminal Assistant message.
+    ///
+    /// Providers emit this at most once, only after the backend process has
+    /// exited successfully. It contains user-visible Assistant prose only;
+    /// tool traffic, diagnostics, and synthetic completion text are excluded.
+    AssistantFinal { content: String },
+    /// Successful completion. Providers must not emit this until the backend
+    /// process has exited successfully.
     Done {
         result: String,
         session_id: Option<String>,
@@ -499,6 +506,25 @@ pub enum StreamMessage {
         stderr: String,
         exit_code: Option<i32>,
     },
+}
+
+/// Publish the shared successful-terminal sequence. Callers are responsible
+/// for invoking this only after their backend has been verified successful.
+/// `done_result` may contain a UI diagnostic; only `assistant_final` is a
+/// canonical conversational message eligible for durable memory.
+pub(crate) fn send_success_terminal(
+    sender: &Sender<StreamMessage>,
+    assistant_final: Option<String>,
+    done_result: String,
+    session_id: Option<String>,
+) -> Result<(), std::sync::mpsc::SendError<StreamMessage>> {
+    if let Some(content) = assistant_final.filter(|content| !content.trim().is_empty()) {
+        sender.send(StreamMessage::AssistantFinal { content })?;
+    }
+    sender.send(StreamMessage::Done {
+        result: done_result,
+        session_id,
+    })
 }
 
 /// Token for cooperative cancellation of streaming requests.
@@ -1407,6 +1433,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
     let mut last_session_id: Option<String> = None;
     let mut final_result: Option<String> = None;
     let mut stdout_error: Option<(String, String)> = None; // (message, raw_line)
+    let mut canonical_stream_valid = true;
     let mut line_count = 0;
     let mut receiver_dropped = false;
 
@@ -1434,12 +1461,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
             }
             Err(e) => {
                 debug_log(&format!("ERROR: Failed to read line: {}", e));
-                let _ = sender.send(StreamMessage::Error {
-                    message: format!("Failed to read output: {}", e),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
+                stdout_error = Some((format!("Failed to read output: {}", e), String::new()));
                 break;
             }
         };
@@ -1522,6 +1544,16 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         if session_id.is_some() {
                             last_session_id = session_id.clone();
                         }
+                        // Claude reports a result before the child necessarily
+                        // exits. Cache it, but do not publish success yet: a
+                        // non-zero exit or later stdout error must still win.
+                        continue;
+                    }
+                    StreamMessage::AssistantFinal { content } => {
+                        debug_log(&format!(
+                            "  >>> AssistantFinal (unexpected parser output): {} chars",
+                            content.len()
+                        ));
                     }
                     StreamMessage::Error { ref message, .. } => {
                         debug_log(&format!("  >>> Error: {}", message));
@@ -1558,6 +1590,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
         } else {
             let invalid_preview: String = line.chars().take(200).collect();
             debug_log(&format!("  NOT valid JSON: {}", invalid_preview));
+            // Keep presentation tolerant of incidental stdout, but do not
+            // treat an earlier result as canonical across unknown protocol
+            // output that could have represented intervening work.
+            canonical_stream_valid = false;
         }
     }
 
@@ -1630,20 +1666,18 @@ IMPORTANT: Format your responses using Markdown for better readability:
         return Ok(());
     }
 
-    // If we didn't get a proper Done message, send one now
-    if final_result.is_none() {
-        debug_log("No Done message received, sending synthetic Done message...");
-        let send_result = sender.send(StreamMessage::Done {
-            result: String::new(),
-            session_id: last_session_id.clone(),
-        });
-        debug_log(&format!(
-            "Synthetic Done message sent, result={:?}",
-            send_result.is_ok()
-        ));
-    } else {
-        debug_log("Done message was already received, not sending synthetic one");
-    }
+    // Publish the canonical answer and completion only after the child has
+    // exited successfully. This is the provider boundary consumed by durable
+    // memory and by final-only presentation.
+    let result = final_result.unwrap_or_default();
+    let assistant_final =
+        (canonical_stream_valid && !result.trim().is_empty()).then(|| result.clone());
+    let send_result =
+        send_success_terminal(&sender, assistant_final, result, last_session_id.clone());
+    debug_log(&format!(
+        "Post-exit Done message sent, result={:?}",
+        send_result.is_ok()
+    ));
 
     debug_log("========================================");
     debug_log("=== execute_command_streaming END (success) ===");
@@ -1793,6 +1827,42 @@ fn parse_stream_message(json: &Value) -> Option<StreamMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn success_terminal_orders_canonical_answer_before_done() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        send_success_terminal(
+            &sender,
+            Some("final answer".to_string()),
+            "final answer".to_string(),
+            Some("session-1".to_string()),
+        )
+        .expect("send terminal sequence");
+
+        assert!(matches!(
+            receiver.recv().expect("assistant final"),
+            StreamMessage::AssistantFinal { content } if content == "final answer"
+        ));
+        assert!(matches!(
+            receiver.recv().expect("done"),
+            StreamMessage::Done { result, session_id }
+                if result == "final answer" && session_id.as_deref() == Some("session-1")
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn success_terminal_diagnostic_is_not_an_assistant_message() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        send_success_terminal(&sender, None, "transport diagnostic".to_string(), None)
+            .expect("send diagnostic terminal sequence");
+
+        assert!(matches!(
+            receiver.recv().expect("done"),
+            StreamMessage::Done { result, .. } if result == "transport diagnostic"
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn private_temp_files_are_unique_no_clobber_and_raii_cleaned() {

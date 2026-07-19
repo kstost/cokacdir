@@ -1,5 +1,21 @@
 # Changelog — cokacdir
 
+## 0.8.8 — 2026-07-19
+
+- **Telegram voice requests now wait for an explicit transcription decision.** After speech-to-text completes, the bot shows the transcript with `이 내용으로 실행` and `취소` inline buttons instead of immediately invoking the Agent. The confirmation has no timeout, only the user who sent the audio can decide it, and the buttons are removed after the decision so a stale callback cannot run the request again.
+
+- **Unconfirmed voice work has a defined replacement and cancellation lifecycle.** A later request from the same user supersedes a voice request that is still transcribing or waiting for confirmation; once Execute is committed, normal per-chat queue behavior resumes. `/stop`, `/stopall`, dispatch failure, dropped confirmation receivers, and shutdown paths cancel the pending decision and clean up its request slot. Mixed-album files are saved immediately, but their records remain absent from session history, pending context, and shared group logs until Execute; orderly shutdown also disables visible confirmation buttons on a best-effort basis.
+
+- **Persistent conversation memory is available as an opt-in, per-chat feature.** `/usememory` toggles the feature and defaults to OFF. When enabled, only a non-empty User message and the successfully completed canonical Assistant answer are written as one immutable plain-text Markdown record under a versioned, bot-and-chat-scoped `~/.cokacdir/memory_store/v1/` tree; system prompts, reasoning, tool calls, tool results, progress events, task notifications, diagnostics, and failed or cancelled turns have no storage representation.
+
+- **Persistent-memory storage and retrieval are fail-closed and agentic.** Enabling first verifies private directory creation, file sync, identity checks, atomic no-replace publication, cleanup, and directory durability without leaving a probe record. When the feature is ON, the system prompt provides only the exact read-only chat scope and a narrow, iterative search protocol—not the stored corpus itself—so the Agent can retry with synonyms while treating every record as untrusted historical data and giving the current user message priority. Companion mode now uses this same memory switch and no longer instructs the Agent to manage a separate legacy `~/.cokacdir/memory/` store.
+
+- **Committed memory writes now have an independent shutdown lifecycle.** Once a canonical answer has been delivered, its storage task is no longer aborted with ordinary Agent work; `run_bot` drains the dedicated writer registry before returning. Group records keep only the non-unique display label in `user_label` and omit the stable Telegram user ID.
+
+- **Provider streams now expose one canonical terminal Assistant boundary.** Claude, Codex, OpenCode, and Agy publish the durable-memory/final-only answer only after the backend exits successfully, invalidating earlier prose when later tool or protocol activity occurs. This keeps intermediate narration, tool traffic, and synthetic diagnostics out of both persistent memory and the terminal-answer projection.
+
+---
+
 ## 0.8.7 — 2026-07-15
 
 - **The Claude model menu now uses stable aliases without version-specific descriptions.** `/model` lists `claude`, `claude:fable`, `claude:opus`, `claude:sonnet`, and `claude:haiku` in that order. The version-labelled Sonnet, Opus, and Haiku descriptions and the previously listed `sonnet[1m]` entry were removed so the installed Claude CLI remains responsible for resolving each alias.

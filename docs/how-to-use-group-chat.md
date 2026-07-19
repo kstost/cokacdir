@@ -139,6 +139,39 @@ Setting `/contextlevel` to `0` disables shared context entirely. The bot will ha
 
 ---
 
+## Persistent Memory in a Group
+
+Persistent memory is separate from the recent shared log controlled by `/contextlevel`.
+
+```text
+@mybot /usememory
+```
+
+`/usememory` is owner-only and toggles memory for that specific bot + group-chat pair. Public access does not allow ordinary group members to change it.
+
+When ON:
+
+- eligible User requests handled by that bot and their successfully delivered final Assistant answers are stored as immutable plain-text records;
+- the bot may search those older records only when they are relevant;
+- records survive provider-session changes, `/clear`, working-directory changes, and model switches;
+- scheduled tasks, bot-to-bot messages, and proactive Companion pings may read the group memory but do not create User/Assistant records;
+- another bot in the same group has a different memory scope and does not automatically share these records.
+
+Because several people can contribute to one group scope, a record can include an optional `user_label`. This is only a display-name hint: names can collide or change, so the Agent is instructed not to assign an old preference, identity, or private fact to the current speaker without reliable current context.
+
+### `/contextlevel` versus `/usememory`
+
+| Feature | Scope | Delivery to the Agent | Typical lifetime | Multi-bot sharing |
+|---|---|---|---|---|
+| `/contextlevel` | Recent group log | Last N entries are inserted into every applicable prompt | Bounded recent context | Designed to expose recent activity from multiple bots |
+| `/usememory` | One bot + one group chat | Exact root and search rules are provided; records are read only on demand | Indefinite until files are deliberately removed | No; each bot has an isolated scope |
+
+Turning `/usememory` OFF stops new storage and removes lookup guidance from later runs, but does not delete the existing group records. The store is unencrypted plain text protected by local owner-only filesystem permissions, so enabling it in a public group should be treated as an explicit long-term retention choice for participants' handled messages.
+
+See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) for exact record contents, search behavior, privacy boundaries, and limitations.
+
+---
+
 ## Customizing Co-work Behavior
 
 The guidelines that govern how bots collaborate in group chats can be customized by editing the file:

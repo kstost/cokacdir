@@ -505,6 +505,182 @@ impl DirectoryAccess {
         }
     }
 
+    /// Atomically rename one child to another without replacing an existing
+    /// destination. Both names are resolved relative to this already-open
+    /// directory, so Unix callers do not have to reopen an attacker-swappable
+    /// pathname while publishing a file.
+    pub(crate) fn rename_noreplace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        validate_directory_entry_name(source)?;
+        validate_directory_entry_name(destination)?;
+
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        {
+            return rustix::fs::renameat_with(
+                &self.directory,
+                source,
+                &self.directory,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from);
+        }
+
+        #[cfg(windows)]
+        {
+            return rename_noreplace(&self.path.join(source), &self.path.join(destination));
+        }
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            windows
+        )))]
+        {
+            let _ = (source, destination);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Atomic no-clobber directory-relative rename is not supported on this platform",
+            ))
+        }
+    }
+
+    /// Rename the exact Windows file identified by `expected` into another
+    /// name in this already-open directory without replacing an existing
+    /// destination. The source object is rebound to a DELETE-capable handle
+    /// before the rename, closing the path-swap window left by `MoveFileExW`.
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    pub(crate) fn rename_file_noreplace_by_identity(
+        &self,
+        source: &OsStr,
+        destination: &OsStr,
+        expected: StablePathIdentity,
+    ) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+        };
+
+        validate_directory_entry_name(source)?;
+        validate_directory_entry_name(destination)?;
+
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(DELETE_ACCESS | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            // A metadata change such as this rename inherits write-through
+            // behavior from the source handle.
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH);
+        let source_file = options.open(self.path.join(source))?;
+        let metadata = source_file.metadata()?;
+        if !metadata.is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || stable_file_identity(&source_file)? != expected
+        {
+            return Err(io::Error::other(
+                "Directory entry changed before handle-bound no-replace rename",
+            ));
+        }
+
+        // Win32's FILE_RENAME_INFO contract uses a full path with a null
+        // RootDirectory. `self.directory` remains open without
+        // FILE_SHARE_DELETE throughout this call, pinning the already-verified
+        // target directory pathname against replacement.
+        let destination_path = self.path.join(destination);
+        let wide_name = destination_path
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        if wide_name.is_empty() || wide_name.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows destination name is empty or contains a NUL character",
+            ));
+        }
+        let name_bytes = wide_name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows destination name is too long",
+                )
+            })?;
+        let buffer_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+            .checked_add(name_bytes as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows rename information is too large",
+                )
+            })?;
+        let word_size = std::mem::size_of::<usize>();
+        let word_count = (buffer_bytes + word_size - 1) / word_size;
+        let mut buffer = vec![0usize; word_count];
+        let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buffer` is word-aligned and large enough for the fixed
+        // FILE_RENAME_INFO header plus the complete UTF-16 destination name.
+        // Both handles stay open until SetFileInformationByHandle returns.
+        unsafe {
+            (*rename_info).Anonymous.ReplaceIfExists = false;
+            (*rename_info).RootDirectory = null_mut();
+            (*rename_info).FileNameLength = name_bytes;
+            std::ptr::copy_nonoverlapping(
+                wide_name.as_ptr(),
+                (*rename_info).FileName.as_mut_ptr(),
+                wide_name.len(),
+            );
+        }
+        // SAFETY: rename_info points to the initialized variable-sized buffer
+        // described above and source_file is an owned, live file handle.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                source_file.as_raw_handle().cast(),
+                FileRenameInfo,
+                rename_info.cast(),
+                u32::try_from(buffer_bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Windows rename information is too large",
+                    )
+                })?,
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(80 | 183)) {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                error.to_string(),
+            ))
+        } else {
+            Err(error)
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn read_link(&self, name: &OsStr) -> io::Result<PathBuf> {
         use std::os::unix::ffi::OsStringExt;

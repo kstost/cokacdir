@@ -15,8 +15,8 @@ use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::services::claude::{
-    create_private_temp_file, debug_log_to, enhanced_path_for_bin, kill_child_tree, CancelToken,
-    ClaudeResponse, PrivateTempFile, StreamMessage,
+    create_private_temp_file, debug_log_to, enhanced_path_for_bin, kill_child_tree,
+    send_success_terminal, CancelToken, ClaudeResponse, PrivateTempFile, StreamMessage,
 };
 use crate::services::file_ops::{
     open_directory_for_read, stable_file_identity, stable_path_identity, StablePathIdentity,
@@ -749,19 +749,13 @@ fn read_agy_hook_lease(
         .next()
         .filter(|name| is_random_agy_temp_name(name, AGY_SYSTEM_PROMPT_PREFIX))
         .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Agy hook lease prompt",
-            )
+            io::Error::new(io::ErrorKind::InvalidData, "invalid Agy hook lease prompt")
         })?;
     let state_name = lines
         .next()
         .filter(|name| is_random_agy_temp_name(name, AGY_HOOK_STATE_PREFIX))
         .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Agy hook lease state",
-            )
+            io::Error::new(io::ErrorKind::InvalidData, "invalid Agy hook lease state")
         })?;
     if lines.next().is_some() {
         return Err(io::Error::new(
@@ -902,8 +896,7 @@ impl AgyHookPrompt {
         let state_file = create_private_temp_file(base, AGY_HOOK_STATE_PREFIX, b"")?;
         let state_identity = stable_path_identity(state_file.path())?;
         let lease_contents = agy_hook_lease_contents(prompt_file.path(), state_file.path())?;
-        let lease_file =
-            create_private_temp_file(base, AGY_HOOK_LEASE_PREFIX, &lease_contents)?;
+        let lease_file = create_private_temp_file(base, AGY_HOOK_LEASE_PREFIX, &lease_contents)?;
         let lease_lock = open_and_lock_owned_temp_file_shared(&lease_file)?;
         let ack_path = derived_hook_ack_path(prompt_file.path())?;
         match std::fs::symlink_metadata(&ack_path) {
@@ -2544,10 +2537,8 @@ pub fn execute_command_streaming(
         }
     }
 
-    let _ = sender.send(StreamMessage::Done {
-        result: visible_output,
-        session_id: last_session_id,
-    });
+    let assistant_final = (!visible_output.trim().is_empty()).then(|| visible_output.clone());
+    let _ = send_success_terminal(&sender, assistant_final, visible_output, last_session_id);
     agy_debug("=== agy execute_command_streaming END ===");
     Ok(())
 }
@@ -2629,12 +2620,10 @@ mod tests {
             r#"{"invocationNum":0,"conversationId":"conversation"}"#,
             r#"{"invocationNum":0,"initialNumSteps":1,"conversationId":""}"#,
         ] {
-            assert!(build_agy_hook_response(
-                input,
-                hook_prompt.prompt_path(),
-                hook_prompt.token(),
-            )
-            .is_err());
+            assert!(
+                build_agy_hook_response(input, hook_prompt.prompt_path(), hook_prompt.token(),)
+                    .is_err()
+            );
         }
     }
 
@@ -2916,7 +2905,9 @@ mod tests {
 
     #[test]
     fn platform_lock_contention_error_is_recognized() {
-        assert!(super::agy_file_lock_is_contended(&fs2::lock_contended_error()));
+        assert!(super::agy_file_lock_is_contended(
+            &fs2::lock_contended_error()
+        ));
     }
 
     #[cfg(windows)]
@@ -2924,15 +2915,9 @@ mod tests {
     fn windows_hook_wrapper_contains_complete_ledger_protocol() {
         let command = super::agy_hook_command();
 
-        assert!(command.contains(&format!(
-            "echo start %{}%",
-            super::AGY_HOOK_ENV_TOKEN
-        )));
+        assert!(command.contains(&format!("echo start %{}%", super::AGY_HOOK_ENV_TOKEN)));
         assert!(command.contains(&format!("echo ok %{}%", super::AGY_HOOK_ENV_TOKEN)));
-        assert!(command.contains(&format!(
-            "echo fail %{}%",
-            super::AGY_HOOK_ENV_TOKEN
-        )));
+        assert!(command.contains(&format!("echo fail %{}%", super::AGY_HOOK_ENV_TOKEN)));
         assert!(command.contains("exit /b 125"));
     }
 

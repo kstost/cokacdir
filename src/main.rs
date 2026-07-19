@@ -1996,6 +1996,10 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
                             task_id, status, summary
                         );
                     }
+                    StreamMessage::AssistantFinal { content } => {
+                        let preview: String = content.chars().take(240).collect();
+                        println!("[TEST] AssistantFinal ({}B): {:?}", content.len(), preview);
+                    }
                     StreamMessage::Done { result, session_id } => {
                         s.done += 1;
                         s.last_session_id = session_id.clone();
@@ -2158,6 +2162,14 @@ fn deploy_docs() {
         (
             "how-to-use-group-chat.md",
             include_str!("../docs/how-to-use-group-chat.md"),
+        ),
+        (
+            "how-to-use-persistent-memory.md",
+            include_str!("../docs/how-to-use-persistent-memory.md"),
+        ),
+        (
+            "how-to-use-telegram-voice-requests.md",
+            include_str!("../docs/how-to-use-telegram-voice-requests.md"),
         ),
         (
             "how-to-use-schedules.md",

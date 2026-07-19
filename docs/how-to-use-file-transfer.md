@@ -18,7 +18,18 @@ If no session is active, a workspace is automatically created.
 
 ### Speech Recognition
 
-Telegram audio and voice uploads are recognized with transcriptor. The bot first replies with `Recognizing speech..` and edits that same message when recognition finishes. If transcriptor needs to download a model first, the same message is edited to show the model download progress.
+Telegram audio and voice uploads are recognized with transcriptor. The bot first replies with `Recognizing speech..` and updates that progress while recognition runs. If transcriptor needs to download a model first, the same message shows model-download progress.
+
+Recognition does **not** immediately invoke the Agent. After transcription, the bot displays the recognized text and waits for one of two inline-button decisions:
+
+- `이 내용으로 실행` — commit the transcript as the User request and run it through the normal Agent path.
+- `취소` — end the voice request without starting the Agent.
+
+The confirmation has no timeout and only the Telegram user who sent the audio can decide it. A later executable request from that same user supersedes a voice request that is still transcribing or waiting for a decision. `/stop` and `/stopall` also cancel the pending voice request. Once a decision is accepted, the bot removes the buttons so an old callback cannot execute it again.
+
+For long transcripts, the transcript can be sent separately from the compact confirmation message. For an album with multiple audio items, the execution request preserves their order as `[Audio 1]`, `[Audio 2]`, and so on. Album-owned attachments stay isolated while confirmation is pending and are handed to the Agent only after Execute.
+
+See [How to Use Telegram Voice Requests](how-to-use-telegram-voice-requests.md) for replacement, queue, group authorization, album rollback, persistent-memory interaction, and troubleshooting details.
 
 Use `/stt_model` to view the current STT model for the chat:
 
@@ -43,7 +54,7 @@ copyright, license, model, and audio-consent notices.
 
 ### Upload with Caption
 
-If you include a caption with the file, the caption is sent to the AI along with the file context. This is useful for giving instructions about the uploaded file.
+If you include a caption with a non-audio file, the caption is sent to the AI along with the file context. For Telegram audio or voice, the caption is held with the recognized transcript and is sent only after the audio sender chooses `이 내용으로 실행`; choosing `취소` does not send either part to the AI.
 
 ### Upload While AI Is Busy
 

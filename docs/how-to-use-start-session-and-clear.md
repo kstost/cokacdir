@@ -112,6 +112,13 @@ Discards the current session and prepares for a fresh start. The working directo
 
 - The workspace directory and its files are not deleted.
 - The previous session is not fully deleted from disk — it is overwritten so that `/start` in the same directory will begin a fresh session rather than restoring the old one.
+- Persistent conversation records under `~/.cokacdir/memory_store/` are not deleted.
+
+### Persistent Memory Is a Separate Layer
+
+If `/usememory` is ON, the fresh provider session created after `/clear` can still search relevant records from earlier completed conversations in the same bot and chat. This is intentional: session history supports exact provider continuation, while persistent memory supports selective recall across sessions.
+
+Turning `/usememory` OFF stops later storage and retrieval guidance but still does not delete existing records. See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) for the full lifecycle and privacy implications.
 
 ### After /clear
 

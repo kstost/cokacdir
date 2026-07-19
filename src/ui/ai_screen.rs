@@ -1059,6 +1059,9 @@ Keep responses concise and terminal-friendly.",
                     });
                     has_new_content = true;
                 }
+                // Canonical projection for durable-memory/final-only consumers.
+                // The TUI already receives the same prose through Text/Done.
+                StreamMessage::AssistantFinal { .. } => {}
                 StreamMessage::Done { result, session_id } => {
                     // Update session ID if provided
                     if let Some(sid) = session_id {

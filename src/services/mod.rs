@@ -4,6 +4,7 @@ pub mod claude;
 pub mod codex;
 pub mod dedup;
 pub mod file_ops;
+pub mod memory;
 pub mod messenger_bridge;
 pub mod opencode;
 pub mod process;

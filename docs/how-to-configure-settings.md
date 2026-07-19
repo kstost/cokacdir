@@ -59,6 +59,31 @@ Telegram shows typing indicators while the agent works. Discord receives typing 
 
 ---
 
+## /usememory
+
+Toggles persistent conversation memory for the current bot and chat. Default: **OFF**.
+
+```text
+/usememory
+```
+
+This is an owner-only pure toggle with no status or mode argument. Each call changes the effective state:
+
+- **ON** — Eligible completed User/Assistant turns are stored as private plain-text Markdown files. The Agent receives the exact current-chat memory root plus read-only, on-demand search instructions.
+- **OFF** — New turns are not stored, memory guidance is omitted from new Agent runs, and existing records remain on disk.
+
+Enabling is fail-closed. Before saving ON, cokacdir verifies that the scoped store can privately create, sync, atomically publish, identity-check, and remove a probe file. A failed probe leaves the setting OFF.
+
+Memory records contain only the canonical User request and successfully delivered terminal Assistant answer plus minimal metadata. Tool calls, tool results, reasoning, progress events, system prompts, diagnostics, failed runs, schedules, bot-to-bot messages, and proactive pings are not written as conversation turns.
+
+The corpus itself is not automatically embedded in the system prompt. The active Agent searches the plain-text store only when earlier preferences, decisions, constraints, or conclusions could materially help, and it can retry with synonyms rather than requiring one exact match.
+
+Companion mode and memory are independent toggles. Companion uses the same common memory only when `/usememory` is ON; enabling `/companion` does not turn memory on.
+
+See [How to Use Persistent Conversation Memory](how-to-use-persistent-memory.md) for storage layout, eligibility, retrieval, privacy, group-chat behavior, failure handling, and current limitations.
+
+---
+
 ## /rich
 
 Configures Telegram Bot API 10.1 Rich Message delivery for eligible final responses. Defaults: delivery **auto**, profile **safe**, RTL **off**, draft streaming **off**.
@@ -173,6 +198,8 @@ Sets the transcriptor speech recognition model for the current chat.
 - `reset`, `clear`, `default`, or `unset` removes the chat override and lets transcriptor use its environment, saved config, or default model.
 
 If the selected model is not cached yet, transcriptor may download it on first use. Telegram STT progress messages show that download before recognition continues.
+
+After recognition, cokacdir displays the transcript with `이 내용으로 실행` and `취소` buttons. It does not invoke the Agent until the audio sender explicitly chooses Execute, and the confirmation has no timeout. See [How to Use Telegram Voice Requests](how-to-use-telegram-voice-requests.md) for replacement, cancellation, queue, group, album, and safety behavior.
 
 STT uses the MIT-licensed `transcriptor` binary and Whisper/whisper.cpp model
 artifacts. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for

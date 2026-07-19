@@ -26,6 +26,18 @@ Cancels the in-progress request **and** clears the entire message queue in one o
 Stopping... (3 queued message(s) cleared)
 ```
 
+## Voice Confirmation Is an Active Request
+
+A Telegram voice/audio request owns the chat's active request slot while speech recognition runs and while the transcript waits for `이 내용으로 실행` or `취소`. The confirmation has no timeout.
+
+- `/stop` cancels the pending voice request, then allows the next queued message to start.
+- `/stopall` cancels the voice request and clears queued messages.
+- A later executable request from the same sender supersedes the voice request before its button decision is committed, even when queue mode is ON. The replacement is admitted through the normal queue or redirect path and starts after voice cleanup releases the slot.
+- A message from another participant in a group does not own or supersede the pending confirmation; it follows normal queue behavior.
+- After Execute commits, the transcript is an ordinary Agent request, so later messages follow the standard queue/redirect rules.
+
+The original audio sender is the only user who can press either confirmation button. Cancelled, replaced, failed, or stale confirmations never invoke the Agent. See [How to Use Telegram Voice Requests](how-to-use-telegram-voice-requests.md) for the full lifecycle.
+
 ## /stop \<ID\>
 
 Removes a specific message from the queue by its ID.

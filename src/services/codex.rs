@@ -8,8 +8,8 @@ use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
 use crate::services::claude::{
-    create_private_temp_file, debug_log_to, kill_child_tree, CancelToken, PrivateTempFile,
-    StreamMessage,
+    create_private_temp_file, debug_log_to, kill_child_tree, send_success_terminal, CancelToken,
+    PrivateTempFile, StreamMessage,
 };
 
 /// Context required to detect images that Codex's built-in `image_gen` tool
@@ -1283,6 +1283,7 @@ pub fn execute_command_streaming(
 
     let mut last_session_id: Option<String> = None;
     let mut got_done = false;
+    let mut last_assistant_message: Option<String> = None;
     let mut stdout_error: Option<(String, String)> = None;
     let mut line_count = 0;
     // Track paths the model itself delivered via cokacdir --sendfile so the
@@ -1305,12 +1306,7 @@ pub fn execute_command_streaming(
             Ok(l) => l,
             Err(e) => {
                 codex_debug_log(&format!("ERROR: Failed to read line: {}", e));
-                let _ = sender.send(StreamMessage::Error {
-                    message: format!("Failed to read output: {}", e),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
+                stdout_error = Some((format!("Failed to read output: {}", e), String::new()));
                 break;
             }
         };
@@ -1325,6 +1321,16 @@ pub fn execute_command_streaming(
         codex_debug_log(&format!("Line {}: {}", line_count, line_preview));
 
         if let Ok(json) = serde_json::from_str::<Value>(&line) {
+            if let Some(content) = completed_agent_message(&json) {
+                last_assistant_message = Some(content);
+            } else if item_event_invalidates_terminal_candidate(&json) {
+                // Fail closed as soon as any new item starts or updates, and
+                // for every completed non-Assistant item. An Assistant message
+                // followed by more work is intermediate narration unless a
+                // later genuine completed Assistant message supersedes it.
+                last_assistant_message = None;
+            }
+
             let messages = parse_codex_event(&json);
             codex_debug_log(&format!("  Parsed {} messages", messages.len()));
 
@@ -1335,24 +1341,11 @@ pub fn execute_command_streaming(
                         last_session_id = Some(session_id.clone());
                     }
                     StreamMessage::Done { .. } => {
-                        codex_debug_log("  >>> Done");
-                        // Inject auto-delivered images BEFORE forwarding Done so
-                        // the polling loop processes them as part of this turn.
-                        if let Some(ctx) = auto_send {
-                            if let Some(sid) = last_session_id.as_deref() {
-                                auto_deliver_new_images(
-                                    sid,
-                                    &image_dir_snapshot,
-                                    &model_sent_paths,
-                                    ctx,
-                                    &sender,
-                                );
-                            } else {
-                                codex_debug_log("[auto-send] skipped: no session_id captured");
-                            }
-                        }
+                        codex_debug_log("  >>> Done (deferred until process exit)");
                         got_done = true;
+                        continue;
                     }
+                    StreamMessage::AssistantFinal { .. } => {}
                     StreamMessage::Error { ref message, .. } => {
                         codex_debug_log(&format!("  >>> Error: {}", message));
                         stdout_error = Some((message.clone(), line.clone()));
@@ -1398,6 +1391,10 @@ pub fn execute_command_streaming(
             }
         } else {
             codex_debug_log(&format!("  NOT valid JSON: {}", line_preview));
+            // The unknown line may describe work after the last completed
+            // Assistant item. Keep UI streaming tolerant, but fail closed for
+            // the canonical durable-memory projection.
+            last_assistant_message = None;
         }
     }
 
@@ -1501,21 +1498,23 @@ pub fn execute_command_streaming(
         }
     }
 
-    // Send synthetic Done if not received
     if !got_done {
-        codex_debug_log("No Done message received, sending synthetic Done");
-        // turn.completed never arrived, so the in-loop auto-deliver hook didn't
-        // fire. Still try to deliver any image_gen output before closing the turn.
-        if let Some(ctx) = auto_send {
-            if let Some(sid) = last_session_id.as_deref() {
-                auto_deliver_new_images(sid, &image_dir_snapshot, &model_sent_paths, ctx, &sender);
-            }
-        }
-        let _ = sender.send(StreamMessage::Done {
-            result: String::new(),
-            session_id: last_session_id,
-        });
+        codex_debug_log("No turn.completed event received; completing from successful exit");
     }
+
+    // Image delivery and terminal messages are success effects: neither may
+    // happen merely because a turn.completed line preceded a failing exit.
+    if let Some(ctx) = auto_send {
+        if let Some(sid) = last_session_id.as_deref() {
+            auto_deliver_new_images(sid, &image_dir_snapshot, &model_sent_paths, ctx, &sender);
+        } else {
+            codex_debug_log("[auto-send] skipped: no session_id captured");
+        }
+    }
+
+    let result = last_assistant_message.unwrap_or_default();
+    let assistant_final = (got_done && !result.trim().is_empty()).then(|| result.clone());
+    let _ = send_success_terminal(&sender, assistant_final, result, last_session_id);
 
     codex_debug_log(&format!(
         "[SP-FILE] About to drop SpFileGuard (path={:?}), is_resume={}",
@@ -2307,6 +2306,49 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
     }
 }
 
+/// Return only a genuine completed Assistant message, excluding error items,
+/// reasoning, task summaries, and unknown text-bearing protocol objects.
+fn completed_agent_message(json: &Value) -> Option<String> {
+    if json.get("type").and_then(Value::as_str) != Some("item.completed") {
+        return None;
+    }
+    let item = json.get("item").unwrap_or(json);
+    if !item_is_assistant_message(item) {
+        return None;
+    }
+    let content = extract_text_content(item);
+    (!content.trim().is_empty()).then_some(content)
+}
+
+fn item_is_assistant_message(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("agent_message") => true,
+        // Some Codex protocol versions use the generic `message` item. If
+        // they provide a role, accept only Assistant; an absent role keeps
+        // compatibility with the untagged generic shape.
+        Some("message") => item
+            .get("role")
+            .and_then(Value::as_str)
+            .map(|role| role.eq_ignore_ascii_case("assistant"))
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn item_event_invalidates_terminal_candidate(json: &Value) -> bool {
+    match json.get("type").and_then(Value::as_str) {
+        // Starting or updating any new protocol item means a previously
+        // completed Assistant message was not terminal. The later completed
+        // Assistant item, if one arrives, becomes the new candidate.
+        Some("item.started" | "item.updated") => true,
+        Some("item.completed") => {
+            let item = json.get("item").unwrap_or(json);
+            !item_is_assistant_message(item)
+        }
+        _ => false,
+    }
+}
+
 /// Extract text content from a Codex item.
 /// Handles both direct "content" string and array-of-objects format.
 fn extract_text_content(item: &Value) -> String {
@@ -2383,6 +2425,87 @@ mod receiver_drop_tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg.contains(&ctx.bot_key)));
+    }
+
+    #[test]
+    fn canonical_assistant_projection_accepts_only_agent_messages() {
+        let assistant = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "content": "final answer"}
+        });
+        let non_fatal_error = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "error", "message": "diagnostic"}
+        });
+        let unknown_text = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "future_protocol_item", "text": "not canonical"}
+        });
+        let user_message = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type": "message", "role": "user", "content": "not assistant"}
+        });
+
+        assert_eq!(
+            completed_agent_message(&assistant).as_deref(),
+            Some("final answer")
+        );
+        assert!(completed_agent_message(&non_fatal_error).is_none());
+        assert!(completed_agent_message(&unknown_text).is_none());
+        assert!(completed_agent_message(&user_message).is_none());
+    }
+
+    #[test]
+    fn later_item_activity_invalidates_an_earlier_terminal_candidate() {
+        for item_type in [
+            "command_execution",
+            "file_change",
+            "mcp_tool_call",
+            "collab_tool_call",
+            "web_search",
+            "todo_list",
+            "reasoning",
+            "error",
+            "future_protocol_item",
+        ] {
+            let event = serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": item_type}
+            });
+            assert!(
+                item_event_invalidates_terminal_candidate(&event),
+                "{item_type}"
+            );
+        }
+        assert!(!item_event_invalidates_terminal_candidate(
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "content": "answer"}
+            })
+        ));
+        assert!(item_event_invalidates_terminal_candidate(
+            &serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "message", "role": "user", "content": "question"}
+            })
+        ));
+        assert!(item_event_invalidates_terminal_candidate(
+            &serde_json::json!({
+                "type": "item.started",
+                "item": {"type": "agent_message"}
+            })
+        ));
+        assert!(item_event_invalidates_terminal_candidate(
+            &serde_json::json!({
+                "type": "item.updated",
+                "item": {"type": "future_protocol_item"}
+            })
+        ));
+        assert!(!item_event_invalidates_terminal_candidate(
+            &serde_json::json!({
+                "type": "turn.completed"
+            })
+        ));
     }
 
     #[cfg(unix)]

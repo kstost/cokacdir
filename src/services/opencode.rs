@@ -5,7 +5,7 @@
 //! with minimal code changes.
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -14,8 +14,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::services::claude::{
-    debug_log_to, kill_child_tree, terminate_child_after_receiver_drop, CancelToken,
-    ClaudeResponse, StreamMessage,
+    debug_log_to, kill_child_tree, send_success_terminal, terminate_child_after_receiver_drop,
+    CancelToken, ClaudeResponse, StreamMessage,
 };
 
 // ============================================================
@@ -40,6 +40,18 @@ const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// declare the turn dead. Covers the "opencode serve crashed mid-turn" case.
 /// 6 * 500ms = ~3s of grace before bailing out.
 const POLL_MAX_CONSECUTIVE_ERRORS: u32 = 6;
+/// Bound the session-message snapshot used to identify this turn's terminal
+/// Assistant message. A turn creating more than this many messages still works:
+/// the newest page then consists entirely of messages from the current turn.
+const SERVE_MESSAGE_LIMIT: usize = 512;
+/// Message persistence can trail the final idle status very briefly. Retry the
+/// authoritative fetch instead of falling back to a timing-sensitive SSE buffer.
+const SERVE_MESSAGE_FETCH_ATTEMPTS: usize = 5;
+/// Keep the SSE reader alive after the authoritative message appears so verbose
+/// presentation normally drains its final deltas before the long-lived stream is
+/// closed. Correctness does not depend on this delay; missing deltas are repaired
+/// from the authoritative message snapshot below.
+const SERVE_SSE_DRAIN_GRACE: Duration = Duration::from_millis(500);
 static OPENCODE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn opencode_debug(msg: &str) {
@@ -4474,8 +4486,11 @@ fn execute_command_streaming_legacy(
 
     let mut last_session_id: Option<String> = None;
     let mut final_result = String::new();
+    let mut terminal_result = String::new();
     let mut got_done = false;
     let mut stdout_error: Option<(String, String)> = None;
+    let mut stdout_read_failed = false;
+    let mut canonical_stream_valid = true;
     let mut init_sent = false;
     let mut event_count = 0u32;
     let mut text_event_count = 0u32;
@@ -4502,18 +4517,8 @@ fn execute_command_streaming_legacy(
             Ok(l) => l,
             Err(e) => {
                 opencode_debug(&format!("[stream] stdout read error: {}", e));
-                if sender
-                    .send(StreamMessage::Error {
-                        message: format!("Failed to read output: {}", e),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: None,
-                    })
-                    .is_err()
-                {
-                    terminate_child_after_receiver_drop(&mut child);
-                    return Ok(());
-                }
+                stdout_read_failed = true;
+                stdout_error = Some((format!("Failed to read output: {}", e), String::new()));
                 break;
             }
         };
@@ -4538,6 +4543,11 @@ fn execute_command_streaming_legacy(
                     "[stream] JSON parse error on event {}: {}",
                     event_count, e
                 ));
+                // Continue presenting any valid surrounding stream events, but
+                // never persist a terminal candidate across an unparseable
+                // protocol line: it could have represented intervening work.
+                canonical_stream_valid = false;
+                terminal_result.clear();
                 continue;
             }
         };
@@ -4591,6 +4601,7 @@ fn execute_command_streaming_legacy(
                         final_result.len() + text.len()
                     ));
                     final_result.push_str(&text);
+                    terminal_result.push_str(&text);
                     if sender.send(StreamMessage::Text { content: text }).is_err() {
                         opencode_debug("[stream] Text send failed (receiver dropped)");
                         terminate_child_after_receiver_drop(&mut child);
@@ -4607,6 +4618,10 @@ fn execute_command_streaming_legacy(
 
             "tool_use" => {
                 tool_event_count += 1;
+                // Any prose before another tool action was intermediate. Only
+                // prose produced after the final tool is a canonical terminal
+                // Assistant message.
+                terminal_result.clear();
                 opencode_debug(&format!(
                     "[stream] TOOL_USE[{}] (event {})",
                     tool_event_count, event_count
@@ -4704,22 +4719,9 @@ fn execute_command_streaming_legacy(
                 ));
                 if is_final {
                     got_done = true;
-                    opencode_debug(&format!(
-                        "[stream] sending Done: result_len={} session_id={:?}",
-                        final_result.len(),
-                        last_session_id
-                    ));
-                    if sender
-                        .send(StreamMessage::Done {
-                            result: final_result.clone(),
-                            session_id: last_session_id.clone(),
-                        })
-                        .is_err()
-                    {
-                        opencode_debug("[stream] Done send failed (receiver dropped)");
-                        terminate_child_after_receiver_drop(&mut child);
-                        return Ok(());
-                    }
+                    opencode_debug(
+                        "[stream] final step observed; terminal send deferred until process exit",
+                    );
                 }
             }
 
@@ -4800,7 +4802,10 @@ fn execute_command_streaming_legacy(
     // auto-compaction and continues the session successfully. If, by the time the
     // stream ends, we have accumulated real output or seen a final step_finish, the
     // earlier error was transient and must not poison the result.
-    if stdout_error.is_some() && (got_done || !final_result.is_empty() || text_event_count > 0) {
+    if !stdout_read_failed
+        && stdout_error.is_some()
+        && (got_done || !final_result.is_empty() || text_event_count > 0)
+    {
         opencode_debug("[stream] transient stdout error ignored — subsequent output succeeded");
         stdout_error = None;
     }
@@ -4841,51 +4846,43 @@ fn execute_command_streaming_legacy(
         return Ok(());
     }
 
-    // Send Done if not already sent
-    if !got_done {
-        // Decide between three cases:
-        //   (a) text events arrived (even empty) or final_result has content → legitimate Done
-        //   (b) nothing usable arrived → synthesize a diagnostic message
-        if text_event_count > 0 || !final_result.is_empty() {
-            opencode_debug(&format!(
-                "[stream] sending fallback Done (no final step_finish): result_len={} text_events={} session_id={:?}",
-                final_result.len(), text_event_count, last_session_id
-            ));
-            let _ = sender.send(StreamMessage::Done {
-                result: final_result,
-                session_id: last_session_id,
-            });
+    // Publish exactly one terminal sequence, and only after successful exit.
+    // A diagnostic Done remains useful to the UI but is deliberately not an
+    // AssistantFinal, so it can never enter durable conversation memory.
+    let (assistant_final, result) = if text_event_count > 0 || !final_result.is_empty() {
+        if got_done && canonical_stream_valid && !terminal_result.trim().is_empty() {
+            (Some(terminal_result.clone()), terminal_result)
         } else {
-            let model_name = model.unwrap_or("default");
-            let hint = match last_finish_reason.as_deref() {
-                Some("length") => "Model hit the output token limit before producing any text.",
-                Some("content-filter") => "Response was blocked by a content filter.",
-                Some("error") => "Model reported an internal error during generation.",
-                Some("tool-calls") => "Session ended while still waiting for a tool call to complete.",
-                Some("unknown") => "Model ended the step with an unknown finish reason.",
-                Some(_) => "Stream ended without a final 'stop' step.",
-                None => "Stream ended before any step_finish event arrived — the run was likely interrupted.",
-            };
-            let reason = format!(
-                "[OpenCode] model='{}' returned empty response — {} (events={}, text_events={}, tool_events={}, last_event={}, last_finish_reason={:?}, output_tokens={:?}, exit_code={:?}, stderr_len={})",
-                model_name,
-                hint,
-                event_count,
-                text_event_count,
-                tool_event_count,
-                if last_event_type.is_empty() { "-" } else { last_event_type.as_str() },
-                last_finish_reason.as_deref().unwrap_or("-"),
-                last_output_tokens,
-                status.code(),
-                stderr_msg.len()
-            );
-            opencode_debug(&format!("[stream] empty response → {}", reason));
-            let _ = sender.send(StreamMessage::Done {
-                result: reason,
-                session_id: last_session_id,
-            });
+            (None, final_result)
         }
-    }
+    } else {
+        let model_name = model.unwrap_or("default");
+        let hint = match last_finish_reason.as_deref() {
+            Some("length") => "Model hit the output token limit before producing any text.",
+            Some("content-filter") => "Response was blocked by a content filter.",
+            Some("error") => "Model reported an internal error during generation.",
+            Some("tool-calls") => "Session ended while still waiting for a tool call to complete.",
+            Some("unknown") => "Model ended the step with an unknown finish reason.",
+            Some(_) => "Stream ended without a final 'stop' step.",
+            None => "Stream ended before any step_finish event arrived — the run was likely interrupted.",
+        };
+        let reason = format!(
+            "[OpenCode] model='{}' returned empty response — {} (events={}, text_events={}, tool_events={}, last_event={}, last_finish_reason={:?}, output_tokens={:?}, exit_code={:?}, stderr_len={})",
+            model_name,
+            hint,
+            event_count,
+            text_event_count,
+            tool_event_count,
+            if last_event_type.is_empty() { "-" } else { last_event_type.as_str() },
+            last_finish_reason.as_deref().unwrap_or("-"),
+            last_output_tokens,
+            status.code(),
+            stderr_msg.len()
+        );
+        opencode_debug(&format!("[stream] empty response → {}", reason));
+        (None, reason)
+    };
+    let _ = send_success_terminal(&sender, assistant_final, result, last_session_id);
 
     opencode_debug("=== opencode execute_command_streaming_legacy END ===");
     Ok(())
@@ -4915,6 +4912,23 @@ struct ServeChild {
 struct ReceiverDropSignal {
     dropped: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+}
+
+/// Presentation state observed by the SSE consumer. It is deliberately not the
+/// source of truth for terminal success: `/session/{id}/message` owns that role.
+/// The per-message text only lets the main task repair a final delta that was
+/// still in flight when the long-lived SSE connection was closed.
+#[derive(Default)]
+struct ServeSseState {
+    delivered_text_by_message: HashMap<String, String>,
+    protocol_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeTurnTerminal {
+    message_id: String,
+    result: String,
+    assistant_final: Option<String>,
 }
 
 impl ReceiverDropSignal {
@@ -5145,6 +5159,26 @@ async fn execute_command_streaming_serve(
         },
     };
 
+    // Snapshot the current message page before submitting the prompt. The
+    // post-idle terminal lookup accepts only IDs absent from this baseline, so
+    // a failed resume can never reuse the previous turn's Assistant answer.
+    let baseline_message_ids = match get_session_messages(&client, &base_url, &parent_sid).await {
+        Ok(messages) => session_message_ids(&messages),
+        Err(error) => {
+            opencode_debug(&format!(
+                "[serve] could not snapshot baseline messages: {error}"
+            ));
+            serve_child.shutdown().await;
+            let _ = sender.send(StreamMessage::Error {
+                message: format!("Failed to establish OpenCode turn boundary: {error}"),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            });
+            return Ok(());
+        }
+    };
+
     // Existing unfinished todos are part of the cloned session's context. They
     // must not keep this new turn alive forever unless the turn touches them or
     // creates new unfinished todos.
@@ -5239,21 +5273,14 @@ async fn execute_command_streaming_serve(
         }
     };
 
-    let final_result: Arc<tokio::sync::Mutex<String>> =
-        Arc::new(tokio::sync::Mutex::new(String::new()));
-    // The most recent session.error message seen by the SSE consumer. Stays
-    // None if no error event arrived. Used by the main task to demote a
-    // "completed with no output" outcome into a hard failure.
-    let last_error: Arc<tokio::sync::Mutex<Option<String>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let sse_state = Arc::new(tokio::sync::Mutex::new(ServeSseState::default()));
     let sse_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let receiver_drop = Arc::new(ReceiverDropSignal::default());
 
     let sse_handle = {
         let parent_sid = parent_sid.clone();
         let sender = sender.clone();
-        let final_result = final_result.clone();
-        let last_error = last_error.clone();
+        let sse_state = sse_state.clone();
         let sse_stop = sse_stop.clone();
         let receiver_drop = receiver_drop.clone();
         tokio::task::spawn(async move {
@@ -5261,8 +5288,7 @@ async fn execute_command_streaming_serve(
                 sse_resp,
                 parent_sid,
                 sender,
-                final_result,
-                last_error,
+                sse_state,
                 sse_stop,
                 receiver_drop,
             )
@@ -5316,57 +5342,96 @@ async fn execute_command_streaming_serve(
         poll_result = Err(PollError::ReceiverDropped);
     }
 
-    // ---- 9. Shut everything down ----
-    sse_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Give the SSE task a brief moment to drain any trailing events, then
-    // abort. The stop flag lets the loop exit on its next iteration; the
-    // short sleep makes that likely before we force-abort.
-    if !matches!(poll_result, Err(PollError::ReceiverDropped)) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    // Cancellation still wins if it races with the last idle poll. Never fetch
+    // or publish a terminal message for a turn the user already stopped.
+    if matches!(poll_result, Ok(())) && serve_cancel_hit(cancel_token.as_ref()) {
+        poll_result = Err(PollError::Cancelled);
     }
+
+    // The session message API, not the SSE accumulator, is the authoritative
+    // terminal boundary. It records message completion, finish state, and any
+    // provider error even if the presentation stream was split or disconnected.
+    let authoritative_terminal = if matches!(poll_result, Ok(())) {
+        Some(
+            fetch_serve_turn_terminal(&client, &base_url, &parent_sid, &baseline_message_ids).await,
+        )
+    } else {
+        None
+    };
+
+    // ---- 9. Shut everything down ----
+    // Keep the reader active during the grace period. The previous ordering set
+    // the stop flag first, which made the consumer discard the next trailing
+    // chunk instead of draining it.
+    if !matches!(poll_result, Err(PollError::ReceiverDropped)) {
+        tokio::time::sleep(SERVE_SSE_DRAIN_GRACE).await;
+    }
+    sse_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     sse_handle.abort();
     let _ = sse_handle.await;
     serve_child.shutdown().await;
 
+    // `/stop` can arrive while the authoritative message request, trailing
+    // SSE grace period, or server reap is awaiting I/O. Re-check at the last
+    // possible boundary so a completed snapshot never outraces explicit user
+    // cancellation into AssistantFinal/Done.
+    if matches!(poll_result, Ok(())) && serve_cancel_hit(cancel_token.as_ref()) {
+        opencode_debug("[serve] cancellation won during terminal verification/shutdown");
+        poll_result = Err(PollError::Cancelled);
+    }
+
     // ---- 10. Report the final outcome ----
-    let accumulated = {
-        let guard = final_result.lock().await;
-        guard.clone()
-    };
-    let captured_error = {
-        let guard = last_error.lock().await;
-        guard.clone()
-    };
+    let sse_state = sse_state.lock().await;
+    if let Some(warning) = sse_state.protocol_warning.as_deref() {
+        opencode_debug(&format!(
+            "[serve] presentation SSE was incomplete; authoritative terminal recovery active: {warning}"
+        ));
+    }
     match poll_result {
         Ok(()) => {
-            // If the SSE consumer captured a session.error AND the turn
-            // produced no usable output, demote the "complete-with-no-text"
-            // outcome into a hard failure. This is the fast-fail case (e.g.
-            // an unknown model where halt() fires before the model ever
-            // emits text). When subsequent text DID materialise, we treat
-            // the error as transient (matches Gap 3 in the legacy path).
-            if accumulated.is_empty() && captured_error.is_some() {
-                let msg = captured_error.unwrap_or_else(|| "Unknown error".into());
-                opencode_debug(&format!(
-                    "[serve] completed but empty result + captured error → demoting to Error: {}",
-                    msg
-                ));
-                let _ = sender.send(StreamMessage::Error {
-                    message: msg,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
-            } else {
-                opencode_debug(&format!(
-                    "[serve] completed normally, final_result_len={} captured_error={}",
-                    accumulated.len(),
-                    captured_error.is_some()
-                ));
-                let _ = sender.send(StreamMessage::Done {
-                    result: accumulated,
-                    session_id: Some(parent_sid),
-                });
+            let terminal = authoritative_terminal.expect("successful poll performs terminal fetch");
+            match terminal {
+                Ok(terminal) => {
+                    let delivered = sse_state
+                        .delivered_text_by_message
+                        .get(&terminal.message_id)
+                        .map(String::as_str);
+                    if let Some(delta) = missing_sse_terminal_delta(delivered, &terminal.result) {
+                        opencode_debug(&format!(
+                            "[serve] repairing {} missing/divergent terminal SSE bytes",
+                            delta.len()
+                        ));
+                        if sender.send(StreamMessage::Text { content: delta }).is_err() {
+                            opencode_debug(
+                                "[serve] receiver dropped while repairing terminal presentation",
+                            );
+                            return Ok(());
+                        }
+                    }
+                    opencode_debug(&format!(
+                        "[serve] authoritative terminal message={} result_len={} canonical={}",
+                        terminal.message_id,
+                        terminal.result.len(),
+                        terminal.assistant_final.is_some()
+                    ));
+                    let _ = send_success_terminal(
+                        &sender,
+                        terminal.assistant_final,
+                        terminal.result,
+                        Some(parent_sid),
+                    );
+                }
+                Err(message) => {
+                    opencode_debug(&format!(
+                        "[serve] terminal message verification failed: {message}"
+                    ));
+                    let _ = sender.send(StreamMessage::Error {
+                        message,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    });
+                }
             }
         }
         Err(PollError::Cancelled) => {
@@ -5568,6 +5633,239 @@ fn serve_cancel_hit(token: Option<&Arc<CancelToken>>) -> bool {
     }
 }
 
+fn session_message_ids(messages: &[Value]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .get("info")
+                .and_then(|info| info.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn opencode_message_error_text(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            error
+                .get("data")
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| error.get("name").and_then(Value::as_str))
+        .or_else(|| error.as_str())
+        .unwrap_or("OpenCode reported an unknown Assistant error")
+        .to_string()
+}
+
+/// Select this turn's authoritative terminal Assistant message from the
+/// session API. SSE is intentionally excluded from this decision because it is
+/// a lossy presentation transport: a split final frame, parser error, or early
+/// disconnect must never certify earlier narration as durable Assistant text.
+fn parse_serve_turn_terminal(
+    messages: &[Value],
+    baseline_ids: &HashSet<String>,
+) -> Result<ServeTurnTerminal, String> {
+    let new_user_ids = messages
+        .iter()
+        .filter_map(|message| {
+            let info = message.get("info")?;
+            let id = info.get("id")?.as_str()?;
+            (info.get("role").and_then(Value::as_str) == Some("user") && !baseline_ids.contains(id))
+                .then(|| id.to_string())
+        })
+        .collect::<HashSet<_>>();
+    if new_user_ids.is_empty() {
+        return Err(
+            "OpenCode session became idle without a new User message boundary for this turn"
+                .to_string(),
+        );
+    }
+
+    let latest = messages
+        .iter()
+        .filter_map(|message| {
+            let info = message.get("info")?;
+            let id = info.get("id")?.as_str()?;
+            let parent_id = info.get("parentID").and_then(Value::as_str)?;
+            if baseline_ids.contains(id)
+                || info.get("role").and_then(Value::as_str) != Some("assistant")
+                || info.get("summary").and_then(Value::as_bool) == Some(true)
+                || !new_user_ids.contains(parent_id)
+            {
+                return None;
+            }
+            let created = info
+                .get("time")
+                .and_then(|time| time.get("created"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some((created, id, message))
+        })
+        .max_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)))
+        .ok_or_else(|| {
+            "OpenCode session became idle without a new Assistant message for this turn".to_string()
+        })?;
+
+    let info = latest
+        .2
+        .get("info")
+        .expect("candidate selection requires message.info");
+    if let Some(error) = info.get("error").filter(|error| !error.is_null()) {
+        return Err(opencode_message_error_text(error));
+    }
+    if info
+        .get("time")
+        .and_then(|time| time.get("completed"))
+        .filter(|completed| !completed.is_null())
+        .is_none()
+    {
+        return Err("OpenCode's newest Assistant message is not complete".to_string());
+    }
+
+    let finish = info.get("finish").and_then(Value::as_str).unwrap_or("");
+    if matches!(finish, "" | "unknown" | "tool-calls") {
+        return Err(format!(
+            "OpenCode session became idle at a non-terminal Assistant finish state: {finish:?}"
+        ));
+    }
+    if finish == "error" {
+        return Err("OpenCode Assistant generation finished with an error".to_string());
+    }
+
+    let result = latest
+        .2
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("text")
+                        && part.get("synthetic").and_then(Value::as_bool) != Some(true)
+                        && part.get("ignored").and_then(Value::as_bool) != Some(true)
+                })
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default();
+
+    // `stop` is the only normal, complete model finish. Truncated, filtered,
+    // or future finish kinds can still be presented through Done.result, but
+    // are deliberately ineligible for durable memory.
+    let assistant_final = (finish == "stop" && !result.trim().is_empty()).then(|| result.clone());
+    Ok(ServeTurnTerminal {
+        message_id: latest.1.to_string(),
+        result,
+        assistant_final,
+    })
+}
+
+async fn get_session_messages(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+) -> Result<Vec<Value>, String> {
+    let url = format!(
+        "{}/session/{}/message?limit={}",
+        base_url, session_id, SERVE_MESSAGE_LIMIT
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("session messages http: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("session messages body: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "session messages returned {}: {}",
+            status,
+            log_preview(&text, 300)
+        ));
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "session messages parse: {} ({})",
+            error,
+            log_preview(&text, 300)
+        )
+    })?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "session messages response is not an array".to_string())
+}
+
+async fn fetch_serve_turn_terminal(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    baseline_ids: &HashSet<String>,
+) -> Result<ServeTurnTerminal, String> {
+    let mut last_error = String::new();
+    for attempt in 0..SERVE_MESSAGE_FETCH_ATTEMPTS {
+        match get_session_messages(client, base_url, session_id).await {
+            Ok(messages) => match parse_serve_turn_terminal(&messages, baseline_ids) {
+                Ok(terminal) => return Ok(terminal),
+                Err(error) => last_error = error,
+            },
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 < SERVE_MESSAGE_FETCH_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    Err(last_error)
+}
+
+fn missing_sse_terminal_delta(delivered: Option<&str>, authoritative: &str) -> Option<String> {
+    if authoritative.is_empty() {
+        return None;
+    }
+    let delivered = delivered.unwrap_or("");
+    if delivered == authoritative || delivered.ends_with(authoritative) {
+        return None;
+    }
+    if authoritative.starts_with(delivered) {
+        let missing = &authoritative[delivered.len()..];
+        return (!missing.is_empty()).then(|| missing.to_string());
+    }
+    if delivered.is_empty() {
+        Some(authoritative.to_string())
+    } else {
+        // The presentation stream diverged rather than merely truncating. It
+        // cannot be retracted, so append a clearly separated authoritative
+        // answer instead of silently leaving the user with stale partial text.
+        Some(format!("\n\n{authoritative}"))
+    }
+}
+
+async fn record_serve_text_delivery(
+    state: &Arc<tokio::sync::Mutex<ServeSseState>>,
+    message_id: &str,
+    delta: &str,
+) {
+    if message_id.is_empty() || delta.is_empty() {
+        return;
+    }
+    let mut state = state.lock().await;
+    state
+        .delivered_text_by_message
+        .entry(message_id.to_string())
+        .or_default()
+        .push_str(delta);
+}
+
 /// Create a brand-new session on the opencode server. The title is derived
 /// from the prompt's first line, mirroring opencode's own default.
 async fn create_session(
@@ -5690,15 +5988,14 @@ async fn post_prompt_async(
 /// SSE frames, translating each into zero or more `StreamMessage` variants
 /// that belong to the parent session. Each frame's outer JSON wraps the real
 /// event in a `payload` field (see the unwrap in the body); `handle_sse_event`
-/// itself operates on the unwrapped event. Text parts feed both the live UI
-/// stream (via `StreamMessage::Text`) and a shared accumulator used for the
-/// final `Done.result`.
+/// itself operates on the unwrapped event. Text parts feed the live UI stream;
+/// terminal success and `Done.result` are resolved separately from the session
+/// message API after polling reaches idle.
 async fn consume_sse_chunks(
     mut resp: reqwest::Response,
     parent_sid: String,
     sender: Sender<StreamMessage>,
-    final_result: Arc<tokio::sync::Mutex<String>>,
-    last_error: Arc<tokio::sync::Mutex<Option<String>>>,
+    sse_state: Arc<tokio::sync::Mutex<ServeSseState>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     receiver_drop: Arc<ReceiverDropSignal>,
 ) {
@@ -5737,10 +6034,16 @@ async fn consume_sse_chunks(
             Ok(Some(c)) => c,
             Ok(None) => {
                 opencode_debug("[serve.sse] stream ended");
+                if !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    sse_state.lock().await.protocol_warning =
+                        Some("SSE stream ended before controlled shutdown".to_string());
+                }
                 break;
             }
             Err(e) => {
                 opencode_debug(&format!("[serve.sse] chunk error: {}", e));
+                sse_state.lock().await.protocol_warning =
+                    Some(format!("SSE chunk read failed: {e}"));
                 break;
             }
         };
@@ -5774,6 +6077,8 @@ async fn consume_sse_chunks(
                         e,
                         log_preview(&payload, 200)
                     ));
+                    sse_state.lock().await.protocol_warning =
+                        Some(format!("SSE JSON frame could not be parsed: {e}"));
                     continue;
                 }
             };
@@ -5800,8 +6105,7 @@ async fn consume_sse_chunks(
                 &json,
                 &parent_sid,
                 &sender,
-                &final_result,
-                &last_error,
+                &sse_state,
                 &mut init_sent,
                 &mut part_progress,
                 &mut part_types,
@@ -5849,14 +6153,13 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 ///   dropped: this includes the original user prompt and plugin-injected
 ///   `<system-reminder>` notifications (the plugin delivers those as
 ///   internal user messages, which is a plumbing detail we should hide).
-/// - Empty text content never writes to `final_result` so the trailing
-///   `Done.result` stays clean.
+/// - Every emitted Assistant text delta is tracked by message id so a truncated
+///   presentation stream can be repaired from the authoritative final message.
 async fn handle_sse_event(
     json: &Value,
     parent_sid: &str,
     sender: &Sender<StreamMessage>,
-    final_result: &Arc<tokio::sync::Mutex<String>>,
-    last_error: &Arc<tokio::sync::Mutex<Option<String>>>,
+    sse_state: &Arc<tokio::sync::Mutex<ServeSseState>>,
     init_sent: &mut bool,
     part_progress: &mut std::collections::HashMap<String, String>,
     part_types: &mut std::collections::HashMap<String, String>,
@@ -5951,23 +6254,17 @@ async fn handle_sse_event(
                         if !delta.is_empty() {
                             if !send_serve_stream_message(
                                 sender,
-                                StreamMessage::Text { content: delta },
+                                StreamMessage::Text {
+                                    content: delta.clone(),
+                                },
                                 receiver_drop,
                             ) {
                                 return;
                             }
+                            record_serve_text_delivery(sse_state, msg_id, &delta).await;
                         }
                     }
                     if has_end {
-                        // Finalize this text part into the trailing-Done
-                        // accumulator — but only if it carried content.
-                        if !text.is_empty() {
-                            let mut guard = final_result.lock().await;
-                            if !guard.is_empty() {
-                                guard.push_str("\n\n");
-                            }
-                            guard.push_str(text);
-                        }
                         part_progress.remove(&part_id);
                         part_types.remove(&part_id);
                     }
@@ -6081,20 +6378,17 @@ async fn handle_sse_event(
             ) {
                 return;
             }
+            record_serve_text_delivery(sse_state, msg_id, delta).await;
         }
 
         "session.error" => {
             if event_sid != parent_sid {
                 return;
             }
-            // Apply the same "tentative error" policy as the legacy adapter:
-            // transient errors such as ContextOverflowError are followed by a
-            // successful retry, so we only log here and let the main task
-            // decide the terminal outcome based on whether subsequent text
-            // arrived. We DO record the latest error message into the shared
-            // `last_error` slot — the main task uses it to demote a "no
-            // output" outcome into a hard failure for fast-fail cases like
-            // an unknown model.
+            // Some errors (for example context overflow followed by automatic
+            // compaction) are recoverable. Log the event for diagnostics; the
+            // authoritative message snapshot later distinguishes a successful
+            // retry from a final Assistant message carrying an error object.
             let err_val = props.and_then(|p| p.get("error"));
             let msg = err_val
                 .and_then(|v| {
@@ -6111,8 +6405,6 @@ async fn handle_sse_event(
                 .unwrap_or("Unknown error")
                 .to_string();
             opencode_debug(&format!("[serve.sse] session.error (tentative): {}", msg));
-            let mut guard = last_error.lock().await;
-            *guard = Some(msg);
         }
 
         _ => {}
@@ -6450,6 +6742,158 @@ fn todos_pending_after_baseline(todos: &[Value], baseline: &TodoFingerprintCount
         }
     }
     false
+}
+
+#[cfg(test)]
+mod serve_terminal_tests {
+    use super::{missing_sse_terminal_delta, parse_serve_turn_terminal};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn user_message(id: &str, created: u64) -> serde_json::Value {
+        json!({
+            "info": {
+                "id": id,
+                "role": "user",
+                "time": {"created": created}
+            },
+            "parts": [{"type": "text", "text": "request"}]
+        })
+    }
+
+    fn message(
+        id: &str,
+        created: u64,
+        finish: &str,
+        text: &str,
+        error: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        message_with_parent(id, "msg_user", created, finish, text, error)
+    }
+
+    fn message_with_parent(
+        id: &str,
+        parent_id: &str,
+        created: u64,
+        finish: &str,
+        text: &str,
+        error: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut info = json!({
+            "id": id,
+            "parentID": parent_id,
+            "role": "assistant",
+            "time": {"created": created, "completed": created + 1},
+            "finish": finish,
+        });
+        if let Some(error) = error {
+            info["error"] = error;
+        }
+        json!({
+            "info": info,
+            "parts": [
+                {"type": "text", "text": text},
+                {"type": "text", "text": "synthetic", "synthetic": true},
+                {"type": "text", "text": "ignored", "ignored": true}
+            ]
+        })
+    }
+
+    #[test]
+    fn authoritative_terminal_ignores_baseline_and_intermediate_tool_messages() {
+        let baseline = HashSet::from(["msg_old".to_string()]);
+        let messages = vec![
+            message("msg_old", 1, "stop", "stale answer", None),
+            user_message("msg_user", 2),
+            message("msg_tool", 2, "tool-calls", "intermediate", None),
+            message("msg_final", 3, "stop", "final answer", None),
+        ];
+
+        let terminal = parse_serve_turn_terminal(&messages, &baseline).unwrap();
+        assert_eq!(terminal.message_id, "msg_final");
+        assert_eq!(terminal.result, "final answer");
+        assert_eq!(terminal.assistant_final.as_deref(), Some("final answer"));
+    }
+
+    #[test]
+    fn later_assistant_error_invalidates_earlier_prose() {
+        let messages = vec![
+            user_message("msg_user", 0),
+            message("msg_partial", 1, "stop", "partial prose", None),
+            message(
+                "msg_error",
+                2,
+                "error",
+                "",
+                Some(json!({"name": "APIError", "data": {"message": "fatal failure"}})),
+            ),
+        ];
+
+        let error = parse_serve_turn_terminal(&messages, &HashSet::new()).unwrap_err();
+        assert!(error.contains("fatal failure"));
+    }
+
+    #[test]
+    fn idle_tool_call_state_is_not_a_terminal_assistant_answer() {
+        let messages = vec![
+            user_message("msg_user", 0),
+            message(
+                "msg_tool",
+                1,
+                "tool-calls",
+                "I will inspect that now.",
+                None,
+            ),
+        ];
+        let error = parse_serve_turn_terminal(&messages, &HashSet::new()).unwrap_err();
+        assert!(error.contains("non-terminal"));
+    }
+
+    #[test]
+    fn truncated_finish_is_presentable_but_not_durable_memory() {
+        let messages = vec![
+            user_message("msg_user", 0),
+            message("msg_length", 1, "length", "partial answer", None),
+        ];
+        let terminal = parse_serve_turn_terminal(&messages, &HashSet::new()).unwrap();
+        assert_eq!(terminal.result, "partial answer");
+        assert!(terminal.assistant_final.is_none());
+    }
+
+    #[test]
+    fn delayed_assistant_for_a_baseline_user_cannot_cross_the_turn_boundary() {
+        let baseline = HashSet::from(["msg_old_user".to_string()]);
+        let messages = vec![
+            user_message("msg_old_user", 0),
+            user_message("msg_user", 1),
+            message("msg_final", 2, "stop", "current answer", None),
+            message_with_parent(
+                "msg_delayed",
+                "msg_old_user",
+                3,
+                "stop",
+                "late stale answer",
+                None,
+            ),
+        ];
+
+        let terminal = parse_serve_turn_terminal(&messages, &baseline).unwrap();
+        assert_eq!(terminal.message_id, "msg_final");
+        assert_eq!(terminal.result, "current answer");
+    }
+
+    #[test]
+    fn terminal_delta_repair_handles_missing_prefix_and_divergence() {
+        assert_eq!(
+            missing_sse_terminal_delta(Some("final "), "final answer").as_deref(),
+            Some("answer")
+        );
+        assert!(missing_sse_terminal_delta(Some("final answer"), "final answer").is_none());
+        assert_eq!(
+            missing_sse_terminal_delta(Some("stale"), "final answer").as_deref(),
+            Some("\n\nfinal answer")
+        );
+    }
 }
 
 #[cfg(test)]
