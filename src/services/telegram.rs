@@ -8785,17 +8785,11 @@ fn parse_bot_settings_snapshot_strict_with_identity(
                 return Err("bot settings identity does not match the running bot".to_string());
             }
         }
-        let effective_identity = stable_identity.or(settings.bot_identity.as_deref());
-        if effective_identity.is_some_and(|identity| {
-            root.iter().any(|(candidate_key, candidate_entry)| {
-                candidate_key != &key
-                    && settings_entry_identity(candidate_entry).as_deref() == Some(identity)
-            })
-        }) {
-            return Err(
-                "current and prior bot settings entries share the running bot identity".to_string(),
-            );
-        }
+        // An exact current-token entry is unambiguous and is the entry that
+        // 0.8.8 used. Older Telegram token keys for the same bot can legitimately
+        // remain beside it after a prior credential rotation; they must not stop
+        // this bot before polling starts. The next ordinary settings save keeps
+        // this exact entry and removes those stale same-identity keys.
         if settings.bot_identity.is_none() {
             settings.bot_identity = stable_identity.map(str::to_string);
         }
@@ -9846,24 +9840,53 @@ mod bot_settings_persistence_tests {
     }
 
     #[test]
-    fn current_and_stale_same_identity_entries_are_fatal_instead_of_losing_old_off() {
+    fn exact_current_legacy_entry_starts_and_removes_stale_same_bot_token_entries() {
         const OLD_TOKEN: &str = "123456:old-secret";
         const CURRENT_TOKEN: &str = "123456:current-secret";
         let chat_id = ChatId(42);
         let mut old_settings = BotSettings::default();
         old_settings.use_memory.insert(chat_id.0.to_string(), false);
-        let current_settings = BotSettings::default();
+        let mut current_settings = BotSettings::default();
+        current_settings
+            .use_memory
+            .insert(chat_id.0.to_string(), true);
+        let mut old_entry = bot_settings_entry_value(OLD_TOKEN, &old_settings);
+        let mut current_entry = bot_settings_entry_value(CURRENT_TOKEN, &current_settings);
+        // 0.8.8 entries predate stable bot identity metadata.
+        old_entry.as_object_mut().unwrap().remove("bot_identity");
+        current_entry
+            .as_object_mut()
+            .unwrap()
+            .remove("bot_identity");
         let mut document = serde_json::json!({});
         document.as_object_mut().unwrap().insert(
             super::token_hash(OLD_TOKEN),
-            bot_settings_entry_value(OLD_TOKEN, &old_settings),
+            old_entry,
         );
         document.as_object_mut().unwrap().insert(
             super::token_hash(CURRENT_TOKEN),
-            bot_settings_entry_value(CURRENT_TOKEN, &current_settings),
+            current_entry,
         );
 
-        assert!(parse_bot_settings_snapshot_strict(CURRENT_TOKEN, &document).is_err());
+        let loaded = parse_bot_settings_snapshot_strict(CURRENT_TOKEN, &document).unwrap();
+        assert!(loaded.entry.is_some());
+        assert!(get_use_memory(&loaded.settings, chat_id));
+        assert_eq!(
+            loaded.settings.bot_identity.as_deref(),
+            Some("telegram:123456")
+        );
+
+        let serialized = serialize_updated_bot_settings_document(
+            document,
+            CURRENT_TOKEN,
+            &loaded.settings,
+            usize::MAX,
+        )
+        .unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
+        let root = updated.as_object().unwrap();
+        assert!(!root.contains_key(&super::token_hash(OLD_TOKEN)));
+        assert!(root.contains_key(&super::token_hash(CURRENT_TOKEN)));
     }
 
     #[test]
