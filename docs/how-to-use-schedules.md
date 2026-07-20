@@ -116,7 +116,7 @@ You can then keep typing as if nothing unusual happened — the bot has full con
 
 ## Persistent Memory and Scheduled Runs
 
-If `/usememory` is ON for the destination chat when a scheduled provider run actually starts, that Agent receives the same shared, read-only `memory_store` search guidance as a normal request. It may consult relevant preferences, constraints, or decisions contributed by any bot or chat.
+If `/usememory` is ON for the destination chat when a scheduled provider run actually starts, that Agent performs the same focused, read-only `memory_store` preflight search as a normal request. It incorporates relevant preferences, constraints, or decisions contributed by any bot or chat when matches are found.
 
 The schedule prompt and its result do **not** create a new persistent User/Assistant record, in either default or inline schedule mode. A scheduled prompt is application-generated execution input rather than a new end-user utterance. Provider session history and persistent conversation memory therefore have different behavior in inline mode: the schedule may be appended to the live provider session, but it is still excluded from the normalized memory store.
 

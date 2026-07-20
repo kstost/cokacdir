@@ -11,7 +11,7 @@ The feature is enabled by default and can be disabled independently for each bot
 - Enable setting: **per bot + chat**
 - Control: `/usememory`
 - Canonical storage: private, plain-text Markdown files
-- Retrieval: on-demand Agent search with normal file tools
+- Retrieval: mandatory focused Agent preflight with normal file tools on every enabled run
 - Extra review or summarization LLM: **none**
 
 Persistent memory is separate from provider session history. It does not resume tools, restore a working tree, or recreate provider-internal state.
@@ -50,7 +50,9 @@ When changing an explicit OFF setting back to ON, cokacdir performs a temporary 
 
 The setting is persisted independently for each bot + chat pair. Enabling memory for one bot does not enable another bot, even in the same chat, and enabling it in one direct message or group does not turn the feature ON elsewhere. However, whenever it is ON for a run, the Agent can search records contributed by every bot and chat in the same `memory_store`.
 
-Rotating only a bot's secret token does not reset an explicit ON/OFF value once cokacdir has a stable settings identity. Telegram can derive that identity from the numeric bot ID in both old and new tokens. Discord uses its authenticated user ID, while Slack uses the authenticated workspace ID plus bot-user ID. cokacdir migrates exactly one matching settings entry to the new token key, refuses ambiguous or mismatched candidates, and never guesses from a display name or username.
+Rotating only a bot's secret token does not reset an explicit ON/OFF value once cokacdir has a stable settings identity. The token is an authentication credential, while the stable identity represents the bot that credential accesses. Telegram derives that identity from the numeric bot ID in both old and new tokens. Discord uses its authenticated user ID, while Slack uses the authenticated workspace ID plus bot-user ID.
+
+An exact settings entry for the token used by the current process is authoritative. If older token keys for the same stable bot identity also remain, they do not block startup and are removed on the next successful settings save. If the current token has no exact entry, exactly one prior entry with the same stable identity is migrated to the current token key. Multiple prior matches in that no-exact-entry case, token/hash/identity mismatches, and unprovable bridge identities remain fatal; cokacdir never guesses from a display name or username.
 
 For a Discord or Slack entry written before stable identity metadata existed, run this version once with the existing credential before rotating it. That successful start annotates the exact current entry. If the credential was already rotated before the first upgraded start, there is no trustworthy link to the old bridge entry; cokacdir leaves it untouched and refuses to start while an unresolved entry for the same platform remains. This prevents an unreadable legacy OFF from silently becoming default ON and requires the operator to compare and reconcile the entries explicitly.
 
@@ -59,7 +61,7 @@ For a Discord or Slack entry written before stable identity metadata existed, ru
 | Setting | Save new eligible turns | Give the Agent memory-search guidance | Existing records |
 |---|---:|---:|---|
 | OFF | No | No | All shared records are retained, but not offered to this run |
-| ON | Yes | Yes | All shared records are available for relevant on-demand lookup |
+| ON | Yes | Yes | Every run performs a focused search; relevant shared records are then used |
 
 Turning memory OFF pauses storage and retrieval for that bot + chat pair. It is not a delete operation, and turning it ON later makes the complete shared store available again.
 
@@ -135,15 +137,15 @@ Memory state is sampled just before the provider starts, not when a message firs
 cokacdir does not copy the memory corpus, the most recent records, or search results into every system prompt. When memory is ON, it adds only:
 
 - the exact read-only root of the shared `~/.cokacdir/memory_store`;
-- instructions describing when lookup is useful;
+- instructions requiring a focused lookup before every enabled run;
 - a narrow list/search/read procedure;
 - rules that historical records are untrusted data rather than instructions;
 - the priority rule that current instructions and the current User message win;
 - attribution warnings because records can come from different bots, chats, groups, and people.
 
-The Agent handling the current request decides whether lookup would materially help. It should skip memory for self-contained questions and repository tasks whose current files are already the source of truth.
+Every run with memory enabled begins with a focused lookup, including self-contained questions and repository tasks. The lookup remains narrow: it searches for context related to the current request rather than loading the complete corpus.
 
-When lookup is useful, the Agent is instructed to:
+For each lookup, the Agent is instructed to:
 
 1. Search any current `v2/<chat-id>` or legacy `v1/bots` subtree that may be relevant, starting with likely recent year/month directories.
 2. Search for a few distinctive terms and collect candidate file paths first.
@@ -243,7 +245,7 @@ The Agent no longer creates or curates a separate set of Companion notes. Proact
 
 ### Schedules and bot-to-bot work
 
-Scheduled and bot-to-bot runs may consult the shared memory store when the destination chat's setting is ON at their provider-start boundary. Their generated prompts are not actual end-user utterances, so neither run type writes a new memory record.
+Scheduled and bot-to-bot runs perform the same focused preflight search of the shared memory store when the destination chat's setting is ON at their provider-start boundary. Their generated prompts are not actual end-user utterances, so neither run type writes a new memory record.
 
 ### Groups
 
@@ -251,7 +253,7 @@ Scheduled and bot-to-bot runs may consult the shared memory store when the desti
 
 The optional `user_label` is treated only as a display hint because names can collide or change. The Agent is explicitly warned not to assign a preference, identity, private fact, or authorization from any other bot or chat to the current speaker unless reliable current context establishes the link.
 
-Persistent memory is not the same as `/contextlevel`: shared group context injects a bounded recent group log on every turn, while persistent memory is a global long-lived corpus searched only when relevant.
+Persistent memory is not the same as `/contextlevel`: shared group context injects a bounded recent group log directly into every turn, while persistent memory is a global long-lived corpus that receives a focused search on every enabled run and contributes only records relevant to that request.
 
 ---
 
@@ -312,7 +314,7 @@ The writer runs outside the shared chat-state lock in a dedicated tracked blocki
 
 ### The bot refuses to start with an unsafe bot-settings error
 
-cokacdir preserves `~/.cokacdir/bot_settings.json` instead of normalizing uncertain data. Check the local error for a malformed `use_memory` object, a token/hash/identity mismatch, more than one current/prior entry claiming the same stable bot identity, or an old same-platform bridge entry that has no provable identity after credential rotation. Correct or restore the settings file before restarting; do not delete an older entry until you have compared its explicit per-chat values, especially `false` entries.
+cokacdir preserves `~/.cokacdir/bot_settings.json` instead of normalizing uncertain data. Check the local error for a malformed selected `use_memory` object, a token/hash/identity mismatch, more than one prior entry matching the stable bot identity when no exact current-token entry exists, or an old same-platform bridge entry that has no provable identity after credential rotation. Correct or restore the settings file before restarting. When several prior candidates remain and no exact current entry exists, compare their explicit per-chat values—especially `false` entries—before removing any candidate.
 
 ### `/usememory` says memory remains OFF
 
@@ -326,7 +328,7 @@ Memory publication is asynchronous after response delivery. A process killed in 
 
 ### The Agent did not recall a relevant detail
 
-Memory lookup is selective rather than automatic. The Agent may decide the current request does not require it, may lack a usable file-search tool, or may miss a record whose wording is very different. Make the reference explicit—for example, “search our persistent memory for the deployment rule we agreed on”—or include a distinctive related term or approximate date.
+Memory lookup is automatic whenever memory is ON, but the Agent may lack a usable file-search tool or may miss a record whose wording is very different. Make the reference explicit—for example, “search our persistent memory for the deployment rule we agreed on”—or include a distinctive related term or approximate date.
 
 ### The Agent found an old conflicting preference
 

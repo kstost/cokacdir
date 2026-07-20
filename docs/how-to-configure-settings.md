@@ -69,7 +69,7 @@ Toggles persistent conversation memory execution for the current bot and chat. T
 
 This is an owner-only pure toggle with no status or mode argument. Each call changes the effective state:
 
-- **ON** — Eligible completed User/Assistant turns are stored as private plain-text Markdown files. The Agent receives the shared `~/.cokacdir/memory_store` root plus read-only, on-demand search instructions and may search records from every bot and chat.
+- **ON** — Eligible completed User/Assistant turns are stored as private plain-text Markdown files. Before handling each run, the Agent receives the shared `~/.cokacdir/memory_store` root and read-only instructions for a mandatory focused search across records from every bot and chat.
 - **OFF** — New turns are not stored, memory guidance is omitted from new Agent runs, and existing records remain on disk.
 
 For a bot + chat pair without an explicit setting, the first `/usememory` call changes the default ON state to OFF.
@@ -78,11 +78,11 @@ Explicit re-enabling is fail-closed. Before changing OFF to ON, cokacdir verifie
 
 The implicit ON default applies only when `use_memory` or the current chat key is absent. If a present `use_memory` field is not an object, a chat key is not a canonical signed integer, or a value is not a JSON boolean, cokacdir refuses to start that bot and preserves the file for correction instead of silently treating the damaged value as ON.
 
-An explicitly saved value follows the same bot when its secret token is rotated. Telegram uses the numeric bot ID embedded in the token, Discord uses the authenticated Discord user ID, and Slack uses both the authenticated workspace ID and bot-user ID. Settings are never selected by display name or username, and an ambiguous or mismatched identity stops startup rather than copying another bot's settings. A Discord/Slack entry created before this metadata existed must first be started once with its existing credential; if the credential was already rotated before that upgraded start, cokacdir cannot prove which legacy entry belongs to it and refuses to start while an unresolved same-platform entry remains.
+An explicitly saved value follows the same bot when its secret token is rotated. The token is the bot's authentication credential, not its stable identity: Telegram uses the numeric bot ID embedded in the token, Discord uses the authenticated Discord user ID, and Slack uses both the authenticated workspace ID and bot-user ID. An exact entry for the token used by the current process takes priority and older keys for the same bot are removed on the next successful save. If there is no exact current-token entry, one prior stable-identity match is migrated, while multiple prior matches stop startup as ambiguous. Token/hash/identity mismatches also stop startup, and settings are never selected by display name or username. A Discord/Slack entry created before this metadata existed must first be started once with its existing credential; if the credential was already rotated before that upgraded start, cokacdir cannot prove which legacy entry belongs to it and refuses to start while an unresolved same-platform entry remains.
 
 Memory records contain only the canonical User request and successfully delivered terminal Assistant answer plus minimal metadata. Tool calls, tool results, reasoning, progress events, system prompts, diagnostics, failed runs, schedules, bot-to-bot messages, and proactive pings are not written as conversation turns.
 
-The corpus itself is not automatically embedded in the system prompt. The active Agent searches the plain-text store only when earlier preferences, decisions, constraints, or conclusions could materially help, and it can retry with synonyms rather than requiring one exact match.
+The corpus itself is not automatically embedded in the system prompt. Instead, every enabled run performs a focused search of the plain-text store, retries with synonyms when the first results are absent or weak, and incorporates only records relevant to the current request.
 
 Companion mode and memory are independent toggles. Companion uses the same common memory only when `/usememory` is ON; enabling `/companion` does not turn memory on.
 

@@ -1,5 +1,17 @@
 # Changelog — cokacdir
 
+## 0.8.12 — 2026-07-20
+
+- **Persistent-memory lookup now begins with a mandatory focused preflight on every enabled run.** The Agent searches the shared `memory_store` before answering or acting even when the request appears self-contained, retries with related terms when initial results are absent or weak, incorporates relevant records when found, and otherwise continues normally without announcing the lookup.
+
+---
+
+## 0.8.11 — 2026-07-20
+
+- **An exact current-token bot-settings entry now takes precedence over older keys for the same stable bot identity.** Those stale keys no longer block startup and are removed on the next successful settings save. When no exact current-token entry exists, exactly one prior identity match is still migrated, while multiple prior matches remain fatal as ambiguous.
+
+---
+
 ## 0.8.9 — 2026-07-20
 
 - **Persistent conversation memory now defaults to ON and uses one shared corpus across bots and chats.** Any bot + chat pair without an explicit `use_memory` value—including existing settings after upgrade—stores eligible turns and receives shared-memory search guidance by default; an explicitly saved OFF value remains OFF, and `/usememory` toggles the setting. When active for a run, only a non-empty User message and the successfully completed canonical Assistant answer are written as one immutable plain-text Markdown record, while the Agent may search relevant records contributed by every bot and chat under the same OS account. System prompts, reasoning, tool calls, tool results, progress events, task notifications, diagnostics, and failed or cancelled turns still have no storage representation.
