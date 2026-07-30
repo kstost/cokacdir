@@ -20,6 +20,7 @@ use crate::services::file_ops::{
     stable_file_identity, stable_path_identity, DirectoryAccess, DirectoryFileOptions,
     StablePathIdentity,
 };
+use crate::services::herdr;
 use crate::services::memory::{self, MemoryTurn};
 use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
@@ -18101,7 +18102,9 @@ enum SessionProvider {
 /// Detect provider from model prefix only (no availability fallback).
 /// Returns "claude" when model is None or has no recognized prefix.
 fn provider_from_model(model: Option<&str>) -> &'static str {
-    if codex::is_codex_model(model) {
+    if herdr::is_herdr_model(model) {
+        "herdr"
+    } else if codex::is_codex_model(model) {
         "codex"
     } else if agy::is_agy_model(model) {
         "agy"
@@ -18122,6 +18125,11 @@ fn detect_provider(model: Option<&str>) -> &'static str {
         "agy"
     } else if !claude::is_claude_available() && opencode::is_opencode_available() {
         "opencode"
+    } else if !claude::is_claude_available()
+        && herdr::is_herdr_available()
+        && herdr::target_from_model(None).is_ok()
+    {
+        "herdr"
     } else {
         "claude"
     }
@@ -23163,6 +23171,14 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         } else {
             Err("opencode")
         }
+    } else if herdr::is_herdr_model(Some(clean)) {
+        if !herdr::is_herdr_available() {
+            return Err("herdr");
+        }
+        if herdr::target_from_model(Some(clean)).is_err() {
+            return Err("");
+        }
+        Ok(clean.to_string())
     } else {
         Err("") // invalid format
     }
@@ -23600,6 +23616,7 @@ async fn handle_model_command(
         let has_codex = codex::is_codex_available();
         let has_agy = agy::is_agy_available();
         let has_opencode = opencode::is_opencode_available();
+        let has_herdr = herdr::is_herdr_available();
 
         let mut msg = match &current {
             Some(m) => format!("Current model: <b>{}</b>\n", m),
@@ -23610,8 +23627,12 @@ async fn handle_model_command(
                     "codex"
                 } else if has_agy {
                     "agy"
-                } else {
+                } else if has_opencode {
                     "opencode"
+                } else if has_herdr {
+                    "herdr"
+                } else {
+                    "none"
                 };
                 format!("Current model: <b>default</b> ({})\n", default_provider)
             }
@@ -23660,6 +23681,16 @@ async fn handle_model_command(
             msg.push_str("<code>/model opencode</code> — default\n");
             for model_id in opencode::list_models() {
                 msg.push_str(&format!("<code>/model opencode:{}</code>\n", model_id));
+            }
+        }
+        if has_herdr {
+            msg.push_str("\n<b>Herdr:</b>\n");
+            msg.push_str("<code>/model herdr:&lt;agent-name&gt;</code>\n");
+            if let Ok(target) = herdr::target_from_model(None) {
+                msg.push_str(&format!(
+                    "<code>/model herdr</code> — configured agent: {}\n",
+                    html_escape(&target)
+                ));
             }
         }
 
@@ -23825,7 +23856,8 @@ async fn handle_model_command(
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
                  <code>/model agy</code> or <code>/model agy:&lt;model&gt;</code>\n\
-                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
+                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>\n\
+                 <code>/model herdr:&lt;agent-name&gt;</code>"
                 )
                 .parse_mode(ParseMode::Html)
                 .await
@@ -24876,7 +24908,19 @@ async fn handle_text_message(
             ));
             ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
                 provider, model_clone, context_prompt.len(), system_prompt_owned.len(), history_clone.len(), session_id_clone, current_path_clone));
-            let result = if provider == "opencode" {
+            let result = if provider == "herdr" {
+                msg_debug(&format!(
+                    "[handle_text_message] → herdr::execute, target={:?}, prompt_len={}",
+                    model_clone.as_deref().and_then(herdr::strip_herdr_prefix),
+                    context_prompt.len()
+                ));
+                herdr::execute_command_streaming(
+                    &context_prompt,
+                    tx.clone(),
+                    Some(cancel_token_clone),
+                    model_clone.as_deref(),
+                )
+            } else if provider == "opencode" {
                 let opencode_model = model_clone
                     .as_deref()
                     .and_then(opencode::strip_opencode_prefix);
@@ -30832,7 +30876,21 @@ async fn execute_schedule(
             provider, model_clone_for_exec, resume_session_id, claude_fork_session
         ));
         let resume_ref = resume_session_id.as_deref();
-        let result = if provider == "opencode" {
+        let result = if provider == "herdr" {
+            sched_debug(&format!(
+                "[execute_schedule] → herdr::execute, target={:?}, prompt_len={}",
+                model_clone_for_exec
+                    .as_deref()
+                    .and_then(herdr::strip_herdr_prefix),
+                prompt.len()
+            ));
+            herdr::execute_command_streaming(
+                &prompt,
+                tx.clone(),
+                Some(cancel_token_clone),
+                model_clone_for_exec.as_deref(),
+            )
+        } else if provider == "opencode" {
             let opencode_model = model_clone_for_exec
                 .as_deref()
                 .and_then(opencode::strip_opencode_prefix);
@@ -32349,7 +32407,19 @@ async fn process_bot_message(
             "[process_bot_message:spawn_blocking] provider={}, model={:?}",
             provider, model_clone
         ));
-        let result = if provider == "opencode" {
+        let result = if provider == "herdr" {
+            msg_debug(&format!(
+                "[process_bot_message] → herdr::execute, target={:?}, prompt_len={}",
+                model_clone.as_deref().and_then(herdr::strip_herdr_prefix),
+                prompt_for_ai.len()
+            ));
+            herdr::execute_command_streaming(
+                &prompt_for_ai,
+                tx.clone(),
+                Some(cancel_token_clone),
+                model_clone.as_deref(),
+            )
+        } else if provider == "opencode" {
             let opencode_model = model_clone
                 .as_deref()
                 .and_then(opencode::strip_opencode_prefix);
@@ -33990,7 +34060,14 @@ async fn execute_companion_ping(
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone.as_deref());
-        let result = if provider == "opencode" {
+        let result = if provider == "herdr" {
+            herdr::execute_command_streaming(
+                &prompt,
+                tx.clone(),
+                Some(cancel_token_clone),
+                model_clone.as_deref(),
+            )
+        } else if provider == "opencode" {
             let opencode_model = model_clone
                 .as_deref()
                 .and_then(opencode::strip_opencode_prefix);
