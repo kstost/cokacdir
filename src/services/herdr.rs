@@ -170,6 +170,97 @@ fn is_tui_elapsed_time(line: &str) -> bool {
     line.starts_with('─') && line.contains("Worked for ") && line.ends_with('─')
 }
 
+fn is_ordered_list_item(line: &str) -> bool {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0
+        && line
+            .get(digits..)
+            .is_some_and(|suffix| suffix.starts_with(". ") || suffix.starts_with(") "))
+}
+
+fn is_markdown_block_start(line: &str) -> bool {
+    let is_indented_code = line.starts_with('\t') || line.starts_with("    ");
+    let line = line.trim_start();
+    line.starts_with("```")
+        || line.starts_with("~~~")
+        || line.starts_with("# ")
+        || line.starts_with("## ")
+        || line.starts_with("### ")
+        || line.starts_with("#### ")
+        || line.starts_with("##### ")
+        || line.starts_with("###### ")
+        || line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("+ ")
+        || line.starts_with("• ")
+        || line.starts_with("> ")
+        || line.starts_with('|')
+        || is_indented_code
+        || is_ordered_list_item(line)
+}
+
+fn prevents_wrapped_continuation(line: &str) -> bool {
+    let is_indented_code = line.starts_with('\t') || line.starts_with("    ");
+    let line = line.trim_start();
+    line.starts_with('#')
+        || line.starts_with('>')
+        || line.starts_with('|')
+        || line.starts_with("```")
+        || line.starts_with("~~~")
+        || is_indented_code
+}
+
+fn unwrap_terminal_text(lines: impl IntoIterator<Item = String>) -> String {
+    let mut output: Vec<String> = Vec::new();
+    let mut in_code_fence = false;
+
+    for raw_line in lines {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+
+        if in_code_fence {
+            output.push(line.to_string());
+            if is_fence {
+                in_code_fence = false;
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if output.last().is_some_and(|line| !line.is_empty()) {
+                output.push(String::new());
+            }
+            continue;
+        }
+
+        if is_fence {
+            output.push(line.to_string());
+            in_code_fence = true;
+            continue;
+        }
+
+        let starts_block = is_markdown_block_start(line);
+        let can_join = !starts_block
+            && output.last().is_some_and(|previous| {
+                !previous.is_empty() && !prevents_wrapped_continuation(previous)
+            });
+
+        match (can_join, output.last_mut()) {
+            (true, Some(previous)) => {
+                previous.push(' ');
+                previous.push_str(trimmed);
+            }
+            _ => output.push(line.to_string()),
+        }
+    }
+
+    while output.last().is_some_and(String::is_empty) {
+        output.pop();
+    }
+    output.join("\n")
+}
+
 fn codex_final_response(turn_output: &str) -> Option<String> {
     let lines: Vec<&str> = turn_output.lines().collect();
     let input_index = lines
@@ -196,7 +287,7 @@ fn codex_final_response(turn_output: &str) -> Option<String> {
             .trim_end()
             .to_string()
     }));
-    let output = output.join("\n").trim().to_string();
+    let output = unwrap_terminal_text(output).trim().to_string();
     if output.is_empty() {
         None
     } else {
@@ -334,6 +425,67 @@ mod tests {
         assert_eq!(
             codex_final_response(snapshot).as_deref(),
             Some("Hello! How can I help?\n- First item\n- Second item")
+        );
+    }
+
+    #[test]
+    fn unwraps_terminal_wrapped_prose_and_preserves_lists() {
+        let snapshot = "\
+• Herdr integration can reliably\n\
+  support the following features.\n\
+\n\
+  - Stream progress commentary\n\
+  - Distinguish final responses\n\
+\n\
+  Bring the API draft back when it is\n\
+  ready for implementation.\n\
+\n\
+────────────────────────────────\n\
+\n\
+› Use /skills to list available skills";
+        assert_eq!(
+            codex_final_response(snapshot).as_deref(),
+            Some(
+                "Herdr integration can reliably support the following features.\n\
+\n\
+- Stream progress commentary\n\
+- Distinguish final responses\n\
+\n\
+Bring the API draft back when it is ready for implementation."
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_markdown_blocks_while_unwrapping_prose() {
+        let snapshot = "\
+• ## Windows\n\
+  Build with:\n\
+\n\
+  ```powershell\n\
+  cargo build --release\n\
+  $env:COKAC_HERDR_PATH = \"C:\\herdr.exe\"\n\
+  ```\n\
+\n\
+  Then restart the\n\
+  application.\n\
+\n\
+────────────────────────────────\n\
+\n\
+› Use /skills to list available skills";
+        assert_eq!(
+            codex_final_response(snapshot).as_deref(),
+            Some(
+                "## Windows\n\
+Build with:\n\
+\n\
+```powershell\n\
+cargo build --release\n\
+$env:COKAC_HERDR_PATH = \"C:\\herdr.exe\"\n\
+```\n\
+\n\
+Then restart the application."
+            )
         );
     }
 
