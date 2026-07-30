@@ -23,6 +23,7 @@ use crate::keybindings::PanelAction;
 use crate::services::agy;
 use crate::services::claude;
 use crate::services::codex;
+use crate::services::herdr;
 use crate::services::opencode;
 use crate::ui::app::{App, Screen};
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
@@ -1600,13 +1601,15 @@ fn handle_ccserver(tokens: Vec<String>) {
     let has_codex = codex::is_codex_available();
     let has_agy = agy::is_agy_available();
     let has_opencode = opencode::is_opencode_available();
+    let has_herdr = herdr::is_herdr_available();
     let mark = |available: bool| if available { "✓" } else { "✗" };
     println!(
-        "  ▸ Providers    : claude {}  codex {}  agy {}  opencode {}",
+        "  ▸ Providers    : claude {}  codex {}  agy {}  opencode {}  herdr {}",
         mark(has_claude),
         mark(has_codex),
         mark(has_agy),
-        mark(has_opencode)
+        mark(has_opencode),
+        mark(has_herdr)
     );
 
     if has_agy {
@@ -1614,10 +1617,10 @@ fn handle_ccserver(tokens: Vec<String>) {
         println!("  ▸ Agy          : v{}", ver);
     }
 
-    if !has_claude && !has_codex && !has_agy && !has_opencode {
+    if !has_claude && !has_codex && !has_agy && !has_opencode && !has_herdr {
         eprintln!();
         eprintln!("  Error: No AI provider available.");
-        eprintln!("  Install Claude CLI, Codex CLI, Antigravity CLI (agy), or OpenCode.");
+        eprintln!("  Install Claude CLI, Codex CLI, Antigravity CLI (agy), OpenCode, or Herdr.");
         std::process::exit(1);
     }
 
