@@ -412,10 +412,15 @@ fn enqueue_upload_request(
     use rand::RngCore;
 
     let abs_path_text = abs_path.to_string_lossy();
+    let created_at_unix = chrono::Utc::now().timestamp();
     let queue_content = serde_json::to_vec(&serde_json::json!({
         "path": abs_path_text,
         "chat_id": chat_id,
         "key": hash_key,
+        "created_at_unix": created_at_unix,
+        "attempt_count": 0,
+        "last_attempt_at_unix": 0,
+        "terminal": false,
     }))
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let now = chrono::Local::now();
@@ -4419,6 +4424,21 @@ mod sendfile_queue_tests {
     }
 
     #[test]
+    fn common_sendfile_path_accepts_files_above_telegram_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = temp.path().join("oversized.bin");
+        fs::File::create(&payload)
+            .unwrap()
+            .set_len(50 * 1024 * 1024 + 1)
+            .unwrap();
+
+        assert_eq!(
+            canonical_sendfile_path(&payload).unwrap(),
+            payload.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn same_file_requests_get_distinct_queue_entries() {
         let temp = tempfile::tempdir().unwrap();
         let queue_dir = temp.path().join("queue");
@@ -4430,6 +4450,22 @@ mod sendfile_queue_tests {
 
         assert_ne!(first, second);
         assert_eq!(fs::read_dir(&queue_dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn new_queue_entries_include_single_attempt_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_dir = temp.path().join("queue");
+        let payload = temp.path().join("payload.txt");
+        fs::write(&payload, b"payload").unwrap();
+
+        let entry = enqueue_upload_request(&queue_dir, &payload, 1, "placeholder-hash").unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&fs::read(entry).unwrap()).unwrap();
+
+        assert!(request["created_at_unix"].as_i64().unwrap() > 0);
+        assert_eq!(request["attempt_count"], 0);
+        assert_eq!(request["last_attempt_at_unix"], 0);
+        assert_eq!(request["terminal"], false);
     }
 
     #[cfg(unix)]

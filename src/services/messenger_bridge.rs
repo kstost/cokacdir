@@ -188,7 +188,9 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-/// Maximum request body size (100 MB — covers Telegram's 50 MB file upload limit)
+/// Defense-in-depth limit for the loopback proxy request body. This is a
+/// transport/resource bound, not a messenger-specific upload policy; Discord
+/// and Slack remain responsible for enforcing their context-specific limits.
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 /// Inbound files are ultimately consumed by telegram.rs's getFile-compatible
 /// 20 MiB path. Enforce the same bound while reading Discord/Slack responses,

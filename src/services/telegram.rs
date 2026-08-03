@@ -40,6 +40,40 @@ static BOT_KEY_FILE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<HashMap<Strin
 const MAX_BOT_SETTINGS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCHEDULE_ENTRY_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_CHAT_LOG_BYTES: usize = 64 * 1024 * 1024;
+/// The public Telegram Bot API rejects multipart `sendDocument` uploads larger
+/// than 50 MiB. Messenger bridges and a local Bot API server have different
+/// limits, so this must only be applied to the public Telegram endpoint.
+const TELEGRAM_SEND_DOCUMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+// Keep queue records tiny. Each request gets exactly one delivery attempt;
+// stale requests are discarded when the queue is next polled.
+const UPLOAD_QUEUE_MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const UPLOAD_QUEUE_MAX_ATTEMPTS: u32 = 1;
+const UPLOAD_QUEUE_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+
+fn uses_public_telegram_api(api_base_url: &str) -> bool {
+    reqwest::Url::parse(api_base_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("api.telegram.org")
+            && matches!(url.path(), "" | "/")
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn telegram_sendfile_size_error(api_base_url: &str, size: u64) -> Option<String> {
+    if !uses_public_telegram_api(api_base_url) {
+        // Discord and Slack limits depend on backend/workspace/channel state
+        // and are enforced by their own APIs. A local Telegram Bot API server
+        // also supports larger uploads than the public endpoint.
+        return None;
+    }
+    (size > TELEGRAM_SEND_DOCUMENT_MAX_BYTES).then(|| {
+        format!(
+            "file is too large for Telegram sendDocument: {size} bytes (maximum {} bytes / 50 MiB)",
+            TELEGRAM_SEND_DOCUMENT_MAX_BYTES
+        )
+    })
+}
 
 fn register_token_for_redaction(token: &str) {
     let lock = TG_BOT_TOKENS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
@@ -9868,14 +9902,14 @@ mod bot_settings_persistence_tests {
             .unwrap()
             .remove("bot_identity");
         let mut document = serde_json::json!({});
-        document.as_object_mut().unwrap().insert(
-            super::token_hash(OLD_TOKEN),
-            old_entry,
-        );
-        document.as_object_mut().unwrap().insert(
-            super::token_hash(CURRENT_TOKEN),
-            current_entry,
-        );
+        document
+            .as_object_mut()
+            .unwrap()
+            .insert(super::token_hash(OLD_TOKEN), old_entry);
+        document
+            .as_object_mut()
+            .unwrap()
+            .insert(super::token_hash(CURRENT_TOKEN), current_entry);
 
         let loaded = parse_bot_settings_snapshot_strict(CURRENT_TOKEN, &document).unwrap();
         assert!(loaded.entry.is_some());
@@ -20976,6 +21010,7 @@ async fn handle_shell_command(
             data.polling_time_ms
         };
         let mut queue_done = false;
+        let mut upload_drain_halted = false;
         let mut response_rendered = false;
         while !done || !queue_done {
             // Check cancel
@@ -21224,9 +21259,14 @@ async fn handle_shell_command(
             }
 
             // Queue processing
-            let queued = process_upload_queue(&bot_owned, chat_id, &state_owned).await;
+            let upload_poll = if upload_drain_halted {
+                UploadQueuePoll::Halted
+            } else {
+                process_upload_queue(&bot_owned, chat_id, &state_owned).await
+            };
+            upload_drain_halted |= upload_poll == UploadQueuePoll::Halted;
             if done {
-                queue_done = !queued;
+                queue_done = !upload_poll.should_keep_draining_after_done();
             }
         }
 
@@ -24995,6 +25035,7 @@ async fn handle_text_message(
 
         let silent_mode = companion_mode || !output_mode.is_verbose();
         let mut queue_done = false;
+        let mut upload_drain_halted = false;
         let mut response_rendered = false;
         while !done || !queue_done {
             // Check cancel token
@@ -26399,9 +26440,14 @@ async fn handle_text_message(
             }
 
             // === Queue processing (both during streaming and after done) ===
-            let queued = process_upload_queue(&bot_owned, chat_id, &state_owned).await;
+            let upload_poll = if upload_drain_halted {
+                UploadQueuePoll::Halted
+            } else {
+                process_upload_queue(&bot_owned, chat_id, &state_owned).await
+            };
+            upload_drain_halted |= upload_poll == UploadQueuePoll::Halted;
             if done {
-                queue_done = !queued;
+                queue_done = !upload_poll.should_keep_draining_after_done();
             }
         }
 
@@ -27259,15 +27305,131 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct UploadQueueRequest {
+    path: String,
+    chat_id: i64,
+    key: String,
+    #[serde(default)]
+    created_at_unix: i64,
+    #[serde(default)]
+    attempt_count: u32,
+    #[serde(default)]
+    last_attempt_at_unix: i64,
+    #[serde(default)]
+    terminal: bool,
+}
+
+fn read_upload_queue_request(path: &Path) -> std::io::Result<UploadQueueRequest> {
+    use std::io::Read;
+
+    let link_metadata = fs::symlink_metadata(path)?;
+    if !link_metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload queue entry is not a regular file",
+        ));
+    }
+    if link_metadata.len() > UPLOAD_QUEUE_MAX_REQUEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload queue entry exceeds the size limit",
+        ));
+    }
+
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(link_metadata.len() as usize);
+    file.take(UPLOAD_QUEUE_MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > UPLOAD_QUEUE_MAX_REQUEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upload queue entry grew beyond the size limit",
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn upload_request_created_at_unix(
+    request: &UploadQueueRequest,
+    queue_path: &Path,
+    now_unix: i64,
+) -> i64 {
+    // Reject timestamps too far in the future instead of allowing a malformed
+    // queue entry to evade the age limit indefinitely.
+    if request.created_at_unix > 0 && request.created_at_unix <= now_unix.saturating_add(5 * 60) {
+        return request.created_at_unix;
+    }
+
+    fs::metadata(queue_path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .filter(|timestamp| *timestamp <= now_unix.saturating_add(5 * 60))
+        .unwrap_or(now_unix)
+}
+
+fn upload_request_is_expired(created_at_unix: i64, now_unix: i64) -> bool {
+    now_unix.saturating_sub(created_at_unix) >= UPLOAD_QUEUE_MAX_AGE_SECONDS
+}
+
+fn upload_request_attempt_consumed(request: &UploadQueueRequest) -> bool {
+    request.attempt_count >= UPLOAD_QUEUE_MAX_ATTEMPTS
+}
+
+/// Result of one upload-queue polling pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UploadQueuePoll {
+    /// No matching request was ready.
+    Idle,
+    /// One request was sent or permanently discarded. Poll again to drain any
+    /// request behind it.
+    Progressed,
+    /// Queue state could not be made durable. Stop draining this turn so the
+    /// handler cannot spin or risk sending the same request twice.
+    Halted,
+}
+
+impl UploadQueuePoll {
+    fn should_keep_draining_after_done(self) -> bool {
+        self == Self::Progressed
+    }
+}
+
+async fn notify_discarded_upload(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    path: &Path,
+    reason: &str,
+) {
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let message =
+        format!("⚠ File delivery skipped and removed from the upload queue: {file}\n{reason}");
+    shared_rate_limit_wait(state, chat_id).await;
+    let _ = tg!(
+        "send_message",
+        state,
+        chat_id,
+        bot.send_message(chat_id, message).await
+    );
+}
+
 /// Process one pending upload queue file for the given chat.
 /// Scans ~/.cokacdir/upload_queue/ for .queue files matching the current bot and chat_id,
-/// sends the oldest one, and deletes the queue file on success.
-/// Returns true if a file was processed (rate limit slot consumed).
+/// sends the oldest one once, and removes the queue file whether delivery
+/// succeeds or fails. Queue-state errors halt the current drain pass.
 struct UploadQueueClaim {
     original: PathBuf,
     // Lock a stable sidecar instead of renaming the request out of the queue.
     // A process crash releases the OS lock and leaves the original request
-    // visible for retry, while concurrent pollers still cannot both send it.
+    // visible. The durable attempt count prevents another delivery attempt,
+    // while concurrent pollers still cannot both send it.
     _lock_file: std::fs::File,
 }
 
@@ -27294,10 +27456,16 @@ impl UploadQueueClaim {
         }
         let lock_file = options.open(lock_path)?;
         match lock_file.try_lock_exclusive() {
-            Ok(()) if original.is_file() => Ok(Some(Self {
-                original: original.to_path_buf(),
-                _lock_file: lock_file,
-            })),
+            Ok(())
+                if fs::symlink_metadata(original)
+                    .map(|metadata| metadata.file_type().is_file())
+                    .unwrap_or(false) =>
+            {
+                Ok(Some(Self {
+                    original: original.to_path_buf(),
+                    _lock_file: lock_file,
+                }))
+            }
             Ok(()) => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
@@ -27306,6 +27474,38 @@ impl UploadQueueClaim {
 
     fn path(&self) -> &Path {
         &self.original
+    }
+
+    fn persist(&self, request: &UploadQueueRequest) -> std::io::Result<()> {
+        let serialized = serde_json::to_vec(request)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if serialized.len() as u64 > UPLOAD_QUEUE_MAX_REQUEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized upload queue entry exceeds the size limit",
+            ));
+        }
+        write_private_file_atomically(&self.original, &serialized)
+    }
+
+    /// Mark a request terminal before removing it. If removal fails, a later
+    /// consumer sees `terminal=true` and will clean it up without sending the
+    /// file again (important after a successful delivery).
+    fn finalize(self, request: &mut UploadQueueRequest) -> std::io::Result<()> {
+        request.terminal = true;
+        let persist_error = self.persist(request).err();
+        match self.discard() {
+            Ok(()) => Ok(()),
+            Err(discard_error) => match persist_error {
+                Some(persist_error) => Err(std::io::Error::new(
+                    discard_error.kind(),
+                    format!(
+                        "failed to persist terminal upload state ({persist_error}); failed to discard request ({discard_error})"
+                    ),
+                )),
+                None => Err(discard_error),
+            },
+        }
     }
 
     /// Hide a completed request first, then best-effort delete the tombstone.
@@ -27343,9 +27543,52 @@ impl UploadQueueClaim {
     }
 }
 
+async fn finalize_upload_with_notice(
+    claim: UploadQueueClaim,
+    request: &mut UploadQueueRequest,
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    source_path: &Path,
+    reason: &str,
+) -> UploadQueuePoll {
+    let request_path = claim.path().to_path_buf();
+    match claim.finalize(request) {
+        Ok(()) => {
+            notify_discarded_upload(bot, chat_id, state, source_path, reason).await;
+            UploadQueuePoll::Progressed
+        }
+        Err(e) => {
+            msg_debug(&format!(
+                "[upload_queue] failed to finalize request {}: {}",
+                request_path.display(),
+                e
+            ));
+            UploadQueuePoll::Halted
+        }
+    }
+}
+
 #[cfg(test)]
 mod upload_queue_claim_tests {
-    use super::UploadQueueClaim;
+    use super::{
+        read_upload_queue_request, telegram_sendfile_size_error, upload_request_attempt_consumed,
+        upload_request_is_expired, UploadQueueClaim, UploadQueuePoll, UploadQueueRequest,
+        TELEGRAM_SEND_DOCUMENT_MAX_BYTES, UPLOAD_QUEUE_MAX_AGE_SECONDS, UPLOAD_QUEUE_MAX_ATTEMPTS,
+        UPLOAD_QUEUE_MAX_REQUEST_BYTES,
+    };
+
+    fn request(path: &str) -> UploadQueueRequest {
+        UploadQueueRequest {
+            path: path.to_string(),
+            chat_id: 1,
+            key: "key".to_string(),
+            created_at_unix: 100,
+            attempt_count: 0,
+            last_attempt_at_unix: 0,
+            terminal: false,
+        }
+    }
 
     #[test]
     fn dropping_failed_claim_keeps_queue_file_and_releases_lock() {
@@ -27409,15 +27652,109 @@ mod upload_queue_claim_tests {
             .expect("claim after first drops")
             .is_some());
     }
+
+    #[test]
+    fn upload_size_guard_is_scoped_to_the_public_telegram_api() {
+        assert!(telegram_sendfile_size_error(
+            "https://api.telegram.org",
+            TELEGRAM_SEND_DOCUMENT_MAX_BYTES
+        )
+        .is_none());
+        assert!(telegram_sendfile_size_error(
+            "https://api.telegram.org/",
+            TELEGRAM_SEND_DOCUMENT_MAX_BYTES + 1
+        )
+        .is_some());
+        assert!(telegram_sendfile_size_error(
+            "http://127.0.0.1:12345",
+            TELEGRAM_SEND_DOCUMENT_MAX_BYTES + 1
+        )
+        .is_none());
+        assert!(telegram_sendfile_size_error(
+            "https://api.telegram.org.example.com",
+            TELEGRAM_SEND_DOCUMENT_MAX_BYTES + 1
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn halted_drain_does_not_keep_a_completed_request_busy() {
+        assert!(!UploadQueuePoll::Halted.should_keep_draining_after_done());
+        assert!(!UploadQueuePoll::Idle.should_keep_draining_after_done());
+        assert!(UploadQueuePoll::Progressed.should_keep_draining_after_done());
+    }
+
+    #[test]
+    fn legacy_queue_request_gets_safe_single_attempt_defaults() {
+        let parsed: UploadQueueRequest =
+            serde_json::from_str(r#"{"path":"/tmp/file","chat_id":1,"key":"key"}"#).unwrap();
+
+        assert_eq!(parsed.attempt_count, 0);
+        assert_eq!(parsed.created_at_unix, 0);
+        assert!(!parsed.terminal);
+        assert!(!upload_request_attempt_consumed(&parsed));
+    }
+
+    #[test]
+    fn prior_retry_metadata_cannot_trigger_another_delivery_attempt() {
+        let parsed: UploadQueueRequest = serde_json::from_str(
+            r#"{"path":"/tmp/file","chat_id":1,"key":"key","attempt_count":1,"next_attempt_at_unix":9223372036854775807}"#,
+        )
+        .unwrap();
+
+        assert!(upload_request_attempt_consumed(&parsed));
+    }
+
+    #[test]
+    fn single_attempt_and_expired_boundaries_are_conservative() {
+        assert!(!upload_request_is_expired(
+            100,
+            100 + UPLOAD_QUEUE_MAX_AGE_SECONDS - 1
+        ));
+        assert!(upload_request_is_expired(
+            100,
+            100 + UPLOAD_QUEUE_MAX_AGE_SECONDS
+        ));
+        assert_eq!(UPLOAD_QUEUE_MAX_ATTEMPTS, 1);
+    }
+
+    #[test]
+    fn attempt_state_is_persisted_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("request.queue");
+        let mut request = request("/tmp/file");
+        std::fs::write(&queue, serde_json::to_vec(&request).unwrap()).unwrap();
+        let claim = UploadQueueClaim::try_claim(&queue)
+            .unwrap()
+            .expect("claim queue file");
+
+        request.attempt_count = 1;
+        claim.persist(&request).unwrap();
+
+        let persisted = read_upload_queue_request(&queue).unwrap();
+        assert_eq!(persisted.attempt_count, 1);
+    }
+
+    #[test]
+    fn oversized_queue_metadata_is_rejected_without_unbounded_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join("request.queue");
+        std::fs::File::create(&queue)
+            .unwrap()
+            .set_len(UPLOAD_QUEUE_MAX_REQUEST_BYTES + 1)
+            .unwrap();
+
+        assert!(read_upload_queue_request(&queue).is_err());
+    }
 }
 
-async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -> bool {
+async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -> UploadQueuePoll {
     let queue_dir = match dirs::home_dir() {
         Some(h) => h.join(".cokacdir").join("upload_queue"),
-        None => return false,
+        None => return UploadQueuePoll::Idle,
     };
     if !queue_dir.is_dir() {
-        return false;
+        return UploadQueuePoll::Idle;
     }
 
     let current_key = token_hash(bot.token());
@@ -27429,33 +27766,31 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("queue"))
             .collect(),
-        Err(_) => return false,
+        Err(_) => return UploadQueuePoll::Idle,
     };
     entries.sort();
 
     // Find the first entry matching this bot and chat_id
     for entry_path in entries {
-        let content = match fs::read_to_string(&entry_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let json: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let request = match read_upload_queue_request(&entry_path) {
+            Ok(request) => request,
+            Err(e) => {
+                msg_debug(&format!(
+                    "[upload_queue] ignoring invalid request {}: {}",
+                    entry_path.display(),
+                    e
+                ));
+                continue;
+            }
         };
 
-        let file_chat_id = json.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
-        let file_key = json.get("key").and_then(|v| v.as_str()).unwrap_or("");
-        let file_path = json.get("path").and_then(|v| v.as_str()).unwrap_or("");
-
-        if file_chat_id != chat_id.0 || file_key != current_key || file_path.is_empty() {
+        if request.chat_id != chat_id.0 || request.key != current_key || request.path.is_empty() {
             continue;
         }
 
         // Atomically claim before any await. Concurrent bot loops may scan the
         // same queue directory; only the process holding the sidecar file lock
-        // may send this request. A crash automatically releases the lock while
-        // leaving the original `.queue` request visible for retry.
+        // may process this request. A crash automatically releases the lock.
         let claim = match UploadQueueClaim::try_claim(&entry_path) {
             Ok(Some(claim)) => claim,
             Ok(None) => continue,
@@ -27471,83 +27806,200 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
 
         // Re-read after locking so the payload we act on is protected from
         // concurrent consumers for the remainder of this iteration.
-        let claimed_content = match fs::read_to_string(claim.path()) {
-            Ok(content) => content,
+        let mut request = match read_upload_queue_request(claim.path()) {
+            Ok(request) => request,
             Err(e) => {
                 msg_debug(&format!(
                     "[upload_queue] failed to read claimed request {}: {}",
                     claim.path().display(),
                     e
                 ));
-                continue;
+                return UploadQueuePoll::Halted;
             }
         };
-        let claimed_json: serde_json::Value = match serde_json::from_str(&claimed_content) {
-            Ok(json) => json,
-            Err(e) => {
-                msg_debug(&format!(
-                    "[upload_queue] invalid claimed request {}: {}",
-                    claim.path().display(),
-                    e
-                ));
-                continue;
-            }
-        };
-        let claimed_chat_id = claimed_json
-            .get("chat_id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let claimed_key = claimed_json
-            .get("key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let claimed_file_path = claimed_json
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if claimed_chat_id != chat_id.0
-            || claimed_key != current_key
-            || claimed_file_path != file_path
-        {
+        if request.chat_id != chat_id.0 || request.key != current_key || request.path.is_empty() {
             continue;
         }
 
-        let path = std::path::PathBuf::from(claimed_file_path);
-        if !path.exists() {
-            // Permanent failure: the requested source no longer exists.
-            let _ = claim.discard();
-            return false;
+        let now_unix = chrono::Utc::now().timestamp();
+        if request.terminal {
+            let request_path = claim.path().to_path_buf();
+            return match claim.discard() {
+                Ok(()) => UploadQueuePoll::Progressed,
+                Err(e) => {
+                    msg_debug(&format!(
+                        "[upload_queue] failed to discard terminal request {}: {}",
+                        request_path.display(),
+                        e
+                    ));
+                    UploadQueuePoll::Halted
+                }
+            };
         }
 
-        // Rate limit and send
+        let created_at_unix = upload_request_created_at_unix(&request, claim.path(), now_unix);
+        if request.created_at_unix != created_at_unix {
+            request.created_at_unix = created_at_unix;
+        }
+
+        let path = std::path::PathBuf::from(&request.path);
+        if upload_request_is_expired(created_at_unix, now_unix) {
+            let reason = format!(
+                "upload request expired after {} hours without successful delivery",
+                UPLOAD_QUEUE_MAX_AGE_SECONDS / (60 * 60)
+            );
+            return finalize_upload_with_notice(
+                claim,
+                &mut request,
+                bot,
+                chat_id,
+                state,
+                &path,
+                &reason,
+            )
+            .await;
+        }
+        if upload_request_attempt_consumed(&request) {
+            let reason = "upload request already consumed its single delivery attempt";
+            return finalize_upload_with_notice(
+                claim,
+                &mut request,
+                bot,
+                chat_id,
+                state,
+                &path,
+                reason,
+            )
+            .await;
+        }
+
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => {
+                return finalize_upload_with_notice(
+                    claim,
+                    &mut request,
+                    bot,
+                    chat_id,
+                    state,
+                    &path,
+                    "upload source is no longer a regular file",
+                )
+                .await;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return finalize_upload_with_notice(
+                    claim,
+                    &mut request,
+                    bot,
+                    chat_id,
+                    state,
+                    &path,
+                    "upload source no longer exists",
+                )
+                .await;
+            }
+            Err(e) => {
+                let reason = format!("cannot inspect upload source: {e}");
+                return finalize_upload_with_notice(
+                    claim,
+                    &mut request,
+                    bot,
+                    chat_id,
+                    state,
+                    &path,
+                    &reason,
+                )
+                .await;
+            }
+        };
+
+        let api_base_url = {
+            let data = state.lock().await;
+            data.api_base_url.clone()
+        };
+        if let Some(reason) = telegram_sendfile_size_error(&api_base_url, metadata.len()) {
+            msg_debug(&format!(
+                "[upload_queue] permanently discarding oversized upload {} ({} bytes)",
+                path.display(),
+                metadata.len()
+            ));
+            return finalize_upload_with_notice(
+                claim,
+                &mut request,
+                bot,
+                chat_id,
+                state,
+                &path,
+                &reason,
+            )
+            .await;
+        }
+
+        // Persist consumption of the request's only delivery attempt before
+        // sending. Even if finalization later fails, another consumer will
+        // clean up this request without sending it again.
         shared_rate_limit_wait(state, chat_id).await;
+        let attempt_started_at = chrono::Utc::now().timestamp();
+        request.attempt_count = request.attempt_count.saturating_add(1);
+        request.last_attempt_at_unix = attempt_started_at;
+        if let Err(e) = claim.persist(&request) {
+            msg_debug(&format!(
+                "[upload_queue] refusing to send because single-attempt state could not be persisted for {}: {}",
+                claim.path().display(),
+                e
+            ));
+            return UploadQueuePoll::Halted;
+        }
+
         match tg!(
             "send_document",
+            state,
+            chat_id,
             bot.send_document(chat_id, teloxide::types::InputFile::file(&path),)
                 .await
         ) {
-            Ok(_) => {
-                if let Err(e) = claim.discard() {
+            Ok(_) => match claim.finalize(&mut request) {
+                Ok(()) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}]   📤 Upload sent: {}", request.path);
+                    return UploadQueuePoll::Progressed;
+                }
+                Err(e) => {
+                    // `finalize` persists terminal=true before removal, so a
+                    // later consumer cleans up without sending a duplicate.
                     msg_debug(&format!(
-                        "[upload_queue] sent but failed to remove claim: {}",
+                        "[upload_queue] sent but failed to finalize request: {}",
                         e
                     ));
+                    return UploadQueuePoll::Halted;
                 }
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}]   📤 Upload sent: {}", file_path);
-            }
+            },
             Err(e) => {
-                // Dropping the claim releases the sidecar lock. The original
-                // queue file was never renamed, so it remains retryable.
-                drop(claim);
+                let reason = redact_err(&e);
+                msg_debug(&format!(
+                    "[upload_queue] abandoning upload after its only delivery attempt {}: {}",
+                    path.display(),
+                    reason
+                ));
+                let poll = finalize_upload_with_notice(
+                    claim,
+                    &mut request,
+                    bot,
+                    chat_id,
+                    state,
+                    &path,
+                    &reason,
+                )
+                .await;
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}]   ⚠ Upload failed: {}", redact_err(&e));
+                println!("  [{ts}]   ⚠ Upload failed and was discarded: {reason}");
+                return poll;
             }
         }
-        return true;
     }
 
-    false
+    UploadQueuePoll::Idle
 }
 
 /// Acquires the lock briefly to calculate and reserve the next API call slot,
@@ -30520,6 +30972,7 @@ async fn execute_schedule(
         let silent_mode = companion_mode || !output_mode.is_verbose();
 
         let mut queue_done = false;
+        let mut upload_drain_halted = false;
         while !done || !queue_done {
             if cancel_token.cancelled.load(Ordering::Relaxed) {
                 if !done {
@@ -30941,9 +31394,14 @@ async fn execute_schedule(
             }
 
             // Queue processing
-            let queued = process_upload_queue(&bot_owned, chat_id, &state_owned).await;
+            let upload_poll = if upload_drain_halted {
+                UploadQueuePoll::Halted
+            } else {
+                process_upload_queue(&bot_owned, chat_id, &state_owned).await
+            };
+            upload_drain_halted |= upload_poll == UploadQueuePoll::Halted;
             if done {
-                queue_done = !queued;
+                queue_done = !upload_poll.should_keep_draining_after_done();
             }
         }
 
@@ -32063,6 +32521,7 @@ async fn process_bot_message(
         ));
 
         let mut queue_done = false;
+        let mut upload_drain_halted = false;
         let mut response_rendered = false;
         while !done || !queue_done {
             if cancel_token.cancelled.load(Ordering::Relaxed) {
@@ -32873,12 +33332,17 @@ async fn process_bot_message(
             }
 
             // Queue processing
-            let queued = process_upload_queue(&bot_owned, chat_id, &state_owned).await;
+            let upload_poll = if upload_drain_halted {
+                UploadQueuePoll::Halted
+            } else {
+                process_upload_queue(&bot_owned, chat_id, &state_owned).await
+            };
+            upload_drain_halted |= upload_poll == UploadQueuePoll::Halted;
             if done {
-                queue_done = !queued;
+                queue_done = !upload_poll.should_keep_draining_after_done();
                 msg_debug(&format!(
-                    "[botmsg_poll:{}] queue: queued={}, queue_done={}",
-                    bmsg_id_for_log, queued, queue_done
+                    "[botmsg_poll:{}] queue: upload_poll={:?}, queue_done={}",
+                    bmsg_id_for_log, upload_poll, queue_done
                 ));
             }
         }

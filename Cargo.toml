@@ -1,6 +1,6 @@
 [package]
 name = "cokacdir"
-version = "0.8.12"
+version = "0.8.13"
 edition = "2021"
 authors = ["cokac <monogatree@gmail.com>"]
 description = "Telegram/Discord bot that runs Claude Code, Codex, Agy, and Opencode, with a multi-panel terminal file manager"
@@ -68,7 +68,7 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
 strip = true
 
