@@ -1353,6 +1353,13 @@ pub(crate) fn stable_path_identity(path: &Path) -> io::Result<StablePathIdentity
     }
 }
 
+/// Check that a pathname still resolves to the object held open by `file`.
+/// Read both identities at verification time: creation-time IDs are not stable
+/// on every macOS network or userspace filesystem while an object is written.
+fn path_still_names_open_object(path: &Path, file: &File) -> io::Result<bool> {
+    Ok(stable_path_identity(path)? == stable_file_identity(file)?)
+}
+
 pub(crate) struct PreparedFileDeletion {
     #[cfg(windows)]
     file: File,
@@ -1459,6 +1466,74 @@ impl PreparedFileDeletion {
 /// than by reopening the pathname at the remove call.
 pub(crate) fn remove_file_by_identity(path: &Path, expected: StablePathIdentity) -> io::Result<()> {
     prepare_file_deletion(path, expected)?.delete()
+}
+
+/// Remove a directory tree only if `path` still names the exact directory
+/// represented by `expected`.
+///
+/// The verified directory is first moved to an unpredictable private name and
+/// rebound there before recursive deletion.  A pathname replacement racing
+/// either verification is therefore preserved instead of being traversed or
+/// deleted.  Callers should derive `expected` from a directory handle that
+/// stayed open for the lifetime of the operation, not from creation-time
+/// metadata that may be re-keyed by synthetic filesystems.
+pub(crate) fn remove_directory_tree_by_identity(
+    path: &Path,
+    expected: StablePathIdentity,
+) -> io::Result<()> {
+    let current = path_identity(path)?;
+    if !current.is_directory || current.stable != expected {
+        return Err(io::Error::other(format!(
+            "Directory changed before verified cleanup and was preserved at '{}'",
+            path.display()
+        )));
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let quarantine = create_private_quarantine_directory(parent, "directory-cleanup")?;
+    let isolated = quarantine.join(format!(
+        "verified-directory-{:032x}",
+        rand::random::<u128>()
+    ));
+    if let Err(error) = rename_to_unpublished_private_path(path, &isolated) {
+        let _ = fs::remove_dir(&quarantine);
+        return Err(error);
+    }
+
+    let moved = match path_identity(&isolated) {
+        Ok(moved) if moved.matches_after_relocation(&current) => moved,
+        Ok(_) => {
+            return Err(io::Error::other(format!(
+                "Directory changed while it was isolated for cleanup; the moved entry was preserved at '{}'",
+                isolated.display()
+            )))
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Could not rebind the directory isolated for cleanup: {}. It was preserved at '{}'",
+                    error,
+                    isolated.display()
+                ),
+            ))
+        }
+    };
+    drop(moved);
+    drop(current);
+
+    if let Err(error) = delete_path_unchecked(&isolated) {
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "Verified directory cleanup failed: {}. Remaining data was preserved under '{}'",
+                error,
+                quarantine.display()
+            ),
+        ));
+    }
+    fs::remove_dir(&quarantine)?;
+    sync_parent(path)
 }
 
 #[derive(Debug)]
@@ -1824,7 +1899,16 @@ pub(crate) fn create_private_quarantine_directory(
 
 struct PrivateStagingDirectory {
     path: PathBuf,
-    stable: StablePathIdentity,
+    // Bind the container itself for its full lifetime. Some synthetic
+    // filesystems can re-key a directory after children are added, just as
+    // they can re-key a newly written file. Cleanup compares the pathname
+    // with this handle's current identity before moving anything.
+    bound_handle: File,
+    // Keep the payload name unpublished and unpredictable until the first
+    // filesystem operation that creates it.  Some macOS/network filesystems
+    // reject RENAME_EXCL; an unpredictable destination lets private staging
+    // use a guarded plain rename without exposing a clobberable name first.
+    payload_name: OsString,
 }
 
 struct OwnedStage {
@@ -1839,6 +1923,11 @@ struct PartialStage {
     directory: PrivateStagingDirectory,
     stable: StablePathIdentity,
     is_directory: bool,
+    // Some filesystems re-key a synthetic inode/file ID after the first write
+    // or metadata update. Keep the object open while it is populated so the
+    // final path can be compared with the handle's *current* identity instead
+    // of assuming the creation-time identity never changes.
+    bound_handle: Option<File>,
 }
 
 struct StagePublishFailure {
@@ -1878,6 +1967,7 @@ impl PartialStage {
             directory,
             stable,
             is_directory: metadata.is_dir() && !metadata.is_symlink(),
+            bound_handle: None,
         })
     }
 
@@ -1894,6 +1984,7 @@ impl PartialStage {
             directory,
             stable,
             is_directory: false,
+            bound_handle: Some(file.try_clone()?),
         })
     }
 
@@ -1911,6 +2002,7 @@ impl PartialStage {
             directory,
             stable,
             is_directory: true,
+            bound_handle: Some(handle),
         })
     }
 
@@ -1918,7 +2010,18 @@ impl PartialStage {
         self.directory.payload()
     }
 
-    fn seal(self) -> io::Result<OwnedStage> {
+    fn matches_current_path(&self, current: &PathIdentity) -> io::Result<bool> {
+        if current.is_directory != self.is_directory {
+            return Ok(false);
+        }
+        let bound = match self.bound_handle.as_ref() {
+            Some(handle) => stable_file_identity(handle)?,
+            None => self.stable,
+        };
+        Ok(current.stable == bound)
+    }
+
+    fn seal(mut self) -> io::Result<OwnedStage> {
         let current = path_identity(&self.path()).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -1929,34 +2032,37 @@ impl PartialStage {
                 ),
             )
         })?;
-        if current.stable != self.stable || current.is_directory != self.is_directory {
+        if !self.matches_current_path(&current)? {
             return Err(io::Error::other(format!(
                 "Staging payload changed while it was being populated and was preserved at '{}'",
                 self.directory.path.display()
             )));
         }
+        // On Windows a bound directory handle intentionally denies delete
+        // sharing. Release it before the owned stage is renamed for publish.
+        drop(self.bound_handle.take());
         Ok(OwnedStage {
             directory: self.directory,
             identity: current,
         })
     }
 
-    fn cleanup(self) -> io::Result<()> {
+    fn cleanup(mut self) -> io::Result<()> {
         let path = self.path();
         let current = match path_identity(&path) {
-            Ok(current)
-                if current.stable == self.stable && current.is_directory == self.is_directory =>
-            {
-                current
-            }
-            Ok(_) => {
-                return Err(io::Error::other(format!(
-                    "Partial staging payload changed and was preserved at '{}'",
-                    self.directory.path.display()
-                )))
+            Ok(current) => {
+                if self.matches_current_path(&current)? {
+                    current
+                } else {
+                    return Err(io::Error::other(format!(
+                        "Partial staging payload changed and was preserved at '{}'",
+                        self.directory.path.display()
+                    )));
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return self.directory.cleanup()
+                drop(self.bound_handle.take());
+                return self.directory.cleanup();
             }
             Err(error) => {
                 return Err(io::Error::new(
@@ -1969,6 +2075,7 @@ impl PartialStage {
                 ))
             }
         };
+        drop(self.bound_handle.take());
         delete_replacement_backup_if_unchanged(&path, current)?;
         self.directory.cleanup()
     }
@@ -2109,8 +2216,8 @@ impl OwnedStage {
 impl PrivateStagingDirectory {
     fn create(parent: &Path, label: &str) -> io::Result<Self> {
         let path = create_private_quarantine_directory(parent, label)?;
-        let stable = match stable_path_identity(&path) {
-            Ok(identity) => identity,
+        let bound_handle = match open_private_staging_directory(&path) {
+            Ok(handle) => handle,
             Err(error) => {
                 return Err(io::Error::new(
                     error.kind(),
@@ -2121,6 +2228,12 @@ impl PrivateStagingDirectory {
                 ));
             }
         };
+        if !path_still_names_open_object(&path, &bound_handle)? {
+            return Err(io::Error::other(format!(
+                "Created private staging directory was replaced and was preserved at '{}'",
+                path.display()
+            )));
+        }
         if let Err(error) = sync_parent(&path) {
             return Err(io::Error::new(
                 error.kind(),
@@ -2130,16 +2243,71 @@ impl PrivateStagingDirectory {
                 ),
             ));
         }
-        Ok(Self { path, stable })
+        let payload_name = OsString::from(format!("payload-{:032x}", rand::random::<u128>()));
+        Ok(Self {
+            path,
+            bound_handle,
+            payload_name,
+        })
     }
 
     fn payload(&self) -> PathBuf {
-        self.path.join("payload")
+        self.path.join(&self.payload_name)
     }
 
     fn cleanup(self) -> io::Result<()> {
-        cleanup_private_staging_directory(&self.path, self.stable)
+        let Self {
+            path,
+            bound_handle,
+            payload_name: _,
+        } = self;
+        if !path_still_names_open_object(&path, &bound_handle)? {
+            return Err(io::Error::other(format!(
+                "Private staging directory changed and was preserved at '{}'",
+                path.display()
+            )));
+        }
+        let current = stable_file_identity(&bound_handle)?;
+        // Windows allows this identity handle to share deletion, but closing
+        // it here also avoids relying on filesystem-specific open-directory
+        // rename semantics.
+        drop(bound_handle);
+        cleanup_private_staging_directory(&path, current)
     }
+}
+
+#[cfg(unix)]
+fn open_private_staging_directory(path: &Path) -> io::Result<File> {
+    open_directory_for_read(path).map(|(directory, _, _)| directory)
+}
+
+#[cfg(windows)]
+fn open_private_staging_directory(path: &Path) -> io::Result<File> {
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    // Unlike the recursive-walk handle, this identity-only handle shares
+    // deletion so staging can eventually be renamed and removed.
+    let directory = open_windows_path_identity(path)?;
+    let information = windows_handle_info(&directory)?;
+    if information.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Private staging path is not a real directory",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_private_staging_directory(path: &Path) -> io::Result<File> {
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Stable private staging directory handles are unavailable on this platform",
+    ))
 }
 
 fn cleanup_private_staging_directory(
@@ -2155,8 +2323,8 @@ fn cleanup_private_staging_directory(
 
     let parent = staging.parent().unwrap_or_else(|| Path::new("."));
     let quarantine = create_private_quarantine_directory(parent, "staging-cleanup")?;
-    let moved = quarantine.join("staging");
-    if let Err(error) = rename_noreplace(staging, &moved) {
+    let moved = quarantine.join(format!("staging-{:032x}", rand::random::<u128>()));
+    if let Err(error) = rename_to_unpublished_private_path(staging, &moved) {
         let _ = fs::remove_dir(&quarantine);
         return Err(error);
     }
@@ -2190,6 +2358,51 @@ fn cleanup_private_staging_directory(
     sync_parent(staging)
 }
 
+/// Rename into a freshly generated private path that has never been published
+/// in the filesystem namespace.  `RENAME_EXCL` is not implemented by every
+/// macOS, FUSE, or network filesystem even when ordinary rename is available.
+///
+/// The fallback is intentionally limited to an unpredictable private
+/// destination.  It must never be used to publish to a caller-selected name:
+/// plain rename could overwrite a destination created after an existence
+/// check. It also must not start a transaction whose later failure requires a
+/// no-clobber rename back to the original name; use it only for destructive
+/// isolation or cleanup that may safely preserve recovery data at `dest`.
+/// A pre-existing private destination is still rejected here.
+fn rename_to_unpublished_private_path(src: &Path, dest: &Path) -> io::Result<()> {
+    rename_to_unpublished_private_path_with(src, dest, rename_noreplace)
+}
+
+fn rename_to_unpublished_private_path_with<F>(
+    src: &Path,
+    dest: &Path,
+    rename_exclusive: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    match rename_exclusive(src, dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+            match fs::symlink_metadata(dest) {
+                Err(check_error) if check_error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "Private staging destination unexpectedly already exists: '{}'",
+                            dest.display()
+                        ),
+                    ));
+                }
+                Err(check_error) => return Err(check_error),
+            }
+            fs::rename(src, dest)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -2214,7 +2427,7 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
         let error = io::Error::last_os_error();
         if matches!(
             error.raw_os_error(),
-            Some(libc::ENOSYS) | Some(libc::EINVAL)
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
         ) {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2238,7 +2451,18 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
     if result == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+        ) {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This filesystem does not support atomic no-clobber rename",
+            ))
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -2522,6 +2746,10 @@ where
             std::process::id(),
             rand::random::<u128>()
         ));
+        // Do not use the private-path fallback here. This backup starts a
+        // recoverable replacement transaction whose publish and rollback both
+        // require atomic no-clobber rename. Advancing on a filesystem that
+        // lacks that primitive could strand the original only at `candidate`.
         match rename_noreplace(dest, &candidate) {
             Ok(()) => {
                 backup = Some(candidate);
@@ -2704,8 +2932,8 @@ fn delete_replacement_backup_if_unchanged(
 
     let parent = backup.parent().unwrap_or_else(|| Path::new("."));
     let quarantine = create_private_quarantine_directory(parent, "replacement-cleanup")?;
-    let quarantined = quarantine.join("previous-target");
-    if let Err(error) = rename_noreplace(backup, &quarantined) {
+    let quarantined = quarantine.join(format!("previous-target-{:032x}", rand::random::<u128>()));
+    if let Err(error) = rename_to_unpublished_private_path(backup, &quarantined) {
         let _ = fs::remove_dir(&quarantine);
         return Err(error);
     }
@@ -2994,6 +3222,9 @@ impl QuarantinedSource {
         let parent = original.parent().unwrap_or_else(|| Path::new("."));
         let directory = PrivateStagingDirectory::create(parent, "move-source")?;
         let payload = directory.payload();
+        // Isolation is reversible, unlike deletion. Require the same atomic
+        // no-clobber primitive needed to restore `payload` to `original` on a
+        // later failure; a guarded plain rename is not safe for that restore.
         if let Err(error) = rename_noreplace(original, &payload) {
             return Err(error_with_staging_cleanup(error, directory));
         }
@@ -3425,6 +3656,9 @@ where
     let target_parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let staging_directory = PrivateStagingDirectory::create(target_parent, "move-stage")?;
     let staging = staging_directory.payload();
+    // This starts a multi-rename overwrite transaction. If no-clobber rename
+    // is unavailable, fail before moving the source: publication and rollback
+    // cannot safely use the private-path fallback at caller-selected names.
     if let Err(error) = rename_noreplace(source, &staging) {
         let error = if error.kind() == io::ErrorKind::Unsupported {
             io::Error::new(
@@ -3641,8 +3875,7 @@ fn preserve_file_metadata(file: &File, metadata: &fs::Metadata) -> io::Result<()
 
 fn preserve_directory_metadata_no_follow(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     let (directory, _, opened) = open_directory_for_read(path)?;
-    let identity = stable_file_identity(&directory)?;
-    if !opened.file_type().is_dir() || stable_path_identity(path)? != identity {
+    if !opened.file_type().is_dir() || !path_still_names_open_object(path, &directory)? {
         return Err(io::Error::other(format!(
             "Destination directory changed before metadata preservation: '{}'",
             path.display()
@@ -3663,7 +3896,7 @@ fn preserve_directory_metadata_no_follow(path: &Path, metadata: &fs::Metadata) -
     // descendants have been synced.
     #[cfg(unix)]
     directory.sync_all()?;
-    if stable_path_identity(path)? != identity {
+    if !path_still_names_open_object(path, &directory)? {
         return Err(io::Error::other(format!(
             "Destination directory changed during metadata preservation: '{}'",
             path.display()
@@ -4345,8 +4578,7 @@ where
     F: FnMut(u64, u64),
 {
     let mut destination = create_new_destination_file(dest)?;
-    let expected = stable_file_identity(&destination)?;
-    if stable_path_identity(dest)? != expected {
+    if !path_still_names_open_object(dest, &destination)? {
         return Err(io::Error::other(format!(
             "Private-tree destination changed immediately after creation: '{}'",
             dest.display()
@@ -4360,7 +4592,7 @@ where
         cancel_flag,
         progress_callback,
     )?;
-    if stable_path_identity(dest)? != expected {
+    if !path_still_names_open_object(dest, &destination)? {
         return Err(io::Error::other(format!(
             "Private-tree destination changed while it was being copied: '{}'",
             dest.display()
@@ -4381,8 +4613,7 @@ where
     F: FnMut(u64, u64),
 {
     let mut destination = create_new_destination_file(dest)?;
-    let expected = stable_file_identity(&destination)?;
-    if stable_path_identity(dest)? != expected {
+    if !path_still_names_open_object(dest, &destination)? {
         return Err(io::Error::other(format!(
             "Private-tree destination changed immediately after creation: '{}'",
             dest.display()
@@ -4397,7 +4628,7 @@ where
         cancel_flag,
         progress_callback,
     )?;
-    if stable_path_identity(dest)? != expected {
+    if !path_still_names_open_object(dest, &destination)? {
         return Err(io::Error::other(format!(
             "Private-tree destination changed while it was being copied: '{}'",
             dest.display()
@@ -6440,7 +6671,7 @@ fn delete_file_detailed_impl(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let quarantine = PrivateStagingDirectory::create(parent, "delete-selected")?;
     let isolated = quarantine.payload();
-    if let Err(error) = rename_noreplace(path, &isolated) {
+    if let Err(error) = rename_to_unpublished_private_path(path, &isolated) {
         return Err(error_with_staging_cleanup(error, quarantine));
     }
 
@@ -7293,6 +7524,175 @@ mod tests {
         assert_eq!(fs::read_to_string(&dest).unwrap(), "racer");
         assert_eq!(fs::read_to_string(&staged).unwrap(), "new");
 
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn private_staging_rename_falls_back_when_exclusive_rename_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        let private_dir = temp_dir.join("private");
+        let destination = private_dir.join("payload-with-unpublished-random-name");
+        fs::write(&source, "selected data").unwrap();
+        fs::create_dir(&private_dir).unwrap();
+
+        rename_to_unpublished_private_path_with(&source, &destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive rename unsupported",
+            ))
+        })
+        .unwrap();
+
+        assert!(fs::symlink_metadata(&source).is_err());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "selected data");
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn private_staging_rename_fallback_never_overwrites_a_collision() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        let destination = temp_dir.join("unexpected-collision");
+        fs::write(&source, "selected data").unwrap();
+        fs::write(&destination, "racer data").unwrap();
+
+        let error = rename_to_unpublished_private_path_with(&source, &destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive rename unsupported",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "selected data");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "racer data");
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn private_staging_rename_fallback_is_limited_to_unsupported_errors() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        let destination = temp_dir.join("unpublished-destination");
+        fs::write(&source, "selected data").unwrap();
+
+        let error = rename_to_unpublished_private_path_with(&source, &destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected permission failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "selected data");
+        assert!(fs::symlink_metadata(&destination).is_err());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_staging_cleanup_never_removes_a_replacement_container() {
+        let temp_dir = create_temp_dir();
+        let staging = PrivateStagingDirectory::create(&temp_dir, "container-swap").unwrap();
+        let staging_path = staging.path.clone();
+        let displaced = temp_dir.join("displaced-container");
+        fs::rename(&staging_path, &displaced).unwrap();
+        fs::create_dir(&staging_path).unwrap();
+        fs::write(staging_path.join("unowned"), "replacement").unwrap();
+
+        let error = staging.cleanup().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Private staging directory changed"));
+        assert_eq!(
+            fs::read_to_string(staging_path.join("unowned")).unwrap(),
+            "replacement"
+        );
+        assert!(displaced.is_dir());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn partial_stage_uses_the_live_handle_identity_after_population() {
+        let temp_dir = create_temp_dir();
+        let staging = PrivateStagingDirectory::create(&temp_dir, "identity-rekey").unwrap();
+        let payload = staging.payload();
+        let file = create_new_destination_file(&payload).unwrap();
+        let actual = stable_file_identity(&file).unwrap();
+        let mut old_object = actual.object;
+        old_object[0] ^= 1;
+        let creation_time_identity = StablePathIdentity {
+            namespace: actual.namespace,
+            object: old_object,
+        };
+        let partial = PartialStage {
+            directory: staging,
+            stable: creation_time_identity,
+            is_directory: false,
+            bound_handle: Some(file.try_clone().unwrap()),
+        };
+
+        let stage = partial.seal().unwrap();
+
+        drop(file);
+        stage.cleanup().unwrap();
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_stage_live_handle_still_rejects_a_path_replacement() {
+        let temp_dir = create_temp_dir();
+        let staging = PrivateStagingDirectory::create(&temp_dir, "identity-swap").unwrap();
+        let payload = staging.payload();
+        let displaced = temp_dir.join("displaced-payload");
+        let file = create_new_destination_file(&payload).unwrap();
+        let partial = PartialStage::bind_file(staging, &file).unwrap();
+        fs::rename(&payload, &displaced).unwrap();
+        fs::write(&payload, "replacement").unwrap();
+
+        let error = partial.seal().err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("changed while it was being populated"));
+        assert_eq!(fs::read_to_string(&payload).unwrap(), "replacement");
+        assert!(displaced.exists());
+        drop(file);
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_tree_copy_live_handle_rejects_a_path_replacement() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        let destination = temp_dir.join("destination");
+        let displaced = temp_dir.join("displaced-destination");
+        fs::write(&source, vec![b'x'; 128 * 1024]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut swapped = false;
+
+        let error =
+            copy_regular_file_into_private_tree(&source, &destination, &cancel, |copied, _| {
+                if copied > 0 && !swapped {
+                    swapped = true;
+                    fs::rename(&destination, &displaced).unwrap();
+                    fs::write(&destination, "replacement").unwrap();
+                }
+            })
+            .unwrap_err();
+
+        assert!(swapped);
+        assert!(error
+            .to_string()
+            .contains("Private-tree destination changed"));
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "replacement");
+        assert!(displaced.exists());
         cleanup_temp_dir(&temp_dir);
     }
 
@@ -8339,8 +8739,14 @@ mod tests {
             })
             .expect("staged source must remain available for recovery")
             .path();
+        let recovered_payload = fs::read_dir(&recovery)
+            .unwrap()
+            .filter_map(Result::ok)
+            .next()
+            .expect("recovery staging must contain its randomized payload")
+            .path();
         assert_eq!(
-            fs::read_to_string(recovery.join("payload/new")).unwrap(),
+            fs::read_to_string(recovered_payload.join("new")).unwrap(),
             "new"
         );
         cleanup_temp_dir(&temp_dir);

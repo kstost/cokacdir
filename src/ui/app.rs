@@ -194,9 +194,7 @@ struct ReservedTarArchive {
     path: PathBuf,
     staging_dir: PathBuf,
     file: Option<fs::File>,
-    file_identity: file_ops::StablePathIdentity,
     directory_guard: Option<fs::File>,
-    directory_identity: file_ops::StablePathIdentity,
 }
 
 impl ReservedTarArchive {
@@ -213,21 +211,25 @@ impl ReservedTarArchive {
                 options.mode(0o600);
             }
             let file = options.open(&path)?;
-            let file_identity = file_ops::stable_file_identity(&file)?;
             let (directory_guard, _, metadata) = file_ops::open_directory_for_read(&staging_dir)?;
             if !metadata.is_dir() {
                 return Err(std::io::Error::other(
                     "temporary archive staging path is not a directory",
                 ));
             }
-            let directory_identity = file_ops::stable_file_identity(&directory_guard)?;
+            if file_ops::stable_path_identity(&path)? != file_ops::stable_file_identity(&file)?
+                || file_ops::stable_path_identity(&staging_dir)?
+                    != file_ops::stable_file_identity(&directory_guard)?
+            {
+                return Err(std::io::Error::other(
+                    "temporary archive staging path changed while it was opened",
+                ));
+            }
             Ok(Self {
                 path: path.clone(),
                 staging_dir: staging_dir.clone(),
                 file: Some(file),
-                file_identity,
                 directory_guard: Some(directory_guard),
-                directory_identity,
             })
         })();
         if result.is_err() {
@@ -248,19 +250,31 @@ impl ReservedTarArchive {
             .try_clone()
     }
 
+    fn reader(&self) -> std::io::Result<fs::File> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut reader = self.writer()?;
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(reader)
+    }
+
     fn verify_owned_path(&self) -> std::io::Result<()> {
-        if file_ops::stable_path_identity(&self.staging_dir)? != self.directory_identity
-            || file_ops::stable_path_identity(&self.path)? != self.file_identity
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?;
+        let directory = self.directory_guard.as_ref().ok_or_else(|| {
+            std::io::Error::other("temporary archive directory handle is unavailable")
+        })?;
+        if file_ops::stable_path_identity(&self.staging_dir)?
+            != file_ops::stable_file_identity(directory)?
+            || file_ops::stable_path_identity(&self.path)? != file_ops::stable_file_identity(file)?
         {
             return Err(std::io::Error::other(
                 "temporary archive path was replaced; refusing to publish or remove it",
             ));
         }
-        let metadata = self
-            .file
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?
-            .metadata()?;
+        let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(std::io::Error::other(
                 "temporary archive handle is not a regular file",
@@ -272,25 +286,148 @@ impl ReservedTarArchive {
 
 impl Drop for ReservedTarArchive {
     fn drop(&mut self) {
-        let owns_staging_file = file_ops::stable_path_identity(&self.staging_dir).ok()
-            == Some(self.directory_identity)
-            && file_ops::stable_path_identity(&self.path).ok() == Some(self.file_identity);
+        let owned_file_identity = self.file.as_ref().and_then(|file| {
+            let file_identity = file_ops::stable_file_identity(file).ok()?;
+            (file_ops::stable_path_identity(&self.path).ok()? == file_identity)
+                .then_some(file_identity)
+        });
+        let owned_directory_identity = self.directory_guard.as_ref().and_then(|directory| {
+            let directory_identity = file_ops::stable_file_identity(directory).ok()?;
+            (file_ops::stable_path_identity(&self.staging_dir).ok()? == directory_identity)
+                .then_some(directory_identity)
+        });
         // A Windows disposition delete can be rejected while another handle
         // to the file remains open. The deletion helper rebinds the pathname
-        // to `file_identity` after this owned writer is closed.
+        // to the current handle identity after this owned writer is closed.
         drop(self.file.take());
-        if owns_staging_file {
-            let _ = file_ops::remove_file_by_identity(&self.path, self.file_identity);
+        if let Some(file_identity) = owned_file_identity {
+            let _ = file_ops::remove_file_by_identity(&self.path, file_identity);
         }
         drop(self.directory_guard.take());
-        if file_ops::stable_path_identity(&self.staging_dir).ok() == Some(self.directory_identity) {
-            let _ = fs::remove_dir(&self.staging_dir);
+        if let Some(directory_identity) = owned_directory_identity {
+            if file_ops::stable_path_identity(&self.staging_dir).ok() == Some(directory_identity) {
+                let _ = fs::remove_dir(&self.staging_dir);
+            }
         }
     }
 }
 
+fn cleanup_exclusive_archive_file(
+    destination: &Path,
+    file: fs::File,
+    cause: std::io::Error,
+) -> std::io::Error {
+    let identity = file_ops::stable_file_identity(&file);
+    drop(file);
+    let cleanup = identity.and_then(|identity| match file_ops::stable_path_identity(destination) {
+        Ok(current) if current == identity => {
+            file_ops::remove_file_by_identity(destination, identity)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "archive destination changed during compatibility publication and was preserved at '{}'",
+            destination.display()
+        ))),
+        Err(error) => Err(error),
+    });
+    match cleanup {
+        Ok(()) => cause,
+        Err(cleanup_error) => std::io::Error::new(
+            cause.kind(),
+            format!(
+                "{cause}; identity-bound cleanup of the incomplete archive also failed: {cleanup_error}"
+            ),
+        ),
+    }
+}
+
+/// Compatibility fallback for filesystems that implement neither atomic
+/// no-clobber rename nor hard links. `create_new` still reserves the final
+/// path without overwriting anything. The destination stays bound to an open
+/// handle, and every handled failure removes only that exact object.
+fn copy_tar_archive_exclusively(
+    temp: &ReservedTarArchive,
+    destination: &Path,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    temp.verify_owned_path()?;
+    let mut source = temp.reader()?;
+    let source_before = source.metadata()?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination_file = options.open(destination)?;
+    let destination_identity = file_ops::stable_file_identity(&destination_file).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "cannot bind the compatibility archive destination; it was preserved at '{}': {error}",
+                destination.display()
+            ),
+        )
+    })?;
+    if file_ops::stable_path_identity(destination)
+        .map(|identity| identity != destination_identity)
+        .unwrap_or(true)
+    {
+        return Err(cleanup_exclusive_archive_file(
+            destination,
+            destination_file,
+            std::io::Error::other(
+                "new archive destination changed before compatibility publication",
+            ),
+        ));
+    }
+
+    let copy_result = (|| {
+        let copied = std::io::copy(&mut source, &mut destination_file)?;
+        destination_file.flush()?;
+        destination_file.sync_all()?;
+        if copied != source_before.len()
+            || !file_ops::metadata_still_matches(&source_before, &source.metadata()?)
+        {
+            return Err(std::io::Error::other(
+                "temporary archive changed during compatibility publication",
+            ));
+        }
+        temp.verify_owned_path()?;
+        if file_ops::stable_path_identity(destination)? != destination_identity
+            || file_ops::stable_file_identity(&destination_file)? != destination_identity
+        {
+            return Err(std::io::Error::other(
+                "archive destination changed during compatibility publication",
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        return Err(cleanup_exclusive_archive_file(
+            destination,
+            destination_file,
+            error,
+        ));
+    }
+    drop(destination_file);
+    sync_parent_directory(destination);
+    Ok(())
+}
+
 /// Publish a completed archive without ever replacing an existing path.
-fn publish_tar_archive(temp: &ReservedTarArchive, destination: &Path) -> std::io::Result<()> {
+fn publish_tar_archive_with<R, L>(
+    temp: &ReservedTarArchive,
+    destination: &Path,
+    rename_noreplace: R,
+    hard_link: L,
+) -> std::io::Result<()>
+where
+    R: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    L: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     // Ensure tar's completed bytes reach the filesystem before the archive
     // name becomes visible.
     temp.file
@@ -298,8 +435,25 @@ fn publish_tar_archive(temp: &ReservedTarArchive, destination: &Path) -> std::io
         .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?
         .sync_all()?;
     temp.verify_owned_path()?;
-    file_ops::rename_noreplace(temp.path(), destination)?;
-    if file_ops::stable_path_identity(destination)? != temp.file_identity {
+    let temp_identity = file_ops::stable_file_identity(
+        temp.file
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("temporary archive handle is unavailable"))?,
+    )?;
+    match rename_noreplace(temp.path(), destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            match hard_link(temp.path(), destination) {
+                Ok(()) => {}
+                Err(link_error) if link_error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(link_error)
+                }
+                Err(_) => return copy_tar_archive_exclusively(temp, destination),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    if file_ops::stable_path_identity(destination)? != temp_identity {
         return Err(std::io::Error::other(format!(
             "archive publication identity mismatch; inspect '{}' and recovery directory '{}'",
             destination.display(),
@@ -310,6 +464,15 @@ fn publish_tar_archive(temp: &ReservedTarArchive, destination: &Path) -> std::io
     Ok(())
 }
 
+fn publish_tar_archive(temp: &ReservedTarArchive, destination: &Path) -> std::io::Result<()> {
+    publish_tar_archive_with(
+        temp,
+        destination,
+        file_ops::rename_noreplace,
+        |source, destination| fs::hard_link(source, destination),
+    )
+}
+
 fn sync_parent_directory(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(directory) = fs::File::open(parent) {
@@ -318,40 +481,178 @@ fn sync_parent_directory(path: &Path) {
     }
 }
 
-fn create_private_extract_directory(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    enforce_private_extract_directory(path)
+/// A newly-created extraction directory whose pathname stays bound to an open
+/// directory handle until extraction either commits or performs verified
+/// cleanup.  The final name is reserved with `create_dir`, which remains
+/// portable on filesystems that do not implement no-clobber rename.
+struct ReservedExtractDirectory {
+    path: PathBuf,
+    directory_guard: Option<fs::File>,
+    cleanup_on_drop: bool,
 }
 
-fn enforce_private_extract_directory(path: &Path) -> std::io::Result<()> {
-    let (directory, _, metadata) = file_ops::open_directory_for_read(path)?;
-    let identity = file_ops::stable_file_identity(&directory)?;
-    if !metadata.file_type().is_dir() || file_ops::stable_path_identity(path)? != identity {
-        return Err(std::io::Error::other(
-            "private extract directory is not a stable real directory",
-        ));
+impl ReservedExtractDirectory {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+
+        let (directory_guard, _, metadata) = file_ops::open_directory_for_read(path)?;
+        if !metadata.file_type().is_dir()
+            || file_ops::stable_path_identity(path)?
+                != file_ops::stable_file_identity(&directory_guard)?
+        {
+            return Err(std::io::Error::other(
+                "private extract directory changed while it was opened",
+            ));
+        }
+        let mut directory = Self {
+            path: path.to_path_buf(),
+            directory_guard: Some(directory_guard),
+            cleanup_on_drop: true,
+        };
+        directory.secure()?;
+        Ok(directory)
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+
+    fn guard(&self) -> std::io::Result<&fs::File> {
+        self.directory_guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("private extract directory handle is unavailable"))
     }
-    if file_ops::stable_path_identity(path)? != identity {
-        return Err(std::io::Error::other(
-            "private extract directory changed while it was secured",
-        ));
+
+    fn verify_owned_path(&self) -> std::io::Result<file_ops::StablePathIdentity> {
+        let guard = self.guard()?;
+        let identity = file_ops::stable_file_identity(guard)?;
+        if !guard.metadata()?.is_dir() || file_ops::stable_path_identity(&self.path)? != identity {
+            return Err(std::io::Error::other(format!(
+                "private extract directory changed and was preserved at '{}'",
+                self.path.display()
+            )));
+        }
+        Ok(identity)
+    }
+
+    fn secure(&mut self) -> std::io::Result<()> {
+        self.verify_owned_path()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            self.guard()?
+                .set_permissions(fs::Permissions::from_mode(0o700))?;
+        }
+        self.verify_owned_path()?;
+        Ok(())
+    }
+
+    fn cleanup_bound_path(&mut self) -> std::io::Result<()> {
+        let identity = self.verify_owned_path()?;
+        // Windows directory handles opened for traversal pin the name. Close
+        // the guard only after deriving its current identity; the cleanup
+        // helper rebinds that identity before it recursively removes anything.
+        drop(self.directory_guard.take());
+        file_ops::remove_directory_tree_by_identity(&self.path, identity)
+    }
+
+    fn cleanup(mut self) -> std::io::Result<()> {
+        self.cleanup_on_drop = false;
+        self.cleanup_bound_path()
+    }
+
+    fn commit(mut self) -> std::io::Result<()> {
+        self.secure()?;
+        self.cleanup_on_drop = false;
+        drop(self.directory_guard.take());
+        sync_parent_directory(&self.path);
+        Ok(())
+    }
+}
+
+impl Drop for ReservedExtractDirectory {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            self.cleanup_on_drop = false;
+            let _ = self.cleanup_bound_path();
+        }
+    }
+}
+
+fn extraction_error_with_cleanup(
+    directory: ReservedExtractDirectory,
+    error: impl Into<String>,
+) -> String {
+    let error = error.into();
+    match directory.cleanup() {
+        Ok(()) => error,
+        Err(cleanup_error) => format!(
+            "{}; verified extraction cleanup failed, so unverified data was preserved: {}",
+            error, cleanup_error
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn bind_command_to_directory_handle(
+    command: &mut std::process::Command,
+    directory_guard: &fs::File,
+    _directory_path: &Path,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let guard = directory_guard.try_clone()?;
+    // The child changes directory through the already-verified handle. A
+    // concurrent rename can no longer redirect extraction to a replacement
+    // placed at the original pathname.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(guard.as_raw_fd()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
     }
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn bind_command_to_directory_handle(
+    command: &mut std::process::Command,
+    directory_guard: &fs::File,
+    directory_path: &Path,
+) -> std::io::Result<()> {
+    if file_ops::stable_path_identity(directory_path)?
+        != file_ops::stable_file_identity(directory_guard)?
+    {
+        return Err(std::io::Error::other(
+            "command working directory changed before it was bound",
+        ));
+    }
+    command.current_dir(directory_path);
+    Ok(())
+}
+
+fn bind_command_to_extract_directory(
+    command: &mut std::process::Command,
+    directory: &ReservedExtractDirectory,
+) -> std::io::Result<()> {
+    directory.verify_owned_path()?;
+    bind_command_to_directory_handle(command, directory.guard()?, &directory.path)
+}
+
+#[cfg(test)]
+fn create_private_extract_directory(path: &Path) -> std::io::Result<()> {
+    ReservedExtractDirectory::create(path)?.commit()
+}
+
 const MAX_TAR_LIST_LINE_BYTES: usize = 256 * 1024;
 const MAX_TAR_ERROR_TAIL_BYTES: usize = 64 * 1024;
+const MAX_TAR_ENTRY_COUNT: usize = 1_000_000;
 
 fn read_bounded_line<R: std::io::BufRead>(
     reader: &mut R,
@@ -429,50 +730,316 @@ fn validate_archive_entry_path(entry: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn tar_supports_safe_extraction_options(tar_cmd: &str) -> bool {
-    std::process::Command::new(tar_cmd)
-        .args([
-            "--no-same-owner",
-            "--no-same-permissions",
-            "--no-overwrite-dir",
-            "--version",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TarCompression {
+    None,
+    Gzip,
+    Bzip2,
+    Xz,
 }
 
-fn tar_extraction_options(archive_name: &str) -> &'static str {
-    if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-        "xvfz"
-    } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
-        "xvfj"
-    } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
-        "xvfJ"
-    } else {
-        "xvf"
+impl TarCompression {
+    fn from_archive_name(archive_name: &str) -> Self {
+        let lower = archive_name.to_ascii_lowercase();
+        if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+            Self::Gzip
+        } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
+            Self::Bzip2
+        } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+            Self::Xz
+        } else {
+            Self::None
+        }
+    }
+
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Gzip => Some("-z"),
+            Self::Bzip2 => Some("-j"),
+            Self::Xz => Some("-J"),
+        }
     }
 }
 
-#[cfg(unix)]
-fn strip_special_permission_bits(root: &Path) -> std::io::Result<()> {
+fn archive_extract_directory_name(archive_name: &str) -> Option<String> {
+    let lower = archive_name.to_ascii_lowercase();
+    for suffix in [
+        ".tar.bz2", ".tar.gz", ".tar.xz", ".tbz2", ".tgz", ".txz", ".tar",
+    ] {
+        if lower.ends_with(suffix) {
+            let stem = &archive_name[..archive_name.len() - suffix.len()];
+            return (!stem.is_empty()).then(|| stem.to_string());
+        }
+    }
+    None
+}
+
+fn tar_create_arguments(
+    compression: TarCompression,
+    excluded_paths: &[String],
+    files: &[String],
+) -> Vec<String> {
+    let mut arguments = vec!["-c".to_string(), "-v".to_string()];
+    if let Some(flag) = compression.flag() {
+        arguments.push(flag.to_string());
+    }
+    arguments.extend(
+        excluded_paths
+            .iter()
+            .map(|path| format!("--exclude=./{path}")),
+    );
+    // Keep -f adjacent to its argument. This is unambiguous in GNU tar,
+    // bsdtar, and traditional short-option parsers.
+    arguments.push("-f".to_string());
+    arguments.push("-".to_string());
+    arguments.extend(files.iter().map(|file| format!("./{file}")));
+    arguments
+}
+
+fn tar_list_arguments(compression: TarCompression) -> Vec<String> {
+    let mut arguments = vec!["-t".to_string()];
+    if let Some(flag) = compression.flag() {
+        arguments.push(flag.to_string());
+    }
+    arguments.push("-f".to_string());
+    arguments.push("-".to_string());
+    arguments
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TarExtractionCapabilities {
+    no_same_owner: bool,
+    no_same_permissions: bool,
+    no_overwrite_dir: bool,
+}
+
+fn configure_tar_command(command: &mut std::process::Command) {
+    command
+        .env_remove("TAR_OPTIONS")
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
+}
+
+fn tar_probe_with_empty_archive(tar_cmd: &str, operation: &str, option: Option<&str>) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(tar_cmd);
+    command.arg(operation);
+    if let Some(option) = option {
+        command.arg(option);
+    }
+    command
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_tar_command(&mut command);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let write_ok = child
+        .stdin
+        .take()
+        .map(|mut input| input.write_all(&[0u8; 1024]).is_ok())
+        .unwrap_or(false);
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    let status_ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    write_ok && status_ok
+}
+
+fn select_tar_command(configured: Option<&str>) -> Option<String> {
+    if let Some(configured) = configured {
+        return tar_probe_with_empty_archive(configured, "-t", None)
+            .then(|| configured.to_string());
+    }
+    ["gtar", "tar"]
+        .into_iter()
+        .find(|candidate| tar_probe_with_empty_archive(candidate, "-t", None))
+        .map(str::to_string)
+}
+
+fn probe_tar_extraction_capabilities(tar_cmd: &str) -> TarExtractionCapabilities {
+    TarExtractionCapabilities {
+        no_same_owner: tar_probe_with_empty_archive(tar_cmd, "-x", Some("--no-same-owner")),
+        no_same_permissions: tar_probe_with_empty_archive(
+            tar_cmd,
+            "-x",
+            Some("--no-same-permissions"),
+        ),
+        no_overwrite_dir: tar_probe_with_empty_archive(tar_cmd, "-x", Some("--no-overwrite-dir")),
+    }
+}
+
+fn tar_extract_arguments(
+    compression: TarCompression,
+    capabilities: TarExtractionCapabilities,
+) -> Result<Vec<String>, String> {
+    if !capabilities.no_same_owner || !capabilities.no_same_permissions {
+        return Err(
+            "tar command cannot disable archived ownership and permission restoration".to_string(),
+        );
+    }
+
+    let mut arguments = vec!["-x".to_string(), "-v".to_string()];
+    if let Some(flag) = compression.flag() {
+        arguments.push(flag.to_string());
+    }
+    arguments.push("--no-same-owner".to_string());
+    arguments.push("--no-same-permissions".to_string());
+    // bsdtar does not expose every GNU directory-overwrite option. Extraction
+    // is into a newly-created, handle-bound 0700 directory, so this remains an
+    // extra defense when present instead of being a portability requirement.
+    if capabilities.no_overwrite_dir {
+        arguments.push("--no-overwrite-dir".to_string());
+    }
+    arguments.push("-f".to_string());
+    arguments.push("-".to_string());
+    Ok(arguments)
+}
+
+fn snapshot_archive_for_extraction(
+    source_path: &Path,
+    cancel_flag: &AtomicBool,
+) -> std::io::Result<ReservedTarArchive> {
+    use std::io::{Read, Write};
+
+    let (mut source, before) = file_ops::open_regular_file_no_follow(source_path)?;
+    let snapshot = ReservedTarArchive::create(source_path)?;
+    let mut output = snapshot.writer()?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Cancelled",
+            ));
+        }
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+    }
+    output.sync_all()?;
+    if !file_ops::metadata_still_matches(&before, &source.metadata()?) {
+        return Err(std::io::Error::other(
+            "Archive changed while its private extraction snapshot was being created",
+        ));
+    }
+    snapshot.verify_owned_path()?;
+    Ok(snapshot)
+}
+
+fn validate_extracted_symlink(
+    root: &Path,
+    canonical_root: &Path,
+    link_path: &Path,
+) -> std::io::Result<()> {
+    use std::path::Component;
+
+    let target = fs::read_link(link_path)?;
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive created an absolute symlink: {} -> {}",
+                link_path.display(),
+                target.display()
+            ),
+        ));
+    }
+
+    let parent = link_path.parent().unwrap_or(root);
+    let mut depth = parent
+        .strip_prefix(root)
+        .map_err(|_| std::io::Error::other("extracted symlink is outside the extraction root"))?
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "archive symlink escapes the extraction root: {} -> {}",
+                        link_path.display(),
+                        target.display()
+                    ),
+                ))
+            }
+        }
+    }
+
+    let resolved = parent.join(&target).canonicalize().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "archive created an unresolvable symlink: {} -> {}: {}",
+                link_path.display(),
+                target.display(),
+                error
+            ),
+        )
+    })?;
+    if !resolved.starts_with(canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive symlink resolves outside the extraction root: {} -> {}",
+                link_path.display(),
+                target.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let canonical_root = root.canonicalize()?;
 
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
+            validate_extracted_symlink(root, &canonical_root, &path)?;
             continue;
         }
         let file_type = metadata.file_type();
-        if file_type.is_block_device()
+        #[cfg(unix)]
+        let is_special = file_type.is_block_device()
             || file_type.is_char_device()
             || file_type.is_fifo()
-            || file_type.is_socket()
-        {
+            || file_type.is_socket();
+        #[cfg(not(unix))]
+        let is_special = !metadata.is_file() && !metadata.is_dir();
+        if is_special {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("archive created a special file: {}", path.display()),
@@ -483,32 +1050,30 @@ fn strip_special_permission_bits(root: &Path) -> std::io::Result<()> {
                 pending.push(entry?.path());
             }
         }
-        let mode = metadata.permissions().mode();
-        if mode & 0o6000 != 0 {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(mode & !0o6000);
-            if metadata.is_dir() {
-                let (directory, _, opened) = file_ops::open_directory_for_read(&path)?;
-                if !opened.is_dir()
-                    || file_ops::stable_file_identity(&directory)?
-                        != file_ops::stable_path_identity(&path)?
-                {
-                    return Err(std::io::Error::other(
-                        "archive directory changed before permission cleanup",
-                    ));
+        #[cfg(unix)]
+        {
+            let mode = metadata.permissions().mode();
+            if mode & 0o6000 != 0 {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(mode & !0o6000);
+                if metadata.is_dir() {
+                    let (directory, _, opened) = file_ops::open_directory_for_read(&path)?;
+                    if !opened.is_dir()
+                        || file_ops::stable_file_identity(&directory)?
+                            != file_ops::stable_path_identity(&path)?
+                    {
+                        return Err(std::io::Error::other(
+                            "archive directory changed before permission cleanup",
+                        ));
+                    }
+                    directory.set_permissions(permissions)?;
+                } else if metadata.is_file() {
+                    let (file, _) = file_ops::open_regular_file_no_follow(&path)?;
+                    file.set_permissions(permissions)?;
                 }
-                directory.set_permissions(permissions)?;
-            } else if metadata.is_file() {
-                let (file, _) = file_ops::open_regular_file_no_follow(&path)?;
-                file.set_permissions(permissions)?;
             }
         }
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn strip_special_permission_bits(_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -6697,6 +7262,12 @@ impl App {
             self.show_message(&format!("Error: {}", e));
             return;
         }
+        if archive_extract_directory_name(archive_name).is_none() {
+            self.show_message(
+                "Error: archive name must end in .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, or .txz",
+            );
+            return;
+        }
 
         let files = self.get_operation_files();
         if files.is_empty() {
@@ -6759,8 +7330,41 @@ impl App {
         use std::io::BufReader;
         use std::process::{Command, Stdio};
 
+        if let Err(error) = file_ops::is_valid_filename(archive_name) {
+            self.show_message(&format!("Error: {error}"));
+            return;
+        }
+        if archive_extract_directory_name(archive_name).is_none() {
+            self.show_message("Error: unsupported tar archive name");
+            return;
+        }
+        for file in files {
+            if let Err(error) = file_ops::is_valid_filename(file) {
+                self.show_message(&format!("Invalid filename '{file}': {error}"));
+                return;
+            }
+        }
+
         let current_dir = self.active_panel().path.clone();
         let archive_path = current_dir.join(archive_name);
+
+        let (source_directory_guard, _, source_metadata) =
+            match file_ops::open_directory_for_read(&current_dir) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    self.show_message(&format!(
+                        "Error: cannot bind archive source directory: {error}"
+                    ));
+                    return;
+                }
+            };
+        if !source_metadata.is_dir()
+            || file_ops::stable_path_identity(&current_dir).ok()
+                != file_ops::stable_file_identity(&source_directory_guard).ok()
+        {
+            self.show_message("Error: archive source directory changed while it was opened");
+            return;
+        }
 
         // Reserve only a uniquely named file that we own. The final archive
         // path remains untouched until a successful no-clobber publish.
@@ -6775,18 +7379,7 @@ impl App {
             }
         };
 
-        // Determine compression option based on extension
-        let tar_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-            "cvfpz"
-        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
-            "cvfpj"
-        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
-            "cvfpJ"
-        } else {
-            "cvfp"
-        };
-
-        let tar_options_owned = tar_options.to_string();
+        let compression = TarCompression::from_archive_name(archive_name);
         let archive_name_owned = archive_name.to_string();
         let archive_path_clone = archive_path;
         let files_owned = files.to_vec();
@@ -6835,16 +7428,10 @@ impl App {
                 return;
             }
 
-            // Build tar_args with --exclude options for unsafe symlinks
-            // Note: archive name must come right after options (e.g., cvfpz archive.tar.gz)
-            // Write the archive to stdout, which is an already-open owned file
-            // handle below. This prevents `tar` from following a pathname that
-            // was replaced after reservation.
-            let mut tar_args = vec![tar_options_owned.clone(), "-".to_string()];
-            for excluded in &excluded_owned {
-                tar_args.push(format!("--exclude=./{}", excluded));
-            }
-            tar_args.extend(files_owned.iter().map(|f| format!("./{}", f)));
+            // Write the archive to stdout through an already-open owned file
+            // handle. Every short option is separate so -f always consumes
+            // exactly the following "-" argument on GNU tar and bsdtar.
+            let tar_args = tar_create_arguments(compression, &excluded_owned, &files_owned);
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
@@ -6860,22 +7447,7 @@ impl App {
             let _ = tx.send(ProgressMessage::Preparing(
                 "Checking tar command...".to_string(),
             ));
-            let tar_cmd = if let Some(ref custom_tar) = tar_path {
-                // Use custom tar path from settings
-                match Command::new(custom_tar).arg("--version").output() {
-                    Ok(output) if output.status.success() => Some(custom_tar.clone()),
-                    _ => None,
-                }
-            } else {
-                // Default: try gtar first, then tar
-                match Command::new("gtar").arg("--version").output() {
-                    Ok(output) if output.status.success() => Some("gtar".to_string()),
-                    _ => match Command::new("tar").arg("--version").output() {
-                        Ok(output) if output.status.success() => Some("tar".to_string()),
-                        _ => None,
-                    },
-                }
-            };
+            let tar_cmd = select_tar_command(tar_path.as_deref());
 
             let tar_cmd = match tar_cmd {
                 Some(cmd) => cmd,
@@ -6888,13 +7460,6 @@ impl App {
                     return;
                 }
             };
-
-            // Check if stdbuf is available (in background)
-            let has_stdbuf = Command::new("stdbuf")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
 
             let archive_output = match temp_archive.writer() {
                 Ok(file) => file,
@@ -6956,29 +7521,30 @@ impl App {
                 total_bytes,
             ));
 
-            // Use stdbuf to disable buffering if available. Each child is
-            // placed into its own process group so kill_child_tree's
-            // group-targeted SIGKILL stays scoped to tar (and never the
-            // cokacdir TUI process itself).
-            let child = if has_stdbuf {
-                let mut args = vec!["-o0".to_string(), "-e0".to_string(), tar_cmd.clone()];
-                args.extend(tar_args);
-                let mut cmd = Command::new("stdbuf");
-                cmd.current_dir(&current_dir)
-                    .args(&args)
-                    .stdout(Stdio::from(archive_output))
-                    .stderr(Stdio::piped());
-                crate::services::claude::detach_into_own_pgroup(&mut cmd);
-                cmd.spawn()
-            } else {
-                let mut cmd = Command::new(&tar_cmd);
-                cmd.current_dir(&current_dir)
-                    .args(&tar_args)
-                    .stdout(Stdio::from(archive_output))
-                    .stderr(Stdio::piped());
-                crate::services::claude::detach_into_own_pgroup(&mut cmd);
-                cmd.spawn()
-            };
+            // Each child is placed into its own process group so
+            // kill_child_tree's group-targeted SIGKILL stays scoped to tar.
+            // Progress buffering is cosmetic; avoiding the non-portable
+            // stdbuf wrapper keeps the selected tar executable exact.
+            let mut command = Command::new(&tar_cmd);
+            command
+                .args(&tar_args)
+                .stdout(Stdio::from(archive_output))
+                .stderr(Stdio::piped());
+            configure_tar_command(&mut command);
+            if let Err(error) = bind_command_to_directory_handle(
+                &mut command,
+                &source_directory_guard,
+                &current_dir,
+            ) {
+                let _ = tx.send(ProgressMessage::Error(
+                    archive_name_owned,
+                    format!("Cannot bind tar to the archive source directory: {error}"),
+                ));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+            crate::services::claude::detach_into_own_pgroup(&mut command);
+            let child = command.spawn();
 
             match child {
                 Ok(mut child) => {
@@ -7116,8 +7682,8 @@ impl App {
     /// List archive contents to get total file count and sizes
     fn list_archive_contents(
         tar_cmd: &str,
-        archive_path: &std::path::Path,
-        archive_name: &str,
+        archive_input: fs::File,
+        compression: TarCompression,
         cancel_flag: Arc<AtomicBool>,
     ) -> Result<(usize, u64, std::collections::HashMap<String, u64>), String> {
         use std::collections::HashMap;
@@ -7128,27 +7694,15 @@ impl App {
         // bsdtar, and common platform tar implementations. Byte totals are
         // intentionally omitted: retaining every verbose entry in a HashMap
         // made the preflight itself an OOM vector for hostile archives.
-        let list_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
-            "tfz"
-        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
-            "tfj"
-        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
-            "tfJ"
-        } else {
-            "tf"
-        };
-
         let mut total_files = 0usize;
         let mut stdout_error_lines = Vec::new();
 
-        let archive_path_str = archive_path.to_string_lossy().to_string();
         let mut cmd = Command::new(tar_cmd);
-        cmd.arg(list_options)
-            .arg(&archive_path_str)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
+        cmd.args(tar_list_arguments(compression))
+            .stdin(Stdio::from(archive_input))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_tar_command(&mut cmd);
         crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
         let mut child = match cmd.spawn() {
@@ -7193,6 +7747,11 @@ impl App {
                 total_files = total_files
                     .checked_add(1)
                     .ok_or_else(|| "Archive contains too many entries".to_string())?;
+                if total_files > MAX_TAR_ENTRY_COUNT {
+                    return Err(format!(
+                        "Archive contains more than {MAX_TAR_ENTRY_COUNT} entries"
+                    ));
+                }
 
                 if (line.starts_with(b"tar:") || line.starts_with(b"gtar:"))
                     && stdout_error_lines.len() < 16
@@ -7253,12 +7812,6 @@ impl App {
             }
         };
 
-        // Fast validations only
-        if !archive_path.exists() {
-            self.show_message(&format!("Archive not found: {}", archive_name));
-            return;
-        }
-
         let current_dir = match archive_path.parent() {
             Some(dir) => dir.to_path_buf(),
             None => {
@@ -7267,16 +7820,13 @@ impl App {
             }
         };
 
-        // Determine extraction directory name (remove archive extensions)
-        let extract_dir_name = archive_name
-            .trim_end_matches(".tar.gz")
-            .trim_end_matches(".tgz")
-            .trim_end_matches(".tar.bz2")
-            .trim_end_matches(".tbz2")
-            .trim_end_matches(".tar.xz")
-            .trim_end_matches(".txz")
-            .trim_end_matches(".tar")
-            .to_string();
+        let extract_dir_name = match archive_extract_directory_name(&archive_name) {
+            Some(name) => name,
+            None => {
+                self.show_message("Unsupported or invalid tar archive name");
+                return;
+            }
+        };
 
         let extract_path = current_dir.join(&extract_dir_name);
 
@@ -7286,12 +7836,9 @@ impl App {
             return;
         }
 
-        // Deliberately omit `p` (preserve permissions); safe-owner and
-        // safe-permission flags are added after probing the selected tar.
-        let tar_options = tar_extraction_options(&archive_name);
+        let compression = TarCompression::from_archive_name(&archive_name);
 
         let archive_path_owned = archive_path.to_path_buf();
-        let archive_name_owned = archive_name.clone();
         let extract_dir_owned = extract_dir_name.clone();
         let extract_path_clone = extract_path.clone();
 
@@ -7325,7 +7872,6 @@ impl App {
 
         // Start all preparation and execution in background thread
         thread::spawn(move || {
-            // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(ProgressMessage::Error(
                     extract_dir_owned,
@@ -7335,28 +7881,10 @@ impl App {
                 return;
             }
 
-            // Determine tar command (in background)
             let _ = tx.send(ProgressMessage::Preparing(
                 "Checking tar command...".to_string(),
             ));
-            let tar_cmd = if let Some(ref custom_tar) = tar_path {
-                // Use custom tar path from settings
-                match Command::new(custom_tar).arg("--version").output() {
-                    Ok(output) if output.status.success() => Some(custom_tar.clone()),
-                    _ => None,
-                }
-            } else {
-                // Default: try gtar first, then tar
-                match Command::new("gtar").arg("--version").output() {
-                    Ok(output) if output.status.success() => Some("gtar".to_string()),
-                    _ => match Command::new("tar").arg("--version").output() {
-                        Ok(output) if output.status.success() => Some("tar".to_string()),
-                        _ => None,
-                    },
-                }
-            };
-
-            let tar_cmd = match tar_cmd {
+            let tar_cmd = match select_tar_command(tar_path.as_deref()) {
                 Some(cmd) => cmd,
                 None => {
                     let _ = tx.send(ProgressMessage::Error(
@@ -7367,28 +7895,16 @@ impl App {
                     return;
                 }
             };
+            let capabilities = probe_tar_extraction_capabilities(&tar_cmd);
+            let tar_args = match tar_extract_arguments(compression, capabilities) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, error));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
 
-            // Root tar implementations may otherwise restore archived owners
-            // and special permission bits even without an explicit `-p`.
-            // Probe the exact configured binary and fail closed if it cannot
-            // enforce the common safe extraction options.
-            if !tar_supports_safe_extraction_options(&tar_cmd) {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    "tar command does not support safe extraction options".to_string(),
-                ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-
-            // Check if stdbuf is available (in background)
-            let has_stdbuf = Command::new("stdbuf")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(ProgressMessage::Error(
                     extract_dir_owned,
@@ -7398,14 +7914,42 @@ impl App {
                 return;
             }
 
-            // List archive contents
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Creating private archive snapshot...".to_string(),
+            ));
+            let archive_snapshot =
+                match snapshot_archive_for_extraction(&archive_path_owned, cancel_flag.as_ref()) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let message = if error.kind() == std::io::ErrorKind::Interrupted {
+                            "Cancelled".to_string()
+                        } else {
+                            format!("Cannot prepare archive snapshot: {error}")
+                        };
+                        let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
+                        let _ = tx.send(ProgressMessage::Completed(0, 1));
+                        return;
+                    }
+                };
+
             let _ = tx.send(ProgressMessage::Preparing(
                 "Reading archive contents...".to_string(),
             ));
+            let list_input = match archive_snapshot.reader() {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = tx.send(ProgressMessage::Error(
+                        extract_dir_owned,
+                        format!("Cannot read private archive snapshot: {error}"),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
             let (total_file_count, total_bytes, size_map) = match Self::list_archive_contents(
                 &tar_cmd,
-                &archive_path_owned,
-                &archive_name_owned,
+                list_input,
+                compression,
                 cancel_flag.clone(),
             ) {
                 Ok(contents) => contents,
@@ -7426,26 +7970,19 @@ impl App {
                 return;
             }
 
-            if total_file_count == 0 {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    "Archive appears to be empty or corrupted".to_string(),
-                ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
+            let mut extract_directory = match ReservedExtractDirectory::create(&extract_path_clone)
+            {
+                Ok(directory) => directory,
+                Err(error) => {
+                    let _ = tx.send(ProgressMessage::Error(
+                        extract_dir_owned,
+                        format!("Failed to create private extraction directory: {error}"),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
 
-            // Create extraction directory
-            if let Err(e) = create_private_extract_directory(&extract_path_clone) {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    format!("Failed to create directory: {}", e),
-                ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-
-            // Preparation complete, send initial totals
             let _ = tx.send(ProgressMessage::PrepareComplete);
             let _ = tx.send(ProgressMessage::TotalProgress(
                 0,
@@ -7454,43 +7991,38 @@ impl App {
                 total_bytes,
             ));
 
-            // Build command arguments
-            let archive_path_str = archive_path_owned.to_string_lossy().to_string();
-            let tar_args = vec![
-                "--no-same-owner".to_string(),
-                "--no-same-permissions".to_string(),
-                "--no-overwrite-dir".to_string(),
-                tar_options.to_string(),
-                archive_path_str,
-            ];
-
-            // Execute tar extraction. Each child is placed into its own
-            // process group so kill_child_tree's group-targeted SIGKILL
-            // stays scoped to tar (and never the cokacdir TUI process itself).
-            let child = if has_stdbuf {
-                let mut args = vec!["-oL".to_string(), "-eL".to_string(), tar_cmd.clone()];
-                args.extend(tar_args);
-                let mut cmd = Command::new("stdbuf");
-                cmd.current_dir(&extract_path_clone)
-                    .args(&args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                crate::services::claude::detach_into_own_pgroup(&mut cmd);
-                cmd.spawn()
-            } else {
-                let mut cmd = Command::new(&tar_cmd);
-                cmd.current_dir(&extract_path_clone)
-                    .args(&tar_args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                crate::services::claude::detach_into_own_pgroup(&mut cmd);
-                cmd.spawn()
+            let extract_input = match archive_snapshot.reader() {
+                Ok(input) => input,
+                Err(error) => {
+                    let message = extraction_error_with_cleanup(
+                        extract_directory,
+                        format!("Cannot rewind private archive snapshot: {error}"),
+                    );
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
             };
 
-            // Cleanup helper for failed extraction
-            let cleanup_extract_dir = |path: &std::path::PathBuf| {
-                let _ = std::fs::remove_dir_all(path);
-            };
+            let mut command = Command::new(&tar_cmd);
+            command
+                .args(&tar_args)
+                .stdin(Stdio::from(extract_input))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_tar_command(&mut command);
+            if let Err(error) = bind_command_to_extract_directory(&mut command, &extract_directory)
+            {
+                let message = extraction_error_with_cleanup(
+                    extract_directory,
+                    format!("Cannot bind tar to the private extraction directory: {error}"),
+                );
+                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+            crate::services::claude::detach_into_own_pgroup(&mut command);
+            let child = command.spawn();
 
             match child {
                 Ok(mut child) => {
@@ -7520,10 +8052,11 @@ impl App {
                                 let _ = child.wait();
                                 cancel_watch_done.store(true, Ordering::Relaxed);
                                 let _ = cancel_watch.join();
-                                cleanup_extract_dir(&extract_path_clone);
+                                let message =
+                                    extraction_error_with_cleanup(extract_directory, "Cancelled");
                                 let _ = tx.send(ProgressMessage::Error(
                                     extract_dir_owned.clone(),
-                                    "Cancelled".to_string(),
+                                    message,
                                 ));
                                 let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
                                 return;
@@ -7569,66 +8102,84 @@ impl App {
                     let wait_result = child.wait();
                     cancel_watch_done.store(true, Ordering::Relaxed);
                     let _ = cancel_watch.join();
+                    let stderr = stderr_handle
+                        .and_then(|handle| handle.join().ok())
+                        .unwrap_or_default();
                     match wait_result {
                         Ok(status) => {
                             if cancel_flag.load(Ordering::Relaxed) {
-                                cleanup_extract_dir(&extract_path_clone);
+                                let message =
+                                    extraction_error_with_cleanup(extract_directory, "Cancelled");
                                 let _ = tx.send(ProgressMessage::Error(
                                     extract_dir_owned.clone(),
-                                    "Cancelled".to_string(),
+                                    message,
                                 ));
                                 let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
                                 return;
                             }
                             if status.success() {
-                                let sanitize_result =
-                                    enforce_private_extract_directory(&extract_path_clone)
-                                        .and_then(|_| {
-                                            strip_special_permission_bits(&extract_path_clone)
-                                        });
+                                let sanitize_result = extract_directory
+                                    .secure()
+                                    .and_then(|_| sanitize_extracted_tree(&extract_path_clone))
+                                    .and_then(|_| extract_directory.secure());
                                 match sanitize_result {
-                                    Ok(()) => {
-                                        let _ =
-                                            tx.send(ProgressMessage::Completed(completed_files, 0));
-                                    }
+                                    Ok(()) => match extract_directory.commit() {
+                                        Ok(()) => {
+                                            let _ = tx.send(ProgressMessage::Completed(
+                                                total_file_count,
+                                                0,
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let _ = tx.send(ProgressMessage::Error(
+                                                    extract_dir_owned,
+                                                    format!(
+                                                        "Extracted data could not be committed safely: {error}"
+                                                    ),
+                                                ));
+                                            let _ = tx.send(ProgressMessage::Completed(0, 1));
+                                        }
+                                    },
                                     Err(error) => {
-                                        cleanup_extract_dir(&extract_path_clone);
+                                        let message = extraction_error_with_cleanup(
+                                            extract_directory,
+                                            format!("Failed to validate extracted data: {error}"),
+                                        );
                                         let _ = tx.send(ProgressMessage::Error(
                                             extract_dir_owned,
-                                            format!(
-                                                "Failed to sanitize extracted permissions: {}",
-                                                error
-                                            ),
+                                            message,
                                         ));
                                         let _ = tx.send(ProgressMessage::Completed(0, 1));
                                     }
                                 }
                             } else {
-                                cleanup_extract_dir(&extract_path_clone);
                                 let error_msg = Self::process_error_message(
-                                    stderr_handle.and_then(|h| h.join().ok()),
+                                    Some(stderr),
                                     &stdout_error_lines,
                                     "tar extraction failed",
                                 );
-                                let _ =
-                                    tx.send(ProgressMessage::Error(extract_dir_owned, error_msg));
+                                let message =
+                                    extraction_error_with_cleanup(extract_directory, error_msg);
+                                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
                                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                             }
                         }
                         Err(e) => {
-                            cleanup_extract_dir(&extract_path_clone);
-                            let _ =
-                                tx.send(ProgressMessage::Error(extract_dir_owned, e.to_string()));
+                            let message = extraction_error_with_cleanup(
+                                extract_directory,
+                                format!("Failed to wait for tar extraction: {e}"),
+                            );
+                            let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
                             let _ = tx.send(ProgressMessage::Completed(0, 1));
                         }
                     }
                 }
                 Err(e) => {
-                    cleanup_extract_dir(&extract_path_clone);
-                    let _ = tx.send(ProgressMessage::Error(
-                        extract_dir_owned,
-                        format!("Failed to run tar: {}", e),
-                    ));
+                    let message = extraction_error_with_cleanup(
+                        extract_directory,
+                        format!("Failed to run tar: {e}"),
+                    );
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                 }
             }
@@ -8989,8 +9540,8 @@ mod tests {
 
         let err = App::list_archive_contents(
             fake_tar.to_str().unwrap(),
-            &archive,
-            "bad.tar",
+            fs::File::open(&archive).unwrap(),
+            TarCompression::None,
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap_err();
@@ -9016,10 +9567,383 @@ mod tests {
     }
 
     #[test]
-    fn extraction_options_never_preserve_archived_permissions() {
-        for archive in ["a.tar", "a.tar.gz", "a.tgz", "a.tar.bz2", "a.tar.xz"] {
-            assert!(!tar_extraction_options(archive).contains('p'));
+    fn tar_arguments_use_unambiguous_modern_short_options() {
+        let capabilities = TarExtractionCapabilities {
+            no_same_owner: true,
+            no_same_permissions: true,
+            no_overwrite_dir: true,
+        };
+        for archive in [
+            "a.tar",
+            "a.tar.gz",
+            "a.tgz",
+            "a.tar.bz2",
+            "a.tar.xz",
+            "A.TAR.GZ",
+        ] {
+            let compression = TarCompression::from_archive_name(archive);
+            let arguments = tar_extract_arguments(compression, capabilities).unwrap();
+            assert_eq!(arguments.first().map(String::as_str), Some("-x"));
+            assert!(!arguments.iter().any(|argument| argument == "-p"));
+            let file_option = arguments
+                .iter()
+                .position(|argument| argument == "-f")
+                .unwrap();
+            assert_eq!(
+                arguments.get(file_option + 1).map(String::as_str),
+                Some("-")
+            );
+            assert!(!arguments.iter().any(|argument| argument == "xvf"));
         }
+
+        let creation = tar_create_arguments(TarCompression::Gzip, &[], &["file name".to_string()]);
+        assert_eq!(creation, ["-c", "-v", "-z", "-f", "-", "./file name"]);
+    }
+
+    #[test]
+    fn archive_extensions_are_case_insensitive_and_strip_exactly_once() {
+        assert_eq!(
+            TarCompression::from_archive_name("Backup.TAR.GZ"),
+            TarCompression::Gzip
+        );
+        assert_eq!(
+            archive_extract_directory_name("Backup.TAR.GZ").as_deref(),
+            Some("Backup")
+        );
+        assert_eq!(
+            archive_extract_directory_name("name.tar.tar").as_deref(),
+            Some("name.tar")
+        );
+        assert_eq!(archive_extract_directory_name(".tar"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_capabilities_are_probed_individually_for_bsdtar_style_profiles() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let fake_tar = temp_dir.path().join("fake-bsdtar");
+        fs::write(
+            &fake_tar,
+            "#!/bin/sh\ncase \" $* \" in\n  *\" --no-overwrite-dir \"*) exit 2 ;;\nesac\ncat >/dev/null\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = select_tar_command(fake_tar.to_str()).unwrap();
+        let capabilities = probe_tar_extraction_capabilities(&command);
+        assert_eq!(
+            capabilities,
+            TarExtractionCapabilities {
+                no_same_owner: true,
+                no_same_permissions: true,
+                no_overwrite_dir: false,
+            }
+        );
+        let arguments = tar_extract_arguments(TarCompression::None, capabilities).unwrap();
+        assert_eq!(arguments.first().map(String::as_str), Some("-x"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--no-overwrite-dir"));
+    }
+
+    #[test]
+    fn tar_extraction_fails_closed_without_owner_and_permission_controls() {
+        let error = tar_extract_arguments(
+            TarCompression::None,
+            TarExtractionCapabilities {
+                no_same_owner: true,
+                no_same_permissions: false,
+                no_overwrite_dir: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("ownership and permission"));
+    }
+
+    #[test]
+    fn archive_snapshot_remains_bound_when_the_source_name_is_replaced() {
+        use std::io::Read;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("archive.tar");
+        let retained = temp_dir.path().join("retained.tar");
+        fs::write(&source, "validated archive bytes").unwrap();
+        let snapshot = snapshot_archive_for_extraction(&source, &AtomicBool::new(false)).unwrap();
+
+        fs::rename(&source, &retained).unwrap();
+        fs::write(&source, "replacement bytes").unwrap();
+        let mut contents = String::new();
+        snapshot
+            .reader()
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+
+        assert_eq!(contents, "validated archive bytes");
+        assert_eq!(fs::read_to_string(source).unwrap(), "replacement bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_cleanup_never_deletes_a_replacement_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let extract_path = temp_dir.path().join("extract");
+        let retained = temp_dir.path().join("retained-extract");
+        let reservation = ReservedExtractDirectory::create(&extract_path).unwrap();
+        fs::write(extract_path.join("owned"), "owned").unwrap();
+
+        fs::rename(&extract_path, &retained).unwrap();
+        fs::create_dir(&extract_path).unwrap();
+        fs::write(extract_path.join("replacement"), "keep").unwrap();
+        let error = reservation.cleanup().unwrap_err();
+
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            fs::read_to_string(extract_path.join("replacement")).unwrap(),
+            "keep"
+        );
+        assert_eq!(fs::read_to_string(retained.join("owned")).unwrap(), "owned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modern_tar_arguments_extract_with_the_selected_real_backend() {
+        use std::process::{Command, Stdio};
+
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        let capabilities = probe_tar_extraction_capabilities(&tar_cmd);
+        let Ok(extract_arguments) = tar_extract_arguments(TarCompression::None, capabilities)
+        else {
+            return;
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("payload.txt"), "payload").unwrap();
+        let archive_path = temp_dir.path().join("archive.tar");
+        let archive_output = fs::File::create(&archive_path).unwrap();
+        let mut create = Command::new(&tar_cmd);
+        create
+            .current_dir(&source_dir)
+            .args(tar_create_arguments(
+                TarCompression::None,
+                &[],
+                &["payload.txt".to_string()],
+            ))
+            .stdout(Stdio::from(archive_output))
+            .stderr(Stdio::null());
+        configure_tar_command(&mut create);
+        let status = create.status().unwrap();
+        assert!(status.success());
+
+        let extract_path = temp_dir.path().join("extract");
+        let extraction = ReservedExtractDirectory::create(&extract_path).unwrap();
+        let mut command = Command::new(&tar_cmd);
+        command
+            .args(extract_arguments)
+            .stdin(Stdio::from(fs::File::open(&archive_path).unwrap()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_tar_command(&mut command);
+        bind_command_to_extract_directory(&mut command, &extraction).unwrap();
+        let status = command.status().unwrap();
+        assert!(status.success());
+        sanitize_extracted_tree(&extract_path).unwrap();
+        extraction.commit().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(extract_path.join("payload.txt")).unwrap(),
+            "payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_untar_end_to_end_uses_snapshot_and_modern_arguments() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        if tar_extract_arguments(
+            TarCompression::None,
+            probe_tar_extraction_capabilities(&tar_cmd),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("payload.txt"), "snapshot payload").unwrap();
+        let archive_path = temp_dir.path().join("bundle.tar");
+        let archive_output = fs::File::create(&archive_path).unwrap();
+        let mut create = Command::new(&tar_cmd);
+        create
+            .current_dir(&source_dir)
+            .args(tar_create_arguments(
+                TarCompression::None,
+                &[],
+                &["payload.txt".to_string()],
+            ))
+            .stdout(Stdio::from(archive_output))
+            .stderr(Stdio::null());
+        configure_tar_command(&mut create);
+        assert!(create.status().unwrap().success());
+
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.execute_untar(&archive_path);
+        for _ in 0..500 {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("untar worker should complete");
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("bundle/payload.txt")).unwrap(),
+            "snapshot payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_tar_and_untar_complete_end_to_end_with_the_real_backend() {
+        use std::time::Duration;
+
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        if tar_extract_arguments(
+            TarCompression::None,
+            probe_tar_extraction_capabilities(&tar_cmd),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("payload.txt"), "round trip").unwrap();
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.active_panel_mut()
+            .selected_files
+            .insert("payload.txt".to_string());
+
+        app.execute_tar("roundtrip.tar");
+        for _ in 0..500 {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let create_result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("tar worker should complete");
+        assert_eq!(
+            create_result.failure_count, 0,
+            "{:?}",
+            create_result.last_error
+        );
+
+        let archive_path = temp_dir.path().join("roundtrip.tar");
+        assert!(archive_path.is_file());
+        app.execute_untar(&archive_path);
+        for _ in 0..500 {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let extract_result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("untar worker should complete");
+        assert_eq!(
+            extract_result.failure_count, 0,
+            "{:?}",
+            extract_result.last_error
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("roundtrip/payload.txt")).unwrap(),
+            "round trip"
+        );
+    }
+
+    #[test]
+    fn execute_untar_accepts_a_valid_empty_archive() {
+        use std::time::Duration;
+
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        if tar_extract_arguments(
+            TarCompression::None,
+            probe_tar_extraction_capabilities(&tar_cmd),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("empty.tar");
+        fs::write(&archive_path, [0u8; 1024]).unwrap();
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+
+        app.execute_untar(&archive_path);
+        for _ in 0..500 {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("empty untar worker should complete");
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        let extract_path = temp_dir.path().join("empty");
+        assert!(extract_path.is_dir());
+        assert!(fs::read_dir(extract_path).unwrap().next().is_none());
     }
 
     #[test]
@@ -9055,8 +9979,8 @@ mod tests {
 
         let error = App::list_archive_contents(
             fake_tar.to_str().unwrap(),
-            &archive,
-            "bad.tar",
+            fs::File::open(&archive).unwrap(),
+            TarCompression::None,
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap_err();
@@ -9066,7 +9990,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn extracted_permission_sanitizer_does_not_follow_symlinks() {
+    fn extracted_tree_sanitizer_rejects_external_symlinks_without_following_them() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -9080,16 +10004,97 @@ mod tests {
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o6755)).unwrap();
         symlink(&outside, root.join("outside-link")).unwrap();
 
-        strip_special_permission_bits(&root).unwrap();
+        let error = sanitize_extracted_tree(&root).unwrap_err();
 
-        assert_eq!(
-            fs::metadata(&extracted).unwrap().permissions().mode() & 0o6000,
-            0
-        );
+        assert!(error.to_string().contains("symlink"));
         assert_eq!(
             fs::metadata(&outside).unwrap().permissions().mode() & 0o6000,
             0o6000
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_tree_sanitizer_accepts_resolvable_internal_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("extract");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("target"), "inside").unwrap();
+        symlink("target", root.join("link")).unwrap();
+
+        sanitize_extracted_tree(&root).unwrap();
+
+        assert_eq!(fs::read_to_string(root.join("link")).unwrap(), "inside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_untar_rejects_external_symlink_and_cleans_only_its_owned_directory() {
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        if tar_extract_arguments(
+            TarCompression::None,
+            probe_tar_extraction_capabilities(&tar_cmd),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let outside = temp_dir.path().join("outside");
+        fs::write(&outside, "outside must remain").unwrap();
+        symlink("../outside", source_dir.join("escape")).unwrap();
+        let archive_path = temp_dir.path().join("unsafe.tar");
+        let archive_output = fs::File::create(&archive_path).unwrap();
+        let mut create = Command::new(&tar_cmd);
+        create
+            .current_dir(&source_dir)
+            .args(tar_create_arguments(
+                TarCompression::None,
+                &[],
+                &["escape".to_string()],
+            ))
+            .stdout(Stdio::from(archive_output))
+            .stderr(Stdio::null());
+        configure_tar_command(&mut create);
+        assert!(create.status().unwrap().success());
+
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.execute_untar(&archive_path);
+        for _ in 0..500 {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false);
+            if !active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("unsafe untar worker should complete");
+        assert_eq!(result.failure_count, 1);
+        assert!(result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("symlink")));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside must remain");
+        assert!(!temp_dir.path().join("unsafe").exists());
     }
 
     #[test]
@@ -9302,6 +10307,102 @@ mod tests {
 
         assert_eq!(fs::read_to_string(destination).unwrap(), "archive bytes");
         assert!(!owned_temp_path.exists());
+    }
+
+    #[test]
+    fn tar_publish_uses_hard_link_when_noreplace_rename_is_unsupported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        let owned_temp_path = reserved.path().to_path_buf();
+        fs::write(reserved.path(), "archive bytes").unwrap();
+
+        publish_tar_archive_with(
+            &reserved,
+            &destination,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "simulated no-clobber rename limitation",
+                ))
+            },
+            |source, destination| fs::hard_link(source, destination),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "archive bytes");
+        assert_eq!(
+            file_ops::stable_path_identity(&destination).unwrap(),
+            file_ops::stable_path_identity(&owned_temp_path).unwrap()
+        );
+        drop(reserved);
+        assert!(!owned_temp_path.exists());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "archive bytes");
+    }
+
+    #[test]
+    fn tar_publish_uses_exclusive_copy_when_rename_and_links_are_unsupported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        fs::write(reserved.path(), "archive bytes").unwrap();
+
+        publish_tar_archive_with(
+            &reserved,
+            &destination,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "simulated no-clobber rename limitation",
+                ))
+            },
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "simulated hard-link limitation",
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "archive bytes");
+        assert_ne!(
+            file_ops::stable_path_identity(&destination).unwrap(),
+            file_ops::stable_path_identity(reserved.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn tar_compatibility_publish_never_overwrites_a_racing_destination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let destination = temp_dir.path().join("archive.tar");
+        let reserved = ReservedTarArchive::create(&destination).unwrap();
+        fs::write(reserved.path(), "our archive").unwrap();
+        fs::write(&destination, "racing destination").unwrap();
+
+        let error = publish_tar_archive_with(
+            &reserved,
+            &destination,
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "simulated no-clobber rename limitation",
+                ))
+            },
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "simulated hard-link limitation",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(destination).unwrap(),
+            "racing destination"
+        );
     }
 
     #[cfg(unix)]
