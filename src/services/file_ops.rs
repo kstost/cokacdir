@@ -1940,6 +1940,97 @@ struct PublishedStage {
     warnings: Vec<String>,
 }
 
+/// A destination name created with an exclusive filesystem operation while a
+/// compatibility copy is in progress.  Keeping the created object bound lets
+/// failure cleanup remove only that object; a pathname replacement is never
+/// followed or deleted.
+struct ExclusiveDestination {
+    path: PathBuf,
+    is_directory: bool,
+    binding: ExclusiveDestinationBinding,
+}
+
+enum ExclusiveDestinationBinding {
+    Open(File),
+    Symlink(StablePathIdentity),
+}
+
+impl ExclusiveDestination {
+    fn from_open(path: &Path, file: File, is_directory: bool) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            is_directory,
+            binding: ExclusiveDestinationBinding::Open(file),
+        }
+    }
+
+    fn from_symlink(path: &Path) -> io::Result<Self> {
+        let current = path_identity(path)?;
+        if current.is_directory || !fs::symlink_metadata(path)?.is_symlink() {
+            return Err(io::Error::other(format!(
+                "Exclusively created symlink could not be bound safely: '{}'",
+                path.display()
+            )));
+        }
+        let stable = current.stable;
+        drop(current);
+        Ok(Self {
+            path: path.to_path_buf(),
+            is_directory: false,
+            binding: ExclusiveDestinationBinding::Symlink(stable),
+        })
+    }
+
+    fn open_file_mut(&mut self) -> io::Result<&mut File> {
+        match &mut self.binding {
+            ExclusiveDestinationBinding::Open(file) if !self.is_directory => Ok(file),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Compatibility destination is not an open regular file",
+            )),
+        }
+    }
+
+    fn current_identity(&self) -> io::Result<PathIdentity> {
+        let current = path_identity(&self.path)?;
+        let expected = match &self.binding {
+            ExclusiveDestinationBinding::Open(file) => stable_file_identity(file)?,
+            ExclusiveDestinationBinding::Symlink(stable) => *stable,
+        };
+        if current.stable == expected && current.is_directory == self.is_directory {
+            Ok(current)
+        } else {
+            Err(io::Error::other(format!(
+                "Compatibility destination changed while it was being populated: '{}'",
+                self.path.display()
+            )))
+        }
+    }
+
+    fn finish(self) -> io::Result<PathIdentity> {
+        self.current_identity()
+    }
+
+    fn cleanup(self) -> io::Result<()> {
+        let current = match self.current_identity() {
+            Ok(current) => current,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let stable = current.stable;
+        let is_directory = current.is_directory;
+        drop(current);
+        drop(self.binding);
+
+        if is_directory {
+            remove_directory_tree_by_identity(&self.path, stable)
+        } else {
+            remove_file_by_identity(&self.path, stable)?;
+            sync_parent(&self.path)
+        }
+    }
+}
+
 impl PartialStage {
     fn bind(directory: PrivateStagingDirectory) -> io::Result<Self> {
         let path = directory.payload();
@@ -2155,23 +2246,33 @@ impl OwnedStage {
     }
 
     fn publish_noreplace(self, destination: &Path) -> Result<PublishedStage, StagePublishFailure> {
+        self.publish_noreplace_with(destination, rename_noreplace)
+    }
+
+    fn publish_noreplace_with<F>(
+        self,
+        destination: &Path,
+        rename_exclusive: F,
+    ) -> Result<PublishedStage, StagePublishFailure>
+    where
+        F: FnOnce(&Path, &Path) -> io::Result<()>,
+    {
         if let Err(error) = self.verify() {
             return Err(StagePublishFailure { error, stage: self });
         }
+        let source_path = self.path();
+        match rename_exclusive(&source_path, destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                return self.publish_by_exclusive_copy(destination);
+            }
+            Err(error) => return Err(StagePublishFailure { error, stage: self }),
+        }
+
         let OwnedStage {
             directory,
             identity,
         } = self;
-        let source_path = directory.payload();
-        if let Err(error) = rename_noreplace(&source_path, destination) {
-            return Err(StagePublishFailure {
-                error,
-                stage: OwnedStage {
-                    directory,
-                    identity,
-                },
-            });
-        }
 
         let published_identity = match path_identity(destination) {
             Ok(current) if current.matches_after_relocation(&identity) => Some(current),
@@ -2211,6 +2312,276 @@ impl OwnedStage {
             warnings,
         })
     }
+
+    /// Compatibility publication for filesystems that implement ordinary
+    /// rename but reject `RENAME_NOREPLACE`/`RENAME_EXCL`.  The public name is
+    /// claimed with an exclusive create operation, populated while bound, and
+    /// content-verified before the private stage is removed.  This preserves
+    /// no-clobber semantics, although the destination can be visible with
+    /// restrictive permissions while it is being populated.
+    fn publish_by_exclusive_copy(
+        self,
+        destination: &Path,
+    ) -> Result<PublishedStage, StagePublishFailure> {
+        if let Err(error) = self.verify() {
+            return Err(StagePublishFailure { error, stage: self });
+        }
+        let source_path = self.path();
+        let source_metadata = match fs::symlink_metadata(&source_path) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(StagePublishFailure { error, stage: self }),
+        };
+        let source_authorization = PathAuthorization::from_identity(&self.identity);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (created, copied_file_digest) = if source_metadata.is_symlink() {
+            if let Err(error) = copy_symlink_to_new(
+                &source_path,
+                destination,
+                destination,
+                Some(&source_authorization),
+            ) {
+                return Err(StagePublishFailure { error, stage: self });
+            }
+            let created = match ExclusiveDestination::from_symlink(destination) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Err(StagePublishFailure {
+                        error: operation_error(
+                            error.kind(),
+                            format!(
+                            "{}; the newly published destination could not be rebound safely: '{}'",
+                            error,
+                            destination.display()
+                        ),
+                            true,
+                        ),
+                        stage: self,
+                    })
+                }
+            };
+            (created, None)
+        } else if source_metadata.is_file() {
+            let destination_file = match create_new_destination_file(destination) {
+                Ok(file) => file,
+                Err(error) => return Err(StagePublishFailure { error, stage: self }),
+            };
+            let mut created = ExclusiveDestination::from_open(destination, destination_file, false);
+            let copy = copy_regular_file_to_open_with_progress(
+                &source_path,
+                match created.open_file_mut() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return Err(compatible_stage_publish_failure(self, error, created))
+                    }
+                },
+                Some(&source_authorization),
+                MoveVerification::Strict,
+                &cancel,
+                |_, _| {},
+            );
+            let (_, digest) = match copy {
+                Ok(result) => result,
+                Err(error) => return Err(compatible_stage_publish_failure(self, error, created)),
+            };
+            (created, digest)
+        } else if source_metadata.is_dir() {
+            if let Err(error) = create_private_directory(destination) {
+                return Err(StagePublishFailure { error, stage: self });
+            }
+            let created_at = match path_identity(destination) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return Err(StagePublishFailure {
+                        error: operation_error(
+                            error.kind(),
+                            format!(
+                                "Created compatibility destination could not be bound and was preserved at '{}': {}",
+                                destination.display(),
+                                error
+                            ),
+                            true,
+                        ),
+                        stage: self,
+                    })
+                }
+            };
+            let (directory, _, metadata) = match open_directory_for_read(destination) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    let stable = created_at.stable;
+                    drop(created_at);
+                    let cleanup = remove_directory_tree_by_identity(destination, stable);
+                    let error = match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup_error) => operation_error(
+                            error.kind(),
+                            format!(
+                                "{}; exclusively created destination cleanup also failed: {}",
+                                error, cleanup_error
+                            ),
+                            true,
+                        ),
+                    };
+                    return Err(StagePublishFailure { error, stage: self });
+                }
+            };
+            if !metadata.is_dir()
+                || stable_file_identity(&directory).ok() != Some(created_at.stable)
+            {
+                return Err(StagePublishFailure {
+                    error: operation_error(
+                        io::ErrorKind::Other,
+                        format!(
+                            "Compatibility destination changed immediately after exclusive creation and was preserved at '{}'",
+                            destination.display()
+                        ),
+                        true,
+                    ),
+                    stage: self,
+                });
+            }
+            drop(created_at);
+            let created = ExclusiveDestination::from_open(destination, directory, true);
+            let mut visited = HashSet::new();
+            if let Err(error) = copy_dir_recursive_inner(
+                &source_path,
+                destination,
+                destination,
+                Some(&source_authorization),
+                &mut visited,
+                0,
+                true,
+                None,
+            ) {
+                return Err(compatible_stage_publish_failure(self, error, created));
+            }
+            (created, None)
+        } else {
+            return Err(StagePublishFailure {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cannot publish a special staging payload",
+                ),
+                stage: self,
+            });
+        };
+
+        if let Err(error) = self.verify() {
+            return Err(compatible_stage_publish_failure(self, error, created));
+        }
+        let destination_identity = match created.current_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(compatible_stage_publish_failure(self, error, created));
+            }
+        };
+
+        let content_verification = if source_metadata.is_file() {
+            let source_digest = copied_file_digest.ok_or_else(|| {
+                io::Error::other("Compatibility file copy did not produce a verification digest")
+            });
+            source_digest.and_then(|source_digest| {
+                let current_source = sha256_regular_file_snapshot(&source_path, &self.identity)?;
+                let current_destination =
+                    sha256_regular_file_snapshot(destination, &destination_identity)?;
+                if source_digest == current_source && source_digest == current_destination {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        "Compatibility publication content changed during verification",
+                    ))
+                }
+            })
+        } else if source_metadata.is_dir() {
+            sha256_directory_tree_snapshot(&source_path, &self.identity).and_then(|source_digest| {
+                let destination_digest =
+                    sha256_directory_tree_snapshot(destination, &destination_identity)?;
+                if source_digest == destination_digest {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        "Compatibility directory publication did not match its staging tree",
+                    ))
+                }
+            })
+        } else {
+            match (fs::read_link(&source_path), fs::read_link(destination)) {
+                (Ok(source_target), Ok(destination_target))
+                    if source_target == destination_target =>
+                {
+                    Ok(())
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+                _ => Err(io::Error::other(
+                    "Compatibility symlink publication changed during verification",
+                )),
+            }
+        };
+        drop(destination_identity);
+        if let Err(error) = content_verification {
+            return Err(compatible_stage_publish_failure(self, error, created));
+        }
+
+        let published_identity = match created.finish() {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(StagePublishFailure {
+                    error: operation_error(
+                        error.kind(),
+                        format!(
+                            "Compatibility publication committed at '{}', but its identity could not be confirmed: {}",
+                            destination.display(), error
+                        ),
+                        true,
+                    ),
+                    stage: self,
+                })
+            }
+        };
+        let mut warnings = Vec::new();
+        if let Err(error) = sync_parent(destination) {
+            warnings.push(format!(
+                "'{}' was compatibility-published, but parent-directory durability could not be confirmed: {}",
+                destination.display(), error
+            ));
+        }
+        if let Err(error) = self.cleanup() {
+            warnings.push(format!(
+                "'{}' was compatibility-published, but private staging cleanup could not be confirmed: {}",
+                destination.display(), error
+            ));
+        }
+        Ok(PublishedStage {
+            identity: Some(published_identity),
+            warnings,
+        })
+    }
+}
+
+fn compatible_stage_publish_failure(
+    stage: OwnedStage,
+    cause: io::Error,
+    destination: ExclusiveDestination,
+) -> StagePublishFailure {
+    let retry_unsafe = is_retry_unsafe(&cause);
+    let error = match destination.cleanup() {
+        Ok(()) => cause,
+        Err(cleanup_error) => operation_error(
+            cause.kind(),
+            format!(
+                "{}; exclusively created destination cleanup also failed: {}",
+                cause, cleanup_error
+            ),
+            true,
+        ),
+    };
+    let error = if retry_unsafe && !is_retry_unsafe(&error) {
+        operation_error(error.kind(), error.to_string(), true)
+    } else {
+        error
+    };
+    StagePublishFailure { error, stage }
 }
 
 impl PrivateStagingDirectory {
@@ -2404,7 +2775,7 @@ where
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
+fn rename_noreplace_native(src: &Path, dest: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let src = CString::new(src.as_os_str().as_bytes())
@@ -2440,7 +2811,7 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
+fn rename_noreplace_native(src: &Path, dest: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let src = CString::new(src.as_os_str().as_bytes())
@@ -2468,7 +2839,7 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
+fn rename_noreplace_native(src: &Path, dest: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
@@ -2516,11 +2887,44 @@ pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
     target_os = "ios",
     windows
 )))]
-pub(crate) fn rename_noreplace(_src: &Path, _dest: &Path) -> io::Result<()> {
+fn rename_noreplace_native(_src: &Path, _dest: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Atomic no-clobber rename is not supported on this platform",
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_RENAME_NOREPLACE_UNSUPPORTED: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+pub(crate) fn rename_noreplace(src: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FORCE_RENAME_NOREPLACE_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "simulated atomic no-clobber rename limitation",
+        ));
+    }
+    rename_noreplace_native(src, dest)
+}
+
+#[cfg(test)]
+fn with_unsupported_rename_noreplace<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FORCE_RENAME_NOREPLACE_UNSUPPORTED.with(|forced| forced.set(self.0));
+        }
+    }
+
+    let previous = FORCE_RENAME_NOREPLACE_UNSUPPORTED.with(|forced| forced.replace(true));
+    let _reset = Reset(previous);
+    operation()
 }
 
 #[cfg(unix)]
@@ -3189,6 +3593,224 @@ fn restore_staged_directory_after_failure(
     }
 }
 
+struct InPlaceMoveSource {
+    original: PathBuf,
+    identity: PathIdentity,
+    verified_directory_digest: Option<[u8; 32]>,
+}
+
+enum PreparedMoveSource {
+    Quarantined(QuarantinedSource),
+    InPlace(InPlaceMoveSource),
+}
+
+impl PreparedMoveSource {
+    fn prepare(original: &Path, expected: PathIdentity) -> io::Result<Self> {
+        Self::prepare_with(original, expected, QuarantinedSource::prepare)
+    }
+
+    fn prepare_with<F>(original: &Path, expected: PathIdentity, quarantine: F) -> io::Result<Self>
+    where
+        F: FnOnce(&Path, PathIdentity) -> io::Result<QuarantinedSource>,
+    {
+        let authorization = PathAuthorization::from_identity(&expected);
+        match quarantine(original, expected) {
+            Ok(source) => Ok(Self::Quarantined(source)),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let current = path_identity(original).map_err(|identity_error| {
+                    io::Error::new(
+                        identity_error.kind(),
+                        format!(
+                            "Atomic source isolation is unsupported and the source could not be rebound in place: {}",
+                            identity_error
+                        ),
+                    )
+                })?;
+                if !authorization.matches_snapshot(&current) {
+                    return Err(io::Error::other(format!(
+                        "Source changed while selecting the compatible move path: '{}'",
+                        original.display()
+                    )));
+                }
+                Ok(Self::InPlace(InPlaceMoveSource {
+                    original: original.to_path_buf(),
+                    identity: current,
+                    verified_directory_digest: None,
+                }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Quarantined(source) => source.path(),
+            Self::InPlace(source) => source.original.clone(),
+        }
+    }
+
+    fn identity(&self) -> &PathIdentity {
+        match self {
+            Self::Quarantined(source) => &source.identity,
+            Self::InPlace(source) => &source.identity,
+        }
+    }
+
+    fn verified_directory_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Quarantined(source) => source.verified_directory_digest,
+            Self::InPlace(source) => source.verified_directory_digest,
+        }
+    }
+
+    fn set_verified_directory_digest(&mut self, digest: [u8; 32]) {
+        match self {
+            Self::Quarantined(source) => source.verified_directory_digest = Some(digest),
+            Self::InPlace(source) => source.verified_directory_digest = Some(digest),
+        }
+    }
+
+    fn verify_unchanged(&self) -> io::Result<()> {
+        match self {
+            Self::Quarantined(source) => source.verify_unchanged(),
+            Self::InPlace(source) => {
+                let current = path_identity(&source.original)?;
+                if !current.same_snapshot(&source.identity) {
+                    return Err(io::Error::other(format!(
+                        "Move source changed before destination publication: '{}'",
+                        source.original.display()
+                    )));
+                }
+                if let Some(expected_digest) = source.verified_directory_digest {
+                    let current_digest =
+                        sha256_directory_tree_snapshot(&source.original, &source.identity)?;
+                    if current_digest != expected_digest {
+                        return Err(io::Error::other(format!(
+                            "Move source tree changed before destination publication: '{}'",
+                            source.original.display()
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn bind_verified_directory_copy(&mut self, stage: &OwnedStage) -> io::Result<()> {
+        if !self.identity().is_directory || !stage.identity.is_directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Directory move verification requires two directories",
+            ));
+        }
+        let source_digest = sha256_directory_tree_snapshot(&self.path(), self.identity())?;
+        let staged_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
+        if source_digest != staged_digest {
+            return Err(io::Error::other(
+                "Source directory changed after it was copied; destination was not published",
+            ));
+        }
+        self.set_verified_directory_digest(source_digest);
+        Ok(())
+    }
+
+    fn verify_stage_matches(&self, stage: &OwnedStage) -> io::Result<()> {
+        stage.verify()?;
+        if let Some(expected_digest) = self.verified_directory_digest() {
+            let current_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
+            if current_digest != expected_digest {
+                return Err(io::Error::other(
+                    "Verified directory staging changed before destination publication",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_regular_file_matches_copy(&self, copied_source_sha256: [u8; 32]) -> io::Result<()> {
+        let current_sha256 = sha256_regular_file_snapshot(&self.path(), self.identity())?;
+        if current_sha256 != copied_source_sha256 {
+            return Err(io::Error::other(
+                "Source bytes changed after they were copied; destination was not published",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore(self, cause: io::Error) -> io::Error {
+        match self {
+            Self::Quarantined(source) => source.restore(cause),
+            Self::InPlace(source) => {
+                let retry_unsafe = is_retry_unsafe(&cause);
+                let status = match path_identity(&source.original) {
+                    Ok(current) if current.same_snapshot(&source.identity) => {
+                        "the source remained unchanged in place".to_string()
+                    }
+                    Ok(_) => format!(
+                        "the in-place source changed and was not removed from '{}'",
+                        source.original.display()
+                    ),
+                    Err(error) => format!(
+                        "the in-place source could not be rebound and was not removed from '{}': {}",
+                        source.original.display(), error
+                    ),
+                };
+                operation_error(cause.kind(), format!("{}; {}", cause, status), retry_unsafe)
+            }
+        }
+    }
+
+    fn finalize_after_commit(self) -> Vec<String> {
+        match self {
+            Self::Quarantined(source) => source.finalize_after_commit(),
+            Self::InPlace(source) => {
+                let current = match path_identity(&source.original) {
+                    Ok(current) if current.same_snapshot(&source.identity) => current,
+                    Ok(_) => {
+                        return vec![format!(
+                            "Destination was committed, but the source changed and was preserved at '{}'",
+                            source.original.display()
+                        )]
+                    }
+                    Err(error) => {
+                        return vec![format!(
+                            "Destination was committed, but the source could not be rebound and was not removed from '{}': {}",
+                            source.original.display(), error
+                        )]
+                    }
+                };
+                if let Some(expected_digest) = source.verified_directory_digest {
+                    match sha256_directory_tree_snapshot(&source.original, &current) {
+                        Ok(current_digest) if current_digest == expected_digest => {}
+                        Ok(_) => {
+                            return vec![format!(
+                                "Destination was committed, but the source tree changed and was preserved at '{}'",
+                                source.original.display()
+                            )]
+                        }
+                        Err(error) => {
+                            return vec![format!(
+                                "Destination was committed, but the source tree could not be reverified and was preserved at '{}': {}",
+                                source.original.display(), error
+                            )]
+                        }
+                    }
+                }
+                let authorization = PathAuthorization::from_identity(&current);
+                drop(current);
+                drop(source.identity);
+                match delete_file_detailed_authorized(&source.original, &authorization) {
+                    Ok(warnings) => warnings,
+                    Err(error) => vec![format!(
+                        "Destination was committed, but verified source cleanup failed for '{}': {}",
+                        source.original.display(), error
+                    )],
+                }
+            }
+        }
+    }
+}
+
 struct QuarantinedSource {
     original: PathBuf,
     directory: PrivateStagingDirectory,
@@ -3287,37 +3909,6 @@ impl QuarantinedSource {
                     "Isolated move source tree changed before destination publication: '{}'",
                     self.original.display()
                 )));
-            }
-        }
-        Ok(())
-    }
-
-    fn bind_verified_directory_copy(&mut self, stage: &OwnedStage) -> io::Result<()> {
-        if !self.identity.is_directory || !stage.identity.is_directory {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Directory move verification requires two directories",
-            ));
-        }
-        let source_digest = sha256_directory_tree_snapshot(&self.path(), &self.identity)?;
-        let staged_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
-        if source_digest != staged_digest {
-            return Err(io::Error::other(
-                "Source directory changed after it was copied; destination was not published",
-            ));
-        }
-        self.verified_directory_digest = Some(source_digest);
-        Ok(())
-    }
-
-    fn verify_stage_matches(&self, stage: &OwnedStage) -> io::Result<()> {
-        stage.verify()?;
-        if let Some(expected_digest) = self.verified_directory_digest {
-            let current_digest = sha256_directory_tree_snapshot(&stage.path(), &stage.identity)?;
-            if current_digest != expected_digest {
-                return Err(io::Error::other(
-                    "Verified directory staging changed before destination publication",
-                ));
             }
         }
         Ok(())
@@ -3480,7 +4071,7 @@ fn commit_cross_filesystem_move(
     stage: OwnedStage,
     destination: &Path,
     expected_destination: Option<PathIdentity>,
-    source: QuarantinedSource,
+    source: PreparedMoveSource,
     mut warnings: Vec<String>,
     target_authorization: Option<&DirectoryAuthorization>,
 ) -> Result<Vec<String>, CrossFilesystemMoveFailure> {
@@ -4361,19 +4952,6 @@ fn sha256_regular_file_snapshot(path: &Path, expected: &PathIdentity) -> io::Res
         ));
     }
     Ok(hasher.finalize().into())
-}
-
-fn verify_isolated_source_matches_copy(
-    source: &QuarantinedSource,
-    copied_source_sha256: [u8; 32],
-) -> io::Result<()> {
-    let current_sha256 = sha256_regular_file_snapshot(&source.path(), &source.identity)?;
-    if current_sha256 != copied_source_sha256 {
-        return Err(io::Error::other(
-            "Source bytes changed after they were copied; destination was not published",
-        ));
-    }
-    Ok(())
 }
 
 fn update_tree_digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -6115,7 +6693,7 @@ pub fn move_files_with_progress(
                     }
 
                     let mut isolated_source =
-                        match QuarantinedSource::prepare(&src, source_identity) {
+                        match PreparedMoveSource::prepare(&src, source_identity) {
                             Ok(source) => source,
                             Err(error) => {
                                 let retry_unsafe = is_retry_unsafe(&error);
@@ -6150,7 +6728,7 @@ pub fn move_files_with_progress(
                     } else if source_is_directory {
                         isolated_source.bind_verified_directory_copy(&stage)
                     } else if let Some(copied_source_sha256) = copied_source_sha256 {
-                        verify_isolated_source_matches_copy(&isolated_source, copied_source_sha256)
+                        isolated_source.verify_regular_file_matches_copy(copied_source_sha256)
                     } else {
                         Ok(())
                     };
@@ -6587,7 +7165,7 @@ fn move_file_via_copy(src: &Path, dest: &Path, source_identity: PathIdentity) ->
         Err(error) => return Err(error_with_staging_cleanup(error, staging)),
     };
     let stage = OwnedStage::from_published(staging, identity)?;
-    let mut source = match QuarantinedSource::prepare(src, source_identity) {
+    let mut source = match PreparedMoveSource::prepare(src, source_identity) {
         Ok(source) => source,
         Err(error) => {
             return Err(match stage.cleanup() {
@@ -6607,7 +7185,7 @@ fn move_file_via_copy(src: &Path, dest: &Path, source_identity: PathIdentity) ->
     } else if source_is_directory {
         source.bind_verified_directory_copy(&stage)
     } else if let Some(copied_source_sha256) = copied_source_sha256 {
-        verify_isolated_source_matches_copy(&source, copied_source_sha256)
+        source.verify_regular_file_matches_copy(copied_source_sha256)
     } else {
         Ok(())
     };
@@ -7589,6 +8167,202 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read_to_string(&source).unwrap(), "selected data");
         assert!(fs::symlink_metadata(&destination).is_err());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn owned_file_stage_uses_verified_copy_when_no_clobber_rename_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let staging = PrivateStagingDirectory::create(&temp_dir, "publish-compat-file").unwrap();
+        let staging_path = staging.path.clone();
+        let payload = staging.payload();
+        let mut file = create_new_destination_file(&payload).unwrap();
+        file.write_all(b"verified compatibility payload").unwrap();
+        file.sync_all().unwrap();
+        let partial = PartialStage::bind_file(staging, &file).unwrap();
+        drop(file);
+        let stage = partial.seal().unwrap();
+        let destination = temp_dir.join("destination");
+
+        let published = match stage.publish_noreplace_with(&destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "simulated no-clobber limitation",
+            ))
+        }) {
+            Ok(published) => published,
+            Err(failure) => panic!("compatibility publication failed: {}", failure.error),
+        };
+
+        assert!(published.identity.is_some());
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"verified compatibility payload"
+        );
+        assert!(fs::symlink_metadata(&staging_path).is_err());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn compatible_stage_publication_never_clobbers_a_late_destination() {
+        let temp_dir = create_temp_dir();
+        let staging =
+            PrivateStagingDirectory::create(&temp_dir, "publish-compat-collision").unwrap();
+        let payload = staging.payload();
+        let mut file = create_new_destination_file(&payload).unwrap();
+        file.write_all(b"staged data").unwrap();
+        file.sync_all().unwrap();
+        let partial = PartialStage::bind_file(staging, &file).unwrap();
+        drop(file);
+        let stage = partial.seal().unwrap();
+        let destination = temp_dir.join("destination");
+        fs::write(&destination, "racer data").unwrap();
+
+        let failure = match stage.publish_noreplace_with(&destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "simulated no-clobber limitation",
+            ))
+        }) {
+            Ok(_) => panic!("compatibility publication unexpectedly replaced a destination"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "racer data");
+        assert_eq!(
+            fs::read_to_string(failure.stage.path()).unwrap(),
+            "staged data"
+        );
+        failure.stage.cleanup().unwrap();
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn owned_directory_stage_uses_verified_copy_when_no_clobber_rename_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let staging =
+            PrivateStagingDirectory::create(&temp_dir, "publish-compat-directory").unwrap();
+        let staging_path = staging.path.clone();
+        let payload = staging.payload();
+        create_private_directory(&payload).unwrap();
+        fs::create_dir(payload.join("nested")).unwrap();
+        fs::write(payload.join("nested/data"), "directory payload").unwrap();
+        let partial = PartialStage::bind_directory(staging).unwrap();
+        let stage = partial.seal().unwrap();
+        let destination = temp_dir.join("destination");
+
+        let published = match stage.publish_noreplace_with(&destination, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "simulated no-clobber limitation",
+            ))
+        }) {
+            Ok(published) => published,
+            Err(failure) => panic!("compatibility publication failed: {}", failure.error),
+        };
+
+        assert!(published.identity.is_some());
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/data")).unwrap(),
+            "directory payload"
+        );
+        assert!(fs::symlink_metadata(&staging_path).is_err());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn move_source_remains_in_place_when_atomic_isolation_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let source = temp_dir.join("source");
+        fs::write(&source, "source payload").unwrap();
+        let expected = path_identity(&source).unwrap();
+
+        let prepared = PreparedMoveSource::prepare_with(&source, expected, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "simulated no-clobber limitation",
+            ))
+        })
+        .unwrap();
+
+        assert!(matches!(prepared, PreparedMoveSource::InPlace(_)));
+        prepared.verify_unchanged().unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source payload");
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn progress_move_file_succeeds_when_no_clobber_rename_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("source");
+        let target_dir = temp_dir.join("target");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let source = source_dir.join("item");
+        fs::write(&source, "compatibility move payload").unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        with_unsupported_rename_noreplace(|| {
+            move_files_with_progress(
+                vec![PathBuf::from("item")],
+                &source_dir,
+                &target_dir,
+                HashMap::new(),
+                HashSet::new(),
+                None,
+                HashMap::new(),
+                None,
+                MoveVerification::Standard,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+            );
+        });
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(fs::symlink_metadata(&source).is_err());
+        assert_eq!(
+            fs::read_to_string(target_dir.join("item")).unwrap(),
+            "compatibility move payload"
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn progress_move_directory_succeeds_when_no_clobber_rename_is_unsupported() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("source");
+        let target_dir = temp_dir.join("target");
+        let source = source_dir.join("item");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        fs::write(source.join("nested/data"), "directory move payload").unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        with_unsupported_rename_noreplace(|| {
+            move_files_with_progress(
+                vec![PathBuf::from("item")],
+                &source_dir,
+                &target_dir,
+                HashMap::new(),
+                HashSet::new(),
+                None,
+                HashMap::new(),
+                None,
+                MoveVerification::Standard,
+                Arc::new(AtomicBool::new(false)),
+                tx,
+            );
+        });
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(fs::symlink_metadata(&source).is_err());
+        assert_eq!(
+            fs::read_to_string(target_dir.join("item/nested/data")).unwrap(),
+            "directory move payload"
+        );
         cleanup_temp_dir(&temp_dir);
     }
 
@@ -8669,7 +9443,10 @@ mod tests {
         })
         .unwrap();
 
-        let error = verify_isolated_source_matches_copy(&isolated, copied_sha256).unwrap_err();
+        let isolated = PreparedMoveSource::Quarantined(isolated);
+        let error = isolated
+            .verify_regular_file_matches_copy(copied_sha256)
+            .unwrap_err();
         assert!(error.to_string().contains("Source bytes changed"));
         let restored = isolated.restore(error);
         assert!(restored.to_string().contains("source was restored"));
