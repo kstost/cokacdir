@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    app::{PanelState, SortBy, SortOrder},
+    app::{DirectorySizeStatus, PanelState, SortBy, SortOrder},
     theme::Theme,
 };
 use crate::utils::format::{format_size, pad_to_display_width, truncate_to_display_width};
@@ -163,6 +163,7 @@ pub fn draw(
     panel.scroll_offset = start_index;
 
     let visible_files = panel.files.iter().skip(start_index).take(visible_height);
+    let directory_size_spinner = directory_size_spinner_frame();
 
     for (i, file) in visible_files.enumerate() {
         let actual_index = start_index + i;
@@ -178,6 +179,7 @@ pub fn draw(
             type_col,
             size_col,
             date_col,
+            directory_size_spinner,
             theme,
         );
 
@@ -385,6 +387,7 @@ fn create_file_line(
     type_width: usize,
     size_width: usize,
     date_width: usize,
+    directory_size_spinner: char,
     theme: &Theme,
 ) -> Line<'static> {
     let marker = if is_marked { "✻" } else { " " };
@@ -449,9 +452,18 @@ fn create_file_line(
     };
 
     let size_str = if file.is_directory {
-        "<DIR>".to_string()
+        match file.directory_size_status {
+            Some(DirectorySizeStatus::Calculating) => {
+                format!("{directory_size_spinner} calc")
+            }
+            Some(DirectorySizeStatus::Complete) => {
+                format_size_for_column(file.size, size_width.saturating_sub(2))
+            }
+            Some(DirectorySizeStatus::Failed) => "<ERR>".to_string(),
+            None => "<DIR>".to_string(),
+        }
     } else {
-        format_size(file.size)
+        format_size_for_column(file.size, size_width.saturating_sub(2))
     };
     let size_col = if size_width > 2 {
         format!(
@@ -521,4 +533,97 @@ fn create_file_line(
         Span::styled(size_col, other_style),
         Span::styled(date_col, other_style),
     ])
+}
+
+fn directory_size_spinner_frame() -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    FRAMES[(elapsed.as_millis() / 100 % FRAMES.len() as u128) as usize]
+}
+
+fn format_size_for_column(bytes: u64, max_width: usize) -> String {
+    let standard = format_size(bytes);
+    if standard.width() <= max_width {
+        return standard;
+    }
+
+    const UNITS: [&str; 7] = ["B", "K", "M", "G", "T", "P", "E"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let compact = if unit == 0 || value >= 100.0 {
+        format!("{value:.0}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    };
+    if compact.width() <= max_width {
+        compact
+    } else {
+        truncate_to_display_width(&compact, max_width)
+            .trim_end()
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::fs;
+
+    #[test]
+    fn calculating_folder_size_is_visible_in_an_80_column_panel() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("folder")).unwrap();
+        let mut panel = PanelState::new(temp.path().to_path_buf());
+        panel
+            .files
+            .iter_mut()
+            .find(|file| file.name == "folder")
+            .unwrap()
+            .directory_size_status = Some(DirectorySizeStatus::Calculating);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut panel,
+                    Rect::new(0, 0, 80, 24),
+                    true,
+                    false,
+                    false,
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let rendered = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("calc"),
+            "folder size spinner should remain visible at 80 columns: {rendered:?}"
+        );
+        assert!(rendered.contains("Modified"));
+    }
+
+    #[test]
+    fn very_large_folder_sizes_stay_inside_the_size_column() {
+        let tebibyte = 1024_u64.pow(4);
+        assert_eq!(format_size_for_column(tebibyte, 8), "1.0T");
+        assert!(format_size_for_column(u64::MAX, 8).width() <= 8);
+    }
 }

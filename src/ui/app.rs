@@ -11,6 +11,9 @@ use std::time::{Instant, SystemTime};
 
 use crate::config::{CrossVolumeMoveVerification, Settings};
 use crate::keybindings::Keybindings;
+use crate::services::directory_size::{
+    self, DirectorySizeMessage, LocalDirectorySizeRequest, RemoteDirectorySizeRequest,
+};
 use crate::services::file_ops::{
     self, FileOperationPhase, FileOperationResult, FileOperationType, ProgressMessage,
 };
@@ -81,7 +84,7 @@ fn normalized_remote_child_path(parent: &Path, file_name: &str) -> Result<String
     if file_name.is_empty()
         || file_name == "."
         || file_name == ".."
-        || file_name.contains(['/', '\\'])
+        || file_name.contains(['/', '\\', '\0'])
     {
         return Err("Remote entry has an unsafe or ambiguous name".to_string());
     }
@@ -2185,9 +2188,17 @@ pub struct FileItem {
     pub is_directory: bool,
     pub is_symlink: bool,
     pub size: u64,
+    pub directory_size_status: Option<DirectorySizeStatus>,
     pub modified: DateTime<Local>,
     #[allow(dead_code)]
     pub permissions: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectorySizeStatus {
+    Calculating,
+    Complete,
+    Failed,
 }
 
 /// Parse sort_by string from settings to SortBy enum
@@ -2340,6 +2351,22 @@ pub struct PanelState {
     pub remote_ctx: Option<Box<RemoteContext>>,
     /// Cached remote display info (user, host, port) — survives while remote_ctx is temporarily taken
     pub remote_display: Option<(String, String, u16)>,
+    directory_size_scan: Option<DirectorySizeScan>,
+    directory_size_generation: u64,
+}
+
+#[derive(Debug)]
+struct DirectorySizeScan {
+    generation: u64,
+    base_path: PathBuf,
+    cancel_flag: Arc<AtomicBool>,
+    receiver: Receiver<DirectorySizeMessage>,
+}
+
+impl Drop for DirectorySizeScan {
+    fn drop(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+    }
 }
 
 impl PanelState {
@@ -2367,6 +2394,8 @@ impl PanelState {
             disk_available: 0,
             remote_ctx: None,
             remote_display: None,
+            directory_size_scan: None,
+            directory_size_generation: 0,
         };
         state.load_files();
         state
@@ -2400,6 +2429,8 @@ impl PanelState {
             disk_available: 0,
             remote_ctx: None,
             remote_display: None,
+            directory_size_scan: None,
+            directory_size_generation: 0,
         };
         state.load_files();
         state
@@ -2427,6 +2458,7 @@ impl PanelState {
     }
 
     pub fn load_files(&mut self) {
+        self.cancel_directory_size_scan();
         if self.is_remote() {
             self.load_files_remote();
         } else {
@@ -2445,6 +2477,7 @@ impl PanelState {
                 is_directory: true,
                 is_symlink: false,
                 size: 0,
+                directory_size_status: None,
                 modified: Local::now(),
                 permissions: String::new(),
             });
@@ -2511,6 +2544,7 @@ impl PanelState {
                     is_directory,
                     is_symlink,
                     size,
+                    directory_size_status: None,
                     modified,
                     permissions,
                 })
@@ -2538,6 +2572,7 @@ impl PanelState {
                 is_directory: true,
                 is_symlink: false,
                 size: 0,
+                directory_size_status: None,
                 modified: Local::now(),
                 permissions: String::new(),
             });
@@ -2559,6 +2594,7 @@ impl PanelState {
                         is_directory: entry.is_directory,
                         is_symlink: entry.is_symlink,
                         size: if entry.is_directory { 0 } else { entry.size },
+                        directory_size_status: None,
                         modified: entry.modified,
                         permissions: entry.permissions,
                     })
@@ -2588,6 +2624,7 @@ impl PanelState {
 
     /// Apply remote directory listing results (no network call)
     pub fn apply_remote_entries(&mut self, entries: Vec<SftpFileEntry>, path: &Path) {
+        self.cancel_directory_size_scan();
         self.files.clear();
         self.path = path.to_path_buf();
 
@@ -2600,6 +2637,7 @@ impl PanelState {
                 is_directory: true,
                 is_symlink: false,
                 size: 0,
+                directory_size_status: None,
                 modified: Local::now(),
                 permissions: String::new(),
             });
@@ -2613,6 +2651,7 @@ impl PanelState {
                 is_directory: entry.is_directory,
                 is_symlink: entry.is_symlink,
                 size: if entry.is_directory { 0 } else { entry.size },
+                directory_size_status: None,
                 modified: entry.modified,
                 permissions: entry.permissions,
             })
@@ -2743,6 +2782,99 @@ impl PanelState {
         self.files.get(self.selected_index)
     }
 
+    fn cancel_directory_size_scan(&mut self) {
+        if let Some(scan) = self.directory_size_scan.take() {
+            scan.cancel_flag.store(true, Ordering::Relaxed);
+        }
+        self.directory_size_generation = self.directory_size_generation.wrapping_add(1);
+        for file in &mut self.files {
+            if file.directory_size_status.is_some() {
+                file.directory_size_status = None;
+                if file.is_directory {
+                    file.size = 0;
+                }
+            }
+        }
+    }
+
+    fn poll_directory_size_scan(&mut self) {
+        let Some(scan) = self.directory_size_scan.as_ref() else {
+            return;
+        };
+        if scan.base_path != self.path || scan.generation != self.directory_size_generation {
+            self.cancel_directory_size_scan();
+            return;
+        }
+
+        loop {
+            let message = {
+                let Some(scan) = self.directory_size_scan.as_ref() else {
+                    return;
+                };
+                scan.receiver.try_recv()
+            };
+
+            match message {
+                Ok(DirectorySizeMessage::Calculated {
+                    generation,
+                    name,
+                    result,
+                }) => {
+                    if generation != self.directory_size_generation {
+                        continue;
+                    }
+                    if let Some(file) = self.files.iter_mut().find(|file| {
+                        file.name == name
+                            && file.is_directory
+                            && file.directory_size_status == Some(DirectorySizeStatus::Calculating)
+                    }) {
+                        match result {
+                            Ok(size) => {
+                                file.size = size;
+                                file.directory_size_status = Some(DirectorySizeStatus::Complete);
+                            }
+                            Err(_) => {
+                                file.size = 0;
+                                file.directory_size_status = Some(DirectorySizeStatus::Failed);
+                            }
+                        }
+                    }
+                }
+                Ok(DirectorySizeMessage::Finished {
+                    generation,
+                    cancelled,
+                }) => {
+                    if generation == self.directory_size_generation {
+                        self.directory_size_scan = None;
+                        for file in &mut self.files {
+                            if file.directory_size_status == Some(DirectorySizeStatus::Calculating)
+                            {
+                                file.size = 0;
+                                file.directory_size_status = if cancelled {
+                                    None
+                                } else {
+                                    Some(DirectorySizeStatus::Failed)
+                                };
+                            }
+                        }
+                    }
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.directory_size_scan = None;
+                    for file in &mut self.files {
+                        if file.directory_size_status == Some(DirectorySizeStatus::Calculating) {
+                            file.size = 0;
+                            file.directory_size_status = Some(DirectorySizeStatus::Failed);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn toggle_sort(&mut self, sort_by: SortBy) {
         if self.sort_by == sort_by {
             self.sort_order = match self.sort_order {
@@ -2754,30 +2886,20 @@ impl PanelState {
             self.sort_order = SortOrder::Asc;
         }
         self.selected_index = 0;
-        if self.is_remote() {
-            // Re-sort existing items locally (no network call)
-            let mut items: Vec<FileItem> =
-                self.files.drain(..).filter(|f| f.name != "..").collect();
-            // Re-add ".." entry
-            let remote_path = normalized_remote_path(&self.path);
-            if remote_path != "/" {
-                self.files.push(FileItem {
-                    name: "..".to_string(),
-                    display_name: None,
-                    is_directory: true,
-                    is_symlink: false,
-                    size: 0,
-                    modified: Local::now(),
-                    permissions: String::new(),
-                });
-            }
-            self.sort_items(&mut items);
-            self.files.reserve(items.len());
-            self.files.extend(items);
-            self.finalize_load();
-        } else {
-            self.load_files();
+        // Re-sort the loaded snapshot in memory so calculated directory sizes
+        // remain available for a later size sort.
+        let parent = self
+            .files
+            .iter()
+            .position(|file| file.name == "..")
+            .map(|index| self.files.remove(index));
+        let mut items = std::mem::take(&mut self.files);
+        self.sort_items(&mut items);
+        if let Some(parent) = parent {
+            self.files.push(parent);
         }
+        self.files.extend(items);
+        self.finalize_load();
     }
 }
 
@@ -4369,6 +4491,93 @@ impl App {
         self.active_panel_mut().toggle_sort(SortBy::Size);
     }
 
+    pub fn start_directory_size_calculation(&mut self) {
+        let panel_index = self.active_panel_index;
+        let remote_profile = if self.panels[panel_index].is_remote() {
+            match self.panels[panel_index].remote_ctx.as_ref() {
+                Some(context) => Some(context.profile.clone()),
+                None => {
+                    self.panels[panel_index].cancel_directory_size_scan();
+                    self.show_message(
+                        "Folder sizes are unavailable while the remote panel is busy",
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let panel = &mut self.panels[panel_index];
+        panel.cancel_directory_size_scan();
+        let generation = panel.directory_size_generation;
+        let base_path = panel.path.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let receiver = if let Some(profile) = remote_profile {
+            let mut requests = Vec::new();
+            for file in &mut panel.files {
+                if file.name == ".." || !file.is_directory || file.is_symlink {
+                    continue;
+                }
+                match normalized_remote_child_path(&base_path, &file.name) {
+                    Ok(path) => {
+                        file.directory_size_status = Some(DirectorySizeStatus::Calculating);
+                        requests.push(RemoteDirectorySizeRequest {
+                            name: file.name.clone(),
+                            path,
+                        });
+                    }
+                    Err(_) => {
+                        file.directory_size_status = Some(DirectorySizeStatus::Failed);
+                    }
+                }
+            }
+            if requests.is_empty() {
+                self.show_message("No folders to measure");
+                return;
+            }
+            directory_size::spawn_remote(generation, profile, requests, Arc::clone(&cancel_flag))
+        } else {
+            let mut requests = Vec::new();
+            for file in &mut panel.files {
+                if file.name == ".." || !file.is_directory || file.is_symlink {
+                    continue;
+                }
+                file.directory_size_status = Some(DirectorySizeStatus::Calculating);
+                requests.push(LocalDirectorySizeRequest {
+                    name: file.name.clone(),
+                    path: base_path.join(&file.name),
+                });
+            }
+            if requests.is_empty() {
+                self.show_message("No folders to measure");
+                return;
+            }
+            directory_size::spawn_local(generation, requests, Arc::clone(&cancel_flag))
+        };
+
+        self.panels[panel_index].directory_size_scan = Some(DirectorySizeScan {
+            generation,
+            base_path,
+            cancel_flag,
+            receiver,
+        });
+        self.show_message("Calculating folder sizes in the background");
+    }
+
+    pub fn poll_directory_size_calculations(&mut self) {
+        for panel in &mut self.panels {
+            panel.poll_directory_size_scan();
+        }
+    }
+
+    pub fn has_active_directory_size_calculation(&self) -> bool {
+        self.panels
+            .iter()
+            .any(|panel| panel.directory_size_scan.is_some())
+    }
+
     pub fn toggle_sort_by_date(&mut self) {
         self.active_panel_mut().toggle_sort(SortBy::Modified);
     }
@@ -4431,6 +4640,7 @@ impl App {
         // Check if any panel is remote and needs async refresh
         let mut remote_panel_idx = None;
         for (i, panel) in self.panels.iter_mut().enumerate() {
+            panel.cancel_directory_size_scan();
             panel.selected_files.clear();
             if panel.is_remote() {
                 if panel.remote_ctx.is_some() {
@@ -8415,6 +8625,7 @@ impl App {
             }
         };
         let panel_idx = self.active_panel_index;
+        self.panels[panel_idx].cancel_directory_size_scan();
 
         thread::spawn(move || {
             let result = match remote::SftpSession::connect(&profile_clone) {
@@ -8466,6 +8677,7 @@ impl App {
     /// Disconnect remote panel and switch back to local
     pub fn disconnect_remote_panel(&mut self) {
         let panel = self.active_panel_mut();
+        panel.cancel_directory_size_scan();
         if let Some(mut ctx) = panel.remote_ctx.take() {
             ctx.session.disconnect();
         }
@@ -8490,6 +8702,7 @@ impl App {
             return;
         }
         let panel_idx = self.active_panel_index;
+        self.panels[panel_idx].cancel_directory_size_scan();
         let mut ctx = match self.panels[panel_idx].remote_ctx.take() {
             Some(ctx) => ctx,
             None => return,
@@ -9308,6 +9521,212 @@ mod tests {
         assert_eq!(panel.sort_by, SortBy::Size);
         assert_eq!(panel.sort_order, SortOrder::Asc);
 
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn sorting_preserves_calculated_directory_sizes() {
+        let temp_dir = create_temp_dir();
+        fs::create_dir(temp_dir.join("folder")).unwrap();
+        let mut panel = PanelState::new(temp_dir.clone());
+        let folder = panel
+            .files
+            .iter_mut()
+            .find(|file| file.name == "folder")
+            .unwrap();
+        folder.size = 1234;
+        folder.directory_size_status = Some(DirectorySizeStatus::Complete);
+
+        panel.toggle_sort(SortBy::Size);
+
+        let folder = panel
+            .files
+            .iter()
+            .find(|file| file.name == "folder")
+            .unwrap();
+        assert_eq!(folder.size, 1234);
+        assert_eq!(
+            folder.directory_size_status,
+            Some(DirectorySizeStatus::Complete)
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn directory_size_results_are_applied_incrementally() {
+        let temp_dir = create_temp_dir();
+        fs::create_dir_all(temp_dir.join("folder/nested")).unwrap();
+        fs::write(temp_dir.join("folder/one.bin"), vec![0u8; 5]).unwrap();
+        fs::write(temp_dir.join("folder/nested/two.bin"), vec![0u8; 8]).unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+
+        app.start_directory_size_calculation();
+        assert!(app.has_active_directory_size_calculation());
+        assert_eq!(
+            app.active_panel()
+                .files
+                .iter()
+                .find(|file| file.name == "folder")
+                .unwrap()
+                .directory_size_status,
+            Some(DirectorySizeStatus::Calculating)
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.has_active_directory_size_calculation() && std::time::Instant::now() < deadline {
+            app.poll_directory_size_calculations();
+            std::thread::yield_now();
+        }
+
+        assert!(!app.has_active_directory_size_calculation());
+        let folder = app
+            .active_panel()
+            .files
+            .iter()
+            .find(|file| file.name == "folder")
+            .unwrap();
+        assert_eq!(folder.size, 13);
+        assert_eq!(
+            folder.directory_size_status,
+            Some(DirectorySizeStatus::Complete)
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn refresh_cancels_directory_size_calculation() {
+        let temp_dir = create_temp_dir();
+        fs::create_dir(temp_dir.join("folder")).unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.start_directory_size_calculation();
+        let cancel_flag = Arc::clone(
+            &app.active_panel()
+                .directory_size_scan
+                .as_ref()
+                .unwrap()
+                .cancel_flag,
+        );
+
+        app.refresh_panels();
+
+        assert!(cancel_flag.load(Ordering::Relaxed));
+        assert!(!app.has_active_directory_size_calculation());
+        assert!(app.active_panel().files.iter().all(|file| {
+            file.directory_size_status.is_none()
+                && (!file.is_directory || file.name == ".." || file.size == 0)
+        }));
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn entering_another_path_cancels_directory_size_calculation() {
+        let temp_dir = create_temp_dir();
+        fs::create_dir(temp_dir.join("folder")).unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.start_directory_size_calculation();
+        let cancel_flag = Arc::clone(
+            &app.active_panel()
+                .directory_size_scan
+                .as_ref()
+                .unwrap()
+                .cancel_flag,
+        );
+        let folder_index = app
+            .active_panel()
+            .files
+            .iter()
+            .position(|file| file.name == "folder")
+            .unwrap();
+        app.active_panel_mut().selected_index = folder_index;
+
+        app.enter_selected();
+
+        assert_eq!(app.active_panel().path, temp_dir.join("folder"));
+        assert!(cancel_flag.load(Ordering::Relaxed));
+        assert!(!app.has_active_directory_size_calculation());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn directory_size_poll_never_waits_for_a_worker_message() {
+        let temp_dir = create_temp_dir();
+        fs::create_dir(temp_dir.join("folder")).unwrap();
+        let mut panel = PanelState::new(temp_dir.clone());
+        panel
+            .files
+            .iter_mut()
+            .find(|file| file.name == "folder")
+            .unwrap()
+            .directory_size_status = Some(DirectorySizeStatus::Calculating);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        panel.directory_size_scan = Some(DirectorySizeScan {
+            generation: panel.directory_size_generation,
+            base_path: panel.path.clone(),
+            cancel_flag,
+            receiver,
+        });
+
+        // The sender remains connected and deliberately sends nothing. This
+        // call can complete only if the UI side uses a non-blocking receive.
+        panel.poll_directory_size_scan();
+        assert!(panel.directory_size_scan.is_some());
+
+        drop(sender);
+        panel.poll_directory_size_scan();
+        assert!(panel.directory_size_scan.is_none());
+        assert_eq!(
+            panel
+                .files
+                .iter()
+                .find(|file| file.name == "folder")
+                .unwrap()
+                .directory_size_status,
+            Some(DirectorySizeStatus::Failed)
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn stale_directory_size_result_is_discarded_after_path_change() {
+        let temp_dir = create_temp_dir();
+        let other_dir = temp_dir.join("other");
+        fs::create_dir_all(temp_dir.join("folder")).unwrap();
+        fs::create_dir(&other_dir).unwrap();
+        let mut panel = PanelState::new(temp_dir.clone());
+        panel
+            .files
+            .iter_mut()
+            .find(|file| file.name == "folder")
+            .unwrap()
+            .directory_size_status = Some(DirectorySizeStatus::Calculating);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        panel.directory_size_scan = Some(DirectorySizeScan {
+            generation: panel.directory_size_generation,
+            base_path: panel.path.clone(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            receiver,
+        });
+        sender
+            .send(DirectorySizeMessage::Calculated {
+                generation: panel.directory_size_generation,
+                name: "folder".to_string(),
+                result: Ok(999),
+            })
+            .unwrap();
+
+        panel.path = other_dir;
+        panel.poll_directory_size_scan();
+
+        let folder = panel
+            .files
+            .iter()
+            .find(|file| file.name == "folder")
+            .unwrap();
+        assert_eq!(folder.size, 0);
+        assert_eq!(folder.directory_size_status, None);
+        assert!(cancel_flag.load(Ordering::Relaxed));
         cleanup_temp_dir(&temp_dir);
     }
 

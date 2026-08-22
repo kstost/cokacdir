@@ -7,8 +7,8 @@ mod utils;
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -3080,7 +3080,6 @@ fn main() -> io::Result<()> {
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
-            DisableMouseCapture,
             DisableBracketedPaste,
             crossterm::cursor::Show
         );
@@ -3096,7 +3095,6 @@ fn main() -> io::Result<()> {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         crossterm::cursor::MoveTo(0, 0),
         EnterAlternateScreen,
-        EnableMouseCapture,
         EnableBracketedPaste
     )?;
 
@@ -3128,7 +3126,6 @@ fn main() -> io::Result<()> {
             let _ = execute!(
                 terminal.backend_mut(),
                 LeaveAlternateScreen,
-                DisableMouseCapture,
                 DisableBracketedPaste,
                 crossterm::cursor::Show
             );
@@ -3155,7 +3152,6 @@ fn main() -> io::Result<()> {
                     let _ = execute!(
                         terminal.backend_mut(),
                         LeaveAlternateScreen,
-                        DisableMouseCapture,
                         DisableBracketedPaste,
                         crossterm::cursor::Show
                     );
@@ -3231,7 +3227,6 @@ fn main() -> io::Result<()> {
         execute!(
             terminal.backend_mut(),
             LeaveAlternateScreen,
-            DisableMouseCapture,
             DisableBracketedPaste,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0),
@@ -3615,10 +3610,11 @@ fn run_app<B: ratatui::backend::Backend>(
             .map(|p| p.is_active)
             .unwrap_or(false);
         let is_remote_spinner = app.remote_spinner.is_some();
+        let is_directory_size_calculating = app.has_active_directory_size_calculation();
 
         let poll_timeout = if is_progress_active || is_dedup_active {
             Duration::from_millis(16) // ~60fps for smooth real-time updates
-        } else if is_remote_spinner {
+        } else if is_remote_spinner || is_directory_size_calculating {
             Duration::from_millis(100) // Fast polling for spinner animation
         } else if app.current_screen == Screen::AIScreen
             || app.is_ai_mode()
@@ -3681,6 +3677,9 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Poll for remote spinner completion
         app.poll_remote_spinner();
+
+        // Poll for non-blocking directory size calculation results
+        app.poll_directory_size_calculations();
 
         // Check for theme file changes (hot-reload, only in design mode)
         if app.design_mode && app.theme_watch_state.check_for_changes() {
@@ -4183,6 +4182,7 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
             PanelAction::SortByName => app.toggle_sort_by_name(),
             PanelAction::SortByType => app.toggle_sort_by_type(),
             PanelAction::SortBySize => app.toggle_sort_by_size(),
+            PanelAction::CalculateDirectorySizes => app.start_directory_size_calculation(),
             PanelAction::SortByDate => app.toggle_sort_by_date(),
             PanelAction::Help => app.show_help(),
             PanelAction::FileInfo => app.show_file_info(),

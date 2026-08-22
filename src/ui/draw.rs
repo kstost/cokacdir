@@ -328,6 +328,8 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         (PanelAction::Mkdir, "mkdir "),
         (PanelAction::Mkfile, "mkfile "),
         (PanelAction::Delete, "del "),
+        (PanelAction::RemoveDuplicates, "dedup "),
+        (PanelAction::CalculateDirectorySizes, "dirsz "),
         (PanelAction::Rename, "ren "),
         (PanelAction::Tar, "tar "),
         (PanelAction::SetHandler, "hnd "),
@@ -511,4 +513,39 @@ fn draw_viewer_with_ai(frame: &mut Frame, app: &mut App, area: Rect, theme: &The
     // Status bar and Function bar
     draw_status_bar(frame, app, chunks[1], theme);
     draw_function_bar(frame, app, chunks[2], theme);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn function_bar_shows_priority_shortcuts_at_80_columns() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::with_settings(Settings::default());
+        let theme = Theme::default();
+
+        terminal
+            .draw(|frame| {
+                draw_function_bar(frame, &app, Rect::new(0, 23, 80, 1), &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..80)
+            .map(|x| buffer.cell((x, 23)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(
+            row.contains("Shift+X:dedup"),
+            "80-column function bar should expose dedup shortcut, got: {row:?}"
+        );
+        assert!(
+            row.contains("Shift+S:dirsz"),
+            "80-column function bar should expose folder-size shortcut, got: {row:?}"
+        );
+    }
 }

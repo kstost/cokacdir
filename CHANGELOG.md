@@ -1,5 +1,19 @@
 # Changelog — cokacdir
 
+## 0.8.16 — 2026-08-22
+
+- **Folder sizes can now be calculated on demand with `Shift+S` in both local and SFTP panels.** Each visible child folder is scanned recursively on a background worker and updates the size column incrementally with calculating, completed, or failed state, while symlinks are skipped. Refreshing or leaving the current path cancels the scan and stale results are discarded without blocking the UI.
+
+- **Calculated folder sizes remain available when sorting the current panel by size.** Sorting now reorders the loaded snapshot in memory instead of reloading it, and compact size formatting keeps large file and folder values inside narrow columns.
+
+- **Folder-size and duplicate-removal shortcuts are now discoverable in compact layouts.** `Shift+S:dirsz` and `Shift+X:dedup` appear in the function bar and Help quick reference, including at 80-column terminal widths, with full descriptions in the Help screen.
+
+- **The TUI no longer captures mouse input.** Pointer handling remains with the terminal, allowing terminal-native text selection while keyboard navigation and bracketed paste continue unchanged.
+
+- **Release metadata now targets version 0.8.16 with reproducible dependency resolution.** `Cargo.lock` is no longer ignored and the generated lockfile is included for the application package.
+
+---
+
 ## 0.8.12 — 2026-07-20
 
 - **Persistent-memory lookup now begins with a mandatory focused preflight on every enabled run.** The Agent searches the shared `memory_store` before answering or acting even when the request appears self-contained, retries with related terms when initial results are absent or weak, incorporates relevant records when found, and otherwise continues normally without announcing the lookup.

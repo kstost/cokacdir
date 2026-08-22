@@ -317,6 +317,7 @@ pub enum PanelAction {
     SortByName,
     SortByType,
     SortBySize,
+    CalculateDirectorySizes,
     SortByDate,
     Help,
     FileInfo,
@@ -494,6 +495,10 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
     m.insert(
         PanelAction::SortBySize,
         vec!["//Sort by size".into(), "s".into()],
+    );
+    m.insert(
+        PanelAction::CalculateDirectorySizes,
+        vec!["//Calculate folder sizes".into(), "shift+s".into()],
     );
     m.insert(
         PanelAction::SortByDate,
@@ -2095,6 +2100,25 @@ mod tests {
         assert_eq!(
             kb.panel_action(KeyCode::Char('V'), KeyModifiers::SHIFT),
             Some(PanelAction::Paste)
+        );
+    }
+
+    #[test]
+    fn test_shift_s_calculates_folders_while_plain_s_sorts() {
+        let config = KeybindingsConfig::default();
+        let kb = Keybindings::from_config(&config);
+
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('s'), KeyModifiers::NONE),
+            Some(PanelAction::SortBySize)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('s'), KeyModifiers::SHIFT),
+            Some(PanelAction::CalculateDirectorySizes)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('S'), KeyModifiers::SHIFT),
+            Some(PanelAction::CalculateDirectorySizes)
         );
     }
 

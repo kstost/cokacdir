@@ -240,6 +240,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(section("Sorting"));
     lines.push(pk(PanelAction::SortByName, "Sort by name"));
     lines.push(pk(PanelAction::SortBySize, "Sort by size"));
+    lines.push(pk(
+        PanelAction::CalculateDirectorySizes,
+        "Calculate folder sizes",
+    ));
     lines.push(pk(PanelAction::SortByDate, "Sort by date"));
     lines.push(pk(PanelAction::SortByType, "Sort by type (extension)"));
     lines.push(Line::from(vec![
@@ -260,6 +264,7 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(pk(PanelAction::Tar, "Create tar archive"));
     lines.push(pk(PanelAction::SetHandler, "Set/Edit file handler"));
     lines.push(pk(PanelAction::Delete, "Delete file(s)"));
+    lines.push(pk(PanelAction::RemoveDuplicates, "Remove duplicate files"));
     lines.push(pk(PanelAction::EncryptAll, "Encrypt all files (AES-256)"));
     lines.push(pk(PanelAction::DecryptAll, "Decrypt .cokacenc files"));
     lines.push(pk(PanelAction::Search, "Find/search files"));
@@ -529,6 +534,8 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
             (PanelAction::Mkdir, "mkdir "),
             (PanelAction::Mkfile, "mkfile "),
             (PanelAction::Delete, "del "),
+            (PanelAction::RemoveDuplicates, "dedup "),
+            (PanelAction::CalculateDirectorySizes, "dirsz "),
             (PanelAction::Rename, "ren "),
             (PanelAction::Tar, "tar "),
             (PanelAction::Search, "find "),
@@ -620,4 +627,38 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     )));
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keybindings::KeybindingsConfig;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn help_exposes_priority_shortcuts_in_details_and_quick_reference() {
+        let theme = Theme::default();
+        let keybindings = Keybindings::from_config(&KeybindingsConfig::default());
+        let lines = build_help_content(&theme, &keybindings);
+        let rendered_lines: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(rendered_lines
+            .iter()
+            .any(|line| { line.contains("Shift+X") && line.contains("Remove duplicate files") }));
+        assert!(rendered_lines
+            .iter()
+            .any(|line| line.contains("Shift+X:dedup")));
+        assert!(rendered_lines
+            .iter()
+            .any(|line| { line.contains("Shift+S") && line.contains("Calculate folder sizes") }));
+        assert!(rendered_lines
+            .iter()
+            .any(|line| line.contains("Shift+S:dirsz")));
+    }
 }
