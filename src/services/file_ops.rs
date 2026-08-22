@@ -4716,10 +4716,39 @@ fn copy_open_symlink_to_new(
     }
 }
 
-/// Calculate total size of files to be copied/moved
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpecialFileHandling {
+    Reject,
+    Skip,
+}
+
+/// Calculate total size of files to be copied/moved.
+///
+/// Copy and move preparation must reject sockets, pipes, and device nodes
+/// because those operations cannot reproduce them as regular files.
 pub fn calculate_total_size(
     files: &[PathBuf],
     cancel_flag: &Arc<AtomicBool>,
+) -> io::Result<(u64, usize)> {
+    calculate_total_size_with_special_file_handling(files, cancel_flag, SpecialFileHandling::Reject)
+}
+
+/// Calculate a logical content size for display in the file panel.
+///
+/// Symlinks and special filesystem nodes contribute zero bytes. Unlike copy
+/// preparation, a socket or FIFO inside an otherwise readable directory must
+/// not make the entire folder-size result fail.
+pub fn calculate_total_size_for_display(
+    files: &[PathBuf],
+    cancel_flag: &Arc<AtomicBool>,
+) -> io::Result<(u64, usize)> {
+    calculate_total_size_with_special_file_handling(files, cancel_flag, SpecialFileHandling::Skip)
+}
+
+fn calculate_total_size_with_special_file_handling(
+    files: &[PathBuf],
+    cancel_flag: &Arc<AtomicBool>,
+    special_file_handling: SpecialFileHandling,
 ) -> io::Result<(u64, usize)> {
     let mut total_size: u64 = 0;
     let mut total_files: usize = 0;
@@ -4733,11 +4762,17 @@ pub fn calculate_total_size(
         if metadata.is_symlink() {
             total_files += 1;
         } else if metadata.is_dir() {
-            let (dir_size, dir_files) = calculate_dir_size(path, cancel_flag)?;
+            let (dir_size, dir_files) = calculate_dir_size_with_special_file_handling(
+                path,
+                cancel_flag,
+                special_file_handling,
+            )?;
             total_size += dir_size;
             total_files += dir_files;
         } else if metadata.is_file() {
             total_size += metadata.len();
+            total_files += 1;
+        } else if special_file_handling == SpecialFileHandling::Skip {
             total_files += 1;
         } else {
             return Err(io::Error::new(
@@ -4752,15 +4787,24 @@ pub fn calculate_total_size(
 
 /// Calculate total size and file count of a directory
 fn calculate_dir_size(path: &Path, cancel_flag: &Arc<AtomicBool>) -> io::Result<(u64, usize)> {
+    calculate_dir_size_with_special_file_handling(path, cancel_flag, SpecialFileHandling::Reject)
+}
+
+fn calculate_dir_size_with_special_file_handling(
+    path: &Path,
+    cancel_flag: &Arc<AtomicBool>,
+    special_file_handling: SpecialFileHandling,
+) -> io::Result<(u64, usize)> {
     let (source_guard, access, _) = open_directory_for_read(path)?;
     drop(source_guard);
-    calculate_open_dir_size(path, &access, cancel_flag)
+    calculate_open_dir_size(path, &access, cancel_flag, special_file_handling)
 }
 
 fn calculate_open_dir_size(
     public_path: &Path,
     access: &DirectoryAccess,
     cancel_flag: &Arc<AtomicBool>,
+    special_file_handling: SpecialFileHandling,
 ) -> io::Result<(u64, usize)> {
     let mut total_size = 0u64;
     let mut total_files = 0usize;
@@ -4788,6 +4832,8 @@ fn calculate_open_dir_size(
         } else if metadata.is_file() {
             total_size += metadata.len();
             total_files += 1;
+        } else if special_file_handling == SpecialFileHandling::Skip {
+            total_files += 1;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4809,8 +4855,12 @@ fn calculate_open_dir_size(
             )));
         }
         drop(child_guard);
-        let (sub_size, sub_files) =
-            calculate_open_dir_size(&entry_path, &child_access, cancel_flag)?;
+        let (sub_size, sub_files) = calculate_open_dir_size(
+            &entry_path,
+            &child_access,
+            cancel_flag,
+            special_file_handling,
+        )?;
         total_size += sub_size;
         total_files += sub_files;
     }

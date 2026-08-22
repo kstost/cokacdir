@@ -1,6 +1,6 @@
 # Changelog — cokacdir
 
-## 0.8.16 — 2026-08-22
+## 0.8.17 — 2026-08-22
 
 - **Folder sizes can now be calculated on demand with `Shift+S` in both local and SFTP panels.** Each visible child folder is scanned recursively on a background worker and updates the size column incrementally with calculating, completed, or failed state, while symlinks are skipped. Refreshing or leaving the current path cancels the scan and stale results are discarded without blocking the UI.
 
@@ -10,7 +10,7 @@
 
 - **The TUI no longer captures mouse input.** Pointer handling remains with the terminal, allowing terminal-native text selection while keyboard navigation and bracketed paste continue unchanged.
 
-- **Release metadata now targets version 0.8.16 with reproducible dependency resolution.** `Cargo.lock` is no longer ignored and the generated lockfile is included for the application package.
+- **Release metadata now targets version 0.8.17 with reproducible dependency and compiler resolution.** `Cargo.lock` is no longer ignored and the generated lockfile is included for the application package. `rust-toolchain.toml` pins Rust 1.96.1 while the manifest declares Rust 1.96 as the minimum supported version, so an older locally installed default toolchain cannot silently drive release builds.
 
 ---
 

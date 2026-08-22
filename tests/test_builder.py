@@ -301,6 +301,23 @@ class BuildExecutorTests(unittest.TestCase):
             (project_root / license_path).read_text(encoding="utf-8"),
         )
 
+    def test_pinned_toolchain_satisfies_manifest_minimum_rust(self):
+        project_root = Path(__file__).resolve().parents[1]
+        manifest = (project_root / "Cargo.toml").read_text(encoding="utf-8")
+        toolchain = (project_root / "rust-toolchain.toml").read_text(encoding="utf-8")
+        minimum_match = re.search(
+            r'^rust-version = "([0-9.]+)"$', manifest, re.MULTILINE
+        )
+        channel_match = re.search(
+            r'^channel = "([0-9.]+)"$', toolchain, re.MULTILINE
+        )
+
+        self.assertIsNotNone(minimum_match)
+        self.assertIsNotNone(channel_match)
+        minimum = tuple(int(part) for part in minimum_match.group(1).split("."))
+        pinned = tuple(int(part) for part in channel_match.group(1).split("."))
+        self.assertGreaterEqual(pinned, minimum)
+
 
 class BuildArgumentTests(unittest.TestCase):
     def test_all_and_windows_flags_are_combined(self):

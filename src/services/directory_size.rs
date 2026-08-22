@@ -46,14 +46,15 @@ pub fn spawn_local(
                 break;
             }
 
-            let result = match file_ops::calculate_total_size(&[request.path], &cancel_flag) {
-                Ok((bytes, _)) => Ok(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    cancelled = true;
-                    break;
-                }
-                Err(error) => Err(error.to_string()),
-            };
+            let result =
+                match file_ops::calculate_total_size_for_display(&[request.path], &cancel_flag) {
+                    Ok((bytes, _)) => Ok(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        cancelled = true;
+                        break;
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
             if is_cancelled(&cancel_flag) {
                 cancelled = true;
                 break;
@@ -299,6 +300,40 @@ mod tests {
         assert!(matches!(
             &messages[0],
             DirectorySizeMessage::Calculated { result: Ok(3), .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_worker_skips_special_files_without_losing_regular_file_sizes() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("regular.bin"), vec![0u8; 7]).unwrap();
+        let _listener = UnixListener::bind(root.join("runtime.sock")).unwrap();
+
+        let receiver = spawn_local(
+            13,
+            vec![LocalDirectorySizeRequest {
+                name: "folder".to_string(),
+                path: root,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        );
+        let messages = receive_until_finished(receiver);
+
+        assert!(matches!(
+            &messages[0],
+            DirectorySizeMessage::Calculated { result: Ok(7), .. }
+        ));
+        assert!(matches!(
+            &messages[1],
+            DirectorySizeMessage::Finished {
+                generation: 13,
+                cancelled: false,
+            }
         ));
     }
 
