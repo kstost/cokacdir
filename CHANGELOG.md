@@ -1,5 +1,11 @@
 # Changelog — cokacdir
 
+## 0.8.19 — 2026-08-30
+
+- **Directory encryption and decryption are now available without opening the TUI.** `cokacdir --encrypt <DIR>` and `cokacdir --decrypt <DIR>` reuse the existing `.cokacenc` implementation, stream per-file results, remove successfully processed source files, and return a failing exit status when any item fails.
+
+---
+
 ## 0.8.17 — 2026-08-22
 
 - **Folder sizes can now be calculated on demand with `Shift+S` in both local and SFTP panels.** Each visible child folder is scanned recursively on a background worker and updates the size column incrementally with calculating, completed, or failed state, while symlinks are skipped. Refreshing or leaving the current path cancels the scan and stale results are discarded without blocking the UI.

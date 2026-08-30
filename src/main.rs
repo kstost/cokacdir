@@ -324,6 +324,155 @@ fn write_new_private_file(path: &std::path::Path, contents: &[u8]) -> io::Result
     create_new_private_file_with(path, |file| file.write_all(contents))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CryptoCliMode {
+    Encrypt,
+    Decrypt,
+}
+
+impl CryptoCliMode {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Encrypt => "--encrypt",
+            Self::Decrypt => "--decrypt",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Encrypt => "cokacdir --encrypt <DIR>",
+            Self::Decrypt => "cokacdir --decrypt <DIR>",
+        }
+    }
+
+    fn completed_verb(self) -> &'static str {
+        match self {
+            Self::Encrypt => "Encrypted",
+            Self::Decrypt => "Decrypted",
+        }
+    }
+
+    fn operation_name(self) -> &'static str {
+        match self {
+            Self::Encrypt => "Encryption",
+            Self::Decrypt => "Decryption",
+        }
+    }
+}
+
+/// Parse an exclusive crypto command from the complete argument list after argv[0].
+fn parse_crypto_cli_directory(
+    mode: CryptoCliMode,
+    args: &[String],
+) -> Result<std::path::PathBuf, String> {
+    let Some((flag, operands)) = args.split_first() else {
+        return Err(format!("{} requires <DIR>", mode.flag()));
+    };
+    if flag != mode.flag() {
+        return Err(format!("{} must be the first argument", mode.flag()));
+    }
+
+    let mut directory = None;
+
+    for arg in operands {
+        match arg.as_str() {
+            option if option.starts_with('-') => {
+                return Err(format!("unknown {} option: {option}", mode.flag()));
+            }
+            path => {
+                if directory.is_some() {
+                    return Err(format!("{} accepts exactly one directory", mode.flag()));
+                }
+                directory = Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+
+    directory.ok_or_else(|| format!("{} requires <DIR>", mode.flag()))
+}
+
+fn run_crypto_cli(mode: CryptoCliMode, directory: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(directory)
+        .map_err(|error| format!("cannot access directory '{}': {error}", directory.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("'{}' is not a directory", directory.display()));
+    }
+
+    let key = crate::enc::ensure_key().map_err(|error| format!("key error: {error}"))?;
+    let split_size_mb = match mode {
+        CryptoCliMode::Encrypt => {
+            crate::config::Settings::load_with_error()
+                .map_err(|error| format!("settings error: {error}"))?
+                .encrypt_split_size
+        }
+        CryptoCliMode::Decrypt => 0,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let directory = directory.to_path_buf();
+
+    let worker = std::thread::spawn(move || match mode {
+        CryptoCliMode::Encrypt => crate::enc::pack_directory_with_progress(
+            &directory,
+            &key,
+            tx,
+            cancel_flag,
+            split_size_mb,
+            true,
+        ),
+        CryptoCliMode::Decrypt => {
+            crate::enc::unpack_directory_with_progress(&directory, &key, tx, cancel_flag)
+        }
+    });
+
+    let mut completed = None;
+    for message in rx {
+        use crate::services::file_ops::ProgressMessage;
+        match message {
+            ProgressMessage::FileCompleted(filename) => {
+                println!("{} {:?}", mode.completed_verb(), filename);
+            }
+            ProgressMessage::Error(filename, error)
+            | ProgressMessage::TerminalError(filename, error) => {
+                if filename.is_empty() {
+                    eprintln!("Error: {error}");
+                } else {
+                    eprintln!("Error {:?}: {error}", filename);
+                }
+            }
+            ProgressMessage::Warning(filename, warning) => {
+                if filename.is_empty() {
+                    eprintln!("Warning: {warning}");
+                } else {
+                    eprintln!("Warning {:?}: {warning}", filename);
+                }
+            }
+            ProgressMessage::Completed(success, failure) => {
+                completed = Some((success, failure));
+            }
+            _ => {}
+        }
+    }
+    worker
+        .join()
+        .map_err(|_| format!("{} worker panicked", mode.operation_name()))?;
+
+    let (success, failure) =
+        completed.ok_or_else(|| format!("{} ended without a result", mode.operation_name()))?;
+    if failure > 0 {
+        return Err(format!(
+            "{} failed: {success} succeeded, {failure} failed",
+            mode.operation_name()
+        ));
+    }
+
+    println!(
+        "{} complete: {success} succeeded, {failure} failed",
+        mode.operation_name()
+    );
+    Ok(())
+}
+
 fn print_help() {
     println!("cokacdir {} - Multi-panel terminal file manager", VERSION);
     println!();
@@ -340,6 +489,8 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
+    println!("    --encrypt <DIR>         Encrypt files; successful originals are removed");
+    println!("    --decrypt <DIR>         Decrypt files; successful .cokacenc inputs are removed");
     println!("    --ccserver-token-file <PATH>");
     println!(
         "                            Start bot server(s), reading one token per line (recommended)"
@@ -2480,6 +2631,26 @@ fn main() -> io::Result<()> {
                 handle_base64(&args[i + 1]);
                 return Ok(());
             }
+            "--encrypt" | "--decrypt" => {
+                let mode = if args[i] == "--encrypt" {
+                    CryptoCliMode::Encrypt
+                } else {
+                    CryptoCliMode::Decrypt
+                };
+                let directory = match parse_crypto_cli_directory(mode, &args[1..]) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        eprintln!("Usage: {}", mode.usage());
+                        std::process::exit(2);
+                    }
+                };
+                if let Err(error) = run_crypto_cli(mode, &directory) {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             "--ccserver-token-file" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --ccserver-token-file requires a path");
@@ -4220,6 +4391,69 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod crypto_cli_tests {
+    use super::{parse_crypto_cli_directory, CryptoCliMode};
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_encrypt_directory() {
+        assert_eq!(
+            parse_crypto_cli_directory(CryptoCliMode::Encrypt, &args(&["--encrypt", "data"])),
+            Ok(PathBuf::from("data"))
+        );
+    }
+
+    #[test]
+    fn parses_decrypt_directory() {
+        assert_eq!(
+            parse_crypto_cli_directory(CryptoCliMode::Decrypt, &args(&["--decrypt", "archives"])),
+            Ok(PathBuf::from("archives"))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_crypto_options() {
+        let error = parse_crypto_cli_directory(
+            CryptoCliMode::Decrypt,
+            &args(&["--decrypt", "archives", "--unknown"]),
+        )
+        .unwrap_err();
+        assert_eq!(error, "unknown --decrypt option: --unknown");
+    }
+
+    #[test]
+    fn rejects_arguments_before_crypto_mode() {
+        let error = parse_crypto_cli_directory(
+            CryptoCliMode::Encrypt,
+            &args(&["ignored", "--encrypt", "target"]),
+        )
+        .unwrap_err();
+        assert_eq!(error, "--encrypt must be the first argument");
+    }
+
+    #[test]
+    fn rejects_missing_crypto_directory() {
+        let error =
+            parse_crypto_cli_directory(CryptoCliMode::Encrypt, &args(&["--encrypt"])).unwrap_err();
+        assert_eq!(error, "--encrypt requires <DIR>");
+    }
+
+    #[test]
+    fn rejects_multiple_crypto_directories() {
+        let error = parse_crypto_cli_directory(
+            CryptoCliMode::Decrypt,
+            &args(&["--decrypt", "first", "second"]),
+        )
+        .unwrap_err();
+        assert_eq!(error, "--decrypt accepts exactly one directory");
+    }
 }
 
 #[cfg(test)]
