@@ -58,11 +58,14 @@ For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 
 For the measured Antigravity CLI integration contract, see [How cokacdir Uses Antigravity CLI (`agy`)](docs/how-to-use-agy-antigravity.md).
 
+To route bot requests to an already-running named Herdr agent, see
+[How to Use Herdr Agents](docs/how-to-use-herdr.md).
+
 ## Chat Bots
 
 **Features:**
 
-* Multi-provider support (Claude, Codex, Agy, OpenCode) with real-time streaming
+* Multi-provider support (Claude, Codex, Agy, OpenCode, Herdr) with native streaming where supported
 * Session persistence and cross-provider session interpretation
 * Scheduled tasks using cron expressions or absolute time
 * Request queue and cancellation controls (`/queue`, `/stop`, `/stopall`, `/stop_<id>`)
@@ -78,7 +81,7 @@ For the measured Antigravity CLI integration contract, see [How cokacdir Uses An
 
 ## Configuration
 
-cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), switch schedules into inline chat-session mode (`COKAC_SCHEDULE_INLINE=1`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
+cokacdir reads environment variables at startup to override binary paths (`COKAC_CLAUDE_PATH`, `COKAC_CODEX_PATH`, `COKAC_AGY_PATH`, `COKAC_OPENCODE_PATH`, `COKAC_HERDR_PATH`), tune the file-attachment threshold (`COKAC_FILE_ATTACH_THRESHOLD`), switch schedules into inline chat-session mode (`COKAC_SCHEDULE_INLINE=1`), and enable debug logging (`COKACDIR_DEBUG=1`). Variables can be set either in your shell environment or in a JSON file at `~/.cokacdir/.env.json` (values in that file take priority). Use the `/envvars` chat command (bot-owner only, 1:1 chat only) to inspect which values are active in the running process. See the [Environment Variables guide](https://cokacdir.cokac.com/#/docs/env-vars) for the full reference.
 
 The file-manager Settings dialog includes **Cross-volume move** verification.
 The default `Standard` mode keeps private staging, source identity checks,

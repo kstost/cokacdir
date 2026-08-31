@@ -79,6 +79,43 @@ Override the path to the Opencode CLI binary. Same semantics as above but for Op
 - **Default:** not set (automatic resolution)
 - **Example:** `COKAC_OPENCODE_PATH=/usr/local/bin/opencode`
 
+### `COKAC_HERDR_PATH`
+
+Override the path to the [Herdr](https://github.com/ogulcancelik/herdr) CLI
+binary. Cokacdir uses Herdr to submit prompts to an already-running named agent,
+wait for it to settle, and read its terminal response.
+
+- **Type:** absolute path to an existing executable
+- **Default:** not set (`herdr` is resolved from `PATH`)
+- **Example:** `COKAC_HERDR_PATH=/usr/local/bin/herdr`
+
+### `COKAC_HERDR_AGENT`
+
+Set the default Herdr agent name used by `/model herdr`. You can select another
+running agent explicitly with `/model herdr:<agent-name>`.
+
+- **Type:** 1-32 lowercase letters, digits, `-`, or `_`; the first character must be a letter
+- **Default:** not set
+- **Example:** `COKAC_HERDR_AGENT=worker`
+
+### `COKAC_HERDR_TIMEOUT_MS`
+
+Set how long Cokacdir waits for a prompted Herdr agent to reach `idle`, `done`,
+or `blocked`.
+
+- **Type:** integer milliseconds, minimum `1000`
+- **Default:** `1800000` (30 minutes)
+- **Example:** `COKAC_HERDR_TIMEOUT_MS=600000`
+
+### `COKAC_HERDR_READ_LINES`
+
+Set the maximum number of recent unwrapped terminal lines Cokacdir reads before
+and after a Herdr turn to extract the response.
+
+- **Type:** positive integer
+- **Default:** `1000`
+- **Example:** `COKAC_HERDR_READ_LINES=500`
+
 ### `COKAC_FILE_ATTACH_THRESHOLD`
 
 Controls the size threshold (in bytes) at which the bot switches from sending a response as multiple Telegram messages to sending it as a single `.txt` file attachment.

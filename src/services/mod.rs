@@ -5,6 +5,7 @@ pub mod codex;
 pub mod dedup;
 pub mod directory_size;
 pub mod file_ops;
+pub mod herdr;
 pub mod memory;
 pub mod messenger_bridge;
 pub mod opencode;
