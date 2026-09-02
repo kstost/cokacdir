@@ -2,6 +2,7 @@ pub mod agy;
 pub mod cgroup;
 pub mod claude;
 pub mod codex;
+pub mod content_md5;
 pub mod dedup;
 pub mod directory_size;
 pub mod file_ops;

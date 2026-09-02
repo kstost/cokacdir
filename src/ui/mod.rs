@@ -12,6 +12,7 @@ pub mod file_viewer;
 pub mod git_screen;
 pub mod help;
 pub mod image_viewer;
+pub mod md5_verification;
 pub mod panel;
 pub mod process_manager;
 pub mod search_result;

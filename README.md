@@ -58,6 +58,8 @@ For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 
 For the measured Antigravity CLI integration contract, see [How cokacdir Uses Antigravity CLI (`agy`)](docs/how-to-use-agy-antigravity.md).
 
+For the `Shift+H`/`Shift+J` TUI actions and the `--md5`/`--md5check` CLI contract, see [File Content MD5 Filename Actions](devdoc/md5-filename-actions.md).
+
 ## Chat Bots
 
 **Features:**

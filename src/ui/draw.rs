@@ -11,7 +11,8 @@ use super::{
     advanced_search, ai_screen,
     app::{App, Screen},
     dedup_screen, dialogs, diff_file_view, diff_screen, file_editor, file_info, file_viewer,
-    git_screen, help, image_viewer, panel, process_manager, search_result, system_info,
+    git_screen, help, image_viewer, md5_verification, panel, process_manager, search_result,
+    system_info,
     theme::Theme,
 };
 use crate::keybindings::PanelAction;
@@ -98,6 +99,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 &theme,
                 &app.keybindings,
             );
+        }
+        Screen::Md5Verification => {
+            if let Some(ref mut state) = app.md5_verification_state {
+                md5_verification::draw(frame, state, area, &theme, &app.keybindings);
+            }
         }
         Screen::DiffScreen => {
             if let Some(ref mut state) = app.diff_state {

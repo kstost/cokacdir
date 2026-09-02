@@ -261,6 +261,14 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(pk(PanelAction::Mkdir, "Create new directory"));
     lines.push(pk(PanelAction::Mkfile, "Create new file"));
     lines.push(pk(PanelAction::Rename, "Rename file/directory"));
+    lines.push(pk(
+        PanelAction::AddContentMd5,
+        "Add content MD5 to filename(s)",
+    ));
+    lines.push(pk(
+        PanelAction::VerifyContentMd5,
+        "Verify selected filename MD5 values against content",
+    ));
     lines.push(pk(PanelAction::Tar, "Create tar archive"));
     lines.push(pk(PanelAction::SetHandler, "Set/Edit file handler"));
     lines.push(pk(PanelAction::Delete, "Delete file(s)"));

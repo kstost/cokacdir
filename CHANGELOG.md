@@ -1,5 +1,15 @@
 # Changelog — cokacdir
 
+## 0.8.20 — 2026-09-02
+
+- **Local files can now be renamed with their content MD5 using `Shift+H`.** The action processes the current selection, or the focused file when nothing is selected, and inserts a lowercase 32-character MD5 immediately before the final filename dot (`archive.tar.gz` becomes `archive.tar.<md5>.gz`). Extensionless and dotfile names are also supported, while filenames that already contain a maximal 32-character hexadecimal run are skipped.
+
+- **`Shift+J` verifies selected files against MD5 values embedded in their filenames, or the focused file when nothing is selected.** Background progress shows the completed count, then a persistent scrollable result screen keeps each file on one compact row with explicit `MATCH`, `MISMATCH`, `NO HASH`, `AMBIGUOUS`, or `ERROR` status and a summary by outcome. Directories, symlinks, remote files, and files that change during hashing are rejected, and MD5 renames never overwrite an existing destination.
+
+- **The same content-MD5 operations are available without opening the TUI.** `cokacdir --md5 <FILE>...` renames multiple local files, while `cokacdir --md5check <FILE>...` prints one stable status row per input and returns a failing exit status unless every verification matches. Both commands continue after per-file failures and share the TUI's filename parsing and file-safety checks.
+
+---
+
 ## 0.8.19 — 2026-08-30
 
 - **Directory encryption and decryption are now available without opening the TUI.** `cokacdir --encrypt <DIR>` and `cokacdir --decrypt <DIR>` reuse the existing `.cokacenc` implementation, stream per-file results, remove successfully processed source files, and return a failing exit status when any item fails.

@@ -330,6 +330,28 @@ enum CryptoCliMode {
     Decrypt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentMd5CliMode {
+    Add,
+    Verify,
+}
+
+impl ContentMd5CliMode {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Add => "--md5",
+            Self::Verify => "--md5check",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Add => "cokacdir --md5 <FILE>...",
+            Self::Verify => "cokacdir --md5check <FILE>...",
+        }
+    }
+}
+
 impl CryptoCliMode {
     fn flag(self) -> &'static str {
         match self {
@@ -389,6 +411,107 @@ fn parse_crypto_cli_directory(
     }
 
     directory.ok_or_else(|| format!("{} requires <DIR>", mode.flag()))
+}
+
+/// Parse an exclusive content-MD5 command from the complete argument list after argv[0].
+fn parse_content_md5_cli_paths(
+    mode: ContentMd5CliMode,
+    args: &[String],
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let Some((flag, operands)) = args.split_first() else {
+        return Err(format!("{} requires at least one <FILE>", mode.flag()));
+    };
+    if flag != mode.flag() {
+        return Err(format!("{} must be the first argument", mode.flag()));
+    }
+
+    let mut paths = Vec::new();
+    let mut options_ended = false;
+    for operand in operands {
+        if !options_ended && operand == "--" {
+            options_ended = true;
+        } else if !options_ended && operand.starts_with('-') {
+            return Err(format!("unknown {} option: {operand}", mode.flag()));
+        } else {
+            paths.push(std::path::PathBuf::from(operand));
+        }
+    }
+
+    if paths.is_empty() {
+        Err(format!("{} requires at least one <FILE>", mode.flag()))
+    } else {
+        Ok(paths)
+    }
+}
+
+fn cli_single_line(text: &str) -> String {
+    text.escape_debug().to_string()
+}
+
+/// Run every requested path even when an earlier path fails.
+/// Returns true only when the aggregate result should use exit status 0.
+fn run_content_md5_cli(mode: ContentMd5CliMode, paths: &[std::path::PathBuf]) -> bool {
+    use crate::services::content_md5::{AddContentMd5Outcome, VerifyContentMd5Outcome};
+
+    let mut successful = true;
+    for path in paths {
+        match mode {
+            ContentMd5CliMode::Add => {
+                match crate::services::content_md5::add_content_md5_to_path(path) {
+                    Ok(AddContentMd5Outcome::Renamed {
+                        new_path,
+                        hash,
+                        warnings,
+                    }) => {
+                        if warnings.is_empty() {
+                            println!("RENAMED {:?} -> {:?} md5={hash}", path, new_path);
+                        } else {
+                            println!(
+                                "RENAMED {:?} -> {:?} md5={hash} warning={}",
+                                path,
+                                new_path,
+                                cli_single_line(&warnings.join("; "))
+                            );
+                        }
+                    }
+                    Ok(AddContentMd5Outcome::SkippedExistingHash { candidate_count }) => {
+                        println!(
+                            "SKIPPED {:?} filename_md5_candidates={candidate_count}",
+                            path
+                        );
+                    }
+                    Err(error) => {
+                        successful = false;
+                        eprintln!("ERROR {:?} {}", path, cli_single_line(&error.to_string()));
+                    }
+                }
+            }
+            ContentMd5CliMode::Verify => {
+                match crate::services::content_md5::verify_content_md5_path(path) {
+                    Ok(VerifyContentMd5Outcome::Match { hash }) => {
+                        println!("MATCH {:?} md5={hash}", path);
+                    }
+                    Ok(VerifyContentMd5Outcome::Mismatch { expected, actual }) => {
+                        successful = false;
+                        println!("MISMATCH {:?} expected={expected} actual={actual}", path);
+                    }
+                    Ok(VerifyContentMd5Outcome::NoHash) => {
+                        successful = false;
+                        println!("NO_HASH {:?}", path);
+                    }
+                    Ok(VerifyContentMd5Outcome::Ambiguous { count }) => {
+                        successful = false;
+                        println!("AMBIGUOUS {:?} filename_md5_candidates={count}", path);
+                    }
+                    Err(error) => {
+                        successful = false;
+                        eprintln!("ERROR {:?} {}", path, cli_single_line(&error.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    successful
 }
 
 fn run_crypto_cli(mode: CryptoCliMode, directory: &std::path::Path) -> Result<(), String> {
@@ -491,6 +614,8 @@ fn print_help() {
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
     println!("    --encrypt <DIR>         Encrypt files; successful originals are removed");
     println!("    --decrypt <DIR>         Decrypt files; successful .cokacenc inputs are removed");
+    println!("    --md5 <FILE>...         Add content MD5 before each filename's final dot");
+    println!("    --md5check <FILE>...    Verify filename MD5 values against file content");
     println!("    --ccserver-token-file <PATH>");
     println!(
         "                            Start bot server(s), reading one token per line (recommended)"
@@ -2651,6 +2776,25 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
+            "--md5" | "--md5check" => {
+                let mode = if args[i] == "--md5" {
+                    ContentMd5CliMode::Add
+                } else {
+                    ContentMd5CliMode::Verify
+                };
+                let paths = match parse_content_md5_cli_paths(mode, &args[1..]) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        eprintln!("Usage: {}", mode.usage());
+                        std::process::exit(2);
+                    }
+                };
+                if !run_content_md5_cli(mode, &paths) {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             "--ccserver-token-file" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --ccserver-token-file requires a path");
@@ -4166,6 +4310,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
+                        Screen::Md5Verification => {
+                            if let Some(ref mut state) = app.md5_verification_state {
+                                if ui::md5_verification::handle_input(
+                                    state,
+                                    key.code,
+                                    key.modifiers,
+                                    &app.keybindings,
+                                ) {
+                                    app.md5_verification_state = None;
+                                    app.current_screen = Screen::FilePanel;
+                                }
+                            } else {
+                                app.current_screen = Screen::FilePanel;
+                            }
+                        }
                         Screen::DiffScreen => {
                             ui::diff_screen::handle_input(app, key.code, key.modifiers);
                         }
@@ -4363,6 +4522,8 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
             PanelAction::Delete => app.show_delete_dialog(),
             PanelAction::ProcessManager => app.show_process_manager(),
             PanelAction::Rename => app.show_rename_dialog(),
+            PanelAction::AddContentMd5 => app.add_content_md5_to_filenames(),
+            PanelAction::VerifyContentMd5 => app.verify_content_md5(),
             PanelAction::Tar => app.show_tar_dialog(),
             PanelAction::Search => app.show_search_dialog(),
             PanelAction::GoToPath => app.show_goto_dialog(),
@@ -4391,6 +4552,75 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod content_md5_cli_tests {
+    use super::{cli_single_line, parse_content_md5_cli_paths, ContentMd5CliMode};
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_multiple_add_and_verify_paths() {
+        assert_eq!(
+            parse_content_md5_cli_paths(
+                ContentMd5CliMode::Add,
+                &args(&["--md5", "hello.tar", "apple.tar"]),
+            ),
+            Ok(vec![PathBuf::from("hello.tar"), PathBuf::from("apple.tar")])
+        );
+        assert_eq!(
+            parse_content_md5_cli_paths(
+                ContentMd5CliMode::Verify,
+                &args(&["--md5check", "named.bin"]),
+            ),
+            Ok(vec![PathBuf::from("named.bin")])
+        );
+    }
+
+    #[test]
+    fn accepts_dash_prefixed_paths_after_option_terminator() {
+        assert_eq!(
+            parse_content_md5_cli_paths(
+                ContentMd5CliMode::Add,
+                &args(&["--md5", "--", "-archive.tar"]),
+            ),
+            Ok(vec![PathBuf::from("-archive.tar")])
+        );
+    }
+
+    #[test]
+    fn rejects_missing_paths_unknown_options_and_nonexclusive_use() {
+        assert_eq!(
+            parse_content_md5_cli_paths(ContentMd5CliMode::Verify, &args(&["--md5check"]),)
+                .unwrap_err(),
+            "--md5check requires at least one <FILE>"
+        );
+        assert_eq!(
+            parse_content_md5_cli_paths(ContentMd5CliMode::Add, &args(&["--md5", "--unknown"]),)
+                .unwrap_err(),
+            "unknown --md5 option: --unknown"
+        );
+        assert_eq!(
+            parse_content_md5_cli_paths(
+                ContentMd5CliMode::Verify,
+                &args(&["before", "--md5check", "file"]),
+            )
+            .unwrap_err(),
+            "--md5check must be the first argument"
+        );
+    }
+
+    #[test]
+    fn cli_error_text_is_kept_on_one_line() {
+        assert_eq!(
+            cli_single_line("first\nsecond\tpart"),
+            "first\\nsecond\\tpart"
+        );
+    }
 }
 
 #[cfg(test)]

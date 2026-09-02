@@ -327,6 +327,8 @@ pub enum PanelAction {
     Delete,
     ProcessManager,
     Rename,
+    AddContentMd5,
+    VerifyContentMd5,
     Tar,
     Search,
     GoToPath,
@@ -531,6 +533,17 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
     m.insert(
         PanelAction::Rename,
         vec!["//Rename file".into(), "r".into()],
+    );
+    m.insert(
+        PanelAction::AddContentMd5,
+        vec!["//Add content MD5 to filenames".into(), "shift+h".into()],
+    );
+    m.insert(
+        PanelAction::VerifyContentMd5,
+        vec![
+            "//Verify selected filename MD5 values against content".into(),
+            "shift+j".into(),
+        ],
     );
     m.insert(PanelAction::Tar, vec!["//Archive (tar)".into(), "t".into()]);
     m.insert(
@@ -2119,6 +2132,44 @@ mod tests {
         assert_eq!(
             kb.panel_action(KeyCode::Char('S'), KeyModifiers::SHIFT),
             Some(PanelAction::CalculateDirectorySizes)
+        );
+    }
+
+    #[test]
+    fn test_shift_h_adds_md5_while_plain_h_navigates() {
+        let config = KeybindingsConfig::default();
+        let kb = Keybindings::from_config(&config);
+
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('h'), KeyModifiers::NONE),
+            Some(PanelAction::SwitchPanelLeft)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('h'), KeyModifiers::SHIFT),
+            Some(PanelAction::AddContentMd5)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('H'), KeyModifiers::SHIFT),
+            Some(PanelAction::AddContentMd5)
+        );
+    }
+
+    #[test]
+    fn test_shift_j_verifies_md5_while_plain_j_moves_down() {
+        let config = KeybindingsConfig::default();
+        let kb = Keybindings::from_config(&config);
+
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('j'), KeyModifiers::NONE),
+            Some(PanelAction::MoveDown)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('j'), KeyModifiers::SHIFT),
+            Some(PanelAction::VerifyContentMd5)
+        );
+        assert_eq!(
+            kb.panel_action(KeyCode::Char('J'), KeyModifiers::SHIFT),
+            Some(PanelAction::VerifyContentMd5)
         );
     }
 
