@@ -106,8 +106,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         Screen::DiffScreen => {
+            let message = app.message.clone();
             if let Some(ref mut state) = app.diff_state {
-                diff_screen::draw(frame, state, area, &theme, &app.keybindings);
+                diff_screen::draw(
+                    frame,
+                    state,
+                    area,
+                    &theme,
+                    &app.keybindings,
+                    message.as_deref(),
+                );
             }
         }
         Screen::DiffFileView => {
@@ -157,8 +165,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_remote_spinner(frame, &spinner.message, area, &theme);
     }
 
-    // Update message timer
-    if app.message_timer > 0 {
+    // Keep copy/delete results visible while their automatic diff refresh is
+    // occupying the screen, then resume the normal timeout afterward.
+    let diff_refresh_is_visible = matches!(app.current_screen, Screen::DiffScreen)
+        && app
+            .diff_state
+            .as_ref()
+            .is_some_and(|state| state.is_comparing);
+    if app.message_timer > 0 && !diff_refresh_is_visible {
         app.message_timer -= 1;
         if app.message_timer == 0 {
             app.message = None;
@@ -337,6 +351,8 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         (PanelAction::RemoveDuplicates, "dedup "),
         (PanelAction::CalculateDirectorySizes, "dirsz "),
         (PanelAction::Rename, "ren "),
+        (PanelAction::AddContentMd5, "md5+ "),
+        (PanelAction::VerifyContentMd5, "md5chk "),
         (PanelAction::Tar, "tar "),
         (PanelAction::SetHandler, "hnd "),
         (PanelAction::Search, "find "),
@@ -553,5 +569,59 @@ mod tests {
             row.contains("Shift+S:dirsz"),
             "80-column function bar should expose folder-size shortcut, got: {row:?}"
         );
+    }
+
+    #[test]
+    fn function_bar_includes_md5_filename_shortcuts() {
+        let backend = TestBackend::new(180, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::with_settings(Settings::default());
+        let theme = Theme::default();
+
+        terminal
+            .draw(|frame| {
+                draw_function_bar(frame, &app, Rect::new(0, 23, 180, 1), &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..180)
+            .map(|x| buffer.cell((x, 23)).unwrap().symbol())
+            .collect::<String>();
+
+        assert!(row.contains("Shift+H:md5+"), "got: {row:?}");
+        assert!(row.contains("Shift+J:md5chk"), "got: {row:?}");
+    }
+
+    #[test]
+    fn diff_refresh_keeps_result_message_visible_until_comparison_finishes() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::with_settings(Settings::default());
+        app.current_screen = Screen::DiffScreen;
+        let mut state = crate::ui::diff_screen::DiffState::new(
+            std::path::PathBuf::from("left"),
+            std::path::PathBuf::from("right"),
+            crate::ui::diff_screen::CompareMethod::Content,
+            crate::ui::app::SortBy::Name,
+            crate::ui::app::SortOrder::Asc,
+        );
+        state.is_comparing = true;
+        app.diff_state = Some(state);
+        app.show_message("Copy completed");
+
+        for _ in 0..20 {
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        assert_eq!(app.message_timer, 10);
+        assert_eq!(app.message.as_deref(), Some("Copy completed"));
+        let row = (0..80)
+            .map(|x| terminal.backend().buffer().cell((x, 11)).unwrap().symbol())
+            .collect::<String>();
+        assert!(row.contains("Copy completed"), "got: {row:?}");
+
+        app.diff_state.as_mut().unwrap().is_comparing = false;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.message_timer, 9);
     }
 }

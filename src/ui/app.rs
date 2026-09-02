@@ -13,6 +13,7 @@ use crate::config::{CrossVolumeMoveVerification, Settings};
 use crate::keybindings::Keybindings;
 use crate::services::content_md5::{
     content_md5_for_authorized_file, filename_md5_candidates, filename_with_content_md5,
+    validate_authorized_regular_file,
 };
 use crate::services::directory_size::{
     self, DirectorySizeMessage, LocalDirectorySizeRequest, RemoteDirectorySizeRequest,
@@ -141,11 +142,17 @@ fn md5_rename_summary(
 
 enum Md5VerificationTask {
     Ready(Md5VerificationResult),
+    Validate {
+        file_name: String,
+        path: PathBuf,
+        source: file_ops::PathAuthorization,
+        status: Md5VerificationStatus,
+    },
     Verify {
         file_name: String,
         path: PathBuf,
         source: file_ops::PathAuthorization,
-        expected: String,
+        candidates: Vec<String>,
     },
 }
 
@@ -1436,6 +1443,8 @@ pub enum DialogType {
     LargeImageConfirm,
     LargeFileConfirm,
     TrueColorWarning,
+    DiffCopy,
+    DiffDelete,
     Progress,
     TarError,
     DuplicateConflict,
@@ -2021,6 +2030,11 @@ impl FileOperationProgress {
         "Operation worker exited without a completion message";
 
     pub fn new(operation_type: FileOperationType) -> Self {
+        let phase = if operation_type == FileOperationType::Delete {
+            FileOperationPhase::Deleting
+        } else {
+            FileOperationPhase::Copying
+        };
         Self {
             operation_type,
             is_active: false,
@@ -2030,7 +2044,7 @@ impl FileOperationProgress {
             preparing_message: String::new(),
             current_file: String::new(),
             current_file_progress: 0.0,
-            phase: FileOperationPhase::Copying,
+            phase,
             total_files: 0,
             completed_files: 0,
             total_bytes: 0,
@@ -2069,12 +2083,20 @@ impl FileOperationProgress {
                             ProgressMessage::PrepareComplete => {
                                 self.is_preparing = false;
                                 self.preparing_message.clear();
-                                self.phase = FileOperationPhase::Copying;
+                                self.phase = if self.operation_type == FileOperationType::Delete {
+                                    FileOperationPhase::Deleting
+                                } else {
+                                    FileOperationPhase::Copying
+                                };
                             }
                             ProgressMessage::FileStarted(name) => {
                                 self.current_file = name;
                                 self.current_file_progress = 0.0;
-                                self.phase = FileOperationPhase::Copying;
+                                self.phase = if self.operation_type == FileOperationType::Delete {
+                                    FileOperationPhase::Deleting
+                                } else {
+                                    FileOperationPhase::Copying
+                                };
                             }
                             ProgressMessage::FileProgress(copied, total) => {
                                 if total > 0 {
@@ -4981,17 +5003,10 @@ impl App {
                 _ => {}
             }
 
-            if !filename_md5_candidates(&name).is_empty() {
-                skipped += 1;
-                if first_skip.is_none() {
-                    first_skip = Some(format!("{}: filename already contains an MD5 hash", name));
-                }
-                continue;
-            }
-
+            let has_existing_hash = !filename_md5_candidates(&name).is_empty();
             let path = directory.resolved_path().join(&name);
             match file_ops::capture_path_authorization(&path) {
-                Ok(source) => entries.push((name, path, source)),
+                Ok(source) => entries.push((name, path, source, has_existing_hash)),
                 Err(error) => {
                     failed += 1;
                     if first_error.is_none() {
@@ -5012,7 +5027,42 @@ impl App {
             let mut renamed = 0;
             let mut first_warning = None;
 
-            for (name, old_path, source) in entries {
+            for index in 0..entries.len() {
+                let (name, old_path, source, has_existing_hash) = entries[index].clone();
+                if has_existing_hash {
+                    let validation = (|| -> std::io::Result<()> {
+                        file_ops::verify_directory_authorization(
+                            directory.resolved_path(),
+                            &directory,
+                            "MD5 parent directory",
+                        )?;
+                        validate_authorized_regular_file(&old_path, &source)?;
+                        file_ops::verify_directory_authorization(
+                            directory.resolved_path(),
+                            &directory,
+                            "MD5 parent directory",
+                        )
+                    })();
+                    match validation {
+                        Ok(()) => {
+                            skipped += 1;
+                            if first_skip.is_none() {
+                                first_skip = Some(format!(
+                                    "{}: filename already contains an MD5 hash",
+                                    name
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            failed += 1;
+                            if first_error.is_none() {
+                                first_error = Some(format!("{}: {}", name, error));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 let hash = match content_md5_for_authorized_file(&old_path, &source) {
                     Ok(hash) => hash,
                     Err(error) => {
@@ -5025,9 +5075,20 @@ impl App {
                 };
                 let new_name = filename_with_content_md5(&name, &hash);
                 let new_path = directory.resolved_path().join(&new_name);
-                match file_ops::rename_file_authorized(&old_path, &new_path, &source, &directory) {
-                    Ok(warnings) => {
+                match file_ops::rename_file_authorized_with_relocated_authorization(
+                    &old_path, &new_path, &source, &directory,
+                ) {
+                    Ok((warnings, relocated_source)) => {
                         renamed += 1;
+                        // A hard-link rename changes shared inode metadata. Advance only
+                        // aliases that had the exact same approved pre-rename snapshot.
+                        for (_, _, pending_source, _) in entries.iter_mut().skip(index + 1) {
+                            file_ops::refresh_path_authorization_after_alias_rename(
+                                pending_source,
+                                &source,
+                                &relocated_source,
+                            );
+                        }
                         if first_warning.is_none() && !warnings.is_empty() {
                             first_warning = Some(format!("{}: {}", name, warnings.join("; ")));
                         }
@@ -5128,41 +5189,34 @@ impl App {
                 continue;
             }
 
-            let candidates = filename_md5_candidates(&file.name);
-            let expected = match candidates.as_slice() {
-                [] => {
+            let path = directory.resolved_path().join(&file.name);
+            let source = match file_ops::capture_path_authorization(&path) {
+                Ok(source) => source,
+                Err(error) => {
                     tasks.push(Md5VerificationTask::Ready(Md5VerificationResult {
                         file_name: file.name,
-                        status: Md5VerificationStatus::NoHash,
-                    }));
-                    continue;
-                }
-                [expected] => expected.clone(),
-                _ => {
-                    tasks.push(Md5VerificationTask::Ready(Md5VerificationResult {
-                        file_name: file.name,
-                        status: Md5VerificationStatus::Ambiguous {
-                            count: candidates.len(),
+                        status: Md5VerificationStatus::Error {
+                            message: error.to_string(),
                         },
                     }));
                     continue;
                 }
             };
-
-            let path = directory.resolved_path().join(&file.name);
-            match file_ops::capture_path_authorization(&path) {
-                Ok(source) => tasks.push(Md5VerificationTask::Verify {
+            let candidates = filename_md5_candidates(&file.name);
+            if candidates.is_empty() {
+                tasks.push(Md5VerificationTask::Validate {
                     file_name: file.name,
                     path,
                     source,
-                    expected,
-                }),
-                Err(error) => tasks.push(Md5VerificationTask::Ready(Md5VerificationResult {
+                    status: Md5VerificationStatus::NoHash,
+                });
+            } else {
+                tasks.push(Md5VerificationTask::Verify {
                     file_name: file.name,
-                    status: Md5VerificationStatus::Error {
-                        message: error.to_string(),
-                    },
-                })),
+                    path,
+                    source,
+                    candidates,
+                });
             }
         }
 
@@ -5175,11 +5229,40 @@ impl App {
             for (index, task) in tasks.into_iter().enumerate() {
                 let result = match task {
                     Md5VerificationTask::Ready(result) => result,
+                    Md5VerificationTask::Validate {
+                        file_name,
+                        path,
+                        source,
+                        status,
+                    } => {
+                        let validation = (|| -> std::io::Result<()> {
+                            file_ops::verify_directory_authorization(
+                                directory.resolved_path(),
+                                &directory,
+                                "MD5 parent directory",
+                            )?;
+                            validate_authorized_regular_file(&path, &source)?;
+                            file_ops::verify_directory_authorization(
+                                directory.resolved_path(),
+                                &directory,
+                                "MD5 parent directory",
+                            )
+                        })();
+                        Md5VerificationResult {
+                            file_name,
+                            status: match validation {
+                                Ok(()) => status,
+                                Err(error) => Md5VerificationStatus::Error {
+                                    message: error.to_string(),
+                                },
+                            },
+                        }
+                    }
                     Md5VerificationTask::Verify {
                         file_name,
                         path,
                         source,
-                        expected,
+                        candidates,
                     } => {
                         let actual = (|| -> std::io::Result<String> {
                             file_ops::verify_directory_authorization(
@@ -5196,10 +5279,14 @@ impl App {
                             Ok(actual)
                         })();
                         let status = match actual {
-                            Ok(actual) if actual.eq_ignore_ascii_case(&expected) => {
+                            Ok(actual)
+                                if candidates
+                                    .iter()
+                                    .any(|candidate| actual.eq_ignore_ascii_case(candidate)) =>
+                            {
                                 Md5VerificationStatus::Match { hash: actual }
                             }
-                            Ok(actual) => Md5VerificationStatus::Mismatch { expected, actual },
+                            Ok(actual) => Md5VerificationStatus::Mismatch { candidates, actual },
                             Err(error) => Md5VerificationStatus::Error {
                                 message: error.to_string(),
                             },
@@ -9759,7 +9846,7 @@ mod tests {
     }
 
     #[test]
-    fn filename_md5_candidates_report_ambiguous_multiple_hashes() {
+    fn filename_md5_candidates_report_multiple_hashes() {
         const FIRST: &str = "d41d8cd98f00b204e9800998ecf8427e";
         const SECOND: &str = "5d41402abc4b2a76b9719d911017c592";
 
@@ -9849,6 +9936,89 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn add_content_md5_renames_every_selected_hard_link() {
+        const HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
+        let temp_dir = create_temp_dir();
+        let first = temp_dir.join("first.bin");
+        let second = temp_dir.join("second.bin");
+        fs::write(&first, b"").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.active_panel_mut()
+            .selected_files
+            .insert("first.bin".to_string());
+        app.active_panel_mut()
+            .selected_files
+            .insert("second.bin".to_string());
+
+        app.add_content_md5_to_filenames();
+        wait_for_background_file_operation(&mut app);
+
+        let renamed_first = temp_dir.join(format!("first.{}.bin", HASH));
+        let renamed_second = temp_dir.join(format!("second.{}.bin", HASH));
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(renamed_first.exists());
+        assert!(renamed_second.exists());
+        assert_eq!(
+            file_ops::stable_path_identity(&renamed_first).unwrap(),
+            file_ops::stable_path_identity(&renamed_second).unwrap()
+        );
+        assert!(app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("2 renamed") && !message.contains("failed")));
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn md5_filename_actions_reject_special_file_fast_paths() {
+        use std::os::unix::net::UnixListener;
+
+        const HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
+        let temp_dir = create_temp_dir();
+        let no_hash_name = "no-hash-socket";
+        let existing_hash_name = format!("socket.{}.bin", HASH);
+        let _no_hash_socket = UnixListener::bind(temp_dir.join(no_hash_name)).unwrap();
+        let _existing_hash_socket = UnixListener::bind(temp_dir.join(&existing_hash_name)).unwrap();
+
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.active_panel_mut()
+            .selected_files
+            .insert(no_hash_name.to_string());
+        app.verify_content_md5();
+        wait_for_background_file_operation(&mut app);
+
+        let state = app.md5_verification_state.as_ref().unwrap();
+        assert!(matches!(
+            state.results.first().map(|result| &result.status),
+            Some(Md5VerificationStatus::Error { .. })
+        ));
+        assert_eq!(state.counts().errors, 1);
+        assert_eq!(state.counts().no_hash, 0);
+
+        app.current_screen = Screen::FilePanel;
+        app.md5_verification_state = None;
+        app.active_panel_mut().selected_files.clear();
+        app.active_panel_mut()
+            .selected_files
+            .insert(existing_hash_name.clone());
+        app.add_content_md5_to_filenames();
+        wait_for_background_file_operation(&mut app);
+
+        assert!(app.message.as_deref().is_some_and(|message| {
+            message.contains("1 failed") && !message.contains("skipped")
+        }));
+        assert!(temp_dir.join(existing_hash_name).exists());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
     #[test]
     fn verify_content_md5_reports_persistent_match_and_mismatch_results() {
         const HASH: &str = "5d41402abc4b2a76b9719d911017c592";
@@ -9902,12 +10072,14 @@ mod tests {
             format!("match.{}.tar", HASH),
             format!("mismatch.{}.tar", HASH),
             "README".to_string(),
-            format!("ambiguous.{}-{}.tar", HASH, SECOND_HASH),
+            format!("multi-match.{}-{}.tar", HASH, SECOND_HASH),
+            format!("multi-mismatch.{}-{}.tar", HASH, SECOND_HASH),
         ];
         fs::write(temp_dir.join(&names[0]), b"hello").unwrap();
         fs::write(temp_dir.join(&names[1]), b"changed").unwrap();
         fs::write(temp_dir.join(&names[2]), b"no hash").unwrap();
         fs::write(temp_dir.join(&names[3]), b"hello").unwrap();
+        fs::write(temp_dir.join(&names[4]), b"changed").unwrap();
 
         let mut app = App::new(temp_dir.clone(), temp_dir.clone());
         for name in &names {
@@ -9925,7 +10097,7 @@ mod tests {
         assert!(app
             .remote_spinner
             .as_ref()
-            .is_some_and(|spinner| spinner.message.ends_with("0/4")));
+            .is_some_and(|spinner| spinner.message.ends_with("0/5")));
         wait_for_background_file_operation(&mut app);
 
         let state = app.md5_verification_state.as_ref().unwrap();
@@ -9940,13 +10112,28 @@ mod tests {
         assert_eq!(
             state.counts(),
             crate::ui::md5_verification::Md5VerificationCounts {
-                matched: 1,
-                mismatched: 1,
+                matched: 2,
+                mismatched: 2,
                 no_hash: 1,
-                ambiguous: 1,
                 errors: 0,
             }
         );
+        assert!(matches!(
+            state
+                .results
+                .iter()
+                .find(|result| result.file_name == names[3])
+                .map(|result| &result.status),
+            Some(Md5VerificationStatus::Match { .. })
+        ));
+        assert!(matches!(
+            state
+                .results
+                .iter()
+                .find(|result| result.file_name == names[4])
+                .map(|result| &result.status),
+            Some(Md5VerificationStatus::Mismatch { candidates, .. }) if candidates.len() == 2
+        ));
 
         cleanup_temp_dir(&temp_dir);
     }

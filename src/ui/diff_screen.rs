@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -18,9 +18,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, Screen, SortBy, SortOrder};
+use super::app::{App, Dialog, DialogType, FileOperationProgress, Screen, SortBy, SortOrder};
 use super::theme::Theme;
-use crate::utils::format::{format_size, safe_suffix};
+use crate::services::file_ops::{self, FileOperationType, ProgressMessage};
+use crate::utils::format::{format_size, safe_suffix, truncate_with_ellipsis};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Data structures
@@ -44,6 +45,7 @@ pub struct DiffFileInfo {
     pub is_directory: bool,
     pub is_symlink: bool,
     pub full_path: PathBuf,
+    authorization: Option<file_ops::PathAuthorization>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +58,8 @@ pub struct DiffEntry {
     pub depth: usize,
     /// true if this is a one-side-only directory whose children have not been loaded yet
     pub children_not_loaded: bool,
+    left_missing: Option<file_ops::MissingPathAuthorization>,
+    right_missing: Option<file_ops::MissingPathAuthorization>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +134,59 @@ enum DiffProgressMsg {
     Comparing(String, usize, usize),
 }
 
+#[derive(Debug, Clone)]
+struct DiffAuthorizedItem {
+    parent: file_ops::DirectoryAuthorization,
+    item: file_ops::PathAuthorization,
+    tree: Option<file_ops::TreeAuthorization>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffCopyPrompt {
+    relative_path: PathBuf,
+    left_root: file_ops::DirectoryAuthorization,
+    right_root: file_ops::DirectoryAuthorization,
+    left_item: Option<DiffAuthorizedItem>,
+    right_item: Option<DiffAuthorizedItem>,
+    left_missing: Option<file_ops::MissingPathAuthorization>,
+    right_missing: Option<file_ops::MissingPathAuthorization>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffCopyDirection {
+    ToLeft,
+    ToRight,
+}
+
+#[derive(Debug, Clone)]
+struct DiffDeletePrompt {
+    relative_path: PathBuf,
+    left_root: file_ops::DirectoryAuthorization,
+    right_root: file_ops::DirectoryAuthorization,
+    left_item: Option<DiffAuthorizedItem>,
+    right_item: Option<DiffAuthorizedItem>,
+    left_missing: Option<file_ops::MissingPathAuthorization>,
+    right_missing: Option<file_ops::MissingPathAuthorization>,
+    contains_directory: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffDeleteDirection {
+    Left,
+    Both,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedDiffDeleteTarget {
+    side: &'static str,
+    root: file_ops::DirectoryAuthorization,
+    parent: file_ops::DirectoryAuthorization,
+    path: PathBuf,
+    item: file_ops::PathAuthorization,
+    tree: Option<file_ops::TreeAuthorization>,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DiffState
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -157,6 +214,12 @@ pub struct DiffState {
     pub progress_current: String,
     pub progress_count: usize,
     pub progress_total: usize,
+    left_root_authorization: Option<file_ops::DirectoryAuthorization>,
+    right_root_authorization: Option<file_ops::DirectoryAuthorization>,
+    copy_prompt: Option<DiffCopyPrompt>,
+    copy_in_progress: bool,
+    delete_prompt: Option<DiffDeletePrompt>,
+    delete_in_progress: bool,
 }
 
 impl DiffState {
@@ -188,6 +251,12 @@ impl DiffState {
             progress_current: String::new(),
             progress_count: 0,
             progress_total: 0,
+            left_root_authorization: None,
+            right_root_authorization: None,
+            copy_prompt: None,
+            copy_in_progress: false,
+            delete_prompt: None,
+            delete_in_progress: false,
         }
     }
 
@@ -205,6 +274,14 @@ impl DiffState {
         self.progress_current = String::new();
         self.progress_count = 0;
         self.progress_total = 0;
+        self.left_root_authorization =
+            file_ops::capture_directory_authorization(&self.left_root).ok();
+        self.right_root_authorization =
+            file_ops::capture_directory_authorization(&self.right_root).ok();
+        self.copy_prompt = None;
+        self.copy_in_progress = false;
+        self.delete_prompt = None;
+        self.delete_in_progress = false;
         self.cancel_flag = Arc::new(AtomicBool::new(false));
 
         let (result_tx, result_rx) = mpsc::channel();
@@ -214,6 +291,8 @@ impl DiffState {
 
         let left_root = self.left_root.clone();
         let right_root = self.right_root.clone();
+        let left_root_authorization = self.left_root_authorization.clone();
+        let right_root_authorization = self.right_root_authorization.clone();
         let compare_method = self.compare_method;
         let sort_by = self.sort_by;
         let sort_order = self.sort_order;
@@ -240,6 +319,8 @@ impl DiffState {
             build_recursive_threaded(
                 &left_root,
                 &right_root,
+                left_root_authorization.as_ref(),
+                right_root_authorization.as_ref(),
                 "",
                 0,
                 compare_method,
@@ -287,6 +368,13 @@ impl DiffState {
             match receiver.try_recv() {
                 Ok(DiffCompareResult(entries)) => {
                     self.all_entries = entries;
+                    let current_paths: HashSet<_> = self
+                        .all_entries
+                        .iter()
+                        .map(|entry| entry.relative_path.as_str())
+                        .collect();
+                    self.selected_files
+                        .retain(|path| current_paths.contains(path.as_str()));
                     // Collapse all directories by default
                     self.collapsed_dirs.clear();
                     for entry in &self.all_entries {
@@ -330,6 +418,8 @@ impl DiffState {
         self.is_comparing = false;
         self.receiver = None;
         self.progress_receiver = None;
+        self.copy_prompt = None;
+        self.delete_prompt = None;
     }
 
     /// Build the flat diff list by recursively comparing both directory trees (synchronous)
@@ -337,9 +427,15 @@ impl DiffState {
         self.all_entries.clear();
         let left_root = self.left_root.clone();
         let right_root = self.right_root.clone();
+        self.left_root_authorization = file_ops::capture_directory_authorization(&left_root).ok();
+        self.right_root_authorization = file_ops::capture_directory_authorization(&right_root).ok();
+        let left_root_authorization = self.left_root_authorization.clone();
+        let right_root_authorization = self.right_root_authorization.clone();
         build_recursive(
             &left_root,
             &right_root,
+            left_root_authorization.as_ref(),
+            right_root_authorization.as_ref(),
             "",
             0,
             self.compare_method,
@@ -347,6 +443,13 @@ impl DiffState {
             self.sort_order,
             &mut self.all_entries,
         );
+        let current_paths: HashSet<_> = self
+            .all_entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        self.selected_files
+            .retain(|path| current_paths.contains(path.as_str()));
         // Collapse all directories by default
         self.collapsed_dirs.clear();
         for entry in &self.all_entries {
@@ -541,41 +644,57 @@ impl DiffState {
         }
     }
 
-    /// Collapse the current directory by one level (Left arrow)
-    /// Only collapses if expanded; descendant directories also get collapsed
+    /// Close the current tree branch by one level (Left arrow).
+    /// An expanded directory collapses in place. From a file or an already
+    /// collapsed directory, its parent is focused and collapsed immediately.
     pub fn collapse_one_level(&mut self) {
-        if let Some(entry) = self.current_entry() {
-            if entry.is_directory && !self.collapsed_dirs.contains(&entry.relative_path) {
-                let path = entry.relative_path.clone();
-                let current_all_idx = self.filtered_indices.get(self.selected_index).copied();
-                let prefix = format!("{}/", path);
-                let descendants: Vec<String> = self
-                    .all_entries
-                    .iter()
-                    .filter(|e| e.is_directory && e.relative_path.starts_with(&prefix))
-                    .map(|e| e.relative_path.clone())
-                    .collect();
-                for d in descendants {
-                    self.collapsed_dirs.insert(d);
-                }
-                self.collapsed_dirs.insert(path);
-                self.apply_filter();
-                if let Some(all_idx) = current_all_idx {
-                    for (i, &fi) in self.filtered_indices.iter().enumerate() {
-                        if fi == all_idx {
-                            self.selected_index = i;
-                            break;
-                        }
-                    }
-                }
-                if self.visible_height > 0 {
-                    if self.selected_index < self.scroll_offset {
-                        self.scroll_offset = self.selected_index;
-                    } else if self.selected_index >= self.scroll_offset + self.visible_height {
-                        self.scroll_offset =
-                            self.selected_index.saturating_sub(self.visible_height - 1);
-                    }
-                }
+        let Some(current_all_idx) = self.filtered_indices.get(self.selected_index).copied() else {
+            return;
+        };
+        let Some(current) = self.all_entries.get(current_all_idx) else {
+            return;
+        };
+
+        let target_path =
+            if current.is_directory && !self.collapsed_dirs.contains(&current.relative_path) {
+                current.relative_path.clone()
+            } else {
+                let Some((parent, _)) = current.relative_path.rsplit_once('/') else {
+                    return;
+                };
+                parent.to_string()
+            };
+        let Some(target_all_idx) = self
+            .all_entries
+            .iter()
+            .position(|entry| entry.is_directory && entry.relative_path == target_path)
+        else {
+            return;
+        };
+
+        let prefix = format!("{}/", target_path);
+        let descendants: Vec<String> = self
+            .all_entries
+            .iter()
+            .filter(|entry| entry.is_directory && entry.relative_path.starts_with(&prefix))
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+        self.collapsed_dirs.extend(descendants);
+        self.collapsed_dirs.insert(target_path);
+        self.apply_filter();
+
+        if let Some(index) = self
+            .filtered_indices
+            .iter()
+            .position(|&all_idx| all_idx == target_all_idx)
+        {
+            self.selected_index = index;
+        }
+        if self.visible_height > 0 {
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset = self.selected_index;
+            } else if self.selected_index >= self.scroll_offset + self.visible_height {
+                self.scroll_offset = self.selected_index.saturating_sub(self.visible_height - 1);
             }
         }
     }
@@ -701,6 +820,30 @@ impl DiffState {
             };
 
             let (left, right) = if is_left { (info, None) } else { (None, info) };
+            let left_missing = if left.is_none() {
+                self.left_root_authorization.as_ref().and_then(|root| {
+                    file_ops::capture_missing_path_authorization(
+                        root,
+                        Path::new(&child_relative),
+                        "Diff left path",
+                    )
+                    .ok()
+                })
+            } else {
+                None
+            };
+            let right_missing = if right.is_none() {
+                self.right_root_authorization.as_ref().and_then(|root| {
+                    file_ops::capture_missing_path_authorization(
+                        root,
+                        Path::new(&child_relative),
+                        "Diff right path",
+                    )
+                    .ok()
+                })
+            } else {
+                None
+            };
 
             children.push(DiffEntry {
                 relative_path: child_relative,
@@ -710,6 +853,8 @@ impl DiffState {
                 is_directory: is_dir,
                 depth: parent_depth + 1,
                 children_not_loaded: is_dir,
+                left_missing,
+                right_missing,
             });
         }
 
@@ -833,6 +978,47 @@ impl DiffState {
             .and_then(|&idx| self.all_entries.get(idx))
     }
 
+    pub(crate) fn copy_prompt_availability(&self) -> (bool, bool) {
+        self.copy_prompt
+            .as_ref()
+            .map(|prompt| (prompt.left_item.is_some(), prompt.right_item.is_some()))
+            .unwrap_or((false, false))
+    }
+
+    pub(crate) fn copy_in_progress(&self) -> bool {
+        self.copy_in_progress
+    }
+
+    pub(crate) fn finish_copy_operation(&mut self) {
+        self.copy_in_progress = false;
+        // Preparing a copy can create destination parent directories, and an
+        // error can still mean that publication committed but could not be
+        // verified. Always rebuild the comparison after the worker exits.
+        self.start_comparison();
+    }
+
+    pub(crate) fn delete_prompt_availability(&self) -> (bool, bool, bool) {
+        self.delete_prompt
+            .as_ref()
+            .map(|prompt| {
+                (
+                    prompt.left_item.is_some(),
+                    prompt.right_item.is_some(),
+                    prompt.contains_directory,
+                )
+            })
+            .unwrap_or((false, false, false))
+    }
+
+    pub(crate) fn delete_in_progress(&self) -> bool {
+        self.delete_in_progress
+    }
+
+    pub(crate) fn finish_delete_operation(&mut self) {
+        self.delete_in_progress = false;
+        self.start_comparison();
+    }
+
     /// Re-sort all_entries in memory (preserving DFS tree structure) and reapply filter
     pub fn resort_entries(&mut self) {
         if self.all_entries.is_empty() {
@@ -925,6 +1111,8 @@ fn make_build_frame(
 fn build_iterative(
     left_root: &Path,
     right_root: &Path,
+    left_root_authorization: Option<&file_ops::DirectoryAuthorization>,
+    right_root_authorization: Option<&file_ops::DirectoryAuthorization>,
     compare_method: CompareMethod,
     sort_by: SortBy,
     sort_order: SortOrder,
@@ -1002,6 +1190,30 @@ fn build_iterative(
 
         let left_info = make_file_info(&left_dir.join(&name), &name);
         let right_info = make_file_info(&right_dir.join(&name), &name);
+        let left_missing = if left_info.is_none() {
+            left_root_authorization.and_then(|root| {
+                file_ops::capture_missing_path_authorization(
+                    root,
+                    Path::new(&relative_path),
+                    "Diff left path",
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+        let right_missing = if right_info.is_none() {
+            right_root_authorization.and_then(|root| {
+                file_ops::capture_missing_path_authorization(
+                    root,
+                    Path::new(&relative_path),
+                    "Diff right path",
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
         let left_is_dir = left_info.as_ref().is_some_and(|info| info.is_directory);
         let right_is_dir = right_info.as_ref().is_some_and(|info| info.is_directory);
         let is_directory = left_is_dir || right_is_dir;
@@ -1017,6 +1229,8 @@ fn build_iterative(
                     is_directory: true,
                     depth,
                     children_not_loaded: false,
+                    left_missing,
+                    right_missing,
                 });
                 frames.push(make_build_frame(
                     left_root,
@@ -1044,6 +1258,8 @@ fn build_iterative(
                     is_directory: false,
                     depth,
                     children_not_loaded: false,
+                    left_missing,
+                    right_missing,
                 });
                 if !same {
                     frames
@@ -1060,6 +1276,8 @@ fn build_iterative(
                     is_directory,
                     depth,
                     children_not_loaded: false,
+                    left_missing,
+                    right_missing,
                 });
                 frames
                     .last_mut()
@@ -1080,6 +1298,8 @@ fn build_iterative(
                 is_directory,
                 depth,
                 children_not_loaded: is_directory,
+                left_missing,
+                right_missing,
             });
             frames
                 .last_mut()
@@ -1092,6 +1312,8 @@ fn build_iterative(
 fn build_recursive(
     left_root: &Path,
     right_root: &Path,
+    left_root_authorization: Option<&file_ops::DirectoryAuthorization>,
+    right_root_authorization: Option<&file_ops::DirectoryAuthorization>,
     relative_path: &str,
     depth: usize,
     compare_method: CompareMethod,
@@ -1115,6 +1337,8 @@ fn build_recursive(
     build_iterative(
         &left,
         &right,
+        left_root_authorization,
+        right_root_authorization,
         compare_method,
         sort_by,
         sort_order,
@@ -1200,6 +1424,8 @@ fn count_entries_recursive(
 fn build_recursive_threaded(
     left_root: &Path,
     right_root: &Path,
+    left_root_authorization: Option<&file_ops::DirectoryAuthorization>,
+    right_root_authorization: Option<&file_ops::DirectoryAuthorization>,
     relative_path: &str,
     depth: usize,
     compare_method: CompareMethod,
@@ -1224,6 +1450,8 @@ fn build_recursive_threaded(
     build_iterative(
         &left,
         &right,
+        left_root_authorization,
+        right_root_authorization,
         compare_method,
         sort_by,
         sort_order,
@@ -1272,6 +1500,7 @@ fn read_dir_names(dir: &Path) -> Vec<String> {
 
 /// Build DiffFileInfo from a path, returning None if the path doesn't exist
 fn make_file_info(path: &Path, name: &str) -> Option<DiffFileInfo> {
+    let initial_authorization = file_ops::capture_path_authorization(path).ok();
     let metadata = fs::symlink_metadata(path).ok()?;
     let is_symlink = metadata.file_type().is_symlink();
     let actual_metadata = if is_symlink {
@@ -1294,6 +1523,9 @@ fn make_file_info(path: &Path, name: &str) -> Option<DiffFileInfo> {
         .ok()
         .map(DateTime::<Local>::from)
         .unwrap_or_else(Local::now);
+    let authorization = initial_authorization.filter(|expected| {
+        file_ops::capture_path_authorization(path).ok().as_ref() == Some(expected)
+    });
 
     Some(DiffFileInfo {
         name: name.to_string(),
@@ -1302,6 +1534,7 @@ fn make_file_info(path: &Path, name: &str) -> Option<DiffFileInfo> {
         is_directory,
         is_symlink,
         full_path: path.to_path_buf(),
+        authorization,
     })
 }
 
@@ -1631,6 +1864,7 @@ pub fn draw(
     area: Rect,
     theme: &Theme,
     kb: &crate::keybindings::Keybindings,
+    message: Option<&str>,
 ) {
     // Layout: Header(1) + ColumnHeader(1) + Content(fill) + StatusBar(1) + FunctionBar(1)
     let layout = Layout::default()
@@ -1686,16 +1920,20 @@ pub fn draw(
         )]);
         frame.render_widget(Paragraph::new(line), status_area);
 
-        // Function bar shows Close key only
-        let close_key = kb.diff_screen_first_key(crate::keybindings::DiffScreenAction::Close);
-        let fn_line = Line::from(vec![
-            Span::styled(
-                close_key.to_string(),
-                Style::default().fg(theme.diff.footer_key),
-            ),
-            Span::styled(":cancel", Style::default().fg(theme.diff.footer_text)),
-        ]);
-        frame.render_widget(Paragraph::new(fn_line), fn_bar_area);
+        if let Some(message) = message {
+            draw_message_bar(frame, fn_bar_area, theme, message);
+        } else {
+            // Function bar shows Close key only
+            let close_key = kb.diff_screen_first_key(crate::keybindings::DiffScreenAction::Close);
+            let fn_line = Line::from(vec![
+                Span::styled(
+                    close_key.to_string(),
+                    Style::default().fg(theme.diff.footer_key),
+                ),
+                Span::styled(":cancel", Style::default().fg(theme.diff.footer_text)),
+            ]);
+            frame.render_widget(Paragraph::new(fn_line), fn_bar_area);
+        }
         return;
     }
 
@@ -1741,7 +1979,33 @@ pub fn draw(
     draw_status_bar(frame, state, status_area, theme);
 
     // ── Function Bar ────────────────────────────────────────────────────────
-    draw_function_bar(frame, fn_bar_area, theme, kb);
+    if let Some(message) = message {
+        draw_message_bar(frame, fn_bar_area, theme, message);
+    } else {
+        draw_function_bar(frame, fn_bar_area, theme, kb);
+    }
+}
+
+fn draw_message_bar(frame: &mut Frame, area: Rect, theme: &Theme, message: &str) {
+    let sanitized: String = message
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let message = truncate_with_ellipsis(&sanitized, area.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(format!(" {message} ")).style(
+            Style::default()
+                .fg(theme.message.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
 }
 
 fn draw_comparing_progress(
@@ -2284,6 +2548,16 @@ fn draw_function_bar(
             ":view ",
         ),
         (
+            kb.diff_screen_first_key(DiffScreenAction::CopyEntry)
+                .to_string(),
+            ":copy ",
+        ),
+        (
+            kb.diff_screen_first_key(DiffScreenAction::DeleteEntry)
+                .to_string(),
+            ":delete ",
+        ),
+        (
             kb.diff_screen_first_key(DiffScreenAction::ExpandAll)
                 .to_string(),
             ":expand ",
@@ -2432,6 +2706,14 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             DiffScreenAction::CollapseAll => {
                 state.collapse();
             }
+            DiffScreenAction::CopyEntry => {
+                open_copy_dialog(app);
+                return;
+            }
+            DiffScreenAction::DeleteEntry => {
+                open_delete_dialog(app);
+                return;
+            }
             DiffScreenAction::Open => {
                 // Handle Enter: view file diff if current entry is a file
                 handle_enter(app);
@@ -2444,6 +2726,873 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
     };
+}
+
+fn validated_diff_relative_path(relative_path: &str) -> io::Result<PathBuf> {
+    use std::path::Component;
+
+    let path = PathBuf::from(relative_path);
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Selected difference has an invalid relative path",
+        ));
+    }
+    Ok(path)
+}
+
+fn capture_diff_item(
+    root: &file_ops::DirectoryAuthorization,
+    relative_path: &Path,
+) -> io::Result<DiffAuthorizedItem> {
+    let file_name = relative_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("Selected difference has no file name"))?;
+    let relative_parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = file_ops::capture_authorized_relative_directory(root, relative_parent)?;
+    let path = parent.resolved_path().join(file_name);
+    let item = file_ops::capture_path_authorization(&path)?;
+    let tree = if item.is_directory() {
+        Some(file_ops::capture_tree_authorization(
+            &path,
+            &item,
+            "Diff selected directory",
+        )?)
+    } else {
+        None
+    };
+    Ok(DiffAuthorizedItem { parent, item, tree })
+}
+
+fn authorized_comparison_roots(
+    state: &DiffState,
+) -> io::Result<(
+    file_ops::DirectoryAuthorization,
+    file_ops::DirectoryAuthorization,
+)> {
+    let left_root = state.left_root_authorization.clone().ok_or_else(|| {
+        io::Error::other("Diff left root identity is unavailable; restart the comparison")
+    })?;
+    let right_root = state.right_root_authorization.clone().ok_or_else(|| {
+        io::Error::other("Diff right root identity is unavailable; restart the comparison")
+    })?;
+    file_ops::verify_directory_authorization(
+        &state.left_root,
+        &left_root,
+        "Diff left comparison root",
+    )?;
+    file_ops::verify_directory_authorization(
+        &state.right_root,
+        &right_root,
+        "Diff right comparison root",
+    )?;
+    Ok((left_root, right_root))
+}
+
+fn ensure_non_overlapping_diff_roots(
+    left_root: &file_ops::DirectoryAuthorization,
+    right_root: &file_ops::DirectoryAuthorization,
+) -> io::Result<()> {
+    let left = left_root.resolved_path();
+    let right = right_root.resolved_path();
+    if left.starts_with(right) || right.starts_with(left) || left_root.same_object(right_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Copy and delete are disabled when comparison roots overlap",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_selected_trees_do_not_contain_other_root(
+    left_item: Option<&DiffAuthorizedItem>,
+    right_item: Option<&DiffAuthorizedItem>,
+    left_root: &file_ops::DirectoryAuthorization,
+    right_root: &file_ops::DirectoryAuthorization,
+) -> io::Result<()> {
+    let left_contains_right = left_item
+        .and_then(|item| item.tree.as_ref())
+        .is_some_and(|tree| tree.contains_directory(right_root));
+    let right_contains_left = right_item
+        .and_then(|item| item.tree.as_ref())
+        .is_some_and(|tree| tree.contains_directory(left_root));
+    if left_contains_right || right_contains_left {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Copy and delete are disabled when a selected directory contains the other comparison root",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_expected_diff_item(
+    root: &file_ops::DirectoryAuthorization,
+    relative_path: &Path,
+    expected: Option<&DiffFileInfo>,
+    side: &str,
+) -> io::Result<Option<DiffAuthorizedItem>> {
+    let expected_authorization = expected
+        .map(|info| {
+            info.authorization.ok_or_else(|| {
+                io::Error::other(format!(
+                    "Diff {side} item identity is unavailable; close and reopen the comparison"
+                ))
+            })
+        })
+        .transpose()?;
+    let current = match capture_diff_item(root, relative_path) {
+        Ok(current) => Some(current),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    match (expected_authorization, current) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Diff {side} item appeared since the comparison; close and reopen it before continuing"
+            ),
+        )),
+        (Some(_), None) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Diff {side} item disappeared since the comparison; close and reopen it before continuing"
+            ),
+        )),
+        (Some(expected), Some(current)) if expected != current.item => {
+            Err(io::Error::other(format!(
+                "Diff {side} item changed since the comparison; close and reopen it before continuing"
+            )))
+        }
+        (Some(_), Some(current)) => Ok(Some(current)),
+    }
+}
+
+fn capture_expected_diff_side(
+    root: &file_ops::DirectoryAuthorization,
+    relative_path: &Path,
+    expected: Option<&DiffFileInfo>,
+    expected_missing: Option<&file_ops::MissingPathAuthorization>,
+    side: &str,
+) -> io::Result<(
+    Option<DiffAuthorizedItem>,
+    Option<file_ops::MissingPathAuthorization>,
+)> {
+    if expected.is_some() {
+        let item =
+            capture_expected_diff_item(root, relative_path, expected, side)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Diff {side} item disappeared since the comparison"),
+                )
+            })?;
+        return Ok((Some(item), None));
+    }
+
+    let missing = expected_missing.cloned().ok_or_else(|| {
+        io::Error::other(format!(
+            "Diff {side} missing-path identity is unavailable; restart the comparison"
+        ))
+    })?;
+    file_ops::verify_missing_path_authorization(&missing, &format!("Diff {side} destination"))?;
+    Ok((None, Some(missing)))
+}
+
+fn open_copy_dialog(app: &mut App) {
+    let Some(entry) = app
+        .diff_state
+        .as_ref()
+        .and_then(DiffState::current_entry)
+        .cloned()
+    else {
+        return;
+    };
+
+    let result = (|| -> io::Result<DiffCopyPrompt> {
+        let relative_path = validated_diff_relative_path(&entry.relative_path)?;
+        let state = app
+            .diff_state
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Diff comparison is no longer available"))?;
+        let (left_root, right_root) = authorized_comparison_roots(state)?;
+        ensure_non_overlapping_diff_roots(&left_root, &right_root)?;
+        let (left_item, left_missing) = capture_expected_diff_side(
+            &left_root,
+            &relative_path,
+            entry.left.as_ref(),
+            entry.left_missing.as_ref(),
+            "left",
+        )?;
+        let (right_item, right_missing) = capture_expected_diff_side(
+            &right_root,
+            &relative_path,
+            entry.right.as_ref(),
+            entry.right_missing.as_ref(),
+            "right",
+        )?;
+        ensure_selected_trees_do_not_contain_other_root(
+            left_item.as_ref(),
+            right_item.as_ref(),
+            &left_root,
+            &right_root,
+        )?;
+
+        Ok(DiffCopyPrompt {
+            relative_path,
+            left_root,
+            right_root,
+            left_item,
+            right_item,
+            left_missing,
+            right_missing,
+        })
+    })();
+
+    let message = match result {
+        Ok(prompt) => {
+            if let Some(state) = app.diff_state.as_mut() {
+                state.copy_prompt = Some(prompt);
+            }
+            String::new()
+        }
+        Err(error) => {
+            if let Some(state) = app.diff_state.as_mut() {
+                state.copy_prompt = None;
+            }
+            format!("Cannot prepare copy: {error}")
+        }
+    };
+
+    app.dialog = Some(Dialog {
+        dialog_type: DialogType::DiffCopy,
+        input: entry.relative_path,
+        cursor_pos: 0,
+        message,
+        completion: None,
+        selected_button: 1,
+        selection: None,
+        use_md5: false,
+    });
+}
+
+fn set_copy_dialog_error(app: &mut App, message: impl Into<String>) {
+    if let Some(dialog) = app
+        .dialog
+        .as_mut()
+        .filter(|dialog| dialog.dialog_type == DialogType::DiffCopy)
+    {
+        dialog.message = message.into();
+    }
+}
+
+fn cancel_copy_dialog(app: &mut App) {
+    if let Some(state) = app.diff_state.as_mut() {
+        state.copy_prompt = None;
+    }
+    app.dialog = None;
+}
+
+fn start_diff_copy(app: &mut App, direction: DiffCopyDirection) -> io::Result<()> {
+    let prompt = app
+        .diff_state
+        .as_ref()
+        .and_then(|state| state.copy_prompt.clone())
+        .ok_or_else(|| io::Error::other("Copy source changed; close the dialog and try again"))?;
+
+    let (source_root, target_root, source_item, target_item, target_missing, source_side) =
+        match direction {
+            DiffCopyDirection::ToLeft => (
+                prompt.right_root,
+                prompt.left_root,
+                prompt.right_item,
+                prompt.left_item,
+                prompt.left_missing,
+                "right",
+            ),
+            DiffCopyDirection::ToRight => (
+                prompt.left_root,
+                prompt.right_root,
+                prompt.left_item,
+                prompt.right_item,
+                prompt.right_missing,
+                "left",
+            ),
+        };
+    let source_item = source_item.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Nothing exists on the {source_side} to copy"),
+        )
+    })?;
+
+    let file_name = prompt
+        .relative_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("Selected difference has no file name"))?
+        .to_os_string();
+    file_ops::verify_directory_authorization(
+        source_root.resolved_path(),
+        &source_root,
+        "Diff source root",
+    )?;
+    file_ops::verify_directory_authorization(
+        target_root.resolved_path(),
+        &target_root,
+        "Diff target root",
+    )?;
+
+    let DiffAuthorizedItem {
+        parent: source_parent,
+        item: source_authorization,
+        tree: source_tree,
+    } = source_item;
+    file_ops::verify_directory_authorization(
+        source_parent.resolved_path(),
+        &source_parent,
+        "Diff source parent",
+    )?;
+    let source_path = source_parent.resolved_path().join(&file_name);
+    file_ops::verify_path_authorization(&source_path, &source_authorization, "Diff copy source")?;
+    if let Some(tree) = source_tree.as_ref() {
+        file_ops::verify_tree_authorization(&source_path, tree, "Diff copy source")?;
+    }
+
+    let (target_parent, overwrite_authorization, destination_tree) = match target_item {
+        Some(target_item) => {
+            let DiffAuthorizedItem { parent, item, tree } = target_item;
+            file_ops::verify_directory_authorization(
+                parent.resolved_path(),
+                &parent,
+                "Diff target parent",
+            )?;
+            let target_path = parent.resolved_path().join(&file_name);
+            file_ops::verify_path_authorization(&target_path, &item, "Diff overwrite destination")?;
+            if let Some(tree) = tree.as_ref() {
+                file_ops::verify_tree_authorization(
+                    &target_path,
+                    tree,
+                    "Diff overwrite destination",
+                )?;
+            }
+            (parent, Some(item), tree)
+        }
+        None => {
+            let target_missing = target_missing.ok_or_else(|| {
+                io::Error::other(
+                    "Diff destination absence is no longer authorized; restart the comparison",
+                )
+            })?;
+            (
+                file_ops::prepare_authorized_missing_path_parent(
+                    &target_missing,
+                    "Diff copy destination",
+                )?,
+                None,
+                None,
+            )
+        }
+    };
+    let source_dir = source_parent.resolved_path().to_path_buf();
+    let target_dir = target_parent.resolved_path().to_path_buf();
+    let target_path = target_dir.join(&file_name);
+    file_ops::validate_copy_destination(&source_path, &target_path)?;
+
+    let mut files_to_overwrite = HashMap::new();
+    if let Some(overwrite_authorization) = overwrite_authorization {
+        files_to_overwrite.insert(source_path.clone(), overwrite_authorization);
+    }
+    let mut source_authorizations = HashMap::new();
+    source_authorizations.insert(source_path.clone(), source_authorization);
+    let mut source_trees = HashMap::new();
+    if let Some(source_tree) = source_tree {
+        source_trees.insert(source_path.clone(), source_tree);
+    }
+    let mut destination_trees = HashMap::new();
+    if let Some(destination_tree) = destination_tree {
+        destination_trees.insert(source_path, destination_tree);
+    }
+
+    let mut progress = FileOperationProgress::new(FileOperationType::Copy);
+    progress.is_active = true;
+    let cancel_flag = progress.cancel_flag.clone();
+    let (tx, rx) = mpsc::channel();
+    progress.receiver = Some(rx);
+
+    thread::spawn(move || {
+        file_ops::copy_files_with_progress_authorized_trees(
+            vec![PathBuf::from(file_name)],
+            &source_dir,
+            &target_dir,
+            files_to_overwrite,
+            HashSet::new(),
+            Some(target_parent),
+            source_authorizations,
+            Some(source_parent),
+            source_trees,
+            destination_trees,
+            cancel_flag,
+            tx,
+        );
+    });
+
+    if let Some(state) = app.diff_state.as_mut() {
+        state.copy_prompt = None;
+        state.copy_in_progress = true;
+    }
+    app.file_operation_progress = Some(progress);
+    app.dialog = Some(Dialog {
+        dialog_type: DialogType::Progress,
+        input: String::new(),
+        cursor_pos: 0,
+        message: String::new(),
+        completion: None,
+        selected_button: 0,
+        selection: None,
+        use_md5: false,
+    });
+    Ok(())
+}
+
+pub(crate) fn handle_copy_dialog_input(
+    app: &mut App,
+    code: KeyCode,
+    _modifiers: KeyModifiers,
+) -> bool {
+    match code {
+        KeyCode::Left => {
+            if let Err(error) = start_diff_copy(app, DiffCopyDirection::ToLeft) {
+                set_copy_dialog_error(app, error.to_string());
+            }
+        }
+        KeyCode::Right => {
+            if let Err(error) = start_diff_copy(app, DiffCopyDirection::ToRight) {
+                set_copy_dialog_error(app, error.to_string());
+            }
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc => {
+            cancel_copy_dialog(app);
+        }
+        _ => {}
+    }
+    false
+}
+
+fn open_delete_dialog(app: &mut App) {
+    let Some(entry) = app
+        .diff_state
+        .as_ref()
+        .and_then(DiffState::current_entry)
+        .cloned()
+    else {
+        return;
+    };
+
+    let result = (|| -> io::Result<DiffDeletePrompt> {
+        let relative_path = validated_diff_relative_path(&entry.relative_path)?;
+        let state = app
+            .diff_state
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Diff comparison is no longer available"))?;
+        let (left_root, right_root) = authorized_comparison_roots(state)?;
+        ensure_non_overlapping_diff_roots(&left_root, &right_root)?;
+        let (left_item, left_missing) = capture_expected_diff_side(
+            &left_root,
+            &relative_path,
+            entry.left.as_ref(),
+            entry.left_missing.as_ref(),
+            "left",
+        )?;
+        let (right_item, right_missing) = capture_expected_diff_side(
+            &right_root,
+            &relative_path,
+            entry.right.as_ref(),
+            entry.right_missing.as_ref(),
+            "right",
+        )?;
+        if left_item.is_none() && right_item.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "The selected item no longer exists on either side",
+            ));
+        }
+        ensure_selected_trees_do_not_contain_other_root(
+            left_item.as_ref(),
+            right_item.as_ref(),
+            &left_root,
+            &right_root,
+        )?;
+
+        let contains_directory = left_item
+            .as_ref()
+            .is_some_and(|item| item.item.is_directory())
+            || right_item
+                .as_ref()
+                .is_some_and(|item| item.item.is_directory());
+        Ok(DiffDeletePrompt {
+            relative_path,
+            left_root,
+            right_root,
+            left_item,
+            right_item,
+            left_missing,
+            right_missing,
+            contains_directory,
+        })
+    })();
+
+    let message = match result {
+        Ok(prompt) => {
+            if let Some(state) = app.diff_state.as_mut() {
+                state.delete_prompt = Some(prompt);
+            }
+            String::new()
+        }
+        Err(error) => {
+            if let Some(state) = app.diff_state.as_mut() {
+                state.delete_prompt = None;
+            }
+            format!("Cannot prepare deletion: {error}")
+        }
+    };
+
+    app.dialog = Some(Dialog {
+        dialog_type: DialogType::DiffDelete,
+        input: entry.relative_path,
+        cursor_pos: 0,
+        message,
+        completion: None,
+        selected_button: 1,
+        selection: None,
+        use_md5: false,
+    });
+}
+
+fn set_delete_dialog_error(app: &mut App, message: impl Into<String>) {
+    if let Some(dialog) = app
+        .dialog
+        .as_mut()
+        .filter(|dialog| dialog.dialog_type == DialogType::DiffDelete)
+    {
+        dialog.message = message.into();
+    }
+}
+
+fn cancel_delete_dialog(app: &mut App) {
+    if let Some(state) = app.diff_state.as_mut() {
+        state.delete_prompt = None;
+    }
+    app.dialog = None;
+}
+
+fn verify_diff_delete_side_absence(
+    item: Option<&DiffAuthorizedItem>,
+    missing: Option<&file_ops::MissingPathAuthorization>,
+    side: &str,
+) -> io::Result<()> {
+    if item.is_some() {
+        return Ok(());
+    }
+    let missing = missing.ok_or_else(|| {
+        io::Error::other(format!(
+            "Diff {side} absence is no longer authorized; restart the comparison"
+        ))
+    })?;
+    file_ops::verify_missing_path_authorization(missing, &format!("Diff {side} delete target"))
+}
+
+fn verify_diff_delete_target(target: &PreparedDiffDeleteTarget) -> io::Result<()> {
+    file_ops::verify_directory_authorization(
+        target.root.resolved_path(),
+        &target.root,
+        &format!("Diff {} root", target.side),
+    )?;
+    file_ops::verify_directory_authorization(
+        target.parent.resolved_path(),
+        &target.parent,
+        &format!("Diff {} delete parent", target.side),
+    )?;
+    file_ops::verify_path_authorization(
+        &target.path,
+        &target.item,
+        &format!("Diff {} delete target", target.side),
+    )?;
+    if let Some(tree) = target.tree.as_ref() {
+        file_ops::verify_tree_authorization(
+            &target.path,
+            tree,
+            &format!("Diff {} delete target", target.side),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_diff_delete_worker(
+    mut targets: Vec<PreparedDiffDeleteTarget>,
+    absence_checks: Vec<(&'static str, file_ops::MissingPathAuthorization)>,
+    relative_path: PathBuf,
+    cancel_flag: Arc<AtomicBool>,
+    tx: Sender<ProgressMessage>,
+) {
+    let total = targets.len();
+    let _ = tx.send(ProgressMessage::TotalProgress(0, total, 0, 0));
+
+    // Repeat absence checks in the worker immediately before the first
+    // mutation. The dialog handler checks them too, but the filesystem can
+    // change while the worker thread is being scheduled.
+    for (side, missing) in &absence_checks {
+        if let Err(error) = file_ops::verify_missing_path_authorization(
+            missing,
+            &format!("Diff {side} delete target"),
+        ) {
+            let _ = tx.send(ProgressMessage::Error(
+                relative_path.display().to_string(),
+                format!("{side}: {error}"),
+            ));
+            let _ = tx.send(ProgressMessage::Completed(0, total));
+            return;
+        }
+    }
+
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    let mut processed_count = 0;
+    let mut errors = Vec::new();
+
+    while processed_count < total {
+        if cancel_flag.load(Ordering::Relaxed) {
+            failure_count += total.saturating_sub(processed_count);
+            errors.push(if success_count == 0 {
+                "Cancelled".to_string()
+            } else {
+                format!(
+                    "Cancelled after deleting {success_count}/{total}; completed deletions cannot be undone"
+                )
+            });
+            break;
+        }
+
+        let target = targets[processed_count].clone();
+        let display_name = format!("{}: {}", target.side, relative_path.display());
+        let _ = tx.send(ProgressMessage::FileStarted(display_name.clone()));
+        let result = verify_diff_delete_target(&target).and_then(|()| {
+            if let Some(tree) = target.tree.as_ref() {
+                file_ops::delete_file_detailed_authorized_tree(&target.path, &target.item, tree)
+            } else {
+                file_ops::delete_file_detailed_authorized(&target.path, &target.item)
+            }
+        });
+        match result {
+            Ok(warnings) => {
+                success_count += 1;
+                // Deleting one hard-link name updates metadata shared by its
+                // aliases. Advance only remaining targets that had the exact
+                // same approved snapshot; replaced or modified paths remain
+                // unauthorized and will fail closed below.
+                for pending in targets.iter_mut().skip(processed_count + 1) {
+                    file_ops::refresh_path_authorization_after_alias_deletion(
+                        &mut pending.item,
+                        &target.item,
+                        &pending.path,
+                    );
+                }
+                for warning in warnings {
+                    let _ = tx.send(ProgressMessage::Warning(display_name.clone(), warning));
+                }
+            }
+            Err(error) => {
+                failure_count += 1;
+                errors.push(format!("{}: {}", target.side, error));
+            }
+        }
+        processed_count += 1;
+        let _ = tx.send(ProgressMessage::TotalProgress(processed_count, total, 0, 0));
+    }
+
+    if !errors.is_empty() {
+        let _ = tx.send(ProgressMessage::Error(
+            relative_path.display().to_string(),
+            errors.join("; "),
+        ));
+    }
+    let _ = tx.send(ProgressMessage::Completed(success_count, failure_count));
+}
+
+fn start_diff_delete(app: &mut App, direction: DiffDeleteDirection) -> io::Result<()> {
+    let prompt = app
+        .diff_state
+        .as_ref()
+        .and_then(|state| state.delete_prompt.clone())
+        .ok_or_else(|| {
+            io::Error::other("Delete selection changed; close the dialog and try again")
+        })?;
+    let file_name = prompt
+        .relative_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("Selected difference has no file name"))?
+        .to_os_string();
+
+    let make_target = |side: &'static str,
+                       root: file_ops::DirectoryAuthorization,
+                       selected: Option<DiffAuthorizedItem>|
+     -> io::Result<PreparedDiffDeleteTarget> {
+        let selected = selected.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Nothing exists on the {side} to delete"),
+            )
+        })?;
+        let path = selected.parent.resolved_path().join(&file_name);
+        Ok(PreparedDiffDeleteTarget {
+            side,
+            root,
+            parent: selected.parent,
+            path,
+            item: selected.item,
+            tree: selected.tree,
+        })
+    };
+
+    let mut targets = Vec::with_capacity(2);
+    let mut absence_checks = Vec::with_capacity(1);
+    match direction {
+        DiffDeleteDirection::Left => {
+            verify_diff_delete_side_absence(
+                prompt.left_item.as_ref(),
+                prompt.left_missing.as_ref(),
+                "left",
+            )?;
+            targets.push(make_target("left", prompt.left_root, prompt.left_item)?)
+        }
+        DiffDeleteDirection::Right => {
+            verify_diff_delete_side_absence(
+                prompt.right_item.as_ref(),
+                prompt.right_missing.as_ref(),
+                "right",
+            )?;
+            targets.push(make_target("right", prompt.right_root, prompt.right_item)?)
+        }
+        DiffDeleteDirection::Both => {
+            // Revalidate every side, including sides that were absent when the
+            // dialog opened, before deleting either existing item.
+            verify_diff_delete_side_absence(
+                prompt.left_item.as_ref(),
+                prompt.left_missing.as_ref(),
+                "left",
+            )?;
+            verify_diff_delete_side_absence(
+                prompt.right_item.as_ref(),
+                prompt.right_missing.as_ref(),
+                "right",
+            )?;
+            if prompt.left_item.is_none() {
+                absence_checks.push((
+                    "left",
+                    prompt.left_missing.clone().ok_or_else(|| {
+                        io::Error::other(
+                            "Diff left absence is no longer authorized; restart the comparison",
+                        )
+                    })?,
+                ));
+            }
+            if prompt.right_item.is_none() {
+                absence_checks.push((
+                    "right",
+                    prompt.right_missing.clone().ok_or_else(|| {
+                        io::Error::other(
+                            "Diff right absence is no longer authorized; restart the comparison",
+                        )
+                    })?,
+                ));
+            }
+            if prompt.left_item.is_some() {
+                targets.push(make_target("left", prompt.left_root, prompt.left_item)?);
+            }
+            if prompt.right_item.is_some() {
+                targets.push(make_target("right", prompt.right_root, prompt.right_item)?);
+            }
+            if targets.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Nothing remains on either side to delete",
+                ));
+            }
+        }
+    }
+
+    // Two panels may resolve to the same directory (including through aliases).
+    // The single directory entry must be removed only once.
+    if targets.len() == 2 && targets[0].path == targets[1].path {
+        targets[0].side = "left and right";
+        targets.truncate(1);
+    }
+
+    // Validate every requested side before mutating either one. The worker
+    // repeats these checks because the filesystem can still change afterward.
+    for target in &targets {
+        verify_diff_delete_target(target)?;
+    }
+
+    let mut progress = FileOperationProgress::new(FileOperationType::Delete);
+    progress.is_active = true;
+    let cancel_flag = progress.cancel_flag.clone();
+    let (tx, rx) = mpsc::channel();
+    progress.receiver = Some(rx);
+    let relative_path = prompt.relative_path;
+
+    thread::spawn(move || {
+        run_diff_delete_worker(targets, absence_checks, relative_path, cancel_flag, tx)
+    });
+
+    if let Some(state) = app.diff_state.as_mut() {
+        state.delete_prompt = None;
+        state.delete_in_progress = true;
+    }
+    app.file_operation_progress = Some(progress);
+    app.dialog = Some(Dialog {
+        dialog_type: DialogType::Progress,
+        input: String::new(),
+        cursor_pos: 0,
+        message: String::new(),
+        completion: None,
+        selected_button: 0,
+        selection: None,
+        use_md5: false,
+    });
+    Ok(())
+}
+
+pub(crate) fn handle_delete_dialog_input(
+    app: &mut App,
+    code: KeyCode,
+    _modifiers: KeyModifiers,
+) -> bool {
+    match code {
+        KeyCode::Left => {
+            if let Err(error) = start_diff_delete(app, DiffDeleteDirection::Left) {
+                set_delete_dialog_error(app, error.to_string());
+            }
+        }
+        KeyCode::Right => {
+            if let Err(error) = start_diff_delete(app, DiffDeleteDirection::Right) {
+                set_delete_dialog_error(app, error.to_string());
+            }
+        }
+        KeyCode::Down => {
+            if let Err(error) = start_diff_delete(app, DiffDeleteDirection::Both) {
+                set_delete_dialog_error(app, error.to_string());
+            }
+        }
+        KeyCode::Up | KeyCode::Enter | KeyCode::Esc => {
+            cancel_delete_dialog(app);
+        }
+        _ => {}
+    }
+    false
 }
 
 /// Toggle sort field/order for the diff state
@@ -2504,6 +3653,104 @@ fn handle_enter(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::{Duration, Instant};
+
+    fn app_with_diff(left: &Path, right: &Path) -> App {
+        let mut app = App::new(left.to_path_buf(), right.to_path_buf());
+        let mut state = DiffState::new(
+            left.to_path_buf(),
+            right.to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.filter = DiffFilter::All;
+        state.build_diff_list();
+        state.apply_filter();
+        state.expand_all();
+        app.current_screen = Screen::DiffScreen;
+        app.diff_state = Some(state);
+        app
+    }
+
+    fn select_entry(app: &mut App, relative_path: &str) {
+        let state = app.diff_state.as_mut().unwrap();
+        state.selected_index = state
+            .filtered_indices
+            .iter()
+            .position(|&index| state.all_entries[index].relative_path == relative_path)
+            .unwrap_or_else(|| panic!("missing diff entry: {relative_path}"));
+    }
+
+    fn open_copy_prompt(app: &mut App) {
+        handle_input(app, KeyCode::Char('C'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffCopy)
+        );
+    }
+
+    fn open_delete_prompt(app: &mut App) {
+        handle_input(app, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffDelete)
+        );
+    }
+
+    fn wait_for_copy(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .expect("copy progress should exist")
+                .poll();
+            if !active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "copy worker timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("copy result should exist");
+        assert_eq!(
+            result.success_count, 1,
+            "copy error: {:?}",
+            result.last_error
+        );
+        assert_eq!(
+            result.failure_count, 0,
+            "copy error: {:?}",
+            result.last_error
+        );
+    }
+
+    fn wait_for_delete(app: &mut App) -> file_ops::FileOperationResult {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let active = app
+                .file_operation_progress
+                .as_mut()
+                .expect("delete progress should exist")
+                .poll();
+            if !active {
+                break;
+            }
+            assert!(Instant::now() < deadline, "delete worker timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        app.file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.clone())
+            .expect("delete result should exist")
+    }
 
     #[test]
     fn read_error_is_not_reported_as_eof() {
@@ -2517,6 +3764,138 @@ mod tests {
         let mut reader = BrokenReader;
         let mut buffer = [0u8; 8];
         assert!(read_exact_or_eof(&mut reader, &mut buffer).is_err());
+    }
+
+    #[test]
+    fn function_bar_exposes_diff_copy_and_delete_at_80_columns() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let keybindings = crate::keybindings::Keybindings::from_config(
+            &crate::keybindings::KeybindingsConfig::default(),
+        );
+
+        terminal
+            .draw(|frame| {
+                draw_function_bar(frame, frame.area(), &theme, &keybindings);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..80)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect::<String>();
+        assert!(row.contains("Shift+C:copy"), "got: {row:?}");
+        assert!(row.contains("Del:delete"), "got: {row:?}");
+    }
+
+    #[test]
+    fn comparison_progress_displays_an_operation_result_message() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        let keybindings = crate::keybindings::Keybindings::from_config(
+            &crate::keybindings::KeybindingsConfig::default(),
+        );
+        let mut state = DiffState::new(
+            PathBuf::from("left"),
+            PathBuf::from("right"),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.is_comparing = true;
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &mut state,
+                    frame.area(),
+                    &theme,
+                    &keybindings,
+                    Some("Copy completed"),
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = (0..80)
+            .map(|x| buffer.cell((x, 9)).unwrap().symbol())
+            .collect::<String>();
+        assert!(row.contains("Copy completed"), "got: {row:?}");
+    }
+
+    #[test]
+    fn completed_comparison_prunes_only_stale_selections() {
+        let mut state = DiffState::new(
+            PathBuf::from("left"),
+            PathBuf::from("right"),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.selected_files.insert("still-present".to_string());
+        state.selected_files.insert("removed".to_string());
+        let entry = DiffEntry {
+            relative_path: "still-present".to_string(),
+            left: None,
+            right: None,
+            status: DiffStatus::LeftOnly,
+            is_directory: false,
+            depth: 0,
+            children_not_loaded: false,
+            left_missing: None,
+            right_missing: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender.send(DiffCompareResult(vec![entry])).unwrap();
+        state.receiver = Some(receiver);
+        state.is_comparing = true;
+
+        assert!(state.poll());
+        assert_eq!(state.selected_files.len(), 1);
+        assert!(state.selected_files.contains("still-present"));
+    }
+
+    #[test]
+    fn copy_completion_restarts_the_comparison_after_any_result() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.copy_in_progress = true;
+
+        state.finish_copy_operation();
+
+        assert!(state.is_comparing);
+        assert!(!state.copy_in_progress());
+        state.cancel();
+    }
+
+    #[test]
+    fn delete_completion_restarts_the_comparison_even_after_failure() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.delete_in_progress = true;
+
+        state.finish_delete_operation();
+
+        assert!(state.is_comparing);
+        assert!(!state.delete_in_progress());
+        state.cancel();
     }
 
     #[cfg(unix)]
@@ -2575,6 +3954,8 @@ mod tests {
                 is_directory: true,
                 depth,
                 children_not_loaded: false,
+                left_missing: None,
+                right_missing: None,
             })
             .collect();
 
@@ -2595,12 +3976,15 @@ mod tests {
                 is_directory: true,
                 is_symlink: false,
                 full_path: PathBuf::from(path),
+                authorization: None,
             }),
             right: None,
             status: DiffStatus::LeftOnly,
             is_directory: true,
             depth,
             children_not_loaded: false,
+            left_missing: None,
+            right_missing: None,
         };
         let entries = vec![
             make_entry("b", "b", 0),
@@ -2616,5 +4000,807 @@ mod tests {
             .collect();
 
         assert_eq!(paths, ["a", "a/child", "b", "b/child"]);
+    }
+
+    #[test]
+    fn left_on_file_focuses_and_collapses_its_parent() {
+        let entry = |relative_path: &str, is_directory: bool, depth: usize| DiffEntry {
+            relative_path: relative_path.to_string(),
+            left: None,
+            right: None,
+            status: if is_directory {
+                DiffStatus::DirModified
+            } else {
+                DiffStatus::Modified
+            },
+            is_directory,
+            depth,
+            children_not_loaded: false,
+            left_missing: None,
+            right_missing: None,
+        };
+        let mut state = DiffState::new(
+            PathBuf::from("left"),
+            PathBuf::from("right"),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.filter = DiffFilter::All;
+        state.all_entries = vec![
+            entry("src", true, 0),
+            entry("src/ui", true, 1),
+            entry("src/ui/help.rs", false, 2),
+            entry("src/ui/nested", true, 2),
+            entry("src/ui/nested/view.rs", false, 3),
+            entry("src/app.rs", false, 1),
+        ];
+        state.apply_filter();
+        state.selected_index = state
+            .filtered_indices
+            .iter()
+            .position(|&index| state.all_entries[index].relative_path == "src/ui/help.rs")
+            .unwrap();
+
+        state.collapse_one_level();
+
+        assert_eq!(
+            state
+                .current_entry()
+                .map(|entry| entry.relative_path.as_str()),
+            Some("src/ui")
+        );
+        assert!(state.collapsed_dirs.contains("src/ui"));
+        assert!(state.collapsed_dirs.contains("src/ui/nested"));
+        let visible_paths: Vec<&str> = state
+            .filtered_indices
+            .iter()
+            .map(|&index| state.all_entries[index].relative_path.as_str())
+            .collect();
+        assert_eq!(visible_paths, ["src", "src/ui", "src/app.rs"]);
+    }
+
+    #[test]
+    fn diff_copy_arrows_overwrite_files_in_both_directions() {
+        for copy_to_right in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let left = temp.path().join("left");
+            let right = temp.path().join("right");
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&right).unwrap();
+            std::fs::write(left.join("item.txt"), b"left version").unwrap();
+            std::fs::write(right.join("item.txt"), b"right version").unwrap();
+
+            let mut app = app_with_diff(&left, &right);
+            select_entry(&mut app, "item.txt");
+            open_copy_prompt(&mut app);
+            crate::ui::dialogs::handle_dialog_input(
+                &mut app,
+                if copy_to_right {
+                    KeyCode::Right
+                } else {
+                    KeyCode::Left
+                },
+                KeyModifiers::NONE,
+            );
+            assert_eq!(
+                app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+                Some(DialogType::Progress)
+            );
+            wait_for_copy(&mut app);
+
+            if copy_to_right {
+                assert_eq!(
+                    std::fs::read(right.join("item.txt")).unwrap(),
+                    b"left version"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(left.join("item.txt")).unwrap(),
+                    b"right version"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diff_copy_replaces_an_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("folder/nested")).unwrap();
+        std::fs::create_dir_all(right.join("folder")).unwrap();
+        std::fs::write(left.join("folder/nested/new.txt"), b"new").unwrap();
+        std::fs::write(right.join("folder/stale.txt"), b"stale").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "folder");
+        open_copy_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        wait_for_copy(&mut app);
+
+        assert_eq!(
+            std::fs::read(right.join("folder/nested/new.txt")).unwrap(),
+            b"new"
+        );
+        assert!(!right.join("folder/stale.txt").exists());
+    }
+
+    #[test]
+    fn diff_copy_rejects_a_source_descendant_changed_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("folder")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("folder/item.txt"), b"confirmed").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "folder");
+        open_copy_prompt(&mut app);
+        std::fs::write(left.join("folder/item.txt"), b"changed after confirmation").unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffCopy)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("tree changed")));
+        assert!(app.file_operation_progress.is_none());
+        assert!(!right.join("folder").exists());
+    }
+
+    #[test]
+    fn diff_copy_rejects_a_destination_descendant_changed_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("folder")).unwrap();
+        std::fs::create_dir_all(right.join("folder")).unwrap();
+        std::fs::write(left.join("folder/item.txt"), b"left version").unwrap();
+        std::fs::write(right.join("folder/item.txt"), b"right version").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "folder");
+        open_copy_prompt(&mut app);
+        std::fs::write(
+            right.join("folder/item.txt"),
+            b"new destination version after confirmation",
+        )
+        .unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffCopy)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("tree changed")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(
+            std::fs::read(right.join("folder/item.txt")).unwrap(),
+            b"new destination version after confirmation"
+        );
+    }
+
+    #[test]
+    fn diff_copy_creates_missing_destination_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("a/b")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("a/b/item.txt"), b"nested").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "a/b/item.txt");
+        open_copy_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        wait_for_copy(&mut app);
+
+        assert_eq!(
+            std::fs::read(right.join("a/b/item.txt")).unwrap(),
+            b"nested"
+        );
+    }
+
+    #[test]
+    fn diff_copy_rejects_a_missing_destination_parent_replaced_after_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("a")).unwrap();
+        std::fs::create_dir_all(right.join("a")).unwrap();
+        std::fs::write(left.join("a/item.txt"), b"selected").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "a/item.txt");
+        open_copy_prompt(&mut app);
+        std::fs::rename(right.join("a"), right.join("a-original")).unwrap();
+        std::fs::create_dir(right.join("a")).unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffCopy)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("replaced")));
+        assert!(app.file_operation_progress.is_none());
+        assert!(!right.join("a/item.txt").exists());
+        assert_eq!(std::fs::read(left.join("a/item.txt")).unwrap(), b"selected");
+    }
+
+    #[test]
+    fn diff_copy_rejects_a_missing_destination_parent_replaced_since_comparison() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("a")).unwrap();
+        std::fs::create_dir_all(right.join("a")).unwrap();
+        std::fs::write(left.join("a/item.txt"), b"selected").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "a/item.txt");
+        std::fs::rename(right.join("a"), right.join("a-original")).unwrap();
+        std::fs::create_dir(right.join("a")).unwrap();
+
+        open_copy_prompt(&mut app);
+
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("replaced")));
+        assert!(app.file_operation_progress.is_none());
+        assert!(!right.join("a/item.txt").exists());
+    }
+
+    #[test]
+    fn overlapping_diff_roots_disable_copy_and_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("base");
+        let right = left.join("folder");
+        let source = right.join("folder/source-marker");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"keep me").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "folder");
+        open_copy_prompt(&mut app);
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("overlap")));
+        assert!(app.file_operation_progress.is_none());
+
+        cancel_copy_dialog(&mut app);
+        open_delete_prompt(&mut app);
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("overlap")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_copy_rejects_a_symlinked_source_parent_after_comparison() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(left.join("a")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(left.join("a/item.txt"), b"selected").unwrap();
+        std::fs::write(outside.join("item.txt"), b"outside").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "a/item.txt");
+        std::fs::rename(left.join("a"), left.join("a-original")).unwrap();
+        std::os::unix::fs::symlink(&outside, left.join("a")).unwrap();
+
+        open_copy_prompt(&mut app);
+
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.message.is_empty()));
+        assert!(app.file_operation_progress.is_none());
+        assert!(!right.join("a/item.txt").exists());
+        assert_eq!(std::fs::read(outside.join("item.txt")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn unavailable_direction_stays_open_and_up_or_down_cancels() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("left-only.txt"), b"left").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "left-only.txt");
+        open_copy_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffCopy)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("right")));
+        assert!(app.file_operation_progress.is_none());
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.dialog.is_none());
+
+        open_copy_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn diff_delete_arrows_remove_only_the_requested_side() {
+        for (key, delete_left) in [(KeyCode::Left, true), (KeyCode::Right, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let left = temp.path().join("left");
+            let right = temp.path().join("right");
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&right).unwrap();
+            std::fs::write(left.join("item.txt"), b"left").unwrap();
+            std::fs::write(right.join("item.txt"), b"right").unwrap();
+
+            let mut app = app_with_diff(&left, &right);
+            select_entry(&mut app, "item.txt");
+            open_delete_prompt(&mut app);
+            crate::ui::dialogs::handle_dialog_input(&mut app, key, KeyModifiers::NONE);
+
+            assert_eq!(
+                app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+                Some(DialogType::Progress)
+            );
+            let result = wait_for_delete(&mut app);
+            assert_eq!((result.success_count, result.failure_count), (1, 0));
+            assert_eq!(left.join("item.txt").exists(), !delete_left);
+            assert_eq!(right.join("item.txt").exists(), delete_left);
+        }
+    }
+
+    #[test]
+    fn diff_delete_rejects_a_descendant_changed_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("folder")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("folder/item.txt"), b"confirmed").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "folder");
+        open_delete_prompt(&mut app);
+        std::fs::write(left.join("folder/item.txt"), b"changed after confirmation").unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Left, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffDelete)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("tree changed")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(
+            std::fs::read(left.join("folder/item.txt")).unwrap(),
+            b"changed after confirmation"
+        );
+    }
+
+    #[test]
+    fn down_deletes_both_sides() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"left").unwrap();
+        std::fs::write(right.join("item.txt"), b"right").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        open_delete_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        let result = wait_for_delete(&mut app);
+        assert_eq!((result.success_count, result.failure_count), (2, 0));
+        assert!(!left.join("item.txt").exists());
+        assert!(!right.join("item.txt").exists());
+    }
+
+    #[test]
+    fn down_deletes_both_hard_link_names_without_false_replacement_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"shared inode").unwrap();
+        std::fs::hard_link(left.join("item.txt"), right.join("item.txt")).unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        open_delete_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        let result = wait_for_delete(&mut app);
+        assert_eq!(
+            (result.success_count, result.failure_count),
+            (2, 0),
+            "delete error: {:?}",
+            result.last_error
+        );
+        assert!(!left.join("item.txt").exists());
+        assert!(!right.join("item.txt").exists());
+    }
+
+    #[test]
+    fn down_deletes_the_existing_side_when_the_other_side_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("left-only.txt"), b"left").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "left-only.txt");
+        open_delete_prompt(&mut app);
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffDelete)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("right")));
+        assert!(app.file_operation_progress.is_none());
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        let result = wait_for_delete(&mut app);
+        assert_eq!((result.success_count, result.failure_count), (1, 0));
+        assert!(!left.join("left-only.txt").exists());
+    }
+
+    #[test]
+    fn delete_both_rejects_a_side_that_appears_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"confirmed left").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        open_delete_prompt(&mut app);
+        std::fs::write(right.join("item.txt"), b"new right").unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffDelete)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("appeared since the comparison")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(
+            std::fs::read(left.join("item.txt")).unwrap(),
+            b"confirmed left"
+        );
+        assert_eq!(std::fs::read(right.join("item.txt")).unwrap(), b"new right");
+    }
+
+    #[test]
+    fn up_cancels_diff_delete_without_changing_either_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"left").unwrap();
+        std::fs::write(right.join("item.txt"), b"right").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        open_delete_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Up, KeyModifiers::NONE);
+
+        assert!(app.dialog.is_none());
+        assert!(app.file_operation_progress.is_none());
+        assert!(left.join("item.txt").exists());
+        assert!(right.join("item.txt").exists());
+    }
+
+    #[test]
+    fn delete_both_handles_directory_and_file_type_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir_all(left.join("item/nested")).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item/nested/file.txt"), b"nested").unwrap();
+        std::fs::write(right.join("item"), b"regular file").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item");
+        open_delete_prompt(&mut app);
+        assert!(app
+            .diff_state
+            .as_ref()
+            .is_some_and(|state| state.delete_prompt_availability() == (true, true, true)));
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        let result = wait_for_delete(&mut app);
+        assert_eq!((result.success_count, result.failure_count), (2, 0));
+        assert!(!left.join("item").exists());
+        assert!(!right.join("item").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_delete_removes_a_symlink_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        let outside = temp.path().join("outside.txt");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, left.join("link")).unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "link");
+        open_delete_prompt(&mut app);
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        let result = wait_for_delete(&mut app);
+        assert_eq!((result.success_count, result.failure_count), (1, 0));
+        assert!(!left.join("link").exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn diff_delete_rejects_a_target_replaced_after_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"confirmed").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        open_delete_prompt(&mut app);
+        std::fs::rename(left.join("item.txt"), left.join("retained.txt")).unwrap();
+        std::fs::write(left.join("item.txt"), b"replacement").unwrap();
+
+        crate::ui::dialogs::handle_dialog_input(&mut app, KeyCode::Left, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.dialog.as_ref().map(|dialog| dialog.dialog_type),
+            Some(DialogType::DiffDelete)
+        );
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("changed")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(
+            std::fs::read(left.join("item.txt")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(left.join("retained.txt")).unwrap(),
+            b"confirmed"
+        );
+    }
+
+    #[test]
+    fn diff_delete_rejects_a_file_replaced_by_a_directory_before_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item"), b"displayed file").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item");
+        std::fs::remove_file(left.join("item")).unwrap();
+        std::fs::create_dir(left.join("item")).unwrap();
+        std::fs::write(left.join("item/keep.txt"), b"keep").unwrap();
+
+        open_delete_prompt(&mut app);
+
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("changed since the comparison")));
+        assert!(app
+            .diff_state
+            .as_ref()
+            .is_some_and(|state| state.delete_prompt_availability() == (false, false, false)));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(std::fs::read(left.join("item/keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn diff_delete_rejects_a_new_copy_on_a_previously_absent_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"left").unwrap();
+
+        let mut app = app_with_diff(&left, &right);
+        select_entry(&mut app, "item.txt");
+        std::fs::write(right.join("item.txt"), b"new right copy").unwrap();
+
+        open_delete_prompt(&mut app);
+
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.contains("appeared since the comparison")));
+        assert!(app.file_operation_progress.is_none());
+        assert_eq!(std::fs::read(left.join("item.txt")).unwrap(), b"left");
+        assert_eq!(
+            std::fs::read(right.join("item.txt")).unwrap(),
+            b"new right copy"
+        );
+    }
+
+    #[test]
+    fn two_sided_delete_reports_partial_failure_and_preserves_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"left").unwrap();
+        std::fs::write(right.join("item.txt"), b"confirmed right").unwrap();
+
+        let left_root = file_ops::capture_directory_authorization(&left).unwrap();
+        let right_root = file_ops::capture_directory_authorization(&right).unwrap();
+        let left_item = capture_diff_item(&left_root, Path::new("item.txt")).unwrap();
+        let right_item = capture_diff_item(&right_root, Path::new("item.txt")).unwrap();
+        let targets = vec![
+            PreparedDiffDeleteTarget {
+                side: "left",
+                root: left_root,
+                path: left_item.parent.resolved_path().join("item.txt"),
+                parent: left_item.parent,
+                item: left_item.item,
+                tree: left_item.tree,
+            },
+            PreparedDiffDeleteTarget {
+                side: "right",
+                root: right_root,
+                path: right_item.parent.resolved_path().join("item.txt"),
+                parent: right_item.parent,
+                item: right_item.item,
+                tree: right_item.tree,
+            },
+        ];
+        std::fs::rename(right.join("item.txt"), right.join("retained.txt")).unwrap();
+        std::fs::write(right.join("item.txt"), b"replacement").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        run_diff_delete_worker(
+            targets,
+            Vec::new(),
+            PathBuf::from("item.txt"),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let mut progress = FileOperationProgress::new(FileOperationType::Delete);
+        progress.is_active = true;
+        progress.receiver = Some(rx);
+        assert!(!progress.poll());
+        let result = progress.result.unwrap();
+
+        assert_eq!((result.success_count, result.failure_count), (1, 1));
+        assert!(result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("right") && error.contains("changed")));
+        assert!(!left.join("item.txt").exists());
+        assert_eq!(
+            std::fs::read(right.join("item.txt")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(right.join("retained.txt")).unwrap(),
+            b"confirmed right"
+        );
+    }
+
+    #[test]
+    fn delete_worker_rechecks_an_absent_side_before_deleting_the_other_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("item.txt"), b"confirmed left").unwrap();
+
+        let left_root = file_ops::capture_directory_authorization(&left).unwrap();
+        let right_root = file_ops::capture_directory_authorization(&right).unwrap();
+        let left_item = capture_diff_item(&left_root, Path::new("item.txt")).unwrap();
+        let right_missing = file_ops::capture_missing_path_authorization(
+            &right_root,
+            Path::new("item.txt"),
+            "Diff right delete target",
+        )
+        .unwrap();
+        let targets = vec![PreparedDiffDeleteTarget {
+            side: "left",
+            root: left_root,
+            path: left_item.parent.resolved_path().join("item.txt"),
+            parent: left_item.parent,
+            item: left_item.item,
+            tree: left_item.tree,
+        }];
+
+        std::fs::write(right.join("item.txt"), b"late right").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        run_diff_delete_worker(
+            targets,
+            vec![("right", right_missing)],
+            PathBuf::from("item.txt"),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let mut progress = FileOperationProgress::new(FileOperationType::Delete);
+        progress.is_active = true;
+        progress.receiver = Some(rx);
+        assert!(!progress.poll());
+        let result = progress.result.unwrap();
+
+        assert_eq!((result.success_count, result.failure_count), (0, 1));
+        assert!(result
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("right") && error.contains("appeared")));
+        assert_eq!(
+            std::fs::read(left.join("item.txt")).unwrap(),
+            b"confirmed left"
+        );
+        assert_eq!(
+            std::fs::read(right.join("item.txt")).unwrap(),
+            b"late right"
+        );
     }
 }

@@ -1,5 +1,23 @@
 # Changelog — cokacdir
 
+## 0.8.22 — 2026-09-02
+
+- **DIFF comparison now supports directional deletion with `Delete`.** The focused item opens a four-action confirmation: Left deletes the left copy, Up cancels, Down deletes every copy currently present, and Right deletes the right copy. Exact targets, absent sides, parent directories, and complete selected-directory trees are revalidated before deletion; symlinks are removed without following them, late unapproved descendants are preserved in recovery staging, partial two-sided failures are reported, and the comparison always refreshes afterward while keeping the result visible.
+
+- **DIFF comparison now supports direct, directional copying with `Shift+C`.** The focused file or directory opens a compact three-action dialog: Left copies right-to-left, Up or Down cancels, and Right copies left-to-right. Source and destination paths and complete selected-directory trees are rebound to the exact items shown by the comparison, including the deepest existing parent of an absent destination; replaced or newly appeared parents are rejected, and a missing parent hierarchy is privately staged before one no-replace publication. Same-name destinations are safely replaced, progress remains cancellable, and every completed copy attempt refreshes the comparison. Copy and delete stay disabled for overlapping or identity-aliased comparison boundaries so replacing one side cannot remove data from the other. Pressing Left on a file also focuses and collapses its parent directory in one step.
+
+---
+
+## 0.8.21 — 2026-09-02
+
+- **Filename MD5 verification now treats every embedded 32-character hash as an alternative candidate.** Content is hashed once, any matching candidate produces `MATCH`, and only an all-candidate miss produces `MISMATCH`. The obsolete `AMBIGUOUS` result has been removed from the TUI, CLI, summaries, and result details, while mismatch state retains every expected candidate.
+
+- **Local MD5 actions now enforce regular-file and identity checks on every path.** Files skipped because their names already contain an MD5 value and verification inputs without a candidate are still validated, so directories, symlinks, Unix sockets, and other special nodes are rejected consistently. Selected hardlink aliases receive freshly verified authorization after a rename changes their shared inode metadata, preventing false failures without accepting replaced or modified files.
+
+- **The MD5 actions are now visible in compact navigation help.** `Shift+H:md5+` and `Shift+J:md5chk` appear in the function bar and Help quick reference, including at 80-column terminal widths.
+
+---
+
 ## 0.8.20 — 2026-09-02
 
 - **Local files can now be renamed with their content MD5 using `Shift+H`.** The action processes the current selection, or the focused file when nothing is selected, and inserts a lowercase 32-character MD5 immediately before the final filename dot (`archive.tar.gz` becomes `archive.tar.<md5>.gz`). Extensionless and dotfile names are also supported, while filenames that already contain a maximal 32-character hexadecimal run are skipped.

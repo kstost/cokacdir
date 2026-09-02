@@ -47,7 +47,7 @@
 | 31자리 16진수 포함 | 0 | 후보 없음 |
 | 연속된 33자리 16진수 포함 | 0 | 후보 없음 |
 | 연속된 64자리 16진수 포함 | 0 | 후보 없음 |
-| `32자리-32자리.txt` | 2 | 여러 후보가 있어 모호함 |
+| `32자리-32자리.txt` | 2 | 독립된 MD5 후보 2개로 추출 |
 
 이 판정은 `filename_md5_candidates`에 한 번만 구현되어 이름 추가와 검증 동작이 같은 규칙을 공유한다.
 
@@ -71,7 +71,7 @@
 
 ### 3.2 건너뛰기와 실패 처리
 
-- 파일명에 MD5 후보가 하나라도 이미 있으면 실제 콘텐츠와 일치하는지와 관계없이 건너뛴다.
+- 파일명에 MD5 후보가 하나라도 이미 있으면 실제 콘텐츠와 일치하는지와 관계없이 건너뛴다. 단, 건너뛰기 전에 선택 경로가 그대로 유지된 로컬 일반 파일인지 검증한다.
 - 디렉터리와 심볼릭 링크는 건너뛴다.
 - 선택 항목이 사라졌거나 읽기·권한 확인·이름 변경에 실패한 항목은 실패로 집계하고 나머지 파일은 계속 처리한다.
 - 새 이름이 이미 존재하면 덮어쓰지 않고 해당 항목을 실패로 처리한다.
@@ -82,14 +82,13 @@
 
 ## 4. `Shift+J`: 파일명 MD5와 콘텐츠 검증
 
-각 대상의 파일명 후보 수에 따라 다음처럼 처리한다.
+각 대상의 파일명 후보와 실제 콘텐츠 MD5를 다음처럼 비교한다. 후보가 여러 개면 하나라도 실제값과 일치하는지 확인한다.
 
 | 상태 | 의미 | 해시 계산 여부 |
 |---|---|---:|
-| `MATCH` | 파일명 후보 하나와 실제 콘텐츠 MD5가 일치 | 함 |
-| `MISMATCH` | 파일명 후보 하나와 실제 콘텐츠 MD5가 불일치 | 함 |
+| `MATCH` | 파일명 후보 중 하나 이상이 실제 콘텐츠 MD5와 일치 | 함 |
+| `MISMATCH` | 파일명 후보가 있지만 어느 것도 실제 콘텐츠 MD5와 일치하지 않음 | 함 |
 | `NO HASH` | 파일명에 32자리 후보가 없음 | 안 함 |
-| `AMBIGUOUS` | 파일명에 후보가 둘 이상 있어 기준을 정할 수 없음 | 안 함 |
 | `ERROR` | 일반 파일이 아니거나 파일을 안전하게 읽지 못함 | 상황에 따라 다름 |
 
 검증은 백그라운드에서 진행되고 스피너에 `Verifying content MD5... n/N` 형식으로 진행률이 표시된다. 항목이 아주 많을 때 메시지 큐가 불필요하게 커지지 않도록 진행 이벤트는 전체 작업당 약 100개 이하로 제한한다.
@@ -99,11 +98,11 @@
 검증이 끝나면 일시적인 토스트 대신 `MD5 Verification` 결과 화면으로 전환한다.
 
 - 파일 하나가 반드시 한 행만 차지한다.
-- 상단에는 전체 파일 수와 `match`, `mismatch`, `no hash`, `ambiguous`, `error` 합계를 표시한다.
+- 상단에는 전체 파일 수와 `match`, `mismatch`, `no hash`, `error` 합계를 표시한다.
 - 각 행에는 명시적인 기호와 상태 문자열, 파일명, 가능한 범위의 해시 상세를 표시한다. 색상만으로 상태를 구분하지 않는다.
 - 긴 파일명은 행 폭에 맞춰 앞부분을 줄이고 끝부분을 보존한다.
 - 파일명이나 오류 메시지에 제어 문자와 줄바꿈이 있어도 공백으로 바꿔 한 행 계약을 유지한다.
-- 좁은 터미널에서는 해시 상세를 8자리 접두사로 줄이거나 숨기고, 넓은 터미널에서는 전체 예상값과 실제값을 표시한다.
+- 좁은 터미널에서는 해시 상세를 8자리 접두사로 줄이거나 숨긴다. 넓은 터미널의 단일 후보 불일치는 전체 예상값과 실제값을 표시하고, 복수 후보 불일치는 후보 수와 전체 실제값을 표시한다.
 - 결과가 화면 높이를 넘으면 스크롤바를 표시한다.
 
 기본 조작은 위/아래, Page Up/Page Down, Home/End이며 검색 결과 화면의 사용자 지정 키 설정을 공유한다. 기본 `Esc`로 닫으면 결과 상태만 제거하고 원래 파일 패널의 선택 상태는 유지한다.
@@ -146,10 +145,9 @@ cokacdir --md5check hello.<md5>.tar apple.<md5>.tar
 | 이름 추가 | `RENAMED` | 새 이름으로 변경됨 |
 | 이름 추가 | `SKIPPED` | 파일명에 MD5 후보가 이미 있음 |
 | 이름 추가 | `ERROR` | 파일을 검증하거나 이름을 바꾸지 못함 |
-| 검증 | `MATCH` | 후보와 실제 MD5가 일치 |
-| 검증 | `MISMATCH` | 예상값과 실제값이 불일치 |
+| 검증 | `MATCH` | 후보 중 하나 이상이 실제 MD5와 일치 |
+| 검증 | `MISMATCH` | 모든 후보가 실제 MD5와 불일치 |
 | 검증 | `NO_HASH` | 파일명에 후보가 없음 |
-| 검증 | `AMBIGUOUS` | 후보가 둘 이상 있음 |
 | 검증 | `ERROR` | 일반 파일이 아니거나 안전하게 읽지 못함 |
 
 정상 결과와 검증 판정은 표준 출력으로, `ERROR` 행은 표준 오류로 쓴다. 파일명과 오류 메시지의 줄바꿈 및 제어 문자는 이스케이프하므로 한 파일이 여러 터미널 행을 생성하지 않는다.
@@ -161,8 +159,8 @@ RENAMED "hello.tar" -> "/work/hello.5d41402abc4b2a76b9719d911017c592.tar" md5=5d
 SKIPPED "already.d41d8cd98f00b204e9800998ecf8427e.txt" filename_md5_candidates=1
 MATCH "hello.5d41402abc4b2a76b9719d911017c592.tar" md5=5d41402abc4b2a76b9719d911017c592
 MISMATCH "changed.5d41402abc4b2a76b9719d911017c592.tar" expected=5d41402abc4b2a76b9719d911017c592 actual=8977dfac2f8e04cb96e66882235f5aba
+MISMATCH "two-5d41402abc4b2a76b9719d911017c592-d41d8cd98f00b204e9800998ecf8427e.txt" expected=5d41402abc4b2a76b9719d911017c592,d41d8cd98f00b204e9800998ecf8427e actual=8977dfac2f8e04cb96e66882235f5aba
 NO_HASH "README"
-AMBIGUOUS "two-<md5>-<md5>.txt" filename_md5_candidates=2
 ERROR "missing.txt" No such file or directory (os error 2)
 ```
 
@@ -173,7 +171,7 @@ ERROR "missing.txt" No such file or directory (os error 2)
 | 코드 | 의미 |
 |---:|---|
 | `0` | 이름 추가는 모든 입력이 `RENAMED` 또는 `SKIPPED`; 검증은 모든 입력이 `MATCH` |
-| `1` | 파일 작업 오류가 하나 이상 발생했거나 검증 결과에 `MISMATCH`, `NO_HASH`, `AMBIGUOUS`, `ERROR`가 있음 |
+| `1` | 파일 작업 오류가 하나 이상 발생했거나 검증 결과에 `MISMATCH`, `NO_HASH`, `ERROR`가 있음 |
 | `2` | 파일 인자가 없거나 알 수 없는 옵션을 전달하는 등 명령행 사용법 오류 |
 
 ---
@@ -199,11 +197,11 @@ App::add_content_md5_to_filenames / verify_content_md5
 ```text
 대상을 패널 순서로 확정
     ↓
-후보 없음·다수·비일반 파일은 즉시 결과로 분류
+각 실제 경로의 권한 스냅샷 캡처
     ↓
-후보가 하나인 일반 파일의 접근 권한을 캡처
+후보 없음은 일반 파일 검증, 후보 하나 이상은 콘텐츠 해시 계산
     ↓
-백그라운드 스레드에서 파일별 MD5 계산
+백그라운드 스레드에서 파일별 검증 수행
     ↓  RemoteSpinnerResult::Md5VerificationProgress
 진행률 갱신
     ↓  RemoteSpinnerResult::Md5VerificationComplete
@@ -212,7 +210,7 @@ Md5VerificationState 생성
 Screen::Md5Verification 전환 및 한 행씩 렌더링
 ```
 
-`Md5VerificationStatus`가 다섯 결과 유형의 데이터를 보관하고, `Md5VerificationState`가 결과 목록·현재 행·스크롤 위치를 보관한다. 완료된 결과를 화면 상태로 옮기기 때문에 스피너 메시지가 사라진 뒤에도 사용자가 직접 닫을 때까지 결과가 남는다.
+`Md5VerificationStatus`가 네 결과 유형의 데이터를 보관하고, `Md5VerificationState`가 결과 목록·현재 행·스크롤 위치를 보관한다. 완료된 결과를 화면 상태로 옮기기 때문에 스피너 메시지가 사라진 뒤에도 사용자가 직접 닫을 때까지 결과가 남는다.
 
 ---
 
@@ -225,13 +223,14 @@ Screen::Md5Verification 전환 및 한 행씩 렌더링
 | `filename_md5_candidates` | 최대 연속 16진수 구간을 스캔해 정확히 32자리인 후보를 소문자로 반환 |
 | `filename_with_content_md5` | 마지막 점 앞 또는 무확장자 이름 끝에 `.{md5}` 삽입 |
 | `content_md5_for_authorized_file` | 승인된 일반 파일을 64 KiB 단위로 읽고 변경 여부를 확인하며 MD5 계산 |
+| `validate_authorized_regular_file` | 해시 계산이 필요 없는 TUI 경로도 승인된 일반 파일인지 확인 |
 | `prepare_file` | CLI 경로의 부모 디렉터리를 해석하고 디렉터리·원본 경로 권한 스냅샷 캡처 |
-| `verify_authorized_regular_file` | 해시가 필요 없는 `SKIPPED`, `NO_HASH`, `AMBIGUOUS` 경로도 실제 일반 파일인지 안전하게 확인 |
+| `verify_authorized_regular_file` | 해시가 필요 없는 `SKIPPED`, `NO_HASH` 경로도 실제 일반 파일인지 안전하게 확인 |
 | `hash_authorized_file` | 부모 디렉터리 권한을 계산 전후로 확인하며 공통 해시 함수 호출 |
 | `add_content_md5_to_path` | CLI 경로 하나를 검증한 뒤 건너뛰거나 no-replace 이름 변경 수행 |
-| `verify_content_md5_path` | CLI 경로 하나를 `MATCH`, `MISMATCH`, `NO_HASH`, `AMBIGUOUS`로 분류 |
+| `verify_content_md5_path` | CLI 경로 하나를 `MATCH`, `MISMATCH`, `NO_HASH`로 분류하며 복수 후보는 모두 비교 |
 | `AddContentMd5Outcome` | `Renamed { new_path, hash, warnings }` 또는 `SkippedExistingHash { candidate_count }` |
-| `VerifyContentMd5Outcome` | `Match`, `Mismatch`, `NoHash`, `Ambiguous` 결과 데이터 |
+| `VerifyContentMd5Outcome` | `Match`, `Mismatch`, `NoHash` 결과 데이터 |
 
 서비스의 두 결과 enum에는 정상적으로 판정할 수 있는 상태만 둔다. 경로 소실, 비일반 파일, 심볼릭 링크, 읽기 실패, 파일 변경 및 이름 변경 실패는 `io::Error`로 반환하며 CLI 계층이 이를 `ERROR` 행과 실패 종료 코드로 바꾼다.
 
@@ -258,7 +257,7 @@ run_content_md5_cli
 `run_content_md5_cli`의 성공 플래그는 처음에 `true`이고 입력 전체를 처리할 때까지 조기 반환하지 않는다.
 
 - 이름 추가 모드에서는 `Renamed`와 `SkippedExistingHash`가 성공을 유지하고 `io::Error`만 실패로 바꾼다.
-- 검증 모드에서는 `Match`만 성공을 유지한다. `Mismatch`, `NoHash`, `Ambiguous`, `io::Error` 중 하나라도 나오면 실패로 바꾼다.
+- 검증 모드에서는 `Match`만 성공을 유지한다. `Mismatch`, `NoHash`, `io::Error` 중 하나라도 나오면 실패로 바꾼다.
 - 한번 실패로 바뀐 플래그는 뒤의 파일이 성공해도 다시 `true`가 되지 않는다.
 - 이름 변경 경고는 작업이 이미 커밋된 상태이므로 성공으로 취급하되 같은 출력 행에 보존한다.
 
@@ -277,6 +276,8 @@ MD5 계산과 이름 변경은 기존 `src/services/file_ops.rs`의 권한 및 �
 7. `rename_file_authorized`의 no-replace 동작으로 기존 목적지를 덮어쓰지 않는다.
 
 이 검사는 작업 시작과 실제 백그라운드 처리 사이에 경로나 파일이 바뀌는 경쟁 조건을 줄이기 위한 것이다.
+
+같은 inode를 가리키는 하드링크가 배치에 여러 개 있으면 한 별칭의 이름 변경이 Unix inode의 `ctime`을 함께 바꾼다. 이 경우 이름 변경 함수가 검증한 이동 후 스냅샷을, 이동 전 스냅샷이 정확히 같았던 나머지 별칭에만 전달해 콘텐츠 변경으로 오인하지 않도록 한다.
 
 ---
 
@@ -310,7 +311,7 @@ MD5 계산과 이름 변경은 기존 `src/services/file_ops.rs`의 권한 및 �
 - 80×24 터미널에서도 파일당 한 행 유지
 - 일반 `h`, `j` 동작과 `Shift+H`, `Shift+J` 단축키의 구분
 - CLI 다중 경로 파싱, 첫 인자 전용 모드, 알 수 없는 옵션 거부, `--` 뒤의 대시 시작 파일명 허용
-- 경로 단위 이름 변경 후 검증 및 `SKIPPED`, `MISMATCH`, `NO_HASH`, `AMBIGUOUS` 결과
+- 경로 단위 이름 변경 후 검증 및 `SKIPPED`, `MISMATCH`, `NO_HASH` 결과와 복수 후보 any-match 판정
 - CLI 오류 문자열의 한 줄 이스케이프
 
 CLI 관련 테스트는 두 층으로 나뉜다.
@@ -325,7 +326,7 @@ CLI 관련 테스트는 두 층으로 나뉜다.
 - 원격 파일 패널은 지원하지 않는다.
 - 디렉터리 콘텐츠를 재귀적으로 해시하지 않는다.
 - 심볼릭 링크 대상도 해시하지 않는다.
-- 파일명 후보가 둘 이상이면 어떤 값을 선택할지 추정하지 않고 `AMBIGUOUS`로 남긴다.
+- 파일명 후보가 둘 이상이면 모두 실제 콘텐츠 MD5와 비교하며, 하나라도 맞으면 `MATCH`, 모두 다르면 `MISMATCH`로 판정한다.
 - `Shift+H`는 이미 들어 있는 후보의 정확성을 자동 검증하지 않는다. 이름을 바꾸지 않고 건너뛴 뒤 필요하면 `Shift+J`로 별도 검증한다.
 - CLI는 파일 경로만 받으며 디렉터리를 재귀 순회하지 않는다.
 - CLI 인자와 경로의 파일명은 UTF-8이어야 한다. 비 UTF-8 파일명은 현재 경로 단위 서비스에서 거부한다.

@@ -1026,6 +1026,8 @@ pub enum DiffScreenAction {
     SortByType,
     ExpandAll,
     CollapseAll,
+    CopyEntry,
+    DeleteEntry,
     Open,
     Close,
 }
@@ -1048,7 +1050,11 @@ pub fn default_diff_screen_keybindings() -> HashMap<DiffScreenAction, Vec<String
     );
     m.insert(
         DiffScreenAction::CollapseDir,
-        vec!["//Collapse directory".into(), "left".into(), "h".into()],
+        vec![
+            "//Collapse directory or parent".into(),
+            "left".into(),
+            "h".into(),
+        ],
     );
     m.insert(
         DiffScreenAction::PageUp,
@@ -1106,6 +1112,17 @@ pub fn default_diff_screen_keybindings() -> HashMap<DiffScreenAction, Vec<String
     );
 
     // Actions
+    m.insert(
+        DiffScreenAction::CopyEntry,
+        vec!["//Copy current item between sides".into(), "shift+c".into()],
+    );
+    m.insert(
+        DiffScreenAction::DeleteEntry,
+        vec![
+            "//Delete current item from either side".into(),
+            "delete".into(),
+        ],
+    );
     m.insert(
         DiffScreenAction::Open,
         vec!["//View file diff / toggle dir".into(), "enter".into()],
@@ -2463,6 +2480,38 @@ mod tests {
         assert_eq!(
             kb.editor_action(KeyCode::Backspace, KeyModifiers::NONE),
             None
+        );
+    }
+
+    #[test]
+    fn diff_copy_uses_shift_c_without_replacing_plain_c() {
+        let kb = Keybindings::from_config(&KeybindingsConfig::default());
+
+        assert_eq!(
+            kb.diff_screen_action(KeyCode::Char('c'), KeyModifiers::NONE),
+            Some(DiffScreenAction::CollapseAll)
+        );
+        assert_eq!(
+            kb.diff_screen_action(KeyCode::Char('C'), KeyModifiers::SHIFT),
+            Some(DiffScreenAction::CopyEntry)
+        );
+        assert_eq!(
+            kb.diff_screen_first_key(DiffScreenAction::CopyEntry),
+            "Shift+C"
+        );
+    }
+
+    #[test]
+    fn diff_delete_uses_delete_key() {
+        let kb = Keybindings::from_config(&KeybindingsConfig::default());
+
+        assert_eq!(
+            kb.diff_screen_action(KeyCode::Delete, KeyModifiers::NONE),
+            Some(DiffScreenAction::DeleteEntry)
+        );
+        assert_eq!(
+            kb.diff_screen_first_key(DiffScreenAction::DeleteEntry),
+            "Del"
         );
     }
 }

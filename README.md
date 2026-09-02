@@ -60,6 +60,8 @@ For the measured Antigravity CLI integration contract, see [How cokacdir Uses An
 
 For the `Shift+H`/`Shift+J` TUI actions and the `--md5`/`--md5check` CLI contract, see [File Content MD5 Filename Actions](devdoc/md5-filename-actions.md).
 
+For DIFF directional copy/delete controls, revalidation rules, and overlapping-root restrictions, see [DIFF Copy and Delete Safety](docs/diff-copy-delete-safety.md). The corresponding defect-review and verification record is in [DIFF Copy/Delete Defect Remediation Record](devdoc/diff-copy-delete-remediation.md).
+
 ## Chat Bots
 
 **Features:**

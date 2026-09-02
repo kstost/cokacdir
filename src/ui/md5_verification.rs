@@ -19,11 +19,17 @@ const COMPACT_DETAIL_WIDTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Md5VerificationStatus {
-    Match { hash: String },
-    Mismatch { expected: String, actual: String },
+    Match {
+        hash: String,
+    },
+    Mismatch {
+        candidates: Vec<String>,
+        actual: String,
+    },
     NoHash,
-    Ambiguous { count: usize },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +50,6 @@ pub struct Md5VerificationCounts {
     pub matched: usize,
     pub mismatched: usize,
     pub no_hash: usize,
-    pub ambiguous: usize,
     pub errors: usize,
 }
 
@@ -64,7 +69,6 @@ impl Md5VerificationState {
                 Md5VerificationStatus::Match { .. } => counts.matched += 1,
                 Md5VerificationStatus::Mismatch { .. } => counts.mismatched += 1,
                 Md5VerificationStatus::NoHash => counts.no_hash += 1,
-                Md5VerificationStatus::Ambiguous { .. } => counts.ambiguous += 1,
                 Md5VerificationStatus::Error { .. } => counts.errors += 1,
             }
         }
@@ -149,22 +153,26 @@ fn status_presentation(
             };
             ("✓", "MATCH", detail)
         }
-        Md5VerificationStatus::Mismatch { expected, actual } => {
-            let detail = if detail_width >= FULL_HASH_DETAIL_WIDTH {
-                format!("{} != {}", expected, actual)
-            } else if detail_width >= HASH_PAIR_DETAIL_WIDTH {
-                format!("{} != {}", hash_prefix(expected), hash_prefix(actual))
-            } else if detail_width >= COMPACT_DETAIL_WIDTH {
-                hash_prefix(actual).to_string()
-            } else {
-                String::new()
+        Md5VerificationStatus::Mismatch { candidates, actual } => {
+            let detail = match candidates.as_slice() {
+                [expected] if detail_width >= FULL_HASH_DETAIL_WIDTH => {
+                    format!("{} != {}", expected, actual)
+                }
+                [expected] if detail_width >= HASH_PAIR_DETAIL_WIDTH => {
+                    format!("{} != {}", hash_prefix(expected), hash_prefix(actual))
+                }
+                _ if detail_width >= FULL_HASH_DETAIL_WIDTH => {
+                    format!("none of {} candidates; actual {}", candidates.len(), actual)
+                }
+                _ if detail_width >= HASH_PAIR_DETAIL_WIDTH => {
+                    format!("{} hashes != {}", candidates.len(), hash_prefix(actual))
+                }
+                _ if detail_width >= COMPACT_DETAIL_WIDTH => hash_prefix(actual).to_string(),
+                _ => String::new(),
             };
             ("✕", "MISMATCH", detail)
         }
         Md5VerificationStatus::NoHash => ("–", "NO HASH", String::new()),
-        Md5VerificationStatus::Ambiguous { count } => {
-            ("!", "AMBIGUOUS", format!("{} hashes", count))
-        }
         Md5VerificationStatus::Error { message } => ("!", "ERROR", single_line_text(message)),
     }
 }
@@ -175,9 +183,7 @@ fn status_style(theme: &Theme, status: &Md5VerificationStatus) -> Style {
         Md5VerificationStatus::Mismatch { .. } | Md5VerificationStatus::Error { .. } => {
             theme.error_style().add_modifier(Modifier::BOLD)
         }
-        Md5VerificationStatus::NoHash | Md5VerificationStatus::Ambiguous { .. } => {
-            theme.warning_style()
-        }
+        Md5VerificationStatus::NoHash => theme.warning_style(),
     }
 }
 
@@ -215,11 +221,6 @@ pub fn draw(
         ),
         Span::styled("  ", theme.dim_style()),
         Span::styled(format!("{} no hash", counts.no_hash), theme.warning_style()),
-        Span::styled("  ", theme.dim_style()),
-        Span::styled(
-            format!("{} ambiguous", counts.ambiguous),
-            theme.warning_style(),
-        ),
         Span::styled("  ", theme.dim_style()),
         Span::styled(format!("{} error", counts.errors), theme.error_style()),
     ]);
@@ -400,17 +401,13 @@ mod tests {
             Md5VerificationResult {
                 file_name: "mismatch".to_string(),
                 status: Md5VerificationStatus::Mismatch {
-                    expected: "a".repeat(32),
+                    candidates: vec!["a".repeat(32)],
                     actual: "b".repeat(32),
                 },
             },
             Md5VerificationResult {
                 file_name: "missing".to_string(),
                 status: Md5VerificationStatus::NoHash,
-            },
-            Md5VerificationResult {
-                file_name: "ambiguous".to_string(),
-                status: Md5VerificationStatus::Ambiguous { count: 2 },
             },
             Md5VerificationResult {
                 file_name: "error".to_string(),
@@ -426,10 +423,24 @@ mod tests {
                 matched: 1,
                 mismatched: 1,
                 no_hash: 1,
-                ambiguous: 1,
                 errors: 1,
             }
         );
+    }
+
+    #[test]
+    fn multiple_candidates_are_presented_as_one_mismatch() {
+        let actual = "c".repeat(32);
+        let status = Md5VerificationStatus::Mismatch {
+            candidates: vec!["a".repeat(32), "b".repeat(32)],
+            actual: actual.clone(),
+        };
+
+        let (_, label, detail) = status_presentation(&status, FULL_HASH_DETAIL_WIDTH);
+
+        assert_eq!(label, "MISMATCH");
+        assert!(detail.contains("2 candidates"));
+        assert!(detail.contains(&actual));
     }
 
     #[test]
@@ -471,7 +482,7 @@ mod tests {
             Md5VerificationResult {
                 file_name: "apple.5d41402abc4b2a76b9719d911017c592.tar".to_string(),
                 status: Md5VerificationStatus::Mismatch {
-                    expected: "5d41402abc4b2a76b9719d911017c592".to_string(),
+                    candidates: vec!["5d41402abc4b2a76b9719d911017c592".to_string()],
                     actual: "8977dfac2f8e04cb96e66882235f5aba".to_string(),
                 },
             },

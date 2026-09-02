@@ -6,7 +6,7 @@ use crossterm::{
     terminal,
 };
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -16,7 +16,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::keybindings::GotoAction;
 use crate::services::file_ops::{FileOperationPhase, FileOperationType};
-use crate::utils::format::{safe_prefix, safe_suffix};
+use crate::utils::format::{safe_prefix, safe_suffix, truncate_with_ellipsis};
 
 use super::{
     app::{
@@ -572,6 +572,8 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
             SIMPLE_INPUT_HEIGHT,
         ),
         DialogType::EncryptConfirm => (SIMPLE_DIALOG_WIDTH, 7, 7),
+        DialogType::DiffCopy => (70, 7, 7),
+        DialogType::DiffDelete => (72, 7, 7),
         DialogType::Progress => (
             SIMPLE_DIALOG_WIDTH,
             PROGRESS_DIALOG_HEIGHT,
@@ -687,6 +689,12 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         }
         DialogType::DecryptConfirm => {
             draw_confirm_dialog(frame, dialog, dialog_area, theme, " Decrypt ");
+        }
+        DialogType::DiffCopy => {
+            draw_diff_copy_dialog(frame, app, dialog, dialog_area, theme);
+        }
+        DialogType::DiffDelete => {
+            draw_diff_delete_dialog(frame, app, dialog, dialog_area, theme);
         }
         DialogType::DedupConfirm => {
             draw_dedup_confirm_dialog(frame, dialog, dialog_area, theme);
@@ -1360,6 +1368,261 @@ fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &T
     );
 }
 
+fn draw_diff_copy_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, theme: &Theme) {
+    let block = Block::default()
+        .title(" Copy Difference ")
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.confirm_dialog.border))
+        .style(Style::default().bg(theme.confirm_dialog.bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sanitized_path: String = dialog
+        .input
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let path_width = inner.width.saturating_sub(9) as usize;
+    let path = truncate_with_ellipsis(&sanitized_path, path_width);
+    let path_line = Line::from(vec![
+        Span::styled(
+            " Item: ",
+            Style::default()
+                .fg(theme.confirm_dialog.message_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(path, Style::default().fg(theme.confirm_dialog.message_text)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(path_line),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+    );
+
+    let (left_exists, right_exists) = app
+        .diff_state
+        .as_ref()
+        .map(|state| state.copy_prompt_availability())
+        .unwrap_or((false, false));
+    let (notice, notice_style) = if dialog.message.is_empty() {
+        (
+            "Existing same-name destination will be overwritten.",
+            Style::default()
+                .fg(theme.confirm_dialog.message_text)
+                .add_modifier(Modifier::DIM),
+        )
+    } else {
+        (
+            dialog.message.as_str(),
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let sanitized_notice: String = notice
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let notice = truncate_with_ellipsis(&sanitized_notice, inner.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(notice)
+            .style(notice_style)
+            .alignment(Alignment::Center),
+        Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
+    );
+
+    let normal_style = Style::default().fg(theme.confirm_dialog.button_text);
+    let disabled_style = normal_style.add_modifier(Modifier::DIM);
+    let selected_style = Style::default()
+        .fg(theme.confirm_dialog.button_selected_text)
+        .bg(theme.confirm_dialog.button_selected_bg)
+        .add_modifier(Modifier::BOLD);
+    let left_style = if right_exists {
+        normal_style
+    } else {
+        disabled_style
+    };
+    let right_style = if left_exists {
+        normal_style
+    } else {
+        disabled_style
+    };
+    let cancel_style = if dialog.selected_button == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let buttons = Line::from(vec![
+        Span::styled(" ← Copy to left ", left_style),
+        Span::raw("  "),
+        Span::styled(" ↑/↓ Cancel ", cancel_style),
+        Span::raw("  "),
+        Span::styled(" Copy to right → ", right_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(buttons).alignment(Alignment::Center),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+}
+
+fn draw_diff_delete_dialog(
+    frame: &mut Frame,
+    app: &App,
+    dialog: &Dialog,
+    area: Rect,
+    theme: &Theme,
+) {
+    let block = Block::default()
+        .title(" Delete Difference ")
+        .title_style(
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.confirm_dialog.border))
+        .style(Style::default().bg(theme.confirm_dialog.bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sanitized_path: String = dialog
+        .input
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let path_width = inner.width.saturating_sub(9) as usize;
+    let path = truncate_with_ellipsis(&sanitized_path, path_width);
+    let path_line = Line::from(vec![
+        Span::styled(
+            " Item: ",
+            Style::default()
+                .fg(theme.confirm_dialog.message_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(path, Style::default().fg(theme.confirm_dialog.message_text)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(path_line),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+    );
+
+    let (left_exists, right_exists, contains_directory) = app
+        .diff_state
+        .as_ref()
+        .map(|state| state.delete_prompt_availability())
+        .unwrap_or((false, false, false));
+    let (notice, notice_style) = if dialog.message.is_empty() {
+        (
+            if contains_directory {
+                "Directories are deleted recursively. This cannot be undone."
+            } else {
+                "Deletion cannot be undone."
+            },
+            Style::default()
+                .fg(theme.confirm_dialog.message_text)
+                .add_modifier(Modifier::DIM),
+        )
+    } else {
+        (
+            dialog.message.as_str(),
+            Style::default()
+                .fg(theme.confirm_dialog.title)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let sanitized_notice: String = notice
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let notice = truncate_with_ellipsis(&sanitized_notice, inner.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(notice)
+            .style(notice_style)
+            .alignment(Alignment::Center),
+        Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
+    );
+
+    let normal_style = Style::default().fg(theme.confirm_dialog.button_text);
+    let disabled_style = normal_style.add_modifier(Modifier::DIM);
+    let selected_style = Style::default()
+        .fg(theme.confirm_dialog.button_selected_text)
+        .bg(theme.confirm_dialog.button_selected_bg)
+        .add_modifier(Modifier::BOLD);
+    let left_style = if left_exists {
+        normal_style
+    } else {
+        disabled_style
+    };
+    let right_style = if right_exists {
+        normal_style
+    } else {
+        disabled_style
+    };
+    let both_style = if left_exists || right_exists {
+        normal_style
+    } else {
+        disabled_style
+    };
+    let cancel_style = if dialog.selected_button == 1 {
+        selected_style
+    } else {
+        normal_style
+    };
+    let buttons = Line::from(vec![
+        Span::styled(" ← Delete left ", left_style),
+        Span::raw(" "),
+        Span::styled(" ↑ Cancel ", cancel_style),
+        Span::raw(" "),
+        Span::styled(" ↓ Delete both ", both_style),
+        Span::raw(" "),
+        Span::styled(" Delete right → ", right_style),
+    ]);
+    frame.render_widget(
+        Paragraph::new(buttons).alignment(Alignment::Center),
+        Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        ),
+    );
+}
+
 fn draw_dedup_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme) {
     let block = Block::default()
         .title(" Remove Duplicates ")
@@ -1978,6 +2241,7 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     let title = match progress.operation_type {
         FileOperationType::Copy => " Copying ",
         FileOperationType::Move => " Moving ",
+        FileOperationType::Delete => " Deleting ",
         FileOperationType::Tar => " Creating Archive ",
         FileOperationType::Untar => " Extracting Archive ",
         FileOperationType::Download => " Downloading ",
@@ -2080,7 +2344,7 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     // sync/verification/finalization explicitly instead of appearing frozen.
     if matches!(
         progress.operation_type,
-        FileOperationType::Copy | FileOperationType::Move
+        FileOperationType::Copy | FileOperationType::Move | FileOperationType::Delete
     ) {
         let phase_line = if progress.phase == FileOperationPhase::Copying {
             Line::from(vec![
@@ -2117,7 +2381,12 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     }
 
     // Total progress info
-    let total_info = if progress.operation_type == FileOperationType::Tar
+    let total_info = if progress.operation_type == FileOperationType::Delete {
+        format!(
+            "{}/{} side(s)",
+            progress.completed_files, progress.total_files
+        )
+    } else if progress.operation_type == FileOperationType::Tar
         || progress.operation_type == FileOperationType::Untar
     {
         if progress.total_files > 0 {
@@ -2709,6 +2978,21 @@ pub fn handle_paste(app: &mut App, text: &str) {
 }
 
 pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if app
+        .dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.dialog_type == DialogType::DiffCopy)
+    {
+        return super::diff_screen::handle_copy_dialog_input(app, code, modifiers);
+    }
+    if app
+        .dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.dialog_type == DialogType::DiffDelete)
+    {
+        return super::diff_screen::handle_delete_dialog_input(app, code, modifiers);
+    }
+
     if let Some(ref mut dialog) = app.dialog {
         match dialog.dialog_type {
             DialogType::Delete => {
@@ -5263,6 +5547,7 @@ fn handle_remote_profile_save_input(app: &mut App, code: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5345,6 +5630,91 @@ mod tests {
         handle_dialog_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
         assert!(app.dialog.is_none());
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn diff_copy_dialog_fits_80_columns_and_shows_all_actions() {
+        let temp_dir = create_temp_test_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.dialog = Some(Dialog {
+            dialog_type: DialogType::DiffCopy,
+            input: "src/ui/\u{1b}[31mhelp.rs".to_string(),
+            cursor_pos: 0,
+            message: String::new(),
+            completion: None,
+            selected_button: 1,
+            selection: None,
+            use_md5: false,
+        });
+        let theme = Theme::default();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_dialog(
+                    frame,
+                    &app,
+                    app.dialog.as_ref().unwrap(),
+                    frame.area(),
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Copy to left"), "got: {rendered:?}");
+        assert!(rendered.contains("Cancel"), "got: {rendered:?}");
+        assert!(rendered.contains("Copy to right"), "got: {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'));
+
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn diff_delete_dialog_fits_80_columns_and_shows_all_actions() {
+        let temp_dir = create_temp_test_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.dialog = Some(Dialog {
+            dialog_type: DialogType::DiffDelete,
+            input: "src/ui/\u{1b}[31mhelp.rs".to_string(),
+            cursor_pos: 0,
+            message: String::new(),
+            completion: None,
+            selected_button: 1,
+            selection: None,
+            use_md5: false,
+        });
+        let theme = Theme::default();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_dialog(
+                    frame,
+                    &app,
+                    app.dialog.as_ref().unwrap(),
+                    frame.area(),
+                    &theme,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..24)
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol()))
+            .collect::<String>();
+        assert!(rendered.contains("Delete left"), "got: {rendered:?}");
+        assert!(rendered.contains("Cancel"), "got: {rendered:?}");
+        assert!(rendered.contains("Delete both"), "got: {rendered:?}");
+        assert!(rendered.contains("Delete right"), "got: {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'));
+
         cleanup_temp_test_dir(&temp_dir);
     }
 

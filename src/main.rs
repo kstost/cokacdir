@@ -491,17 +491,17 @@ fn run_content_md5_cli(mode: ContentMd5CliMode, paths: &[std::path::PathBuf]) ->
                     Ok(VerifyContentMd5Outcome::Match { hash }) => {
                         println!("MATCH {:?} md5={hash}", path);
                     }
-                    Ok(VerifyContentMd5Outcome::Mismatch { expected, actual }) => {
+                    Ok(VerifyContentMd5Outcome::Mismatch { candidates, actual }) => {
                         successful = false;
-                        println!("MISMATCH {:?} expected={expected} actual={actual}", path);
+                        println!(
+                            "MISMATCH {:?} expected={} actual={actual}",
+                            path,
+                            candidates.join(",")
+                        );
                     }
                     Ok(VerifyContentMd5Outcome::NoHash) => {
                         successful = false;
                         println!("NO_HASH {:?}", path);
-                    }
-                    Ok(VerifyContentMd5Outcome::Ambiguous { count }) => {
-                        successful = false;
-                        println!("AMBIGUOUS {:?} filename_md5_candidates={count}", path);
                     }
                     Err(error) => {
                         successful = false;
@@ -3726,9 +3726,31 @@ fn file_operation_completion_message(
         return (Some(format!("Error: {}", error)), tar_error);
     }
 
+    if progress.operation_type == crate::services::file_ops::FileOperationType::Delete {
+        let warning = if result.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(". Warning: {}", result.warnings.join("; "))
+        };
+        let total = result.success_count + result.failure_count;
+        let message = if result.failure_count == 0 {
+            format!("Deleted from {} side(s){}", result.success_count, warning)
+        } else {
+            format!(
+                "Deleted from {}/{} side(s). Error: {}{}",
+                result.success_count,
+                total,
+                result.last_error.as_deref().unwrap_or("Unknown error"),
+                warning
+            )
+        };
+        return (Some(message), None);
+    }
+
     let op_name = match progress.operation_type {
         crate::services::file_ops::FileOperationType::Copy => "Copied",
         crate::services::file_ops::FileOperationType::Move => "Moved",
+        crate::services::file_ops::FileOperationType::Delete => "Deleted",
         crate::services::file_ops::FileOperationType::Tar => "Archived",
         crate::services::file_ops::FileOperationType::Untar => "Extracted",
         crate::services::file_ops::FileOperationType::Download => "Downloaded",
@@ -4028,6 +4050,14 @@ fn run_app<B: ratatui::backend::Backend>(
                 .as_ref()
                 .map(completed_file_operation_succeeded)
                 .unwrap_or(false);
+            let diff_copy_completed = app
+                .diff_state
+                .as_ref()
+                .is_some_and(|state| state.copy_in_progress());
+            let diff_delete_completed = app
+                .diff_state
+                .as_ref()
+                .is_some_and(|state| state.delete_in_progress());
 
             // 원격 다운로드 완료 → 편집기/뷰어 열기
             if let Some(pending) = app.pending_remote_open.take() {
@@ -4164,6 +4194,18 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 app.file_operation_progress = None;
                 app.dialog = None;
+                if diff_copy_completed {
+                    if let Some(state) = app.diff_state.as_mut() {
+                        state.finish_copy_operation();
+                    }
+                }
+                if diff_delete_completed {
+                    if let Some(state) = app.diff_state.as_mut() {
+                        // A two-sided delete can partially succeed, so refresh
+                        // even when the aggregate operation reports failure.
+                        state.finish_delete_operation();
+                    }
+                }
                 if let Some(message) = tar_error_dialog {
                     app.dialog = Some(new_tar_error_dialog(message));
                 }
@@ -4326,7 +4368,11 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Screen::DiffScreen => {
-                            ui::diff_screen::handle_input(app, key.code, key.modifiers);
+                            if app.dialog.is_some() {
+                                ui::dialogs::handle_dialog_input(app, key.code, key.modifiers);
+                            } else {
+                                ui::diff_screen::handle_input(app, key.code, key.modifiers);
+                            }
                         }
                         Screen::DiffFileView => {
                             ui::diff_file_view::handle_input(app, key.code, key.modifiers);
@@ -5163,5 +5209,24 @@ mod file_operation_completion_tests {
             warnings: Vec::new(),
         });
         assert!(completed_file_operation_succeeded(&progress));
+    }
+
+    #[test]
+    fn partial_delete_completion_identifies_sides_and_error() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Delete);
+        progress.result = Some(FileOperationResult {
+            success_count: 1,
+            failure_count: 1,
+            last_error: Some("right: target changed".to_string()),
+            warnings: Vec::new(),
+        });
+
+        let (status, modal) = file_operation_completion_message(&progress, None, None);
+
+        assert_eq!(
+            status,
+            Some("Deleted from 1/2 side(s). Error: right: target changed".to_string())
+        );
+        assert_eq!(modal, None);
     }
 }

@@ -18,10 +18,14 @@ pub(crate) enum AddContentMd5Outcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyContentMd5Outcome {
-    Match { hash: String },
-    Mismatch { expected: String, actual: String },
+    Match {
+        hash: String,
+    },
+    Mismatch {
+        candidates: Vec<String>,
+        actual: String,
+    },
     NoHash,
-    Ambiguous { count: usize },
 }
 
 struct AuthorizedFile {
@@ -93,6 +97,23 @@ pub(crate) fn content_md5_for_authorized_file(
     Ok(format!("{:032x}", hasher.finalize()))
 }
 
+pub(crate) fn validate_authorized_regular_file(
+    path: &Path,
+    authorization: &file_ops::PathAuthorization,
+) -> io::Result<()> {
+    file_ops::verify_path_authorization(path, authorization, "MD5 source file")?;
+    let (opened, before) = file_ops::open_regular_file_no_follow(path)?;
+    let after = opened.metadata()?;
+    if !file_ops::metadata_still_matches(&before, &after)
+        || file_ops::stable_file_identity(&opened)? != file_ops::stable_path_identity(path)?
+    {
+        return Err(io::Error::other(
+            "File changed while it was being validated",
+        ));
+    }
+    file_ops::verify_path_authorization(path, authorization, "MD5 source file")
+}
+
 fn prepare_file(path: &Path) -> io::Result<AuthorizedFile> {
     let file_name_os = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -126,17 +147,7 @@ fn verify_authorized_regular_file(file: &AuthorizedFile) -> io::Result<()> {
         &file.directory,
         "MD5 parent directory",
     )?;
-    file_ops::verify_path_authorization(&file.path, &file.source, "MD5 source file")?;
-    let (opened, before) = file_ops::open_regular_file_no_follow(&file.path)?;
-    let after = opened.metadata()?;
-    if !file_ops::metadata_still_matches(&before, &after)
-        || file_ops::stable_file_identity(&opened)? != file_ops::stable_path_identity(&file.path)?
-    {
-        return Err(io::Error::other(
-            "File changed while it was being validated",
-        ));
-    }
-    file_ops::verify_path_authorization(&file.path, &file.source, "MD5 source file")?;
+    validate_authorized_regular_file(&file.path, &file.source)?;
     file_ops::verify_directory_authorization(
         file.directory.resolved_path(),
         &file.directory,
@@ -185,28 +196,19 @@ pub(crate) fn add_content_md5_to_path(path: &Path) -> io::Result<AddContentMd5Ou
 pub(crate) fn verify_content_md5_path(path: &Path) -> io::Result<VerifyContentMd5Outcome> {
     let file = prepare_file(path)?;
     let candidates = filename_md5_candidates(&file.file_name);
-    let expected = match candidates.as_slice() {
-        [] => {
-            verify_authorized_regular_file(&file)?;
-            return Ok(VerifyContentMd5Outcome::NoHash);
-        }
-        [expected] => expected,
-        _ => {
-            verify_authorized_regular_file(&file)?;
-            return Ok(VerifyContentMd5Outcome::Ambiguous {
-                count: candidates.len(),
-            });
-        }
-    };
+    if candidates.is_empty() {
+        verify_authorized_regular_file(&file)?;
+        return Ok(VerifyContentMd5Outcome::NoHash);
+    }
 
     let actual = hash_authorized_file(&file)?;
-    if actual.eq_ignore_ascii_case(expected) {
+    if candidates
+        .iter()
+        .any(|candidate| actual.eq_ignore_ascii_case(candidate))
+    {
         Ok(VerifyContentMd5Outcome::Match { hash: actual })
     } else {
-        Ok(VerifyContentMd5Outcome::Mismatch {
-            expected: expected.to_string(),
-            actual,
-        })
+        Ok(VerifyContentMd5Outcome::Mismatch { candidates, actual })
     }
 }
 
@@ -247,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn path_api_reports_skip_mismatch_no_hash_and_ambiguity() {
+    fn path_api_checks_every_filename_hash_candidate() {
         const HELLO_HASH: &str = "5d41402abc4b2a76b9719d911017c592";
         const EMPTY_HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
         let temp_dir = tempfile::tempdir().unwrap();
@@ -270,13 +272,27 @@ mod tests {
             VerifyContentMd5Outcome::NoHash
         );
 
-        let ambiguous = temp_dir
+        let matching_candidates = temp_dir
             .path()
             .join(format!("two-{HELLO_HASH}-{EMPTY_HASH}.txt"));
-        std::fs::write(&ambiguous, b"hello").unwrap();
+        std::fs::write(&matching_candidates, b"hello").unwrap();
         assert_eq!(
-            verify_content_md5_path(&ambiguous).unwrap(),
-            VerifyContentMd5Outcome::Ambiguous { count: 2 }
+            verify_content_md5_path(&matching_candidates).unwrap(),
+            VerifyContentMd5Outcome::Match {
+                hash: HELLO_HASH.to_string(),
+            }
+        );
+
+        let mismatching_candidates = temp_dir
+            .path()
+            .join(format!("none-{HELLO_HASH}-{EMPTY_HASH}.txt"));
+        std::fs::write(&mismatching_candidates, b"changed").unwrap();
+        assert_eq!(
+            verify_content_md5_path(&mismatching_candidates).unwrap(),
+            VerifyContentMd5Outcome::Mismatch {
+                candidates: vec![HELLO_HASH.to_string(), EMPTY_HASH.to_string()],
+                actual: "8977dfac2f8e04cb96e66882235f5aba".to_string(),
+            }
         );
     }
 }

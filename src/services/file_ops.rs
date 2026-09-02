@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
@@ -753,6 +753,7 @@ fn is_cross_device_error(_e: &io::Error) -> bool {
 pub enum FileOperationType {
     Copy,
     Move,
+    Delete,
     Tar,
     Untar,
     Download,
@@ -782,6 +783,7 @@ impl MoveVerification {
 pub enum FileOperationPhase {
     #[default]
     Copying,
+    Deleting,
     Syncing,
     Verifying,
     Finalizing,
@@ -791,6 +793,7 @@ impl FileOperationPhase {
     pub fn label(self) -> &'static str {
         match self {
             Self::Copying => "Copying",
+            Self::Deleting => "Deleting",
             Self::Syncing => "Syncing destination",
             Self::Verifying => "Verifying contents",
             Self::Finalizing => "Finalizing move",
@@ -870,6 +873,7 @@ fn finish_copied_item(
     publication_staging: Option<PrivateStagingDirectory>,
     destination: &Path,
     expected_destination: Option<PathIdentity>,
+    expected_destination_tree: Option<&TreeAuthorization>,
     published: PublishedStage,
     cancel_flag: &Arc<AtomicBool>,
     target_authorization: Option<&DirectoryAuthorization>,
@@ -916,6 +920,7 @@ fn finish_copied_item(
                     stage,
                     destination,
                     expected,
+                    expected_destination_tree,
                 )?);
             } else {
                 let published = stage
@@ -941,6 +946,17 @@ fn finish_copied_item(
     Ok(warnings)
 }
 
+fn verify_staged_source_tree(
+    source: &Path,
+    expected: Option<&TreeAuthorization>,
+    published: PublishedStage,
+) -> io::Result<PublishedStage> {
+    if let Some(expected) = expected {
+        verify_tree_authorization(source, expected, "Diff copy source")?;
+    }
+    Ok(published)
+}
+
 fn verified_publication_parts(
     published: PublishedStage,
     destination: &Path,
@@ -957,6 +973,18 @@ fn verified_publication_parts(
 
 fn path_exists_no_follow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+fn path_ancestry_contains_identity(start: &Path, expected: StablePathIdentity) -> io::Result<bool> {
+    let mut current = start.to_path_buf();
+    loop {
+        if stable_path_identity(&current)? == expected {
+            return Ok(true);
+        }
+        if !current.pop() {
+            return Ok(false);
+        }
+    }
 }
 
 fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io::Result<()> {
@@ -993,6 +1021,39 @@ fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io
         }
     }
 
+    // Replacing a real destination directory with one of its own descendants
+    // destroys the namespace that still contains the source. The copy/move may
+    // finish staging successfully and then delete its source while committing
+    // the replacement, so reject this relationship for every source type.
+    let source_namespace_path = src
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| src.file_name().map(|name| parent.join(name)));
+    let destination_is_real_directory = fs::symlink_metadata(dest)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false);
+    if destination_is_real_directory {
+        if let (Some(source_namespace_path), Ok(canonical_dest)) =
+            (source_namespace_path, dest.canonicalize())
+        {
+            let destination_identity = stable_path_identity(&canonical_dest)?;
+            let source_parent = source_namespace_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            if source_namespace_path.starts_with(&canonical_dest)
+                || path_ancestry_contains_identity(source_parent, destination_identity)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Cannot {} an item from inside the destination it would replace",
+                        operation
+                    ),
+                ));
+            }
+        }
+    }
+
     if source_metadata.is_dir() && !source_metadata.is_symlink() {
         let canonical_src = canonical_src.ok_or_else(|| {
             io::Error::new(
@@ -1009,7 +1070,10 @@ fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io
         };
 
         if let Ok(canonical_anchor) = dest_anchor {
-            if canonical_anchor.starts_with(&canonical_src) {
+            let source_identity = stable_path_identity(&canonical_src)?;
+            if canonical_anchor.starts_with(&canonical_src)
+                || path_ancestry_contains_identity(&canonical_anchor, source_identity)?
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Cannot {} a directory into itself", operation),
@@ -1019,6 +1083,10 @@ fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_copy_destination(src: &Path, dest: &Path) -> io::Result<()> {
+    validate_destination_not_self(src, dest, "copy")
 }
 
 fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
@@ -1571,7 +1639,7 @@ struct PathIdentity {
 /// Handle-free snapshot retained while an overwrite dialog is open. Keeping
 /// thousands of Windows handles alive across user interaction would both
 /// exhaust resources and interfere with later delete-pending cleanup.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PathAuthorization {
     stable: StablePathIdentity,
     is_directory: bool,
@@ -1598,6 +1666,14 @@ pub(crate) struct PathAuthorization {
 }
 
 impl PathAuthorization {
+    pub(crate) fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    fn stable_identity(&self) -> StablePathIdentity {
+        self.stable
+    }
+
     fn from_identity(identity: &PathIdentity) -> Self {
         Self {
             stable: identity.stable,
@@ -1649,11 +1725,77 @@ impl PathAuthorization {
             current.len == self.len
         }
     }
+
+    fn matches_after_authorized_alias_change(&self, current: &PathAuthorization) -> bool {
+        if current.stable != self.stable || current.is_directory != self.is_directory {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            current.size == self.size
+                && current.modified_seconds == self.modified_seconds
+                && current.modified_nanoseconds == self.modified_nanoseconds
+        }
+        #[cfg(windows)]
+        {
+            current.creation_time == self.creation_time
+                && current.last_write_time == self.last_write_time
+                && current.size == self.size
+                && current.attributes == self.attributes
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            current.len == self.len
+        }
+    }
 }
 
 pub(crate) fn capture_path_authorization(path: &Path) -> io::Result<PathAuthorization> {
     let identity = path_identity(path)?;
     Ok(PathAuthorization::from_identity(&identity))
+}
+
+/// Refresh an authorization from the relocation snapshot produced while this
+/// process renamed another hard link to the same object. On Unix, that rename
+/// changes the inode ctime shared by every link even though the contents and
+/// remaining paths did not change. Exact pre-rename snapshots and all stable,
+/// content-related post-rename fields must agree before the refresh is applied.
+pub(crate) fn refresh_path_authorization_after_alias_rename(
+    authorization: &mut PathAuthorization,
+    renamed_source: &PathAuthorization,
+    relocated_source: &PathAuthorization,
+) -> bool {
+    if *authorization == *renamed_source
+        && renamed_source.matches_after_authorized_alias_change(relocated_source)
+    {
+        *authorization = *relocated_source;
+        true
+    } else {
+        false
+    }
+}
+
+/// Advance a still-pending hard-link authorization after this process removed
+/// another authorized name for the same object. Removing a hard link changes
+/// shared inode metadata on Unix, so an otherwise unchanged alias would fail
+/// the original snapshot check. Only an identical pre-delete snapshot with the
+/// same stable object and unchanged content-related fields may be refreshed.
+pub(crate) fn refresh_path_authorization_after_alias_deletion(
+    authorization: &mut PathAuthorization,
+    deleted_source: &PathAuthorization,
+    pending_path: &Path,
+) -> bool {
+    let Ok(current) = capture_path_authorization(pending_path) else {
+        return false;
+    };
+    if *authorization == *deleted_source
+        && deleted_source.matches_after_authorized_alias_change(&current)
+    {
+        *authorization = current;
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1662,9 +1804,38 @@ pub(crate) struct DirectoryAuthorization {
     object: PathAuthorization,
 }
 
+/// Snapshot of one selected filesystem object and, for a real directory, every
+/// descendant below it. Paths are relative to the selected object so the same
+/// snapshot can be checked again after the top-level directory is quarantined.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeAuthorization {
+    entries: BTreeMap<PathBuf, PathAuthorization>,
+}
+
+/// Proof that a path was absent below a specific, authorized directory.
+/// `missing_components` starts with the first name that did not exist, so the
+/// absence can be rechecked without accepting a replacement parent directory.
+#[derive(Debug, Clone)]
+pub(crate) struct MissingPathAuthorization {
+    existing_parent: DirectoryAuthorization,
+    missing_components: Vec<OsString>,
+}
+
 impl DirectoryAuthorization {
     pub(crate) fn resolved_path(&self) -> &Path {
         &self.resolved
+    }
+
+    pub(crate) fn same_object(&self, other: &Self) -> bool {
+        self.object.stable_identity() == other.object.stable_identity()
+    }
+}
+
+impl TreeAuthorization {
+    pub(crate) fn contains_directory(&self, directory: &DirectoryAuthorization) -> bool {
+        self.entries.values().any(|entry| {
+            entry.is_directory() && entry.stable_identity() == directory.object.stable_identity()
+        })
     }
 }
 
@@ -1681,6 +1852,716 @@ pub(crate) fn capture_directory_authorization(path: &Path) -> io::Result<Directo
         resolved,
         object: PathAuthorization::from_identity(&identity),
     })
+}
+
+fn capture_tree_entries(root: &Path) -> io::Result<BTreeMap<PathBuf, PathAuthorization>> {
+    let root_authorization = capture_path_authorization(root)?;
+    let mut entries = BTreeMap::new();
+    entries.insert(PathBuf::new(), root_authorization);
+    if !root_authorization.is_directory() {
+        return Ok(entries);
+    }
+
+    let mut pending = vec![PathBuf::new()];
+    let mut visited_directories = HashSet::new();
+    while let Some(relative_directory) = pending.pop() {
+        let directory_path = root.join(&relative_directory);
+        let before = capture_path_authorization(&directory_path)?;
+        if !before.is_directory() || !visited_directories.insert(before.stable_identity()) {
+            return Err(io::Error::other(format!(
+                "Directory tree contains a changed or repeated directory: '{}'",
+                directory_path.display()
+            )));
+        }
+
+        let (directory, access, _) = open_directory_for_read(&directory_path)?;
+        if stable_file_identity(&directory)? != before.stable_identity() {
+            return Err(io::Error::other(format!(
+                "Directory changed while its tree snapshot was captured: '{}'",
+                directory_path.display()
+            )));
+        }
+
+        let mut names = access.collect_entry_names()?;
+        names.sort();
+        for name in names {
+            let relative = relative_directory.join(&name);
+            let path = root.join(&relative);
+            let child_identity = access.child_identity(&name)?;
+            let authorization = capture_path_authorization(&path)?;
+            if authorization.stable_identity() != child_identity
+                || capture_path_authorization(&path)? != authorization
+            {
+                return Err(io::Error::other(format!(
+                    "Directory entry changed while its tree snapshot was captured: '{}'",
+                    path.display()
+                )));
+            }
+
+            if authorization.is_directory() {
+                let (child, _, _) = access.open_directory(&name)?;
+                if stable_file_identity(&child)? != authorization.stable_identity() {
+                    return Err(io::Error::other(format!(
+                        "Directory entry changed while it was opened: '{}'",
+                        path.display()
+                    )));
+                }
+                pending.push(relative.clone());
+            }
+            entries.insert(relative, authorization);
+        }
+
+        if capture_path_authorization(&directory_path)? != before {
+            return Err(io::Error::other(format!(
+                "Directory changed while its tree snapshot was captured: '{}'",
+                directory_path.display()
+            )));
+        }
+    }
+
+    Ok(entries)
+}
+
+pub(crate) fn capture_tree_authorization(
+    path: &Path,
+    expected_root: &PathAuthorization,
+    role: &str,
+) -> io::Result<TreeAuthorization> {
+    verify_path_authorization(path, expected_root, role)?;
+    let entries = capture_tree_entries(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{} tree could not be captured: {}", role, error),
+        )
+    })?;
+    if entries.get(Path::new("")) != Some(expected_root) {
+        return Err(io::Error::other(format!(
+            "{} changed while its tree snapshot was captured; retry the operation",
+            role
+        )));
+    }
+    Ok(TreeAuthorization { entries })
+}
+
+pub(crate) fn verify_tree_authorization(
+    path: &Path,
+    authorization: &TreeAuthorization,
+    role: &str,
+) -> io::Result<()> {
+    let current = capture_tree_entries(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{} tree changed before the operation started: {}",
+                role, error
+            ),
+        )
+    })?;
+    if current == authorization.entries {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} tree changed after confirmation; retry the operation",
+            role
+        )))
+    }
+}
+
+fn verify_tree_authorization_after_root_relocation(
+    path: &Path,
+    authorization: &TreeAuthorization,
+    role: &str,
+) -> io::Result<()> {
+    let mut current = capture_tree_entries(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{} tree changed while it was isolated: {}", role, error),
+        )
+    })?;
+    let current_root = current
+        .remove(Path::new(""))
+        .ok_or_else(|| io::Error::other("Relocated tree snapshot has no root"))?;
+    let mut expected = authorization.entries.clone();
+    let expected_root = expected
+        .remove(Path::new(""))
+        .ok_or_else(|| io::Error::other("Authorized tree snapshot has no root"))?;
+    if expected_root.matches_after_authorized_alias_change(&current_root) && current == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} tree changed while it was isolated; the operation was stopped",
+            role
+        )))
+    }
+}
+
+/// Remove only the entries captured in `authorization`. The selected root is
+/// already under a private name, but it may still be reachable through a bind
+/// mount or an open namespace alias. Walking the approved entries bottom-up
+/// prevents a late, unapproved child from being swept up by `remove_dir_all`.
+fn delete_authorized_tree_after_root_relocation(
+    root: &Path,
+    authorization: &TreeAuthorization,
+    role: &str,
+) -> io::Result<()> {
+    verify_tree_authorization_after_root_relocation(root, authorization, role)?;
+    let root_expected = authorization
+        .entries
+        .get(Path::new(""))
+        .ok_or_else(|| io::Error::other("Authorized tree snapshot has no root"))?;
+    if !root_expected.is_directory() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Authorized tree deletion requires a directory root",
+        ));
+    }
+
+    let mut entries: Vec<_> = authorization
+        .entries
+        .iter()
+        .filter(|(relative, _)| !relative.as_os_str().is_empty())
+        .map(|(relative, expected)| (relative.clone(), *expected))
+        .collect();
+    entries.sort_by(|(left, _), (right, _)| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| right.cmp(left))
+    });
+
+    let mut entry_index = 0;
+    while entry_index < entries.len() {
+        let (relative, expected) = entries[entry_index].clone();
+        let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let mut traversed = PathBuf::new();
+        let (mut parent_directory, mut parent_access, _) = open_directory_for_read(root)?;
+        if stable_file_identity(&parent_directory)? != root_expected.stable_identity() {
+            return Err(io::Error::other(format!(
+                "{} root changed while approved children were being removed",
+                role
+            )));
+        }
+
+        for name in validated_relative_components(relative_parent)? {
+            traversed.push(&name);
+            let expected_parent = authorization.entries.get(&traversed).ok_or_else(|| {
+                io::Error::other(format!(
+                    "{} tree snapshot is missing parent '{}'",
+                    role,
+                    traversed.display()
+                ))
+            })?;
+            if !expected_parent.is_directory()
+                || parent_access.child_identity(&name)? != expected_parent.stable_identity()
+            {
+                return Err(io::Error::other(format!(
+                    "{} parent '{}' changed during approved tree deletion",
+                    role,
+                    traversed.display()
+                )));
+            }
+            let (next_directory, next_access, _) = parent_access.open_directory(&name)?;
+            if stable_file_identity(&next_directory)? != expected_parent.stable_identity() {
+                return Err(io::Error::other(format!(
+                    "{} parent '{}' changed while it was opened",
+                    role,
+                    traversed.display()
+                )));
+            }
+            parent_directory = next_directory;
+            parent_access = next_access;
+        }
+
+        let name = relative
+            .file_name()
+            .ok_or_else(|| io::Error::other("Authorized tree entry has no file name"))?;
+        let metadata = parent_access.child_metadata(name)?;
+        if metadata.identity() != expected.stable_identity()
+            || metadata.is_dir() != expected.is_directory()
+        {
+            return Err(io::Error::other(format!(
+                "{} entry '{}' changed during approved tree deletion",
+                role,
+                relative.display()
+            )));
+        }
+
+        if expected.is_directory() {
+            let (child_directory, child_access, _) = parent_access.open_directory(name)?;
+            if stable_file_identity(&child_directory)? != expected.stable_identity() {
+                return Err(io::Error::other(format!(
+                    "{} directory '{}' changed while it was opened",
+                    role,
+                    relative.display()
+                )));
+            }
+            let mut remaining = child_access.collect_entry_names()?;
+            remaining.sort();
+            if !remaining.is_empty() {
+                return Err(io::Error::other(format!(
+                    "{} directory '{}' gained an unapproved entry and was preserved",
+                    role,
+                    relative.display()
+                )));
+            }
+            drop(child_access);
+            drop(child_directory);
+            parent_access.remove_directory_if_identity(name, expected.stable_identity())?;
+        } else {
+            let current = capture_path_authorization(&root.join(&relative))?;
+            if current != expected {
+                return Err(io::Error::other(format!(
+                    "{} entry '{}' changed immediately before deletion",
+                    role,
+                    relative.display()
+                )));
+            }
+            parent_access.remove_file_if_identity(name, expected.stable_identity())?;
+            // Removing one hard-link name updates shared inode metadata on
+            // Unix. Advance only pending aliases that had the exact same
+            // approved snapshot, just as the top-level multi-delete path does.
+            for (pending_relative, pending_expected) in entries.iter_mut().skip(entry_index + 1) {
+                refresh_path_authorization_after_alias_deletion(
+                    pending_expected,
+                    &expected,
+                    &root.join(pending_relative),
+                );
+            }
+        }
+        drop(parent_directory);
+        entry_index += 1;
+    }
+
+    let (root_directory, root_access, _) = open_directory_for_read(root)?;
+    if stable_file_identity(&root_directory)? != root_expected.stable_identity() {
+        return Err(io::Error::other(format!(
+            "{} root changed before final removal",
+            role
+        )));
+    }
+    let mut remaining = root_access.collect_entry_names()?;
+    remaining.sort();
+    if !remaining.is_empty() {
+        return Err(io::Error::other(format!(
+            "{} root gained an unapproved entry and was preserved",
+            role
+        )));
+    }
+    drop(root_access);
+    drop(root_directory);
+
+    let parent = root.parent().unwrap_or_else(|| Path::new("."));
+    let name = root
+        .file_name()
+        .ok_or_else(|| io::Error::other("Authorized tree root has no file name"))?;
+    let (_, parent_access, _) = open_directory_for_read(parent)?;
+    parent_access.remove_directory_if_identity(name, root_expected.stable_identity())?;
+    sync_parent(root)
+}
+
+fn validated_relative_components(relative: &Path) -> io::Result<Vec<OsString>> {
+    use std::path::Component;
+
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_os_string()),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Relative path contains an invalid component",
+                ));
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn authorize_opened_directory(
+    resolved: &Path,
+    directory: &File,
+    role: &str,
+) -> io::Result<DirectoryAuthorization> {
+    let authorization = capture_directory_authorization(resolved)?;
+    if stable_file_identity(directory)? != authorization.object.stable {
+        return Err(io::Error::other(format!(
+            "{} changed while it was being authorized; retry the operation",
+            role
+        )));
+    }
+    Ok(authorization)
+}
+
+fn open_authorized_directory(
+    authorization: &DirectoryAuthorization,
+    role: &str,
+) -> io::Result<(File, DirectoryAccess)> {
+    authorized_current_directory(authorization.resolved_path(), authorization, role)?;
+    let (directory, access, _) = open_directory_for_read(authorization.resolved_path())?;
+    if stable_file_identity(&directory)? != authorization.object.stable {
+        return Err(io::Error::other(format!(
+            "{} changed while it was being opened; retry the operation",
+            role
+        )));
+    }
+    Ok((directory, access))
+}
+
+fn missing_path_conflict(role: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "{} appeared since the comparison; close and reopen it before continuing",
+            role
+        ),
+    )
+}
+
+/// Capture the deepest existing real directory and the first path component
+/// that was absent beneath it. Every traversal step is relative to an open
+/// directory handle and refuses symlinks.
+pub(crate) fn capture_missing_path_authorization(
+    root: &DirectoryAuthorization,
+    relative: &Path,
+    role: &str,
+) -> io::Result<MissingPathAuthorization> {
+    let components = validated_relative_components(relative)?;
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Missing path must contain a file name",
+        ));
+    }
+
+    let (mut directory, mut access) = open_authorized_directory(root, role)?;
+    let mut resolved = root.resolved.clone();
+
+    for (index, name) in components.iter().enumerate() {
+        if index + 1 == components.len() {
+            return match access.child_metadata(name) {
+                Ok(_) => Err(missing_path_conflict(role)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let existing_parent = authorize_opened_directory(&resolved, &directory, role)?;
+                    Ok(MissingPathAuthorization {
+                        existing_parent,
+                        missing_components: components[index..].to_vec(),
+                    })
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        match access.open_directory(name) {
+            Ok((opened_directory, opened_access, _)) => {
+                resolved.push(name);
+                directory = opened_directory;
+                access = opened_access;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let existing_parent = authorize_opened_directory(&resolved, &directory, role)?;
+                return Ok(MissingPathAuthorization {
+                    existing_parent,
+                    missing_components: components[index..].to_vec(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("a non-empty relative path always returns from the traversal")
+}
+
+/// Recheck that the first missing component is still absent and that its
+/// existing parent is still the exact directory captured during comparison.
+pub(crate) fn verify_missing_path_authorization(
+    authorization: &MissingPathAuthorization,
+    role: &str,
+) -> io::Result<()> {
+    let first_missing = authorization
+        .missing_components
+        .first()
+        .ok_or_else(|| io::Error::other("Missing-path authorization is empty"))?;
+    let (directory, access) = open_authorized_directory(&authorization.existing_parent, role)?;
+    match access.child_metadata(first_missing) {
+        Ok(_) => return Err(missing_path_conflict(role)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if stable_file_identity(&directory)? != authorization.existing_parent.object.stable {
+        return Err(io::Error::other(format!(
+            "{} parent changed while absence was being verified; retry the operation",
+            role
+        )));
+    }
+    authorized_current_directory(
+        authorization.existing_parent.resolved_path(),
+        &authorization.existing_parent,
+        role,
+    )
+    .map(drop)
+}
+
+/// Create only the directory components proven missing by an earlier
+/// `MissingPathAuthorization`, then return an authorization for the final
+/// parent directory. Any component that appeared in the meantime is rejected.
+pub(crate) fn prepare_authorized_missing_path_parent(
+    authorization: &MissingPathAuthorization,
+    role: &str,
+) -> io::Result<DirectoryAuthorization> {
+    verify_missing_path_authorization(authorization, role)?;
+    let parent_component_count = authorization.missing_components.len().saturating_sub(1);
+    let final_name = authorization
+        .missing_components
+        .last()
+        .ok_or_else(|| io::Error::other("Missing-path authorization is empty"))?;
+    let (directory, access) = open_authorized_directory(&authorization.existing_parent, role)?;
+
+    if parent_component_count == 0 {
+        match access.child_metadata(final_name) {
+            Ok(_) => return Err(missing_path_conflict(role)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return authorize_opened_directory(
+            authorization.existing_parent.resolved_path(),
+            &directory,
+            role,
+        );
+    }
+
+    let first_missing = &authorization.missing_components[0];
+    let private_name = access.create_private_directory("diff-parent")?;
+    let private_path = authorization
+        .existing_parent
+        .resolved_path()
+        .join(&private_name);
+    let private_identity = match access.child_identity(&private_name) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{} private parent staging could not be bound at '{}': {}",
+                    role,
+                    private_path.display(),
+                    error
+                ),
+            ));
+        }
+    };
+
+    let cleanup_private =
+        |cause: io::Error| match remove_directory_tree_by_identity(&private_path, private_identity)
+        {
+            Ok(()) => cause,
+            Err(cleanup_error) => io::Error::new(
+                cause.kind(),
+                format!(
+                    "{}; private parent staging cleanup also failed at '{}': {}",
+                    cause,
+                    private_path.display(),
+                    cleanup_error
+                ),
+            ),
+        };
+
+    let created_identities = (|| -> io::Result<Vec<StablePathIdentity>> {
+        let (mut created_directory, mut created_access, _) =
+            access.open_directory(&private_name)?;
+        if stable_file_identity(&created_directory)? != private_identity {
+            return Err(io::Error::other(format!(
+                "{} private parent staging changed while it was opened",
+                role
+            )));
+        }
+
+        let mut identities = vec![private_identity];
+        for name in authorization
+            .missing_components
+            .iter()
+            .skip(1)
+            .take(parent_component_count - 1)
+        {
+            created_access.create_directory(name, 0o755)?;
+            let identity = created_access.child_identity(name)?;
+            let (next_directory, next_access, _) = created_access.open_directory(name)?;
+            if stable_file_identity(&next_directory)? != identity {
+                return Err(io::Error::other(format!(
+                    "{} parent changed while it was being staged; retry the operation",
+                    role
+                )));
+            }
+            identities.push(identity);
+            created_directory = next_directory;
+            created_access = next_access;
+        }
+
+        let mut final_entries = created_access.collect_entry_names()?;
+        final_entries.sort();
+        if !final_entries.is_empty() {
+            return Err(io::Error::other(format!(
+                "{} private parent staging changed while it was being populated",
+                role
+            )));
+        }
+        drop(created_directory);
+        Ok(identities)
+    })()
+    .map_err(cleanup_private)?;
+
+    let pre_publish_check = (|| -> io::Result<()> {
+        if stable_file_identity(&directory)?
+            != authorization.existing_parent.object.stable_identity()
+            || stable_path_identity(authorization.existing_parent.resolved_path())?
+                != authorization.existing_parent.object.stable_identity()
+        {
+            return Err(io::Error::other(format!(
+                "{} parent changed while its missing path was staged; retry the operation",
+                role
+            )));
+        }
+        let (private_directory, _, _) = access.open_directory(&private_name)?;
+        if stable_file_identity(&private_directory)? != private_identity {
+            return Err(io::Error::other(format!(
+                "{} private parent staging changed before publication",
+                role
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            private_directory.set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        if access.child_identity(&private_name)? != private_identity {
+            return Err(io::Error::other(format!(
+                "{} private parent staging changed before publication",
+                role
+            )));
+        }
+        match access.child_metadata(first_missing) {
+            Ok(_) => Err(missing_path_conflict(role)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    })();
+    if let Err(error) = pre_publish_check {
+        return Err(cleanup_private(error));
+    }
+
+    if let Err(error) = access.rename_noreplace(&private_name, first_missing) {
+        return Err(cleanup_private(error));
+    }
+
+    let committed_path = authorization
+        .existing_parent
+        .resolved_path()
+        .join(first_missing);
+    let committed_error = |error: io::Error| {
+        operation_error(
+            error.kind(),
+            format!(
+                "{} parent directories were created at '{}', but their final verification failed: {}; recompare before retrying",
+                role,
+                committed_path.display(),
+                error
+            ),
+            true,
+        )
+    };
+
+    let refreshed_root = authorize_opened_directory(
+        authorization.existing_parent.resolved_path(),
+        &directory,
+        role,
+    )
+    .map_err(committed_error)?;
+    let (mut created_directory, mut created_access) =
+        open_authorized_directory(&refreshed_root, role).map_err(committed_error)?;
+    let mut resolved = authorization.existing_parent.resolved.clone();
+
+    for (index, name) in authorization
+        .missing_components
+        .iter()
+        .take(parent_component_count)
+        .enumerate()
+    {
+        let expected = created_identities[index];
+        if created_access
+            .child_identity(name)
+            .map_err(committed_error)?
+            != expected
+        {
+            return Err(committed_error(io::Error::other(format!(
+                "{} created parent changed before it could be authorized",
+                role
+            ))));
+        }
+        let (opened_directory, opened_access, _) = created_access
+            .open_directory(name)
+            .map_err(committed_error)?;
+        if stable_file_identity(&opened_directory).map_err(committed_error)? != expected {
+            return Err(committed_error(io::Error::other(format!(
+                "{} created parent changed while it was being opened",
+                role
+            ))));
+        }
+        resolved.push(name);
+        created_directory = opened_directory;
+        created_access = opened_access;
+    }
+
+    match created_access.child_metadata(final_name) {
+        Ok(_) => return Err(committed_error(missing_path_conflict(role))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(committed_error(error)),
+    }
+    authorize_opened_directory(&resolved, &created_directory, role).map_err(committed_error)
+}
+
+/// Resolve an existing directory below an already-authorized root without
+/// following symlinks or accepting `..` traversal.
+pub(crate) fn capture_authorized_relative_directory(
+    root: &DirectoryAuthorization,
+    relative: &Path,
+) -> io::Result<DirectoryAuthorization> {
+    authorized_relative_directory(root, relative)
+}
+
+/// Each step is opened relative to a held parent-directory handle. The final
+/// authorization is tied to the exact directory reached through that handle,
+/// so a concurrent rename or replacement is rejected before the caller acts.
+fn authorized_relative_directory(
+    root: &DirectoryAuthorization,
+    relative: &Path,
+) -> io::Result<DirectoryAuthorization> {
+    let components = validated_relative_components(relative)?;
+
+    authorized_current_directory(root.resolved_path(), root, "Diff target root")?;
+    let (mut directory, mut access, _) = open_directory_for_read(root.resolved_path())?;
+    if stable_file_identity(&directory)? != root.object.stable {
+        return Err(io::Error::other(
+            "Diff target root changed while it was being opened; retry the operation",
+        ));
+    }
+
+    let mut resolved = root.resolved.clone();
+    for name in components {
+        let opened = access.open_directory(&name)?;
+
+        resolved.push(&name);
+        directory = opened.0;
+        access = opened.1;
+    }
+
+    let authorization = capture_directory_authorization(&resolved)?;
+    if stable_file_identity(&directory)? != authorization.object.stable {
+        return Err(io::Error::other(
+            "Diff target directory changed while it was being prepared; retry the operation",
+        ));
+    }
+    Ok(authorization)
 }
 
 fn authorized_current_identity(
@@ -2167,7 +3048,7 @@ impl PartialStage {
             }
         };
         drop(self.bound_handle.take());
-        delete_replacement_backup_if_unchanged(&path, current)?;
+        delete_replacement_backup_if_unchanged(&path, current, None)?;
         self.directory.cleanup()
     }
 }
@@ -2223,7 +3104,7 @@ impl OwnedStage {
                 // the original binding before deleting the payload and its
                 // parent staging directory.
                 drop(identity);
-                delete_replacement_backup_if_unchanged(&path, current)?;
+                delete_replacement_backup_if_unchanged(&path, current, None)?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -2980,7 +3861,7 @@ fn publish_noreplace(temp_path: &Path, dest: &Path) -> io::Result<PublishNorepla
 
 #[cfg(test)]
 fn install_completed_replacement(temp_path: &Path, dest: &Path) -> io::Result<()> {
-    install_completed_replacement_impl(temp_path, dest, None, None, |_| {}).map(|_| ())
+    install_completed_replacement_impl(temp_path, dest, None, None, None, |_| {}).map(|_| ())
 }
 
 fn install_completed_replacement_if_unchanged(
@@ -2988,12 +3869,14 @@ fn install_completed_replacement_if_unchanged(
     dest: &Path,
     expected_destination: PathIdentity,
     expected_candidate: Option<&PathIdentity>,
+    expected_destination_tree: Option<&TreeAuthorization>,
 ) -> io::Result<Vec<String>> {
     install_completed_replacement_impl(
         temp_path,
         dest,
         Some(expected_destination),
         expected_candidate,
+        expected_destination_tree,
         |_| {},
     )
 }
@@ -3002,6 +3885,7 @@ fn install_owned_replacement_if_unchanged(
     stage: OwnedStage,
     destination: &Path,
     expected_destination: PathIdentity,
+    expected_destination_tree: Option<&TreeAuthorization>,
 ) -> io::Result<Vec<String>> {
     let stage_path = stage.path();
     let result = install_completed_replacement_if_unchanged(
@@ -3009,6 +3893,7 @@ fn install_owned_replacement_if_unchanged(
         destination,
         expected_destination,
         Some(&stage.identity),
+        expected_destination_tree,
     );
     match result {
         Ok(mut warnings) => {
@@ -3042,6 +3927,7 @@ fn install_completed_replacement_impl<F>(
     dest: &Path,
     expected_destination: Option<PathIdentity>,
     expected_candidate: Option<&PathIdentity>,
+    expected_destination_tree: Option<&TreeAuthorization>,
     after_backup: F,
 ) -> io::Result<Vec<String>>
 where
@@ -3053,6 +3939,7 @@ where
         dest,
         expected_destination,
         expected_candidate,
+        expected_destination_tree,
         after_backup,
         &mut terminal_failure,
     );
@@ -3076,6 +3963,7 @@ fn install_completed_replacement_detailed(
         dest,
         Some(expected_destination),
         Some(expected_candidate),
+        None,
         |_| {},
         &mut terminal_failure,
     );
@@ -3087,6 +3975,7 @@ fn install_completed_replacement_impl_inner<F>(
     dest: &Path,
     mut expected_destination: Option<PathIdentity>,
     expected_candidate: Option<&PathIdentity>,
+    expected_destination_tree: Option<&TreeAuthorization>,
     after_backup: F,
     terminal_failure: &mut bool,
 ) -> io::Result<Vec<String>>
@@ -3223,6 +4112,15 @@ where
         *terminal_failure = is_retry_unsafe(&error);
         return Err(error);
     }
+    if let Some(tree) = expected_destination_tree {
+        if let Err(error) =
+            verify_tree_authorization_after_root_relocation(&backup, tree, "Overwrite destination")
+        {
+            let error = restore_verified_replacement_backup(&backup, dest, &backup_identity, error);
+            *terminal_failure = is_retry_unsafe(&error);
+            return Err(error);
+        }
+    }
     after_backup(&backup);
 
     if let Some(expected) = expected_candidate {
@@ -3282,7 +4180,11 @@ where
                     )));
                 }
             }
-            match delete_replacement_backup_if_unchanged(&backup, backup_identity) {
+            match delete_replacement_backup_if_unchanged(
+                &backup,
+                backup_identity,
+                expected_destination_tree,
+            ) {
                 Ok(VerifiedCleanupOutcome::Removed) => {}
                 Ok(VerifiedCleanupOutcome::RemovedWithDurabilityWarning(error)) => {
                     warnings.push(format!(
@@ -3324,6 +4226,7 @@ where
 fn delete_replacement_backup_if_unchanged(
     backup: &Path,
     expected: PathIdentity,
+    expected_tree: Option<&TreeAuthorization>,
 ) -> io::Result<VerifiedCleanupOutcome> {
     let current = path_identity(backup)?;
     if !current.same_snapshot(&expected) {
@@ -3378,9 +4281,14 @@ fn delete_replacement_backup_if_unchanged(
     drop(moved);
     drop(expected);
 
-    let deletion = match prepared_file {
-        Some(prepared) => prepared.delete(),
-        None => delete_path_unchecked(&quarantined),
+    let deletion = match (prepared_file, expected_tree) {
+        (None, Some(tree)) => delete_authorized_tree_after_root_relocation(
+            &quarantined,
+            tree,
+            "Previous overwrite destination",
+        ),
+        (Some(prepared), _) => prepared.delete(),
+        (None, None) => delete_path_unchecked(&quarantined),
     };
     if let Err(error) = deletion {
         return Err(io::Error::new(
@@ -4036,7 +4944,7 @@ impl QuarantinedSource {
         drop(identity);
 
         let mut warnings = Vec::new();
-        match delete_replacement_backup_if_unchanged(&payload, current) {
+        match delete_replacement_backup_if_unchanged(&payload, current, None) {
             Ok(VerifiedCleanupOutcome::Removed) => {}
             Ok(VerifiedCleanupOutcome::RemovedWithDurabilityWarning(error)) => {
                 warnings.push(format!(
@@ -5760,11 +6668,73 @@ pub fn copy_files_with_progress(
     files: Vec<PathBuf>,
     source_dir: &Path,
     target_dir: &Path,
+    files_to_overwrite: HashMap<PathBuf, PathAuthorization>,
+    files_to_skip: HashSet<PathBuf>,
+    target_authorization: Option<DirectoryAuthorization>,
+    source_authorizations: HashMap<PathBuf, PathAuthorization>,
+    source_directory_authorization: Option<DirectoryAuthorization>,
+    cancel_flag: Arc<AtomicBool>,
+    progress_tx: Sender<ProgressMessage>,
+) {
+    copy_files_with_progress_impl(
+        files,
+        source_dir,
+        target_dir,
+        files_to_overwrite,
+        files_to_skip,
+        target_authorization,
+        source_authorizations,
+        source_directory_authorization,
+        HashMap::new(),
+        HashMap::new(),
+        cancel_flag,
+        progress_tx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn copy_files_with_progress_authorized_trees(
+    files: Vec<PathBuf>,
+    source_dir: &Path,
+    target_dir: &Path,
+    files_to_overwrite: HashMap<PathBuf, PathAuthorization>,
+    files_to_skip: HashSet<PathBuf>,
+    target_authorization: Option<DirectoryAuthorization>,
+    source_authorizations: HashMap<PathBuf, PathAuthorization>,
+    source_directory_authorization: Option<DirectoryAuthorization>,
+    source_trees: HashMap<PathBuf, TreeAuthorization>,
+    destination_trees: HashMap<PathBuf, TreeAuthorization>,
+    cancel_flag: Arc<AtomicBool>,
+    progress_tx: Sender<ProgressMessage>,
+) {
+    copy_files_with_progress_impl(
+        files,
+        source_dir,
+        target_dir,
+        files_to_overwrite,
+        files_to_skip,
+        target_authorization,
+        source_authorizations,
+        source_directory_authorization,
+        source_trees,
+        destination_trees,
+        cancel_flag,
+        progress_tx,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_files_with_progress_impl(
+    files: Vec<PathBuf>,
+    source_dir: &Path,
+    target_dir: &Path,
     mut files_to_overwrite: HashMap<PathBuf, PathAuthorization>,
     files_to_skip: HashSet<PathBuf>,
     target_authorization: Option<DirectoryAuthorization>,
     mut source_authorizations: HashMap<PathBuf, PathAuthorization>,
     source_directory_authorization: Option<DirectoryAuthorization>,
+    mut source_trees: HashMap<PathBuf, TreeAuthorization>,
+    mut destination_trees: HashMap<PathBuf, TreeAuthorization>,
     cancel_flag: Arc<AtomicBool>,
     progress_tx: Sender<ProgressMessage>,
 ) {
@@ -5809,6 +6779,13 @@ pub fn copy_files_with_progress(
         })
         .filter(|p| !files_to_skip.contains(p))
         .collect();
+
+    for (source, tree) in &source_trees {
+        if let Err(error) = verify_tree_authorization(source, tree, "Diff copy source") {
+            send_prepare_error_result(&progress_tx, error, files.len());
+            return;
+        }
+    }
 
     // Send preparing message before calculating sizes
     let _ = progress_tx.send(ProgressMessage::Preparing(
@@ -5903,6 +6880,7 @@ pub fn copy_files_with_progress(
                 continue;
             }
         }
+        let source_tree = source_trees.remove(&src);
 
         let filename = src
             .file_name()
@@ -5919,6 +6897,7 @@ pub fn copy_files_with_progress(
 
         let dest_exists = path_exists_no_follow(&dest);
         let overwrite_authorization = files_to_overwrite.remove(&src);
+        let destination_tree = destination_trees.remove(&src);
         let overwriting = overwrite_authorization.is_some();
         if overwriting && !dest_exists {
             failure_count += 1;
@@ -5955,6 +6934,13 @@ pub fn copy_files_with_progress(
         } else {
             None
         };
+        if let Some(tree) = destination_tree.as_ref() {
+            if let Err(error) = verify_tree_authorization(&dest, tree, "Overwrite destination") {
+                failure_count += 1;
+                let _ = progress_tx.send(ProgressMessage::Error(filename, error.to_string()));
+                continue;
+            }
+        }
         let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
         // Every authorized copy is first completed under an owned staging
         // name. This gives us a final target-directory revalidation point for
@@ -6018,11 +7004,14 @@ pub fn copy_files_with_progress(
                 &mut completed_files,
                 total_bytes,
                 total_files,
-            ) {
+            )
+            .and_then(|published| verify_staged_source_tree(&src, source_tree.as_ref(), published))
+            {
                 Ok(warnings) => match finish_copied_item(
                     overwrite_staging.take(),
                     &dest,
                     destination_identity,
+                    destination_tree.as_ref(),
                     warnings,
                     &cancel_flag,
                     target_authorization.as_ref(),
@@ -6067,6 +7056,7 @@ pub fn copy_files_with_progress(
                     overwrite_staging.take(),
                     &dest,
                     destination_identity,
+                    destination_tree.as_ref(),
                     warnings,
                     &cancel_flag,
                     target_authorization.as_ref(),
@@ -6124,6 +7114,7 @@ pub fn copy_files_with_progress(
                     overwrite_staging.take(),
                     &dest,
                     destination_identity,
+                    destination_tree.as_ref(),
                     warnings,
                     &cancel_flag,
                     target_authorization.as_ref(),
@@ -7275,20 +8266,32 @@ pub fn delete_file(path: &Path) -> io::Result<()> {
 /// failure at that point would invite a destructive retry of a name that may
 /// already refer to a different object.
 pub(crate) fn delete_file_detailed(path: &Path) -> io::Result<Vec<String>> {
-    delete_file_detailed_impl(path, None)
+    delete_file_detailed_impl(path, None, None)
 }
 
 pub(crate) fn delete_file_detailed_authorized(
     path: &Path,
     expected_source: &PathAuthorization,
 ) -> io::Result<Vec<String>> {
-    delete_file_detailed_impl(path, Some(expected_source))
+    delete_file_detailed_impl(path, Some(expected_source), None)
+}
+
+pub(crate) fn delete_file_detailed_authorized_tree(
+    path: &Path,
+    expected_source: &PathAuthorization,
+    expected_tree: &TreeAuthorization,
+) -> io::Result<Vec<String>> {
+    delete_file_detailed_impl(path, Some(expected_source), Some(expected_tree))
 }
 
 fn delete_file_detailed_impl(
     path: &Path,
     expected_source: Option<&PathAuthorization>,
+    expected_tree: Option<&TreeAuthorization>,
 ) -> io::Result<Vec<String>> {
+    if let Some(tree) = expected_tree {
+        verify_tree_authorization(path, tree, "Selected delete target")?;
+    }
     let expected = path_identity(path)?;
     if expected_source.is_some_and(|authorization| !authorization.matches_snapshot(&expected)) {
         return Err(io::Error::other(format!(
@@ -7321,6 +8324,18 @@ fn delete_file_detailed_impl(
             return Err(error_with_staging_cleanup(error, quarantine));
         }
     };
+    if let Some(tree) = expected_tree {
+        if let Err(error) = verify_tree_authorization_after_root_relocation(
+            &isolated,
+            tree,
+            "Selected delete target",
+        ) {
+            drop(moved);
+            let error =
+                restore_staged_directory_after_failure(path, &isolated, path, &expected, error);
+            return Err(error_with_staging_cleanup(error, quarantine));
+        }
+    }
     if let Err(error) = sync_parent(path).and_then(|()| sync_parent(&isolated)) {
         drop(moved);
         let error = restore_staged_directory_after_failure(path, &isolated, path, &expected, error);
@@ -7343,9 +8358,12 @@ fn delete_file_detailed_impl(
     drop(moved);
     drop(expected);
 
-    let deletion = match prepared_file {
-        Some(prepared) => prepared.delete(),
-        None => delete_path_unchecked(&isolated),
+    let deletion = match (prepared_file, expected_tree) {
+        (None, Some(tree)) => {
+            delete_authorized_tree_after_root_relocation(&isolated, tree, "Selected delete target")
+        }
+        (Some(prepared), _) => prepared.delete(),
+        (None, None) => delete_path_unchecked(&isolated),
     };
     if let Err(error) = deletion {
         return Err(io::Error::new(
@@ -7426,6 +8444,21 @@ pub(crate) fn rename_file_authorized(
     expected_source: &PathAuthorization,
     expected_directory: &DirectoryAuthorization,
 ) -> io::Result<Vec<String>> {
+    rename_file_authorized_with_relocated_authorization(
+        old_path,
+        new_path,
+        expected_source,
+        expected_directory,
+    )
+    .map(|(warnings, _)| warnings)
+}
+
+pub(crate) fn rename_file_authorized_with_relocated_authorization(
+    old_path: &Path,
+    new_path: &Path,
+    expected_source: &PathAuthorization,
+    expected_directory: &DirectoryAuthorization,
+) -> io::Result<(Vec<String>, PathAuthorization)> {
     rename_file_detailed(
         old_path,
         new_path,
@@ -7439,7 +8472,7 @@ fn rename_file_detailed(
     new_path: &Path,
     expected_source: Option<&PathAuthorization>,
     expected_directory: Option<&DirectoryAuthorization>,
-) -> io::Result<Vec<String>> {
+) -> io::Result<(Vec<String>, PathAuthorization)> {
     if let Some(directory) = expected_directory {
         authorized_current_directory(
             directory.resolved_path(),
@@ -7469,10 +8502,12 @@ fn rename_file_detailed(
         None => path_identity(old_path)?,
     };
     rename_noreplace(old_path, new_path)?;
-    let verified = matches!(
-        path_identity(new_path),
-        Ok(current) if current.matches_after_relocation(&expected)
-    );
+    let relocated = match path_identity(new_path) {
+        Ok(current) if current.matches_after_relocation(&expected) => {
+            Some(PathAuthorization::from_identity(&current))
+        }
+        _ => None,
+    };
     let mut warnings = Vec::new();
     if let Err(error) = sync_parent(new_path) {
         warnings.push(format!(
@@ -7488,8 +8523,8 @@ fn rename_file_detailed(
             ));
         }
     }
-    if verified {
-        Ok(warnings)
+    if let Some(relocated) = relocated {
+        Ok((warnings, relocated))
     } else {
         Err(operation_error(
             io::ErrorKind::Other,
@@ -8071,6 +9106,22 @@ mod tests {
     }
 
     #[test]
+    fn copy_rejects_a_source_inside_the_directory_it_would_replace() {
+        let temp_dir = create_temp_dir();
+        let destination = temp_dir.join("folder");
+        let source = destination.join("folder");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, "source").unwrap();
+
+        let error = validate_copy_destination(&source, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(source.exists());
+        assert!(destination.is_dir());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
     fn test_copy_file_dest_exists_rejected() {
         let temp_dir = create_temp_dir();
         let src = temp_dir.join("src.txt");
@@ -8559,12 +9610,63 @@ mod tests {
         fs::write(&dest, "racer").unwrap();
 
         let error =
-            install_completed_replacement_if_unchanged(&staged, &dest, expected, None).unwrap_err();
+            install_completed_replacement_if_unchanged(&staged, &dest, expected, None, None)
+                .unwrap_err();
 
         assert!(error.to_string().contains("Destination changed"));
         assert_eq!(fs::read_to_string(&dest).unwrap(), "racer");
         assert_eq!(fs::read_to_string(&staged).unwrap(), "new");
         assert_eq!(fs::read_to_string(&retained_original).unwrap(), "original");
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn replacement_preserves_a_destination_descendant_changed_after_backup() {
+        let temp_dir = create_temp_dir();
+        let staged = temp_dir.join("staged");
+        let dest = temp_dir.join("dest");
+        fs::create_dir(&staged).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(staged.join("new"), "new").unwrap();
+        fs::write(dest.join("old"), "confirmed old").unwrap();
+        let destination_item = capture_path_authorization(&dest).unwrap();
+        let destination_tree =
+            capture_tree_authorization(&dest, &destination_item, "test destination").unwrap();
+        let expected_destination = path_identity(&dest).unwrap();
+
+        let warnings = install_completed_replacement_impl(
+            &staged,
+            &dest,
+            Some(expected_destination),
+            None,
+            Some(&destination_tree),
+            |backup| {
+                fs::write(backup.join("old"), "changed through an alias").unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(dest.join("new")).unwrap(), "new");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("cleanup could not be confirmed")));
+        let mut pending = vec![temp_dir.clone()];
+        let mut recovered = false;
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap().filter_map(Result::ok) {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else if entry.file_name() == "old"
+                    && fs::read_to_string(entry.path()).unwrap() == "changed through an alias"
+                {
+                    recovered = true;
+                }
+            }
+        }
+        assert!(
+            recovered,
+            "changed previous destination should remain recoverable"
+        );
         cleanup_temp_dir(&temp_dir);
     }
 
@@ -8592,10 +9694,16 @@ mod tests {
         let staged_inside_dest = dest.join("staged");
         fs::write(&staged_inside_dest, "new").unwrap();
 
-        let result =
-            install_completed_replacement_impl(&staged_inside_dest, &dest, None, None, |_| {
+        let result = install_completed_replacement_impl(
+            &staged_inside_dest,
+            &dest,
+            None,
+            None,
+            None,
+            |_| {
                 fs::write(&dest, "racer").unwrap();
-            });
+            },
+        );
 
         let error = result.unwrap_err().to_string();
         assert!(error.contains("original target is preserved"));
@@ -9839,6 +10947,73 @@ mod tests {
     }
 
     #[test]
+    fn authorized_tree_delete_rejects_a_changed_descendant() {
+        let temp_dir = create_temp_dir();
+        let selected = temp_dir.join("selected");
+        fs::create_dir_all(selected.join("nested")).unwrap();
+        fs::write(selected.join("nested/item.txt"), "confirmed").unwrap();
+        let item = capture_path_authorization(&selected).unwrap();
+        let tree = capture_tree_authorization(&selected, &item, "test delete").unwrap();
+        fs::write(
+            selected.join("nested/item.txt"),
+            "changed after confirmation",
+        )
+        .unwrap();
+
+        let error = delete_file_detailed_authorized_tree(&selected, &item, &tree).unwrap_err();
+
+        assert!(error.to_string().contains("tree changed"));
+        assert_eq!(
+            fs::read_to_string(selected.join("nested/item.txt")).unwrap(),
+            "changed after confirmation"
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn authorized_tree_delete_handles_hard_linked_descendants() {
+        let temp_dir = create_temp_dir();
+        let selected = temp_dir.join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("first"), "shared").unwrap();
+        fs::hard_link(selected.join("first"), selected.join("second")).unwrap();
+        let item = capture_path_authorization(&selected).unwrap();
+        let tree = capture_tree_authorization(&selected, &item, "test delete").unwrap();
+
+        delete_file_detailed_authorized_tree(&selected, &item, &tree).unwrap();
+
+        assert!(!selected.exists());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn relocated_tree_delete_preserves_an_unapproved_child() {
+        let temp_dir = create_temp_dir();
+        let selected = temp_dir.join("selected");
+        let isolated = temp_dir.join("isolated");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("approved"), "approved").unwrap();
+        let item = capture_path_authorization(&selected).unwrap();
+        let tree = capture_tree_authorization(&selected, &item, "test delete").unwrap();
+        fs::rename(&selected, &isolated).unwrap();
+        fs::write(isolated.join("late"), "preserve").unwrap();
+
+        let error = delete_authorized_tree_after_root_relocation(&isolated, &tree, "test delete")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("tree changed"));
+        assert_eq!(
+            fs::read_to_string(isolated.join("approved")).unwrap(),
+            "approved"
+        );
+        assert_eq!(
+            fs::read_to_string(isolated.join("late")).unwrap(),
+            "preserve"
+        );
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
     fn test_delete_directory() {
         let temp_dir = create_temp_dir();
         let dir_path = temp_dir.join("delete_dir");
@@ -9868,6 +11043,145 @@ mod tests {
         assert!(result.is_ok());
         assert!(!link.exists());
         assert!(target.exists()); // Target should still exist
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    // ========== authorized relative directory tests ==========
+
+    #[test]
+    fn missing_path_authorization_creates_only_confirmed_missing_parents() {
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        fs::create_dir(&root).unwrap();
+        let root_authorization = capture_directory_authorization(&root).unwrap();
+        let missing = capture_missing_path_authorization(
+            &root_authorization,
+            Path::new("a/b/item.txt"),
+            "test destination",
+        )
+        .unwrap();
+
+        let parent = prepare_authorized_missing_path_parent(&missing, "test destination").unwrap();
+
+        assert_eq!(parent.resolved_path(), root.join("a/b"));
+        assert!(root.join("a/b").is_dir());
+        assert!(!root.join("a/b/item.txt").exists());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn missing_path_authorization_rejects_a_replaced_existing_parent() {
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        fs::create_dir_all(root.join("a")).unwrap();
+        let root_authorization = capture_directory_authorization(&root).unwrap();
+        let missing = capture_missing_path_authorization(
+            &root_authorization,
+            Path::new("a/item.txt"),
+            "test destination",
+        )
+        .unwrap();
+        fs::rename(root.join("a"), root.join("a-original")).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+
+        let error = verify_missing_path_authorization(&missing, "test destination").unwrap_err();
+
+        assert!(error.to_string().contains("replaced"));
+        assert!(!root.join("a/item.txt").exists());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn missing_path_authorization_rejects_a_component_that_appeared() {
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        fs::create_dir(&root).unwrap();
+        let root_authorization = capture_directory_authorization(&root).unwrap();
+        let missing = capture_missing_path_authorization(
+            &root_authorization,
+            Path::new("a/item.txt"),
+            "test destination",
+        )
+        .unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+
+        let error =
+            prepare_authorized_missing_path_parent(&missing, "test destination").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!root.join("a/item.txt").exists());
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_parent_staging_failure_leaves_no_partial_public_tree() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        fs::create_dir(&root).unwrap();
+        let root_authorization = capture_directory_authorization(&root).unwrap();
+        let mut relative = PathBuf::from("a");
+        relative.push(OsString::from_vec(b"invalid\0component".to_vec()));
+        relative.push("item.txt");
+        let missing =
+            capture_missing_path_authorization(&root_authorization, &relative, "test destination")
+                .unwrap();
+
+        assert!(prepare_authorized_missing_path_parent(&missing, "test destination").is_err());
+        assert!(!root.join("a").exists());
+        assert!(!fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cokacdir-diff-parent-")
+            }));
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn capture_authorized_relative_directory_never_creates_missing_components() {
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("existing")).unwrap();
+        let authorization = capture_directory_authorization(&root).unwrap();
+
+        let existing =
+            capture_authorized_relative_directory(&authorization, Path::new("existing")).unwrap();
+        assert_eq!(existing.resolved_path(), root.join("existing"));
+        assert!(
+            capture_authorized_relative_directory(&authorization, Path::new("missing/child"))
+                .is_err()
+        );
+        assert!(!root.join("missing").exists());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_path_authorization_does_not_follow_symlinks() {
+        let temp_dir = create_temp_dir();
+        let root = temp_dir.join("root");
+        let outside = temp_dir.join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let authorization = capture_directory_authorization(&root).unwrap();
+
+        assert!(capture_missing_path_authorization(
+            &authorization,
+            Path::new("link/created"),
+            "test destination"
+        )
+        .is_err());
+        assert!(!outside.join("created").exists());
 
         cleanup_temp_dir(&temp_dir);
     }

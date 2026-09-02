@@ -468,6 +468,14 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(dsk(DiffScreenAction::GoHome, "Go to first item"));
     lines.push(dsk(DiffScreenAction::GoEnd, "Go to last item"));
     lines.push(dsk(DiffScreenAction::Open, "View file content diff"));
+    lines.push(dsk(
+        DiffScreenAction::CopyEntry,
+        "Copy current item between sides",
+    ));
+    lines.push(dsk(
+        DiffScreenAction::DeleteEntry,
+        "Delete current item from left, right, or both",
+    ));
     lines.push(dsk(DiffScreenAction::ToggleSelect, "Select/deselect item"));
     lines.push(dsk(
         DiffScreenAction::CycleFilter,
@@ -478,7 +486,10 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     lines.push(dsk(DiffScreenAction::SortByDate, "Sort by date"));
     lines.push(dsk(DiffScreenAction::SortByType, "Sort by type"));
     lines.push(dsk(DiffScreenAction::ExpandDir, "Expand directory"));
-    lines.push(dsk(DiffScreenAction::CollapseDir, "Collapse directory"));
+    lines.push(dsk(
+        DiffScreenAction::CollapseDir,
+        "Collapse directory or parent",
+    ));
     lines.push(dsk(DiffScreenAction::ExpandAll, "Expand all"));
     lines.push(dsk(DiffScreenAction::CollapseAll, "Collapse all"));
     lines.push(dsk(DiffScreenAction::Close, "Return to file panel"));
@@ -545,6 +556,8 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
             (PanelAction::RemoveDuplicates, "dedup "),
             (PanelAction::CalculateDirectorySizes, "dirsz "),
             (PanelAction::Rename, "ren "),
+            (PanelAction::AddContentMd5, "md5+ "),
+            (PanelAction::VerifyContentMd5, "md5chk "),
             (PanelAction::Tar, "tar "),
             (PanelAction::Search, "find "),
             (PanelAction::AIScreen, "AI "),
@@ -668,5 +681,18 @@ mod tests {
         assert!(rendered_lines
             .iter()
             .any(|line| line.contains("Shift+S:dirsz")));
+        assert!(rendered_lines.iter().any(|line| {
+            line.contains("Shift+H") && line.contains("Add content MD5 to filename(s)")
+        }));
+        assert!(rendered_lines
+            .iter()
+            .any(|line| line.contains("Shift+H:md5+")));
+        assert!(rendered_lines.iter().any(|line| {
+            line.contains("Shift+J")
+                && line.contains("Verify selected filename MD5 values against content")
+        }));
+        assert!(rendered_lines
+            .iter()
+            .any(|line| line.contains("Shift+J:md5chk")));
     }
 }
