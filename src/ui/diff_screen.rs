@@ -134,6 +134,22 @@ enum DiffProgressMsg {
     Comparing(String, usize, usize),
 }
 
+struct DiffCursorAnchor {
+    focused_path: Option<String>,
+    following_paths: Vec<String>,
+    preceding_paths: Vec<String>,
+    parent_path: Option<String>,
+    visual_row: usize,
+    previous_index: usize,
+    previous_scroll: usize,
+}
+
+#[derive(Default)]
+struct CreatedAncestorSides {
+    left: Vec<String>,
+    right: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct DiffAuthorizedItem {
     parent: file_ops::DirectoryAuthorization,
@@ -218,8 +234,10 @@ pub struct DiffState {
     right_root_authorization: Option<file_ops::DirectoryAuthorization>,
     copy_prompt: Option<DiffCopyPrompt>,
     copy_in_progress: bool,
+    pending_copy_path: Option<String>,
     delete_prompt: Option<DiffDeletePrompt>,
     delete_in_progress: bool,
+    pending_delete_path: Option<String>,
 }
 
 impl DiffState {
@@ -255,8 +273,10 @@ impl DiffState {
             right_root_authorization: None,
             copy_prompt: None,
             copy_in_progress: false,
+            pending_copy_path: None,
             delete_prompt: None,
             delete_in_progress: false,
+            pending_delete_path: None,
         }
     }
 
@@ -280,8 +300,10 @@ impl DiffState {
             file_ops::capture_directory_authorization(&self.right_root).ok();
         self.copy_prompt = None;
         self.copy_in_progress = false;
+        self.pending_copy_path = None;
         self.delete_prompt = None;
         self.delete_in_progress = false;
+        self.pending_delete_path = None;
         self.cancel_flag = Arc::new(AtomicBool::new(false));
 
         let (result_tx, result_rx) = mpsc::channel();
@@ -368,13 +390,6 @@ impl DiffState {
             match receiver.try_recv() {
                 Ok(DiffCompareResult(entries)) => {
                     self.all_entries = entries;
-                    let current_paths: HashSet<_> = self
-                        .all_entries
-                        .iter()
-                        .map(|entry| entry.relative_path.as_str())
-                        .collect();
-                    self.selected_files
-                        .retain(|path| current_paths.contains(path.as_str()));
                     // Collapse all directories by default
                     self.collapsed_dirs.clear();
                     for entry in &self.all_entries {
@@ -382,6 +397,13 @@ impl DiffState {
                             self.collapsed_dirs.insert(entry.relative_path.clone());
                         }
                     }
+                    let current_paths: HashSet<_> = self
+                        .all_entries
+                        .iter()
+                        .map(|entry| entry.relative_path.as_str())
+                        .collect();
+                    self.selected_files
+                        .retain(|path| current_paths.contains(path.as_str()));
                     self.apply_filter();
                     self.is_comparing = false;
                     self.receiver = None;
@@ -419,7 +441,9 @@ impl DiffState {
         self.receiver = None;
         self.progress_receiver = None;
         self.copy_prompt = None;
+        self.pending_copy_path = None;
         self.delete_prompt = None;
+        self.pending_delete_path = None;
     }
 
     /// Build the flat diff list by recursively comparing both directory trees (synchronous)
@@ -786,9 +810,21 @@ impl DiffState {
     /// Lazily load children for a one-side-only directory that hasn't been expanded yet.
     /// Inserts child entries right after the directory entry in all_entries.
     fn lazy_load_children(&mut self, all_entry_idx: usize) {
+        let _ = self.lazy_load_children_with_policy(all_entry_idx, false);
+    }
+
+    fn lazy_load_children_checked(&mut self, all_entry_idx: usize) -> io::Result<()> {
+        self.lazy_load_children_with_policy(all_entry_idx, true)
+    }
+
+    fn lazy_load_children_with_policy(
+        &mut self,
+        all_entry_idx: usize,
+        strict_reads: bool,
+    ) -> io::Result<()> {
         let entry = &self.all_entries[all_entry_idx];
         if !entry.children_not_loaded || !entry.is_directory {
-            return;
+            return Ok(());
         }
 
         let is_left = entry.status == DiffStatus::LeftOnly;
@@ -802,7 +838,11 @@ impl DiffState {
 
         // Load one level of children
         let dir_path = root.join(&relative_path);
-        let names = read_dir_names(&dir_path);
+        let names = if strict_reads {
+            read_dir_names_checked(&dir_path)?
+        } else {
+            read_dir_names(&dir_path)
+        };
 
         let mut sorted_names = names;
         sort_names_one_side(&mut sorted_names, &dir_path);
@@ -812,6 +852,12 @@ impl DiffState {
             let child_relative = format!("{}/{}", relative_path, name);
             let full_path = dir_path.join(name);
             let info = make_file_info(&full_path, name);
+            if strict_reads && info.is_none() {
+                return Err(io::Error::other(format!(
+                    "Expanded DIFF entry '{}' changed while it was refreshed",
+                    child_relative
+                )));
+            }
             let is_dir = info.as_ref().map_or(false, |i| i.is_directory);
             let status = if is_left {
                 DiffStatus::LeftOnly
@@ -881,6 +927,7 @@ impl DiffState {
                 }
             }
         }
+        Ok(())
     }
 
     /// Recursively lazy-load all descendants of a directory
@@ -989,12 +1036,19 @@ impl DiffState {
         self.copy_in_progress
     }
 
-    pub(crate) fn finish_copy_operation(&mut self) {
+    pub(crate) fn finish_copy_operation(&mut self) -> io::Result<()> {
         self.copy_in_progress = false;
-        // Preparing a copy can create destination parent directories, and an
-        // error can still mean that publication committed but could not be
-        // verified. Always rebuild the comparison after the worker exits.
-        self.start_comparison();
+        let Some(relative_path) = self.pending_copy_path.take() else {
+            self.left_root_authorization = None;
+            self.right_root_authorization = None;
+            return Err(io::Error::other("Copy completion path is unavailable"));
+        };
+        let result = self.reconcile_operation_path(&relative_path, true);
+        if result.is_err() {
+            self.left_root_authorization = None;
+            self.right_root_authorization = None;
+        }
+        result
     }
 
     pub(crate) fn delete_prompt_availability(&self) -> (bool, bool, bool) {
@@ -1014,9 +1068,306 @@ impl DiffState {
         self.delete_in_progress
     }
 
-    pub(crate) fn finish_delete_operation(&mut self) {
+    pub(crate) fn finish_delete_operation(&mut self) -> io::Result<()> {
         self.delete_in_progress = false;
-        self.start_comparison();
+        let Some(relative_path) = self.pending_delete_path.take() else {
+            self.left_root_authorization = None;
+            self.right_root_authorization = None;
+            return Err(io::Error::other("Delete completion path is unavailable"));
+        };
+        let result = self.reconcile_operation_path(&relative_path, false);
+        if result.is_err() {
+            self.left_root_authorization = None;
+            self.right_root_authorization = None;
+        }
+        result
+    }
+
+    /// Re-read only the item touched by a DIFF mutation and its ancestor
+    /// metadata. The rest of the comparison remains the snapshot the user was
+    /// working with until they explicitly request another full comparison.
+    fn reconcile_operation_path(
+        &mut self,
+        relative_path: &str,
+        allow_ancestor_creation: bool,
+    ) -> io::Result<()> {
+        let relative = validated_diff_relative_path(relative_path)?;
+        let target_index = self
+            .all_entries
+            .iter()
+            .position(|entry| entry.relative_path == relative_path)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Completed operation target '{relative_path}' is no longer in the comparison"
+                    ),
+                )
+            })?;
+        let target_depth = self.all_entries[target_index].depth;
+        let target_end = diff_subtree_end(&self.all_entries, target_index);
+        let cursor_anchor = self.capture_cursor_anchor();
+        let expanded_dirs: HashSet<String> = self.all_entries[target_index..target_end]
+            .iter()
+            .filter(|entry| {
+                entry.is_directory && !self.collapsed_dirs.contains(&entry.relative_path)
+            })
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+
+        let roots = self.capture_refreshed_roots();
+        let (left_root_authorization, right_root_authorization) = match roots {
+            Ok(roots) => roots,
+            Err(error) => {
+                // A replaced comparison boundary invalidates every relative
+                // authorization. Disable further mutations until a full
+                // comparison deliberately establishes new boundaries.
+                self.left_root_authorization = None;
+                self.right_root_authorization = None;
+                return Err(error);
+            }
+        };
+
+        let replacement = build_targeted_subtree(
+            &self.left_root,
+            &self.right_root,
+            &left_root_authorization,
+            &right_root_authorization,
+            relative_path,
+            &relative,
+            target_depth,
+            self.compare_method,
+            self.sort_by,
+            self.sort_order,
+        )?;
+
+        // Stage the tree rewrite so any validation/read failure leaves the
+        // displayed comparison untouched.
+        let mut entries = self.all_entries.clone();
+        entries.splice(target_index..target_end, replacement);
+        let created_ancestors = refresh_diff_ancestor_entries(
+            &mut entries,
+            &self.left_root,
+            &self.right_root,
+            &left_root_authorization,
+            &right_root_authorization,
+            relative_path,
+            self.compare_method,
+            allow_ancestor_creation,
+        )?;
+        refresh_created_ancestor_missing_authorizations(
+            &mut entries,
+            &left_root_authorization,
+            &right_root_authorization,
+            &created_ancestors,
+        );
+
+        let mut collapsed_dirs = self.collapsed_dirs.clone();
+        collapsed_dirs.retain(|path| !diff_path_is_within(path, relative_path));
+        for entry in &entries {
+            if entry.is_directory && diff_path_is_within(&entry.relative_path, relative_path) {
+                collapsed_dirs.insert(entry.relative_path.clone());
+            }
+        }
+
+        // Restoring an expanded one-sided directory may lazily read its
+        // children. Install the staged state only for that synchronous work,
+        // then validate the roots once more before allowing the new state to
+        // become visible. A failed boundary check restores the prior snapshot.
+        let previous_entries = std::mem::replace(&mut self.all_entries, entries);
+        let previous_collapsed_dirs = std::mem::replace(&mut self.collapsed_dirs, collapsed_dirs);
+        let previous_filtered_indices = std::mem::take(&mut self.filtered_indices);
+        self.left_root_authorization = Some(left_root_authorization);
+        self.right_root_authorization = Some(right_root_authorization);
+        if let Err(error) = self.restore_expanded_directories(expanded_dirs) {
+            self.all_entries = previous_entries;
+            self.collapsed_dirs = previous_collapsed_dirs;
+            self.filtered_indices = previous_filtered_indices;
+            return Err(error);
+        }
+        self.all_entries = resort_flat_tree(&self.all_entries, self.sort_by, self.sort_order);
+
+        let left_root = self.left_root.clone();
+        let right_root = self.right_root.clone();
+        let mut selected_files = self.selected_files.clone();
+        selected_files.retain(|path| {
+            !diff_path_is_within(path, relative_path)
+                || !path_is_definitely_missing(&left_root.join(path))
+                || !path_is_definitely_missing(&right_root.join(path))
+        });
+
+        // Rebind the roots after every targeted read. If either boundary was
+        // swapped while the subtree, restored expansions, or retained
+        // selections were being inspected, do not publish a mixed snapshot.
+        let (left_root_authorization, right_root_authorization) =
+            match self.capture_refreshed_roots() {
+                Ok(roots) => roots,
+                Err(error) => {
+                    self.all_entries = previous_entries;
+                    self.collapsed_dirs = previous_collapsed_dirs;
+                    self.filtered_indices = previous_filtered_indices;
+                    self.left_root_authorization = None;
+                    self.right_root_authorization = None;
+                    return Err(error);
+                }
+            };
+
+        self.left_root_authorization = Some(left_root_authorization);
+        self.right_root_authorization = Some(right_root_authorization);
+        self.selected_files = selected_files;
+        self.apply_filter();
+        self.restore_cursor_anchor(cursor_anchor);
+        Ok(())
+    }
+
+    fn capture_refreshed_roots(
+        &self,
+    ) -> io::Result<(
+        file_ops::DirectoryAuthorization,
+        file_ops::DirectoryAuthorization,
+    )> {
+        let expected_left = self.left_root_authorization.as_ref().ok_or_else(|| {
+            io::Error::other("Diff left root identity is unavailable; restart the comparison")
+        })?;
+        let expected_right = self.right_root_authorization.as_ref().ok_or_else(|| {
+            io::Error::other("Diff right root identity is unavailable; restart the comparison")
+        })?;
+        let current_left =
+            file_ops::capture_directory_authorization(&self.left_root).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Cannot refresh the DIFF left root safely: {error}"),
+                )
+            })?;
+        let current_right =
+            file_ops::capture_directory_authorization(&self.right_root).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Cannot refresh the DIFF right root safely: {error}"),
+                )
+            })?;
+        if !expected_left.same_object(&current_left) || !expected_right.same_object(&current_right)
+        {
+            return Err(io::Error::other(
+                "A comparison root was replaced; run the comparison again",
+            ));
+        }
+        ensure_non_overlapping_diff_roots(&current_left, &current_right)?;
+        Ok((current_left, current_right))
+    }
+
+    fn capture_cursor_anchor(&self) -> DiffCursorAnchor {
+        let visible_paths: Vec<String> = self
+            .filtered_indices
+            .iter()
+            .filter_map(|&index| self.all_entries.get(index))
+            .map(|entry| entry.relative_path.clone())
+            .collect();
+        let focused_path = visible_paths.get(self.selected_index).cloned();
+        let following_paths = visible_paths
+            .iter()
+            .skip(self.selected_index.saturating_add(1))
+            .cloned()
+            .collect();
+        let preceding_paths = visible_paths
+            .iter()
+            .take(self.selected_index)
+            .rev()
+            .cloned()
+            .collect();
+        let parent_path = focused_path
+            .as_deref()
+            .and_then(|path| path.rsplit_once('/').map(|(parent, _)| parent.to_string()));
+
+        DiffCursorAnchor {
+            focused_path,
+            following_paths,
+            preceding_paths,
+            parent_path,
+            visual_row: self.selected_index.saturating_sub(self.scroll_offset),
+            previous_index: self.selected_index,
+            previous_scroll: self.scroll_offset,
+        }
+    }
+
+    fn restore_cursor_anchor(&mut self, anchor: DiffCursorAnchor) {
+        if self.filtered_indices.is_empty() {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+
+        let positions: HashMap<&str, usize> = self
+            .filtered_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(visible_index, &entry_index)| {
+                self.all_entries
+                    .get(entry_index)
+                    .map(|entry| (entry.relative_path.as_str(), visible_index))
+            })
+            .collect();
+        let position_of = |path: &str| positions.get(path).copied();
+        let selected = anchor
+            .focused_path
+            .as_deref()
+            .and_then(position_of)
+            .or_else(|| {
+                anchor
+                    .following_paths
+                    .iter()
+                    .find_map(|path| position_of(path))
+            })
+            .or_else(|| {
+                anchor
+                    .preceding_paths
+                    .iter()
+                    .find_map(|path| position_of(path))
+            })
+            .or_else(|| anchor.parent_path.as_deref().and_then(position_of))
+            .unwrap_or_else(|| anchor.previous_index.min(self.filtered_indices.len() - 1));
+        self.selected_index = selected;
+
+        let viewport_height = self.visible_height.max(1);
+        let max_scroll = self.filtered_indices.len().saturating_sub(viewport_height);
+        let visual_row = anchor.visual_row.min(viewport_height - 1);
+        let mut scroll = if anchor.focused_path.is_some() {
+            selected.saturating_sub(visual_row)
+        } else {
+            anchor.previous_scroll
+        }
+        .min(max_scroll);
+        if selected < scroll {
+            scroll = selected;
+        } else if selected >= scroll.saturating_add(viewport_height) {
+            scroll = selected.saturating_sub(viewport_height - 1);
+        }
+        self.scroll_offset = scroll;
+    }
+
+    fn restore_expanded_directories(&mut self, expanded_dirs: HashSet<String>) -> io::Result<()> {
+        let mut expanded_dirs: Vec<_> = expanded_dirs.into_iter().collect();
+        expanded_dirs.sort_by(|left, right| {
+            left.matches('/')
+                .count()
+                .cmp(&right.matches('/').count())
+                .then_with(|| left.cmp(right))
+        });
+
+        for path in expanded_dirs {
+            let Some(index) = self
+                .all_entries
+                .iter()
+                .position(|entry| entry.is_directory && entry.relative_path == path)
+            else {
+                continue;
+            };
+            if self.all_entries[index].children_not_loaded {
+                self.lazy_load_children_checked(index)?;
+            }
+            self.collapsed_dirs.remove(&path);
+        }
+        Ok(())
     }
 
     /// Re-sort all_entries in memory (preserving DFS tree structure) and reapply filter
@@ -1027,6 +1378,321 @@ impl DiffState {
         let sorted = resort_flat_tree(&self.all_entries, self.sort_by, self.sort_order);
         self.all_entries = sorted;
         self.apply_filter();
+    }
+}
+
+fn diff_path_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn diff_subtree_end(entries: &[DiffEntry], root_index: usize) -> usize {
+    let root_depth = entries[root_index].depth;
+    entries
+        .iter()
+        .enumerate()
+        .skip(root_index + 1)
+        .find_map(|(index, entry)| (entry.depth <= root_depth).then_some(index))
+        .unwrap_or(entries.len())
+}
+
+fn path_is_definitely_missing(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            )
+    )
+}
+
+fn capture_diff_path_snapshot(
+    filesystem_root: &Path,
+    root_authorization: &file_ops::DirectoryAuthorization,
+    relative_path: &Path,
+    relative_key: &str,
+    role: &str,
+) -> io::Result<(
+    Option<DiffFileInfo>,
+    Option<file_ops::MissingPathAuthorization>,
+)> {
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("DIFF refresh path has no file name"))?
+        .to_string_lossy();
+    let info = make_file_info(&filesystem_root.join(relative_path), &name);
+    let missing = if info.is_none() {
+        Some(file_ops::capture_missing_path_authorization(
+            root_authorization,
+            Path::new(relative_key),
+            role,
+        )?)
+    } else {
+        None
+    };
+    Ok((info, missing))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_targeted_subtree(
+    left_root: &Path,
+    right_root: &Path,
+    left_root_authorization: &file_ops::DirectoryAuthorization,
+    right_root_authorization: &file_ops::DirectoryAuthorization,
+    relative_key: &str,
+    relative_path: &Path,
+    depth: usize,
+    compare_method: CompareMethod,
+    sort_by: SortBy,
+    sort_order: SortOrder,
+) -> io::Result<Vec<DiffEntry>> {
+    let (left, left_missing) = capture_diff_path_snapshot(
+        left_root,
+        left_root_authorization,
+        relative_path,
+        relative_key,
+        "Diff left refresh path",
+    )?;
+    let (right, right_missing) = capture_diff_path_snapshot(
+        right_root,
+        right_root_authorization,
+        relative_path,
+        relative_key,
+        "Diff right refresh path",
+    )?;
+
+    if left.is_none() && right.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let left_is_dir = left.as_ref().is_some_and(|info| info.is_directory);
+    let right_is_dir = right.as_ref().is_some_and(|info| info.is_directory);
+    let is_directory = left_is_dir || right_is_dir;
+    let status = match (&left, &right) {
+        (Some(_), None) => DiffStatus::LeftOnly,
+        (None, Some(_)) => DiffStatus::RightOnly,
+        (Some(_), Some(_)) if left_is_dir && right_is_dir => DiffStatus::DirSame,
+        (Some(left), Some(right)) if !left_is_dir && !right_is_dir => {
+            if compare_files(left, right, compare_method) {
+                DiffStatus::Same
+            } else {
+                DiffStatus::Modified
+            }
+        }
+        (Some(_), Some(_)) => DiffStatus::Modified,
+        (None, None) => unreachable!("both-absent target returned above"),
+    };
+    let both_directories = left_is_dir && right_is_dir;
+    let is_one_sided_directory =
+        is_directory && matches!(status, DiffStatus::LeftOnly | DiffStatus::RightOnly);
+    let mut entries = vec![DiffEntry {
+        relative_path: relative_key.to_string(),
+        left,
+        right,
+        status,
+        is_directory,
+        depth,
+        children_not_loaded: is_one_sided_directory,
+        left_missing,
+        right_missing,
+    }];
+
+    if both_directories {
+        build_iterative_from(
+            left_root,
+            right_root,
+            Some(left_root_authorization),
+            Some(right_root_authorization),
+            relative_key.to_string(),
+            depth + 1,
+            Some(0),
+            compare_method,
+            sort_by,
+            sort_order,
+            &mut entries,
+            None,
+            true,
+        )?;
+    }
+    Ok(entries)
+}
+
+fn diff_info_is_same_object(old: &DiffFileInfo, current: &DiffFileInfo) -> bool {
+    match (old.authorization.as_ref(), current.authorization.as_ref()) {
+        (Some(old), Some(current)) => old.same_object(current),
+        _ => false,
+    }
+}
+
+fn diff_status_has_difference(status: DiffStatus) -> bool {
+    !matches!(status, DiffStatus::Same | DiffStatus::DirSame)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_diff_ancestor_entries(
+    entries: &mut [DiffEntry],
+    left_root: &Path,
+    right_root: &Path,
+    left_root_authorization: &file_ops::DirectoryAuthorization,
+    right_root_authorization: &file_ops::DirectoryAuthorization,
+    relative_key: &str,
+    compare_method: CompareMethod,
+    allow_ancestor_creation: bool,
+) -> io::Result<CreatedAncestorSides> {
+    let mut child_path = relative_key;
+    let mut ancestors = Vec::new();
+    let mut created = CreatedAncestorSides::default();
+    while let Some((parent, _)) = child_path.rsplit_once('/') {
+        ancestors.push(parent.to_string());
+        child_path = parent;
+    }
+
+    // The closest ancestor is refreshed first so each parent can derive its
+    // status from already-updated descendants.
+    for ancestor_key in ancestors {
+        let index = entries
+            .iter()
+            .position(|entry| entry.relative_path == ancestor_key)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "DIFF ancestor '{ancestor_key}' changed; run the comparison again"
+                ))
+            })?;
+        let old_left = entries[index].left.as_ref();
+        let old_right = entries[index].right.as_ref();
+        let left_was_missing = old_left.is_none();
+        let right_was_missing = old_right.is_none();
+        let old_children_not_loaded = entries[index].children_not_loaded;
+        let ancestor_path = Path::new(&ancestor_key);
+        let (left, left_missing) = capture_diff_path_snapshot(
+            left_root,
+            left_root_authorization,
+            ancestor_path,
+            &ancestor_key,
+            "Diff left ancestor refresh",
+        )?;
+        let (right, right_missing) = capture_diff_path_snapshot(
+            right_root,
+            right_root_authorization,
+            ancestor_path,
+            &ancestor_key,
+            "Diff right ancestor refresh",
+        )?;
+
+        for (side, old, current) in [
+            ("left", old_left, left.as_ref()),
+            ("right", old_right, right.as_ref()),
+        ] {
+            match (old, current) {
+                (Some(old), Some(current)) if !diff_info_is_same_object(old, current) => {
+                    return Err(io::Error::other(format!(
+                        "DIFF {side} ancestor '{ancestor_key}' was replaced; run the comparison again"
+                    )));
+                }
+                (Some(_), None) => {
+                    return Err(io::Error::other(format!(
+                        "DIFF {side} ancestor '{ancestor_key}' disappeared; run the comparison again"
+                    )));
+                }
+                (None, Some(_)) if !allow_ancestor_creation => {
+                    return Err(io::Error::other(format!(
+                        "DIFF {side} ancestor '{ancestor_key}' appeared unexpectedly; run the comparison again"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if left.is_none() && right.is_none() {
+            return Err(io::Error::other(format!(
+                "DIFF ancestor '{ancestor_key}' disappeared; run the comparison again"
+            )));
+        }
+        if left_was_missing && left.is_some() {
+            created.left.push(ancestor_key.clone());
+        }
+        if right_was_missing && right.is_some() {
+            created.right.push(ancestor_key.clone());
+        }
+
+        let left_is_dir = left.as_ref().is_some_and(|info| info.is_directory);
+        let right_is_dir = right.as_ref().is_some_and(|info| info.is_directory);
+        let is_directory = left_is_dir || right_is_dir;
+        let end = diff_subtree_end(entries, index);
+        let descendants_differ = entries[index + 1..end]
+            .iter()
+            .any(|entry| diff_status_has_difference(entry.status));
+        let status = match (&left, &right) {
+            (Some(_), None) => DiffStatus::LeftOnly,
+            (None, Some(_)) => DiffStatus::RightOnly,
+            (Some(_), Some(_)) if left_is_dir && right_is_dir => {
+                if descendants_differ {
+                    DiffStatus::DirModified
+                } else {
+                    DiffStatus::DirSame
+                }
+            }
+            (Some(left), Some(right)) if !left_is_dir && !right_is_dir => {
+                if compare_files(left, right, compare_method) {
+                    DiffStatus::Same
+                } else {
+                    DiffStatus::Modified
+                }
+            }
+            (Some(_), Some(_)) => DiffStatus::Modified,
+            (None, None) => unreachable!("both-absent ancestor rejected above"),
+        };
+        let entry = &mut entries[index];
+        entry.left = left;
+        entry.right = right;
+        entry.status = status;
+        entry.is_directory = is_directory;
+        entry.children_not_loaded = is_directory
+            && matches!(status, DiffStatus::LeftOnly | DiffStatus::RightOnly)
+            && old_children_not_loaded;
+        entry.left_missing = left_missing;
+        entry.right_missing = right_missing;
+    }
+    Ok(created)
+}
+
+fn refresh_created_ancestor_missing_authorizations(
+    entries: &mut [DiffEntry],
+    left_root_authorization: &file_ops::DirectoryAuthorization,
+    right_root_authorization: &file_ops::DirectoryAuthorization,
+    created: &CreatedAncestorSides,
+) {
+    for entry in entries {
+        if entry.left.is_none()
+            && created
+                .left
+                .iter()
+                .any(|ancestor| diff_path_is_within(&entry.relative_path, ancestor))
+        {
+            // A sibling may have appeared independently. In that case keep
+            // the displayed snapshot but remove its mutation authorization.
+            entry.left_missing = file_ops::capture_missing_path_authorization(
+                left_root_authorization,
+                Path::new(&entry.relative_path),
+                "Diff left path after parent creation",
+            )
+            .ok();
+        }
+        if entry.right.is_none()
+            && created
+                .right
+                .iter()
+                .any(|ancestor| diff_path_is_within(&entry.relative_path, ancestor))
+        {
+            entry.right_missing = file_ops::capture_missing_path_authorization(
+                right_root_authorization,
+                Path::new(&entry.relative_path),
+                "Diff right path after parent creation",
+            )
+            .ok();
+        }
     }
 }
 
@@ -1062,7 +1728,8 @@ fn make_build_frame(
     owner_index: Option<usize>,
     sort_by: SortBy,
     sort_order: SortOrder,
-) -> BuildFrame {
+    strict_reads: bool,
+) -> io::Result<BuildFrame> {
     let left_dir = if relative_path.is_empty() {
         left_root.to_path_buf()
     } else {
@@ -1073,8 +1740,20 @@ fn make_build_frame(
     } else {
         right_root.join(&relative_path)
     };
-    let left_names_vec = read_dir_names(&left_dir);
-    let right_names_vec = read_dir_names(&right_dir);
+    let read_names = |dir: &Path| {
+        if strict_reads {
+            read_dir_names_checked(dir).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("Cannot refresh DIFF directory '{}': {error}", dir.display()),
+                )
+            })
+        } else {
+            Ok(read_dir_names(dir))
+        }
+    };
+    let left_names_vec = read_names(&left_dir)?;
+    let right_names_vec = read_names(&right_dir)?;
     let left_refs: HashSet<&str> = left_names_vec.iter().map(String::as_str).collect();
     let right_refs: HashSet<&str> = right_names_vec.iter().map(String::as_str).collect();
     let mut names: Vec<String> = left_names_vec
@@ -1094,7 +1773,7 @@ fn make_build_frame(
         sort_order,
     );
 
-    BuildFrame {
+    Ok(BuildFrame {
         relative_path,
         left_dir,
         right_dir,
@@ -1105,7 +1784,7 @@ fn make_build_frame(
         depth,
         owner_index,
         has_difference: false,
-    }
+    })
 }
 
 fn build_iterative(
@@ -1119,22 +1798,56 @@ fn build_iterative(
     entries: &mut Vec<DiffEntry>,
     progress: Option<BuildProgress<'_>>,
 ) {
-    let mut frames = vec![make_build_frame(
+    let _ = build_iterative_from(
         left_root,
         right_root,
+        left_root_authorization,
+        right_root_authorization,
         String::new(),
         0,
         None,
+        compare_method,
         sort_by,
         sort_order,
-    )];
+        entries,
+        progress,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_iterative_from(
+    left_root: &Path,
+    right_root: &Path,
+    left_root_authorization: Option<&file_ops::DirectoryAuthorization>,
+    right_root_authorization: Option<&file_ops::DirectoryAuthorization>,
+    initial_relative_path: String,
+    initial_depth: usize,
+    initial_owner_index: Option<usize>,
+    compare_method: CompareMethod,
+    sort_by: SortBy,
+    sort_order: SortOrder,
+    entries: &mut Vec<DiffEntry>,
+    progress: Option<BuildProgress<'_>>,
+    strict_reads: bool,
+) -> io::Result<()> {
+    let mut frames = vec![make_build_frame(
+        left_root,
+        right_root,
+        initial_relative_path,
+        initial_depth,
+        initial_owner_index,
+        sort_by,
+        sort_order,
+        strict_reads,
+    )?];
 
     while !frames.is_empty() {
         if progress
             .as_ref()
             .is_some_and(|p| p.cancel_flag.load(Ordering::Relaxed))
         {
-            return;
+            return Ok(());
         }
 
         let finished = frames
@@ -1190,6 +1903,16 @@ fn build_iterative(
 
         let left_info = make_file_info(&left_dir.join(&name), &name);
         let right_info = make_file_info(&right_dir.join(&name), &name);
+        if strict_reads && left_exists && left_info.is_none() {
+            return Err(io::Error::other(format!(
+                "DIFF left entry '{relative_path}' changed while it was refreshed"
+            )));
+        }
+        if strict_reads && right_exists && right_info.is_none() {
+            return Err(io::Error::other(format!(
+                "DIFF right entry '{relative_path}' changed while it was refreshed"
+            )));
+        }
         let left_missing = if left_info.is_none() {
             left_root_authorization.and_then(|root| {
                 file_ops::capture_missing_path_authorization(
@@ -1240,7 +1963,8 @@ fn build_iterative(
                     Some(dir_index),
                     sort_by,
                     sort_order,
-                ));
+                    strict_reads,
+                )?);
             } else if !left_is_dir && !right_is_dir {
                 let same = match (left_info.as_ref(), right_info.as_ref()) {
                     (Some(left), Some(right)) => compare_files(left, right, compare_method),
@@ -1307,6 +2031,7 @@ fn build_iterative(
                 .has_difference = true;
         }
     }
+    Ok(())
 }
 
 fn build_recursive(
@@ -1491,11 +2216,17 @@ fn sort_names_one_side(names: &mut Vec<String>, dir: &Path) {
 fn read_dir_names(dir: &Path) -> Vec<String> {
     match fs::read_dir(dir) {
         Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+fn read_dir_names_checked(dir: &Path) -> io::Result<Vec<String>> {
+    fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().to_string()))
+        .collect()
 }
 
 /// Build DiffFileInfo from a path, returning None if the path doesn't exist
@@ -3003,6 +3734,7 @@ fn start_diff_copy(app: &mut App, direction: DiffCopyDirection) -> io::Result<()
         .as_ref()
         .and_then(|state| state.copy_prompt.clone())
         .ok_or_else(|| io::Error::other("Copy source changed; close the dialog and try again"))?;
+    let operation_path = prompt.relative_path.to_string_lossy().into_owned();
 
     let (source_root, target_root, source_item, target_item, target_missing, source_side) =
         match direction {
@@ -3143,6 +3875,7 @@ fn start_diff_copy(app: &mut App, direction: DiffCopyDirection) -> io::Result<()
     if let Some(state) = app.diff_state.as_mut() {
         state.copy_prompt = None;
         state.copy_in_progress = true;
+        state.pending_copy_path = Some(operation_path);
     }
     app.file_operation_progress = Some(progress);
     app.dialog = Some(Dialog {
@@ -3430,6 +4163,7 @@ fn start_diff_delete(app: &mut App, direction: DiffDeleteDirection) -> io::Resul
         .ok_or_else(|| {
             io::Error::other("Delete selection changed; close the dialog and try again")
         })?;
+    let operation_path = prompt.relative_path.to_string_lossy().into_owned();
     let file_name = prompt
         .relative_path
         .file_name()
@@ -3551,6 +4285,7 @@ fn start_diff_delete(app: &mut App, direction: DiffDeleteDirection) -> io::Resul
     if let Some(state) = app.diff_state.as_mut() {
         state.delete_prompt = None;
         state.delete_in_progress = true;
+        state.pending_delete_path = Some(operation_path);
     }
     app.file_operation_progress = Some(progress);
     app.dialog = Some(Dialog {
@@ -3859,9 +4594,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_completion_restarts_the_comparison_after_any_result() {
+    fn copy_completion_reconciles_only_the_operated_path() {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
+        std::fs::write(left.path().join("target.txt"), b"target").unwrap();
+        std::fs::write(left.path().join("unrelated.txt"), b"unrelated").unwrap();
         let mut state = DiffState::new(
             left.path().to_path_buf(),
             right.path().to_path_buf(),
@@ -3869,19 +4606,45 @@ mod tests {
             SortBy::Name,
             SortOrder::Asc,
         );
+        state.filter = DiffFilter::All;
+        state.build_diff_list();
+        state.apply_filter();
+
+        std::fs::write(right.path().join("target.txt"), b"target").unwrap();
+        // This simulates an unrelated external change. A local reconciliation
+        // must deliberately leave that comparison snapshot alone.
+        std::fs::write(right.path().join("unrelated.txt"), b"unrelated").unwrap();
         state.copy_in_progress = true;
+        state.pending_copy_path = Some("target.txt".to_string());
 
-        state.finish_copy_operation();
+        state.finish_copy_operation().unwrap();
 
-        assert!(state.is_comparing);
+        assert!(!state.is_comparing);
         assert!(!state.copy_in_progress());
-        state.cancel();
+        assert_eq!(
+            state
+                .all_entries
+                .iter()
+                .find(|entry| entry.relative_path == "target.txt")
+                .map(|entry| entry.status),
+            Some(DiffStatus::Same)
+        );
+        assert_eq!(
+            state
+                .all_entries
+                .iter()
+                .find(|entry| entry.relative_path == "unrelated.txt")
+                .map(|entry| entry.status),
+            Some(DiffStatus::LeftOnly)
+        );
     }
 
     #[test]
-    fn delete_completion_restarts_the_comparison_even_after_failure() {
+    fn nested_copy_reconciles_the_created_ancestor_side() {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(left.path().join("parent/child")).unwrap();
+        std::fs::write(left.path().join("parent/child/target.txt"), b"target").unwrap();
         let mut state = DiffState::new(
             left.path().to_path_buf(),
             right.path().to_path_buf(),
@@ -3889,13 +4652,240 @@ mod tests {
             SortBy::Name,
             SortOrder::Asc,
         );
+        state.filter = DiffFilter::All;
+        state.build_diff_list();
+        state.apply_filter();
+        state.expand_all();
+
+        std::fs::create_dir_all(right.path().join("parent/child")).unwrap();
+        std::fs::write(right.path().join("parent/child/target.txt"), b"target").unwrap();
+        state.copy_in_progress = true;
+        state.pending_copy_path = Some("parent/child/target.txt".to_string());
+        state.finish_copy_operation().unwrap();
+
+        for path in ["parent", "parent/child"] {
+            let entry = state
+                .all_entries
+                .iter()
+                .find(|entry| entry.relative_path == path)
+                .unwrap();
+            assert!(entry.left.is_some());
+            assert!(entry.right.is_some());
+            assert_eq!(entry.status, DiffStatus::DirSame);
+            assert!(!state.collapsed_dirs.contains(path));
+        }
+        assert_eq!(
+            state
+                .all_entries
+                .iter()
+                .find(|entry| entry.relative_path == "parent/child/target.txt")
+                .map(|entry| entry.status),
+            Some(DiffStatus::Same)
+        );
+    }
+
+    #[test]
+    fn targeted_reconciliation_preserves_expansion_and_unrelated_state() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(left.path().join("dir/expanded")).unwrap();
+        std::fs::create_dir_all(left.path().join("dir/collapsed")).unwrap();
+        std::fs::write(left.path().join("dir/expanded/file.txt"), b"expanded").unwrap();
+        std::fs::write(left.path().join("dir/collapsed/file.txt"), b"collapsed").unwrap();
+
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.filter = DiffFilter::All;
+        state.build_diff_list();
+        state.apply_filter();
+        state.expand_all();
+        state.collapsed_dirs.insert("dir/collapsed".to_string());
+        state.apply_filter();
+        state
+            .selected_files
+            .insert("dir/expanded/file.txt".to_string());
+        state
+            .selected_files
+            .insert("unrelated-selection.txt".to_string());
+
+        // A completed attempt is reconciled even when the worker failed. An
+        // unrelated external addition must not leak into that local update.
+        std::fs::create_dir_all(left.path().join("unrelated-new")).unwrap();
+
+        state.copy_in_progress = true;
+        state.pending_copy_path = Some("dir".to_string());
+        state.finish_copy_operation().unwrap();
+
+        assert!(!state.collapsed_dirs.contains("dir"));
+        assert!(!state.collapsed_dirs.contains("dir/expanded"));
+        assert!(state.collapsed_dirs.contains("dir/collapsed"));
+        assert!(state.selected_files.contains("dir/expanded/file.txt"));
+        assert!(state.selected_files.contains("unrelated-selection.txt"));
+        assert!(!state
+            .all_entries
+            .iter()
+            .any(|entry| entry.relative_path == "unrelated-new"));
+
+        let visible_paths: Vec<_> = state
+            .filtered_indices
+            .iter()
+            .map(|&index| state.all_entries[index].relative_path.as_str())
+            .collect();
+        assert!(visible_paths.contains(&"dir/expanded/file.txt"));
+        assert!(!visible_paths.contains(&"dir/collapsed/file.txt"));
+    }
+
+    #[test]
+    fn cursor_moves_to_the_next_surviving_row_and_keeps_its_visual_offset() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(left.path().join(name), name.as_bytes()).unwrap();
+        }
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.build_diff_list();
+        state.apply_filter();
+        state.visible_height = 2;
+        state.selected_index = 2;
+        state.scroll_offset = 1;
+        assert_eq!(
+            state
+                .current_entry()
+                .map(|entry| entry.relative_path.as_str()),
+            Some("c.txt")
+        );
+
+        std::fs::write(right.path().join("c.txt"), b"c.txt").unwrap();
+        state.copy_in_progress = true;
+        state.pending_copy_path = Some("c.txt".to_string());
+        state.finish_copy_operation().unwrap();
+
+        assert_eq!(
+            state
+                .current_entry()
+                .map(|entry| entry.relative_path.as_str()),
+            Some("d.txt")
+        );
+        assert_eq!(state.selected_index.saturating_sub(state.scroll_offset), 1);
+        assert!(!state.is_comparing);
+    }
+
+    #[test]
+    fn partial_delete_keeps_the_cursor_on_the_still_visible_target() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        std::fs::write(left.path().join("target.txt"), b"left").unwrap();
+        std::fs::write(right.path().join("target.txt"), b"right").unwrap();
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.build_diff_list();
+        state.apply_filter();
+
+        std::fs::remove_file(left.path().join("target.txt")).unwrap();
         state.delete_in_progress = true;
+        state.pending_delete_path = Some("target.txt".to_string());
+        state.finish_delete_operation().unwrap();
 
-        state.finish_delete_operation();
-
-        assert!(state.is_comparing);
+        let current = state.current_entry().unwrap();
+        assert_eq!(current.relative_path, "target.txt");
+        assert_eq!(current.status, DiffStatus::RightOnly);
         assert!(!state.delete_in_progress());
-        state.cancel();
+        assert!(!state.is_comparing);
+    }
+
+    #[test]
+    fn two_sided_delete_removes_only_the_target_entry_and_its_selection() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        std::fs::create_dir(left.path().join("target")).unwrap();
+        std::fs::create_dir(right.path().join("target")).unwrap();
+        std::fs::write(left.path().join("target/child.txt"), b"same").unwrap();
+        std::fs::write(right.path().join("target/child.txt"), b"same").unwrap();
+        std::fs::write(left.path().join("unrelated.txt"), b"left").unwrap();
+        let mut state = DiffState::new(
+            left.path().to_path_buf(),
+            right.path().to_path_buf(),
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.filter = DiffFilter::All;
+        state.build_diff_list();
+        state.apply_filter();
+        state.selected_files.insert("target".to_string());
+        state.selected_files.insert("target/child.txt".to_string());
+        state.selected_files.insert("unrelated.txt".to_string());
+
+        std::fs::remove_dir_all(left.path().join("target")).unwrap();
+        std::fs::remove_dir_all(right.path().join("target")).unwrap();
+        state.delete_in_progress = true;
+        state.pending_delete_path = Some("target".to_string());
+        state.finish_delete_operation().unwrap();
+
+        assert!(!state
+            .all_entries
+            .iter()
+            .any(|entry| diff_path_is_within(&entry.relative_path, "target")));
+        assert!(!state.selected_files.contains("target"));
+        assert!(!state.selected_files.contains("target/child.txt"));
+        assert!(state.selected_files.contains("unrelated.txt"));
+        assert_eq!(
+            state
+                .current_entry()
+                .map(|entry| entry.relative_path.as_str()),
+            Some("unrelated.txt")
+        );
+    }
+
+    #[test]
+    fn targeted_reconciliation_rejects_a_replaced_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let left = workspace.path().join("left");
+        let displaced_left = workspace.path().join("left-old");
+        let right = workspace.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("target.txt"), b"target").unwrap();
+        let mut state = DiffState::new(
+            left.clone(),
+            right,
+            CompareMethod::Content,
+            SortBy::Name,
+            SortOrder::Asc,
+        );
+        state.build_diff_list();
+        state.apply_filter();
+        let previous_entries = state.all_entries.clone();
+
+        std::fs::rename(&left, &displaced_left).unwrap();
+        std::fs::create_dir(&left).unwrap();
+        state.delete_in_progress = true;
+        state.pending_delete_path = Some("target.txt".to_string());
+
+        let error = state.finish_delete_operation().unwrap_err();
+
+        assert!(error.to_string().contains("root was replaced"));
+        assert_eq!(state.all_entries.len(), previous_entries.len());
+        assert_eq!(state.all_entries[0].relative_path, "target.txt");
+        assert!(state.left_root_authorization.is_none());
+        assert!(state.right_root_authorization.is_none());
+        assert!(!state.delete_in_progress());
     }
 
     #[cfg(unix)]
@@ -4198,6 +5188,7 @@ mod tests {
         std::fs::create_dir_all(left.join("a/b")).unwrap();
         std::fs::create_dir(&right).unwrap();
         std::fs::write(left.join("a/b/item.txt"), b"nested").unwrap();
+        std::fs::write(left.join("a/b/next.txt"), b"next").unwrap();
 
         let mut app = app_with_diff(&left, &right);
         select_entry(&mut app, "a/b/item.txt");
@@ -4206,9 +5197,42 @@ mod tests {
         wait_for_copy(&mut app);
 
         assert_eq!(
+            app.diff_state
+                .as_ref()
+                .and_then(|state| state.pending_copy_path.as_deref()),
+            Some("a/b/item.txt")
+        );
+        app.diff_state
+            .as_mut()
+            .unwrap()
+            .finish_copy_operation()
+            .unwrap();
+
+        assert_eq!(
             std::fs::read(right.join("a/b/item.txt")).unwrap(),
             b"nested"
         );
+        assert_eq!(
+            app.diff_state
+                .as_ref()
+                .unwrap()
+                .all_entries
+                .iter()
+                .find(|entry| entry.relative_path == "a/b/item.txt")
+                .map(|entry| entry.status),
+            Some(DiffStatus::Same)
+        );
+
+        // The first copy created a/b on the right. The remaining row's old
+        // absence proof originally stopped at the right root, so targeted
+        // reconciliation must rebind that proof without rescanning the row.
+        select_entry(&mut app, "a/b/next.txt");
+        open_copy_prompt(&mut app);
+        assert!(app
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.message.is_empty()));
+        cancel_copy_dialog(&mut app);
     }
 
     #[test]
@@ -4430,6 +5454,21 @@ mod tests {
         assert_eq!((result.success_count, result.failure_count), (2, 0));
         assert!(!left.join("item.txt").exists());
         assert!(!right.join("item.txt").exists());
+        assert_eq!(
+            app.diff_state
+                .as_ref()
+                .and_then(|state| state.pending_delete_path.as_deref()),
+            Some("item.txt")
+        );
+        app.diff_state
+            .as_mut()
+            .unwrap()
+            .finish_delete_operation()
+            .unwrap();
+        assert!(app
+            .diff_state
+            .as_ref()
+            .is_some_and(|state| state.all_entries.is_empty()));
     }
 
     #[test]

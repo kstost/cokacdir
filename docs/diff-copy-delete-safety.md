@@ -32,6 +32,21 @@ Press `Delete` on a focused difference to open the delete dialog.
 Directory deletion is recursive and cannot be undone. A direction for a side
 where the item is absent is unavailable.
 
+## After an Operation
+
+Copy and delete completion immediately reconciles the operated relative path
+on both sides. A directory target may require rebuilding that target's subtree,
+and ancestor rows are updated so their `same`/`modified` state remains correct.
+The rest of the comparison is not rescanned. This deliberately prevents an
+unrelated filesystem change from rearranging the tree while the user is
+working; start a new comparison when a current snapshot of every path is
+needed.
+
+The active filter, sort, checked paths, expansion state, cursor, and viewport
+are retained. If an operation makes the focused row disappear under the active
+filter, the cursor chooses the next surviving row, then the previous row or
+parent, while staying at the same screen row when possible.
+
 ## Safety Invariants
 
 The filesystem may change after a comparison is displayed or while a
@@ -67,10 +82,28 @@ confirmation dialog is open. DIFF therefore applies the following checks:
    remaining recovery data intact. For a two-sided delete, present and absent
    sides are all checked before the first deletion; any later per-side failure
    is reported explicitly.
-8. Every completed copy or delete attempt rebuilds the comparison, including
-   cancelled and partially failed operations. Its result message remains
-   visible during that rebuild, and selections for vanished entries are
-   discarded when the new result arrives.
+8. Every completed copy or delete worker attempt, including cancellation and
+   partial failure, re-reads the operated relative path on both sides and
+   recalculates its ancestor metadata and statuses. It does not rescan unrelated
+   branches; external changes elsewhere enter the displayed snapshot only when
+   the user explicitly starts a new comparison.
+9. Targeted reconciliation verifies both comparison-root identities before and
+   after all of its reads, including restoration of expanded one-sided
+   directories. A directory-enumeration error, replaced or newly overlapping
+   root, or any other reconciliation failure aborts the UI update, invalidates
+   further mutations from that snapshot, and requires a new comparison. The
+   tree rewrite is staged in memory so a failure leaves the displayed entries
+   unchanged.
+10. A targeted update preserves the active filter and sort, checked paths,
+    collapsed and expanded branches, cursor focus, and viewport row. If the
+    focused row is no longer visible, focus moves to the next surviving row,
+    then the previous row or its parent. Selections below the operated path are
+    removed only when that path is absent on both sides; unrelated selection
+    state is not rewritten.
+11. If a copy creates missing ancestor directories, absence proofs for other
+    displayed children below exactly those new ancestors are rebound. A child
+    that independently appeared is left visually unchanged but loses mutation
+    authorization, so it cannot be overwritten from a stale row.
 
 These checks are fail-closed. A rejection detected before the worker starts
 leaves the confirmation dialog open with an error. A later rejection is
@@ -110,10 +143,11 @@ replaced, or created part of the selected path.
 
 ## Implementation and Regression Coverage
 
-The DIFF snapshot, prompt-time checks, worker preparation, and automatic
-refresh are implemented in `src/ui/diff_screen.rs`. Reusable path identity,
-missing-path authorization, symlink-safe traversal, and source/destination
-relationship checks are implemented in `src/services/file_ops.rs`.
+The DIFF snapshot, prompt-time checks, worker preparation, and targeted
+reconciliation are implemented in `src/ui/diff_screen.rs`. Reusable path
+identity, missing-path authorization, symlink-safe traversal, and
+source/destination relationship checks are implemented in
+`src/services/file_ops.rs`.
 
 The findings, corrections, regression coverage, and final verification from
 the 2026-09-03 defect review are recorded in
@@ -130,6 +164,8 @@ Regression tests cover:
 - replacement, type changes, and descendant changes of copy and delete targets;
 - late unapproved children after directory isolation and hard-linked children;
 - a previously absent side appearing after a two-sided delete confirmation;
-- operation-result visibility during refresh and stale-selection pruning;
+- target-only reconciliation, root-replacement rejection, expansion and
+  unrelated-state preservation, cursor/viewport fallback, and stale-selection
+  pruning within a removed target;
 - normal overwrite, missing-parent creation, directional copy, directional
-  delete, cancellation, and comparison refresh behavior.
+  delete, cancellation, and partial-success behavior.

@@ -4150,11 +4150,11 @@ fn run_app<B: ratatui::backend::Backend>(
             } else {
                 app.finish_pending_cut_operation(operation_succeeded);
                 let show_tar_error_dialog = tar_error_dialog.is_some();
-                if let Some(msg) = progress_message {
-                    if !show_tar_error_dialog {
-                        app.show_message(&msg);
-                    }
-                }
+                let completion_message = if show_tar_error_dialog {
+                    None
+                } else {
+                    progress_message
+                };
                 // Focus on created tar archive if applicable
                 if let Some(archive_name) = app.pending_tar_archive.take() {
                     app.refresh_panels();
@@ -4194,17 +4194,33 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 app.file_operation_progress = None;
                 app.dialog = None;
+                let mut diff_reconcile_error = None;
                 if diff_copy_completed {
                     if let Some(state) = app.diff_state.as_mut() {
-                        state.finish_copy_operation();
+                        if let Err(error) = state.finish_copy_operation() {
+                            diff_reconcile_error = Some(format!(
+                                "Copy finished, but the DIFF view could not be updated safely: {error}. Run the comparison again before another DIFF mutation"
+                            ));
+                        }
                     }
                 }
                 if diff_delete_completed {
                     if let Some(state) = app.diff_state.as_mut() {
-                        // A two-sided delete can partially succeed, so refresh
-                        // even when the aggregate operation reports failure.
-                        state.finish_delete_operation();
+                        // A two-sided delete can partially succeed, so reconcile
+                        // the operated path even when the aggregate result fails.
+                        if let Err(error) = state.finish_delete_operation() {
+                            diff_reconcile_error = Some(format!(
+                                "Delete finished, but the DIFF view could not be updated safely: {error}. Run the comparison again before another DIFF mutation"
+                            ));
+                        }
                     }
+                }
+                if let Some(message) = diff_reconcile_error {
+                    app.show_message(&message);
+                } else if let Some(message) = completion_message {
+                    // Start the result-message timer only after any synchronous
+                    // DIFF reconciliation has finished.
+                    app.show_message(&message);
                 }
                 if let Some(message) = tar_error_dialog {
                     app.dialog = Some(new_tar_error_dialog(message));

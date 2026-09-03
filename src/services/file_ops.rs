@@ -1670,6 +1670,10 @@ impl PathAuthorization {
         self.is_directory
     }
 
+    pub(crate) fn same_object(&self, other: &Self) -> bool {
+        self.stable_identity() == other.stable_identity()
+    }
+
     fn stable_identity(&self) -> StablePathIdentity {
         self.stable
     }
