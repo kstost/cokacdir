@@ -1,22 +1,22 @@
 //! Antigravity CLI (`agy`) provider.
 //!
-//! Agy's non-TTY stdin interface emits plain stdout rather than a
-//! Claude/Gemini-compatible JSON event stream. This adapter synthesizes
-//! cokacdir's shared `StreamMessage` contract from that stdout.
+//! Uses Agy's non-TTY stdin and stream-json output, validating terminal
+//! status and the actual conversation ID before publishing a completion.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::services::claude::{
-    create_private_temp_file, debug_log_to, enhanced_path_for_bin, kill_child_tree,
-    send_success_terminal, CancelToken, ClaudeResponse, PrivateTempFile, StreamMessage,
+    create_private_temp_file, debug_log_to, enhanced_path_for_bin, kill_child_tree, CancelToken,
+    ClaudeResponse, PrivateTempFile, StreamMessage,
 };
 use crate::services::file_ops::{
     open_directory_for_read, stable_file_identity, stable_path_identity, StablePathIdentity,
@@ -25,9 +25,131 @@ use crate::services::file_ops::{
 #[path = "agy_reserved_vfs.rs"]
 mod reserved_sqlite_vfs;
 
+#[path = "agy_transport.rs"]
+mod transport;
+
 static AGY_PATH: OnceLock<Option<String>> = OnceLock::new();
 static AGY_VERSION: OnceLock<Option<String>> = OnceLock::new();
-static AGY_MODELS: OnceLock<Vec<String>> = OnceLock::new();
+static AGY_MODELS: OnceLock<AgyModelStore> = OnceLock::new();
+
+const AGY_MODELS_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const AGY_MODELS_RETRY_DELAY: Duration = Duration::from_secs(15);
+const AGY_MODELS_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+const AGY_MODELS_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct AgyModel {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgyModelCatalog {
+    pub models: Vec<AgyModel>,
+    pub stale: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgyModelError {
+    Unknown,
+    Unavailable,
+}
+
+#[derive(Default)]
+struct AgyModelCache {
+    models: Vec<AgyModel>,
+    refresh_after: Option<Instant>,
+    refresh_failed: bool,
+    revision: u64,
+}
+
+impl AgyModelCache {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.refresh_after.is_some_and(|deadline| now < deadline)
+    }
+
+    fn catalog(&self, now: Instant) -> AgyModelCatalog {
+        AgyModelCatalog {
+            models: self.models.clone(),
+            stale: self.refresh_failed || !self.is_fresh(now),
+        }
+    }
+
+    fn load(
+        &mut self,
+        now: Instant,
+        force_refresh: bool,
+        fetch: impl FnOnce() -> io::Result<Vec<AgyModel>>,
+    ) -> Vec<AgyModel> {
+        if !force_refresh && self.is_fresh(now) {
+            return self.models.clone();
+        }
+        self.revision = self.revision.wrapping_add(1);
+        match fetch() {
+            Ok(models) => {
+                self.models = models;
+                self.refresh_failed = false;
+                self.refresh_after = Some(now + AGY_MODELS_CACHE_TTL);
+            }
+            Err(error) => {
+                agy_debug(&format!("[list_models] refresh failed: {error}"));
+                // A temporary CLI/network failure must not erase a working list
+                // or permanently cache an empty result before authentication.
+                self.refresh_failed = true;
+                self.refresh_after = Some(now + AGY_MODELS_RETRY_DELAY);
+            }
+        }
+        self.models.clone()
+    }
+}
+
+#[derive(Default)]
+struct AgyModelStore {
+    cache: Mutex<AgyModelCache>,
+    refresh: Mutex<()>,
+}
+
+impl AgyModelStore {
+    fn load(
+        &self,
+        force_refresh: bool,
+        fetch: impl FnOnce() -> io::Result<Vec<AgyModel>>,
+    ) -> AgyModelCatalog {
+        let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        if !force_refresh && cache.is_fresh(Instant::now()) {
+            return cache.catalog(Instant::now());
+        }
+        let revision = cache.revision;
+        let cached = cache.catalog(Instant::now());
+        drop(cache);
+
+        let _refresh = if !force_refresh && !cached.models.is_empty() {
+            match self.refresh.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return cached,
+            }
+        } else {
+            self.refresh
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        };
+        let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        // Another request may have refreshed while this one waited. Reuse
+        // that result instead of serializing another network call behind it.
+        if cache.revision != revision || (!force_refresh && cache.is_fresh(Instant::now())) {
+            return cache.catalog(Instant::now());
+        }
+        drop(cache);
+
+        // Never hold the catalog lock while starting or waiting for Agy.
+        let result = fetch();
+        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        cache.load(Instant::now(), true, || result);
+        cache.catalog(Instant::now())
+    }
+}
 
 const AGY_SYSTEM_PROMPT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const AGY_SYSTEM_PROMPT_PREFIX: &str = "agy_system_prompt";
@@ -211,39 +333,199 @@ pub fn agy_version() -> Option<&'static String> {
     AGY_VERSION.get_or_init(detect_agy_version).as_ref()
 }
 
-fn detect_agy_models() -> Vec<String> {
-    let Some(bin) = get_agy_path() else {
-        return Vec::new();
-    };
-    let output = match Command::new(bin).arg("models").output() {
-        Ok(o) => o,
-        Err(e) => {
-            agy_debug(&format!("[detect_agy_models] failed: {}", e));
-            return Vec::new();
+fn normalize_agy_models(models: impl IntoIterator<Item = AgyModel>) -> Vec<AgyModel> {
+    let mut normalized = Vec::<AgyModel>::new();
+    for model in models {
+        let id = model.id.trim();
+        if !id.is_empty() && !normalized.iter().any(|existing| existing.id == id) {
+            normalized.push(AgyModel {
+                id: id.to_string(),
+                label: model.label.trim().to_string(),
+            });
         }
-    };
-    if !output.status.success() {
-        agy_debug(&format!(
-            "[detect_agy_models] non-zero exit: {:?}",
-            output.status.code()
-        ));
-        return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
+    normalized
 }
 
-pub fn list_models() -> Vec<String> {
-    AGY_MODELS.get_or_init(detect_agy_models).clone()
+fn parse_agy_models_json(stdout: &str) -> io::Result<Vec<AgyModel>> {
+    let payload: Value = serde_json::from_str(stdout)?;
+    if payload["status"] != "SUCCESS" || payload["command"]["name"] != "models" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy did not return a successful models response",
+        ));
+    }
+    let models = payload.pointer("/command/data/models").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Agy models response has no list",
+        )
+    })?;
+    let models: Vec<AgyModel> = serde_json::from_value(models.clone())?;
+    Ok(normalize_agy_models(models))
 }
 
-pub fn is_valid_agy_model(model: &str) -> bool {
-    let model = model.trim();
-    !model.is_empty() && list_models().iter().any(|m| m == model)
+fn parse_agy_models_text(stdout: &str) -> Vec<AgyModel> {
+    normalize_agy_models(stdout.lines().map(|line| {
+        // Current Agy emits ID<TAB>label. Older versions use a single
+        // display label, which is also their accepted --model argument.
+        let (id, label) = line.split_once('\t').unwrap_or((line, ""));
+        AgyModel {
+            id: id.to_string(),
+            label: label.to_string(),
+        }
+    }))
+}
+
+fn run_agy_models_command(
+    bin: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> io::Result<std::process::Output> {
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "Agy model lookup timed out");
+    if Instant::now() >= deadline {
+        return Err(timed_out());
+    }
+    let temp = crate::utils::path::cokacdir_temp_dir()?;
+    let stdout_guard = create_private_temp_file(&temp, "agy_models_stdout", b"")?;
+    let stderr_guard = create_private_temp_file(&temp, "agy_models_stderr", b"")?;
+    let (_directory, access, _) = open_directory_for_read(&temp)?;
+    let open_capture = |guard: &PrivateTempFile| -> io::Result<std::fs::File> {
+        let file = access.open_file(
+            guard.verified_path()?.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "model output has no file name")
+            })?,
+            crate::services::file_ops::DirectoryFileOptions::new()
+                .read(true)
+                .write(true),
+        )?;
+        if stable_file_identity(&file)? != guard.identity() {
+            return Err(io::Error::other("model output file changed while opening"));
+        }
+        Ok(file)
+    };
+    let mut stdout = open_capture(&stdout_guard)?;
+    let mut stderr = open_capture(&stderr_guard)?;
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .env("PATH", enhanced_path_for_bin(bin))
+        .stdin(Stdio::null())
+        // Files avoid pipe-buffer deadlocks and EOF waits on inherited
+        // descriptors after the model-list process has already exited.
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    crate::services::claude::detach_into_own_pgroup(&mut command);
+    let mut child = ReapingAgyChild::new(command.spawn()?);
+    let read_capture = |file: &mut std::fs::File| -> io::Result<Vec<u8>> {
+        file.seek(io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        Read::by_ref(file)
+            .take(AGY_MODELS_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > AGY_MODELS_OUTPUT_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Agy model output is too large",
+            ));
+        }
+        Ok(bytes)
+    };
+    loop {
+        if stdout.metadata()?.len() > AGY_MODELS_OUTPUT_LIMIT
+            || stderr.metadata()?.len() > AGY_MODELS_OUTPUT_LIMIT
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Agy model output is too large",
+            ));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(std::process::Output {
+                status,
+                stdout: read_capture(&mut stdout)?,
+                stderr: read_capture(&mut stderr)?,
+            });
+        }
+        if Instant::now() >= deadline {
+            // ReapingAgyChild terminates the process tree before the output
+            // handles and their private-file guards are dropped.
+            return Err(timed_out());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn detect_agy_models_from(bin: &str) -> io::Result<Vec<AgyModel>> {
+    let deadline = Instant::now() + AGY_MODELS_QUERY_TIMEOUT;
+    let output = run_agy_models_command(bin, &["--output-format", "json", "models"], deadline)?;
+    if output.status.success() {
+        if let Ok(models) = parse_agy_models_json(&String::from_utf8_lossy(&output.stdout)) {
+            return Ok(models);
+        }
+    }
+
+    // Agy before 1.1.12 has no structured models subcommand output.
+    let output = run_agy_models_command(bin, &["models"], deadline)?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "agy models exited with code {:?}",
+            output.status.code()
+        )));
+    }
+    Ok(parse_agy_models_text(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn load_agy_models(force_refresh: bool) -> AgyModelCatalog {
+    AGY_MODELS
+        .get_or_init(AgyModelStore::default)
+        .load(force_refresh, || {
+            let bin = get_agy_path()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Agy CLI not found"))?;
+            detect_agy_models_from(bin)
+        })
+}
+
+pub fn list_models() -> AgyModelCatalog {
+    load_agy_models(false)
+}
+
+/// Refresh the catalog when the user opens /model, even within the cache TTL.
+pub fn refresh_models() -> AgyModelCatalog {
+    load_agy_models(true)
+}
+
+fn find_agy_model_id(models: &[AgyModel], model: &str) -> Option<String> {
+    let model = model.split(" \u{2014} ").next().unwrap_or(model);
+    let model = model.split('\t').next().unwrap_or(model).trim();
+    if model.is_empty() {
+        return None;
+    }
+    if let Some(found) = models.iter().find(|entry| entry.id == model) {
+        return Some(found.id.clone());
+    }
+    // Preserve saved display-label selections from older Agy versions, but
+    // never silently choose between two IDs sharing the same display label.
+    let mut aliases = models.iter().filter(|entry| entry.label == model);
+    let found = aliases.next()?;
+    aliases.next().is_none().then(|| found.id.clone())
+}
+
+fn resolve_agy_model_in_catalog(
+    catalog: &AgyModelCatalog,
+    model: &str,
+) -> Result<String, AgyModelError> {
+    find_agy_model_id(&catalog.models, model).ok_or(if catalog.stale {
+        AgyModelError::Unavailable
+    } else {
+        AgyModelError::Unknown
+    })
+}
+
+pub fn resolve_agy_model(model: &str) -> Result<String, AgyModelError> {
+    resolve_agy_model_in_catalog(&list_models(), model)
 }
 
 /// `gemini` is accepted as a compatibility alias but routed to `agy`.
@@ -343,13 +625,6 @@ fn working_dir_cache_keys(working_dir: &str) -> Vec<String> {
     keys
 }
 
-fn stdout_absence_error_message(raw_stdout: &str) -> Option<String> {
-    if !raw_stdout.trim().is_empty() {
-        return None;
-    }
-    Some("Agy exited successfully but produced no stdout response.".to_string())
-}
-
 #[cfg(not(any(unix, windows)))]
 fn build_legacy_agy_stdin_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
     match system_prompt.filter(|value| !value.trim().is_empty()) {
@@ -372,6 +647,8 @@ fn build_agy_command_args(
         args.push("--conversation".into());
         args.push(sid.into());
     }
+    args.push("--output-format".into());
+    args.push("stream-json".into());
     args.push("--print-timeout".into());
     args.push(print_timeout.into());
     args.push("--log-file".into());
@@ -1380,18 +1657,6 @@ impl ReapingAgyChild {
         self.child.id()
     }
 
-    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
-    }
-
-    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
-    }
-
-    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
-        self.child.stderr.take()
-    }
-
     fn kill_and_reap(&mut self) {
         if self.status.is_some() {
             return;
@@ -1414,15 +1679,6 @@ impl ReapingAgyChild {
         if let Some(status) = status {
             self.status = Some(status);
         }
-        Ok(status)
-    }
-
-    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        if let Some(status) = self.status {
-            return Ok(status);
-        }
-        let status = self.child.wait()?;
-        self.status = Some(status);
         Ok(status)
     }
 }
@@ -1607,6 +1863,66 @@ fn backup_sqlite_into_connection(
     }
 }
 
+fn rebind_cloned_conversation(destination: &Connection, target: &Path) -> Result<(), String> {
+    let update = || -> Result<(), rusqlite::Error> {
+        // Legacy databases may not have this table. In the current schema,
+        // Agy looks up the trajectory by cascade_id, independently of the
+        // filename. A page-for-page backup alone is therefore not resumable.
+        let has_meta: bool = destination.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='trajectory_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_meta {
+            return Ok(());
+        }
+        let count: i64 =
+            destination.query_row("SELECT count(*) FROM trajectory_meta", [], |row| row.get(0))?;
+        if count != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let target_id = target
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|id| crate::services::process::is_valid_session_id(id))
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        // Retain trajectory_id and opaque step payloads, which reference the
+        // copied history. Only the destination's conversation identity changes.
+        destination.execute("UPDATE trajectory_meta SET cascade_id=?1", [target_id])?;
+        Ok(())
+    };
+    update().map_err(|error| {
+        format!(
+            "Failed to rebind Agy clone conversation metadata in {}: {error}",
+            target.display()
+        )
+    })
+}
+
+fn prepare_standalone_sqlite_backup(reserved: &std::fs::File) -> io::Result<()> {
+    // sqlite3_backup includes committed WAL pages in the main database, but
+    // retains the source's WAL read/write version bytes. The completed backup
+    // has no WAL of its own. With all SQLite connections to it closed, switch
+    // just those documented header bytes to rollback mode before reopening in
+    // the handle-only VFS (which deliberately cannot create WAL paths).
+    // https://sqlite.org/fileformat.html#file_format_version_numbers
+    let mut file = reserved.try_clone()?;
+    file.rewind()?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(io::Error::other("invalid SQLite backup header"));
+    }
+    match &header[18..20] {
+        [1, 1] => Ok(()),
+        [2, 2] => {
+            file.seek(io::SeekFrom::Start(18))?;
+            file.write_all(&[1, 1])
+        }
+        _ => Err(io::Error::other("unsupported SQLite backup file format")),
+    }
+}
+
 fn backup_sqlite_to_reserved_handle(
     source: &Connection,
     reserved: &std::fs::File,
@@ -1662,6 +1978,23 @@ fn backup_sqlite_to_reserved_handle(
             )
         })?;
     backup_sqlite_into_connection(source, &mut destination, target)?;
+    destination
+        .close()
+        .map_err(|(_, error)| format!("Failed to close Agy SQLite backup: {error}"))?;
+    prepare_standalone_sqlite_backup(reserved)
+        .map_err(|error| format!("Failed to prepare standalone Agy SQLite backup: {error}"))?;
+    // Rebind through the same reserved handle before publishing the clone.
+    // This VFS intentionally creates no journal or WAL sidecar paths.
+    let destination = Connection::open_with_flags_and_vfs(
+        registration.filename(),
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        registration.name(),
+    )
+    .map_err(|error| format!("Failed to reopen reserved Agy clone: {error}"))?;
+    destination
+        .execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;")
+        .map_err(|error| format!("Failed to prepare Agy clone metadata update: {error}"))?;
+    rebind_cloned_conversation(&destination, target)?;
     drop(destination);
     registration.unregister().map_err(|error| {
         format!(
@@ -2090,13 +2423,12 @@ pub fn execute_command(
         match msg {
             StreamMessage::Text { content } => response.push_str(&content),
             StreamMessage::Done { result, session_id } => {
-                if response.is_empty() {
-                    response = result;
-                }
+                response = result;
                 last_session_id = session_id;
                 break;
             }
             StreamMessage::Error { message, .. } => {
+                response.clear();
                 error = Some(message);
                 break;
             }
@@ -2129,6 +2461,8 @@ pub fn execute_command_streaming(
     no_session_persistence: bool,
 ) -> Result<(), String> {
     agy_debug("=== agy execute_command_streaming START ===");
+    let timeout_setting = default_print_timeout();
+    let timeout = transport::parse_timeout(&timeout_setting)?;
     agy_debug(&format!(
         "[stream] prompt_len={} session_id={:?} working_dir={} model={:?} no_session_persistence={}",
         prompt.len(),
@@ -2147,14 +2481,19 @@ pub fn execute_command_streaming(
         }
     }
 
-    if let Some(m) = model {
-        if !is_valid_agy_model(m) {
-            return Err(format!(
-                "Unsupported agy model: {}. Use /model to list available agy models.",
-                m
-            ));
-        }
-    }
+    let resolved_model = model
+        .map(|model| {
+            resolve_agy_model(model).map_err(|error| match error {
+                AgyModelError::Unknown => format!(
+                    "Unsupported agy model: {}. Use /model to list available agy models.",
+                    model
+                ),
+                AgyModelError::Unavailable => {
+                    "Unable to refresh Agy models. Check Agy sign-in and retry /model.".to_string()
+                }
+            })
+        })
+        .transpose()?;
     let agy_bin = get_agy_path()
         .ok_or_else(|| "Agy CLI not found. Is Antigravity CLI installed?".to_string())?;
 
@@ -2188,9 +2527,9 @@ pub fn execute_command_streaming(
         .map_err(|e| format!("Failed to create private Agy log file: {}", e))?;
     let args = build_agy_command_args(
         session_id,
-        &default_print_timeout(),
+        &timeout_setting,
         agy_log_guard.path(),
-        model,
+        resolved_model.as_deref(),
     );
     let _agy_log_guard = agy_log_guard;
 
@@ -2210,10 +2549,7 @@ pub fn execute_command_streaming(
         .env_remove(AGY_HOOK_ENV_PROMPT_FILE)
         .env_remove(AGY_HOOK_ENV_TOKEN)
         .env_remove(AGY_HOOK_ENV_EXECUTABLE)
-        .env_remove(AGY_HOOK_ENV_STATE_FILE)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env_remove(AGY_HOOK_ENV_STATE_FILE);
     if let Some(ref hook_prompt) = agy_hook_prompt {
         cmd.env(AGY_HOOK_ENV_PROMPT_FILE, hook_prompt.prompt_path())
             .env(AGY_HOOK_ENV_TOKEN, hook_prompt.token())
@@ -2225,322 +2561,16 @@ pub fn execute_command_streaming(
                     .expect("hook executable exists with hook prompt"),
             );
     }
-    crate::services::claude::detach_into_own_pgroup(&mut cmd);
-    crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
-
-    let mut child = ReapingAgyChild::new(cmd.spawn().map_err(|e| {
-        agy_debug(&format!("[stream] spawn failed: {}", e));
-        format!("Failed to start agy: {}", e)
-    })?);
-    agy_debug(&format!("[stream] spawned pid={}", child.id()));
-
-    if let Some(ref token) = cancel_token {
-        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(child.id());
-        drop(guard);
-        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            child.kill_and_reap();
-            return Ok(());
-        }
-    }
-
-    let stderr_thread = child.take_stderr().map(|stderr| {
-        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
-    });
-
-    // With no `--print`/`-p` flag, Agy treats non-TTY stdin as the complete
-    // headless prompt. Closing the pipe is required so Agy sees EOF and starts
-    // the request. On Unix and Windows, cokacdir's system instructions are
-    // supplied as a transient system message by Agy's PreInvocation hook and
-    // stdin contains only the user's current message. Unsupported target
-    // families retain the composed-stdin compatibility transport.
-    let stdin_result = match child.take_stdin() {
-        Some(mut stdin) => {
-            let result = stdin.write_all(stdin_prompt.as_bytes());
-            drop(stdin);
-            result.map_err(|e| format!("Failed to write Agy prompt to stdin: {}", e))
-        }
-        None => Err("Failed to open Agy stdin".to_string()),
-    };
-    if let Err(error) = stdin_result {
-        agy_debug(&format!("[stream] stdin failed: {}", error));
-        child.kill_and_reap();
-        let stderr_msg = stderr_thread
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-        if stderr_msg.is_empty() {
-            return Err(error);
-        }
-        return Err(format!("{}; stderr: {}", error, stderr_msg.trim()));
-    }
-    agy_debug(&format!(
-        "[stream] wrote {} stdin prompt bytes and closed it",
-        stdin_prompt.len()
-    ));
-
-    // Agy 1.1.1 treats hook failures as non-fatal and would otherwise call the
-    // model without cokacdir's system instructions. The helper acknowledges
-    // only after its complete JSON response has been written. Refuse to wait
-    // for or expose model output unless that handshake arrives promptly.
-    if let Some(ref hook_prompt) = agy_hook_prompt {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let hook_state = hook_prompt.hook_state();
-            if hook_state == AgyHookState::Failed {
-                child.kill_and_reap();
-                return Err(
-                    "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
-                        .to_string(),
-                );
-            }
-            if hook_prompt.acknowledged() && hook_state == AgyHookState::Complete {
-                break;
-            }
-            if let Some(ref token) = cancel_token {
-                if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    child.kill_and_reap();
-                    return Ok(());
-                }
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {}
-                Err(error) => {
-                    child.kill_and_reap();
-                    return Err(format!(
-                        "Failed while waiting for the Agy system-prompt hook: {}",
-                        error
-                    ));
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                agy_debug("[stream] system-prompt hook acknowledgement timed out");
-                child.kill_and_reap();
-                let stderr_msg = stderr_thread
-                    .and_then(|handle| handle.join().ok())
-                    .unwrap_or_default();
-                let suffix = if stderr_msg.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("; stderr: {}", stderr_msg.trim())
-                };
-                return Err(format!(
-                    "Agy did not acknowledge cokacdir's system-prompt hook within 30 seconds{}",
-                    suffix
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| "Failed to capture agy stdout".to_string())?;
-    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel::<Result<String, String>>();
-    let stdout_thread = std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let mut chunk = String::new();
-            match reader.read_line(&mut chunk) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if stdout_sender.send(Ok(chunk)).is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ =
-                        stdout_sender.send(Err(format!("Failed to read agy output: {}", error)));
-                    break;
-                }
-            }
-        }
-    });
-
-    let mut raw_stdout = String::new();
-    let mut visible_output = String::new();
-    let mut forwarded_bytes = 0usize;
-    let mut hook_pending_since: Option<std::time::Instant> = None;
-
-    loop {
-        if let Some(ref token) = cancel_token {
-            if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                agy_debug("[stream] cancelled during stdout read");
-                child.kill_and_reap();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.and_then(|handle| handle.join().ok());
-                return Ok(());
-            }
-        }
-
-        if let Some(ref hook_prompt) = agy_hook_prompt {
-            match hook_prompt.hook_state() {
-                AgyHookState::Complete => hook_pending_since = None,
-                AgyHookState::Failed => {
-                    agy_debug("[stream] Agy hook ledger reported failure");
-                    child.kill_and_reap();
-                    let _ = stdout_thread.join();
-                    let _ = stderr_thread.and_then(|handle| handle.join().ok());
-                    return Err(
-                        "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
-                            .to_string(),
-                    );
-                }
-                AgyHookState::Pending => {
-                    let pending_since =
-                        hook_pending_since.get_or_insert_with(std::time::Instant::now);
-                    if pending_since.elapsed() >= std::time::Duration::from_secs(30) {
-                        agy_debug("[stream] Agy hook ledger remained incomplete");
-                        child.kill_and_reap();
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.and_then(|handle| handle.join().ok());
-                        return Err(
-                            "Agy's system-prompt hook did not complete within 30 seconds; the response was discarded."
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        let chunk = match stdout_receiver.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(Ok(chunk)) => chunk,
-            Ok(Err(error)) => {
-                agy_debug(&format!("[stream] stdout read failed: {}", error));
-                child.kill_and_reap();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.and_then(|handle| handle.join().ok());
-                return Err(error);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        raw_stdout.push_str(&chunk);
-        agy_debug(&format!(
-            "[stream] stdout chunk: {} bytes, preview={:?}",
-            chunk.len(),
-            log_preview(&chunk, 200)
-        ));
-
-        visible_output.push_str(&chunk);
-        // Agy's hook runner is fail-open. With a system prompt, retain all
-        // stdout until the child exits and every ledger start has a matching
-        // successful completion;
-        // otherwise a later failed PreInvocation could leak an answer after
-        // the first successful acknowledgement. Runs without a hook retain
-        // normal streaming behavior.
-        if agy_hook_prompt.is_none() && forwarded_bytes < visible_output.len() {
-            let pending = visible_output[forwarded_bytes..].to_string();
-            if sender
-                .send(StreamMessage::Text { content: pending })
-                .is_err()
-            {
-                agy_debug("[stream] receiver dropped");
-                child.kill_and_reap();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.and_then(|handle| handle.join().ok());
-                return Ok(());
-            }
-            forwarded_bytes = visible_output.len();
-        }
-    }
-
-    if stdout_thread.join().is_err() {
-        child.kill_and_reap();
-        let _ = stderr_thread.and_then(|handle| handle.join().ok());
-        return Err("Agy stdout reader thread failed".to_string());
-    }
-
-    if let Some(ref token) = cancel_token {
-        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            agy_debug("[stream] cancelled after stdout read");
-            child.kill_and_reap();
-            let _ = stderr_thread.and_then(|handle| handle.join().ok());
-            return Ok(());
-        }
-    }
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Agy process error: {}", e))?;
-    let stderr_msg = stderr_thread
-        .and_then(|h| h.join().ok())
-        .unwrap_or_default();
-    if !stderr_msg.is_empty() {
-        agy_debug(&format!(
-            "[stream] stderr: {} bytes, preview={:?}",
-            stderr_msg.len(),
-            log_preview(&stderr_msg, 500)
-        ));
-    }
-
-    let last_session_id = session_id
-        .map(ToString::to_string)
-        .or_else(|| read_last_conversation_id(working_dir));
-
-    let hook_acknowledged = agy_hook_prompt
-        .as_ref()
-        .map(AgyHookPrompt::acknowledged)
-        .unwrap_or(true);
-    let hook_state = agy_hook_prompt
-        .as_ref()
-        .map(AgyHookPrompt::hook_state)
-        .unwrap_or(AgyHookState::Complete);
-    let hook_failed = hook_state != AgyHookState::Complete;
-    let detected_error = if hook_failed {
-        Some(
-            "Agy failed while running cokacdir's system-prompt hook; the response was discarded."
-                .to_string(),
-        )
-    } else if !hook_acknowledged {
-        Some(
-            "Agy completed without running cokacdir's system-prompt hook; the response was discarded."
-                .to_string(),
-        )
-    } else if status.success() {
-        stdout_absence_error_message(&raw_stdout)
-    } else {
-        None
-    };
-    if detected_error.is_some() || !status.success() {
-        let discard_hook_output = hook_failed || !hook_acknowledged;
-        let message =
-            detected_error.unwrap_or_else(|| format!("Agy exited with code {:?}", status.code()));
-        agy_debug(&format!(
-            "[stream] error: {}, exit={:?}, stdout_len={}, stderr_len={}",
-            message,
-            status.code(),
-            raw_stdout.len(),
-            stderr_msg.len()
-        ));
-        let _ = sender.send(StreamMessage::Error {
-            message,
-            stdout: if discard_hook_output {
-                String::new()
-            } else {
-                raw_stdout
-            },
-            stderr: stderr_msg,
-            exit_code: status.code(),
-        });
-        return Ok(());
-    }
-
-    if forwarded_bytes < visible_output.len() {
-        if sender
-            .send(StreamMessage::Text {
-                content: visible_output[forwarded_bytes..].to_string(),
-            })
-            .is_err()
-        {
-            return Ok(());
-        }
-    }
-
-    let assistant_final = (!visible_output.trim().is_empty()).then(|| visible_output.clone());
-    let _ = send_success_terminal(&sender, assistant_final, visible_output, last_session_id);
-    agy_debug("=== agy execute_command_streaming END ===");
-    Ok(())
+    transport::run(
+        cmd,
+        &temp_dir,
+        &stdin_prompt,
+        timeout,
+        session_id,
+        &sender,
+        agy_hook_prompt.as_ref(),
+        cancel_token.as_ref(),
+    )
 }
 
 #[cfg(test)]
@@ -2549,9 +2579,288 @@ mod tests {
         backup_sqlite_to_reserved_file, backup_sqlite_to_reserved_handle, build_agy_command_args,
         build_agy_hook_response, cleanup_owned_failed_clone, clone_file_identity,
         clone_target_still_owned, copy_conversation_to_id, ensure_agy_hook_plugin_in,
-        execute_command_streaming, prepare_agy_hook_prompt, stdout_absence_error_message,
-        working_dir_cache_keys, write_hook_ack, AGY_HOOK_INTERNAL_ARG,
+        execute_command_streaming, prepare_agy_hook_prompt, working_dir_cache_keys, write_hook_ack,
+        AGY_HOOK_INTERNAL_ARG,
     };
+
+    #[test]
+    fn model_catalog_reads_structured_ids_and_labels() {
+        let models = super::parse_agy_models_json(
+            r#"{"status":"SUCCESS","response":"human-readable output is not an ID","command":{"name":"models","data":{"models":[{"id":"gemini-3.8-flash-high","label":"Gemini 3.8 Flash (High)"},{"id":"claude-sonnet-4-6","label":"Claude Sonnet 4.6 (Thinking)"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gemini-3.8-flash-high");
+        assert_eq!(models[0].label, "Gemini 3.8 Flash (High)");
+        assert_eq!(models[1].id, "claude-sonnet-4-6");
+        assert!(super::parse_agy_models_json(
+            r#"{"status":"ERROR","command":{"name":"models","data":{"models":[]}}}"#
+        )
+        .is_err());
+        assert!(super::parse_agy_models_json(
+            r#"{"status":"SUCCESS","command":{"name":"models","data":{}}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn model_catalog_supports_tab_separated_and_legacy_output() {
+        let models = super::parse_agy_models_text(
+            "\r\n gemini-3.8-flash-high\tGemini 3.8 Flash (High) \r\n\
+             claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\r\n\
+             Gemini 3.5 Flash (Medium)\r\n\
+             gemini-3.8-flash-high\tDuplicate\r\n\tMissing ID\r\n",
+        );
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "gemini-3.8-flash-high");
+        assert_eq!(models[0].label, "Gemini 3.8 Flash (High)");
+        assert_eq!(models[2].id, "Gemini 3.5 Flash (Medium)");
+        assert!(models[2].label.is_empty());
+    }
+
+    #[test]
+    fn model_selection_resolves_ids_labels_and_copied_rows_to_only_the_id() {
+        let models =
+            super::parse_agy_models_text("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n");
+        for selection in [
+            "gemini-3.8-flash-high",
+            " Gemini 3.8 Flash (High) ",
+            "gemini-3.8-flash-high — Gemini 3.8 Flash (High)",
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)",
+        ] {
+            let id = super::find_agy_model_id(&models, selection).unwrap();
+            assert_eq!(id, "gemini-3.8-flash-high");
+            let args =
+                build_agy_command_args(None, "1h", std::path::Path::new("agy.log"), Some(&id));
+            assert_eq!(args.last().unwrap(), "gemini-3.8-flash-high");
+        }
+        assert!(super::find_agy_model_id(&models, "unknown-model").is_none());
+        assert!(super::find_agy_model_id(&models, " ").is_none());
+        let ambiguous = super::parse_agy_models_text("first\tShared name\nsecond\tShared name\n");
+        assert!(super::find_agy_model_id(&ambiguous, "Shared name").is_none());
+        assert_eq!(
+            super::find_agy_model_id(&ambiguous, "second").as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn model_catalog_cache_expires_and_can_be_refreshed_immediately() {
+        let now = super::Instant::now();
+        let mut cache = super::AgyModelCache::default();
+        let first = super::parse_agy_models_text("first\tFirst\n");
+        let second = super::parse_agy_models_text("second\tSecond\n");
+        assert_eq!(cache.load(now, false, || Ok(first.clone())), first);
+        assert_eq!(
+            cache.load(now + super::Duration::from_secs(1), false, || {
+                panic!("a fresh catalog should be reused")
+            }),
+            first
+        );
+        let expiry = now + super::AGY_MODELS_CACHE_TTL;
+        assert_eq!(cache.load(expiry, false, || Ok(second.clone())), second);
+        assert_eq!(cache.load(expiry, true, || Ok(first.clone())), first);
+    }
+
+    #[test]
+    fn model_catalog_retries_failures_and_preserves_the_last_success() {
+        let now = super::Instant::now();
+        let mut cache = super::AgyModelCache::default();
+        let failure = || Err(std::io::Error::other("temporary model lookup failure"));
+        assert!(cache.load(now, false, failure).is_empty());
+        assert!(cache.catalog(now).stale);
+        let retry = now + super::AGY_MODELS_RETRY_DELAY;
+        let models = super::parse_agy_models_text("available\tAvailable\n");
+        assert_eq!(cache.load(retry, false, || Ok(models.clone())), models);
+        assert!(!cache.catalog(retry).stale);
+        let expiry = retry + super::AGY_MODELS_CACHE_TTL;
+        assert_eq!(cache.load(expiry, false, failure), models);
+        assert!(cache.catalog(expiry).stale);
+        assert_eq!(
+            cache.load(expiry + super::Duration::from_secs(1), false, || {
+                panic!("a failed lookup should respect the retry delay")
+            }),
+            models
+        );
+        // A successful empty list is authoritative (for example, access was
+        // removed), and a manual refresh can retry before the backoff expires.
+        assert!(cache.load(expiry, true, || Ok(Vec::new())).is_empty());
+        assert!(!cache.catalog(expiry).stale);
+    }
+
+    #[test]
+    fn model_selection_distinguishes_lookup_failure_from_unknown_id() {
+        let mut catalog = super::AgyModelCatalog {
+            models: super::parse_agy_models_text("known\tKnown model\n"),
+            stale: true,
+        };
+        assert_eq!(
+            super::resolve_agy_model_in_catalog(&catalog, "new-model"),
+            Err(super::AgyModelError::Unavailable)
+        );
+        assert_eq!(
+            super::resolve_agy_model_in_catalog(&catalog, "known"),
+            Ok("known".into())
+        );
+        catalog.stale = false;
+        assert_eq!(
+            super::resolve_agy_model_in_catalog(&catalog, "new-model"),
+            Err(super::AgyModelError::Unknown)
+        );
+    }
+
+    #[test]
+    fn model_catalog_readers_can_use_expired_cache_during_a_refresh() {
+        let store = std::sync::Arc::new(super::AgyModelStore::default());
+        let first = super::parse_agy_models_text("first\tFirst\n");
+        store.load(false, || Ok(first.clone()));
+        store.cache.lock().unwrap().refresh_after = Some(super::Instant::now());
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let refreshing = store.clone();
+        let worker = std::thread::spawn(move || {
+            refreshing.load(true, || {
+                started.send(()).unwrap();
+                wait.recv_timeout(super::Duration::from_secs(3)).unwrap();
+                Ok(super::parse_agy_models_text("second\tSecond\n"))
+            })
+        });
+        ready.recv_timeout(super::Duration::from_secs(3)).unwrap();
+        let cached = store.load(false, || panic!("only one refresh may run"));
+        assert!(cached.stale);
+        assert_eq!(cached.models, first);
+        release.send(()).unwrap();
+        let refreshed = worker.join().unwrap();
+        assert!(!refreshed.stale);
+        assert_eq!(refreshed.models[0].id, "second");
+    }
+
+    #[cfg(unix)]
+    fn write_model_query_script(directory: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = directory.join("agy");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_query_timeout_terminates_and_reaps_the_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
+        let bin = write_model_query_script(
+            temp.path(),
+            "printf '%s\\n' \"$$\" > \"$1\"\nexec sleep 60\n",
+        );
+        let start = super::Instant::now();
+        let error = super::run_agy_models_command(
+            bin.to_str().unwrap(),
+            &[pid_file.to_str().unwrap()],
+            start + super::Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < super::Duration::from_secs(5));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        assert!(!std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_query_rejects_unbounded_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = write_model_query_script(temp.path(), "while :; do printf '%01024d' 0; done\n");
+        let error = super::run_agy_models_command(
+            bin.to_str().unwrap(),
+            &[],
+            super::Instant::now() + super::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_query_does_not_wait_for_inherited_output_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = write_model_query_script(temp.path(), "sleep 5 &\nprintf 'id\\tLabel\\n'\n");
+        let start = super::Instant::now();
+        let output = super::run_agy_models_command(
+            bin.to_str().unwrap(),
+            &[],
+            start + super::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"id\tLabel\n");
+        assert!(start.elapsed() < super::Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_catalog_falls_back_when_structured_output_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("agy");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = --output-format ]; then exit 2; fi\n\
+             [ \"$#\" = 1 ] && [ \"$1\" = models ] || exit 3\n\
+             printf '%s\\n' 'Gemini 3.5 Flash (Medium)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let models = super::detect_agy_models_from(bin.to_str().unwrap()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "Gemini 3.5 Flash (Medium)");
+    }
+
+    #[test]
+    #[ignore = "requires an installed, authenticated Agy CLI; only queries the model catalog"]
+    fn live_agy_model_catalog_matches_text_and_json_and_accepts_every_id() {
+        let bin = super::get_agy_path().expect("Agy CLI must be installed");
+        let catalog = super::refresh_models();
+        assert!(!catalog.stale, "the live model lookup must succeed");
+        let models = catalog.models;
+        assert!(!models.is_empty(), "Agy must expose at least one model");
+        let json = super::run_agy_models_command(
+            bin,
+            &["--output-format", "json", "models"],
+            super::Instant::now() + super::AGY_MODELS_QUERY_TIMEOUT,
+        )
+        .unwrap();
+        assert!(json.status.success());
+        assert_eq!(
+            models,
+            super::parse_agy_models_json(&String::from_utf8_lossy(&json.stdout)).unwrap()
+        );
+        let text = super::run_agy_models_command(
+            bin,
+            &["models"],
+            super::Instant::now() + super::AGY_MODELS_QUERY_TIMEOUT,
+        )
+        .unwrap();
+        assert!(text.status.success());
+        assert_eq!(
+            models,
+            super::parse_agy_models_text(&String::from_utf8_lossy(&text.stdout))
+        );
+        for model in &models {
+            assert!(!model.id.contains('\t'));
+            assert_eq!(super::resolve_agy_model(&model.id), Ok(model.id.clone()));
+        }
+        println!(
+            "Validated {} models from the installed Agy CLI",
+            models.len()
+        );
+    }
 
     #[test]
     fn agy_command_uses_user_stdin_without_prompt_or_workspace_flags() {
@@ -2576,6 +2885,8 @@ mod tests {
             vec![
                 "--conversation",
                 "conversation-id",
+                "--output-format",
+                "stream-json",
                 "--print-timeout",
                 "1h",
                 "--log-file",
@@ -3022,20 +3333,26 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().into_owned();
+        let memory_token = format!("COKAC_MEMORY_{:016x}", rand::random::<u64>());
         let model = super::list_models()
+            .models
             .into_iter()
             .next()
-            .expect("Agy must expose at least one model");
+            .expect("Agy must expose at least one model")
+            .id;
+        eprintln!("Checking Agy request and resume with model {model}");
         let (sender, receiver) = std::sync::mpsc::channel();
 
         execute_command_streaming(
-            "What is 2 + 2? Return only the result.",
+            &format!(
+                "Remember the token {memory_token} for a later turn. Carry out the integration check described in your injected instructions."
+            ),
             None,
             &working_dir,
             sender,
-            Some(
-                "For this integration check, create a file named cokacdir-hook-one.txt in the active workspace containing exactly HOOK_FILE_ONE. Then reply with exactly COKACDIR_AGY_LIVE_OK and nothing else.",
-            ),
+            Some(&format!(
+                "For this integration check, your workspace is {working_dir}. Create cokacdir-hook-one.txt in that directory containing exactly HOOK_FILE_ONE. Then reply with exactly COKACDIR_AGY_LIVE_OK and nothing else."
+            )),
             None,
             None,
             Some(&model),
@@ -3044,7 +3361,10 @@ mod tests {
         .unwrap();
 
         let (completed_result, session_id) = collect_live_result(receiver);
-        assert!(completed_result.contains("COKACDIR_AGY_LIVE_OK"));
+        assert!(
+            completed_result.contains("COKACDIR_AGY_LIVE_OK"),
+            "unexpected response: {completed_result:?}; session_id={session_id:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("cokacdir-hook-one.txt"))
                 .unwrap()
@@ -3052,16 +3372,21 @@ mod tests {
             "HOOK_FILE_ONE"
         );
         let session_id = session_id.expect("new Agy call must report its conversation id");
+        assert_eq!(
+            super::read_last_conversation_id(&working_dir).as_deref(),
+            Some(session_id.as_str()),
+            "reported session must match the conversation Agy actually persisted"
+        );
 
         let (sender, receiver) = std::sync::mpsc::channel();
         execute_command_streaming(
-            "What is 3 + 3? Return only the result.",
+            "Carry out the resumed integration check described in your current injected instructions.",
             Some(&session_id),
             &working_dir,
             sender,
-            Some(
-                "For this resumed integration check, create a file named cokacdir-hook-two.txt in the active workspace containing exactly HOOK_FILE_TWO. Then reply with exactly COKACDIR_AGY_RESUME_OK and nothing else.",
-            ),
+            Some(&format!(
+                "For this resumed integration check, your workspace is {working_dir}. Create cokacdir-hook-two.txt in that directory containing exactly HOOK_FILE_TWO. Then reply with COKACDIR_AGY_RESUME_OK followed by the memory token from the first user turn, and nothing else. If no memory token is present in the conversation context, use UNKNOWN. Do not search files or call tools to find the memory token."
+            )),
             None,
             None,
             Some(&model),
@@ -3070,7 +3395,19 @@ mod tests {
         .unwrap();
 
         let (resumed_result, resumed_session_id) = collect_live_result(receiver);
-        assert!(resumed_result.contains("COKACDIR_AGY_RESUME_OK"));
+        assert_eq!(
+            super::read_last_conversation_id(&working_dir).as_deref(),
+            resumed_session_id.as_deref(),
+            "reported resumed session must match the conversation Agy actually persisted"
+        );
+        assert!(
+            resumed_result.contains("COKACDIR_AGY_RESUME_OK"),
+            "unexpected resumed response: {resumed_result:?}; session_id={resumed_session_id:?}"
+        );
+        assert!(
+            resumed_result.contains(&memory_token),
+            "resumed conversation lost the first turn's memory token: {resumed_result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("cokacdir-hook-two.txt"))
                 .unwrap()
@@ -3078,19 +3415,31 @@ mod tests {
             "HOOK_FILE_TWO"
         );
         assert_eq!(resumed_session_id.as_deref(), Some(session_id.as_str()));
-    }
 
-    #[test]
-    fn detects_successful_empty_stdout_as_error() {
-        assert_eq!(
-            stdout_absence_error_message("").as_deref(),
-            Some("Agy exited successfully but produced no stdout response.")
+        // Scheduled runs resume a copy under a new ID. Strict result-ID
+        // validation must preserve that workflow and leave the source intact.
+        let original_path = super::conversation_path(&session_id).unwrap();
+        let original_bytes = std::fs::read(&original_path).unwrap();
+        let clone_id = super::clone_session_for_schedule(&session_id, &working_dir).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        execute_command_streaming(
+            "Recall the memory token from the first user turn. Do not use tools.",
+            Some(&clone_id),
+            &working_dir,
+            sender,
+            Some("Reply with COKACDIR_AGY_CLONE_OK followed by the first user turn's memory token. If absent, use UNKNOWN. Do not use tools."),
+            None,
+            None,
+            Some(&model),
+            false,
+        ).unwrap();
+        let (clone_result, returned_clone_id) = collect_live_result(receiver);
+        assert_eq!(returned_clone_id.as_deref(), Some(clone_id.as_str()));
+        assert!(
+            clone_result.contains("COKACDIR_AGY_CLONE_OK") && clone_result.contains(&memory_token),
+            "unexpected clone response: {clone_result:?}"
         );
-    }
-
-    #[test]
-    fn allows_successful_visible_stdout() {
-        assert!(stdout_absence_error_message("OLD\nNEW\n").is_none());
+        assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
     }
 
     #[test]
@@ -3190,6 +3539,74 @@ mod tests {
             .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn sqlite_clone_rebinds_conversation_metadata_and_preserves_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.db");
+        let writer = rusqlite::Connection::open(&source).unwrap();
+        writer.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE trajectory_meta(trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER, source INTEGER);
+             INSERT INTO trajectory_meta VALUES('trajectory-id', 'source', 4, 17);
+             CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES(0, x'00736f7572636500'), (1, x'ff00ff');",
+        ).unwrap();
+        let before = std::fs::read(&source).unwrap();
+        let wal_before = std::fs::read(temp.path().join("source.db-wal")).unwrap();
+
+        copy_conversation_to_id(&source, "scheduled-clone").unwrap();
+
+        let clone = rusqlite::Connection::open(temp.path().join("scheduled-clone.db")).unwrap();
+        let meta: (String, String, i64, i64) = clone
+            .query_row(
+                "SELECT trajectory_id, cascade_id, trajectory_type, source FROM trajectory_meta",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            meta,
+            ("trajectory-id".into(), "scheduled-clone".into(), 4, 17)
+        );
+        let payloads: String = clone.query_row(
+            "SELECT group_concat(hex(step_payload), ',') FROM (SELECT step_payload FROM steps ORDER BY idx)", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(payloads, "00736F7572636500,FF00FF");
+        let integrity: String = clone
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert_eq!(
+            std::fs::read(temp.path().join("source.db-wal")).unwrap(),
+            wal_before
+        );
+        assert!(!temp.path().join("scheduled-clone.db-journal").exists());
+        assert!(!temp.path().join("scheduled-clone.db-wal").exists());
+    }
+
+    #[test]
+    fn sqlite_clone_rejects_ambiguous_conversation_metadata_and_removes_its_target() {
+        for rows in [
+            "",
+            "INSERT INTO trajectory_meta VALUES('one','source'),('two','source');",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source.db");
+            let writer = rusqlite::Connection::open(&source).unwrap();
+            writer.execute_batch("CREATE TABLE trajectory_meta(trajectory_id TEXT PRIMARY KEY, cascade_id TEXT);").unwrap();
+            writer.execute_batch(rows).unwrap();
+            drop(writer);
+            let before = std::fs::read(&source).unwrap();
+
+            let error = copy_conversation_to_id(&source, "rejected-clone").unwrap_err();
+
+            assert!(error.contains("conversation metadata"), "{error}");
+            assert!(!temp.path().join("rejected-clone.db").exists());
+            assert_eq!(std::fs::read(&source).unwrap(), before);
+        }
     }
 
     #[test]

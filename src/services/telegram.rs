@@ -2077,12 +2077,10 @@ fn normalize_model_setting(model: &str) -> String {
         }
         "gemini" => "agy".to_string(),
         s if s.starts_with("gemini:") => {
-            let model_name = s.trim_start_matches("gemini:");
-            if agy::is_valid_agy_model(model_name) {
-                s.to_string()
-            } else {
-                "agy".to_string()
-            }
+            // Settings are often read while holding the shared bot-state
+            // lock. Normalize the provider without starting a CLI lookup or
+            // losing the selected model when Agy is temporarily unavailable.
+            format!("agy:{}", s.trim_start_matches("gemini:"))
         }
         _ => model.to_string(),
     }
@@ -23158,9 +23156,98 @@ async fn handle_public_command(
     Ok(())
 }
 
+fn format_agy_model_option(model: &agy::AgyModel) -> String {
+    let command = format!("<code>/model agy:{}</code>", html_escape(&model.id));
+    if model.label.is_empty() || model.label == model.id {
+        format!("{command}\n")
+    } else {
+        format!("{command} — {}\n", html_escape(&model.label))
+    }
+}
+
+fn format_agy_model_catalog(catalog: &agy::AgyModelCatalog) -> String {
+    let mut message = String::new();
+    if catalog.stale {
+        message.push_str(if catalog.models.is_empty() {
+            "<i>Could not fetch Agy models. Check Agy sign-in and retry /model.</i>\n"
+        } else {
+            "<i>Could not refresh Agy models; showing the last available list. Retry /model.</i>\n"
+        });
+    }
+    for model in &catalog.models {
+        message.push_str(&format_agy_model_option(model));
+    }
+    message
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelNameError {
+    ProviderUnavailable(&'static str),
+    InvalidFormat,
+    LookupFailed,
+}
+
+#[cfg(test)]
+mod agy_model_option_tests {
+    use super::*;
+
+    #[test]
+    fn model_option_keeps_only_the_id_in_the_copyable_command() {
+        let option = format_agy_model_option(&agy::AgyModel {
+            id: "gemini-3.8-flash-high".into(),
+            label: "Gemini 3.8 Flash (High) & more".into(),
+        });
+        assert_eq!(
+            option,
+            "<code>/model agy:gemini-3.8-flash-high</code> — Gemini 3.8 Flash (High) &amp; more\n"
+        );
+        assert_eq!(
+            agy::strip_agy_prefix("agy:gemini-3.8-flash-high — Gemini 3.8 Flash (High)"),
+            Some("gemini-3.8-flash-high")
+        );
+        assert_eq!(
+            format_agy_model_option(&agy::AgyModel {
+                id: "Gemini 3.5 Flash (Medium)".into(),
+                label: String::new(),
+            }),
+            "<code>/model agy:Gemini 3.5 Flash (Medium)</code>\n"
+        );
+    }
+
+    #[test]
+    fn model_catalog_reports_failed_refresh_without_hiding_cached_choices() {
+        let mut catalog = agy::AgyModelCatalog {
+            models: Vec::new(),
+            stale: true,
+        };
+        assert!(format_agy_model_catalog(&catalog).contains("Could not fetch Agy models"));
+        catalog.models.push(agy::AgyModel {
+            id: "available-model".into(),
+            label: "Available model".into(),
+        });
+        let message = format_agy_model_catalog(&catalog);
+        assert!(message.contains("showing the last available list"));
+        assert!(message.contains("<code>/model agy:available-model</code>"));
+        catalog.stale = false;
+        assert!(!format_agy_model_catalog(&catalog).contains("Could not"));
+    }
+
+    #[test]
+    fn legacy_agy_settings_keep_the_model_without_a_catalog_lookup() {
+        assert_eq!(normalize_model_setting("gemini"), "agy");
+        assert_eq!(
+            normalize_model_setting("gemini:Gemini 3.5 Flash (Medium)"),
+            "agy:Gemini 3.5 Flash (Medium)"
+        );
+        assert_eq!(
+            normalize_model_setting("gemini:new-model-not-yet-in-the-cache"),
+            "agy:new-model-not-yet-in-the-cache"
+        );
+    }
+}
+
 /// Resolve a model name with provider prefix.
-/// Returns Err(provider_name) if the provider binary is unavailable, or Err("") if the format is invalid.
-fn resolve_model_name(name: &str) -> Result<String, &'static str> {
+fn resolve_model_name(name: &str) -> Result<String, ModelNameError> {
     // Strip display-name suffix (" — Description") that users may copy-paste
     // from the /model help text.
     let clean = name.split(" \u{2014} ").next().unwrap_or(name).trim();
@@ -23168,34 +23255,35 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
         if claude::is_claude_available() {
             Ok(clean.to_string())
         } else {
-            Err("claude")
+            Err(ModelNameError::ProviderUnavailable("claude"))
         }
     } else if codex::is_codex_model(Some(clean)) {
         if codex::is_codex_available() {
             Ok(clean.to_string())
         } else {
-            Err("codex")
+            Err(ModelNameError::ProviderUnavailable("codex"))
         }
     } else if agy::is_agy_model(Some(clean)) {
         if agy::is_agy_available() {
             if let Some(model) = agy::strip_agy_prefix(clean) {
-                if !agy::is_valid_agy_model(model) {
-                    return Err("");
-                }
+                let model = agy::resolve_agy_model(model).map_err(|error| match error {
+                    agy::AgyModelError::Unknown => ModelNameError::InvalidFormat,
+                    agy::AgyModelError::Unavailable => ModelNameError::LookupFailed,
+                })?;
                 return Ok(format!("agy:{}", model));
             }
             Ok("agy".to_string())
         } else {
-            Err("agy")
+            Err(ModelNameError::ProviderUnavailable("agy"))
         }
     } else if opencode::is_opencode_model(Some(clean)) {
         if opencode::is_opencode_available() {
             Ok(clean.to_string())
         } else {
-            Err("opencode")
+            Err(ModelNameError::ProviderUnavailable("opencode"))
         }
     } else {
-        Err("") // invalid format
+        Err(ModelNameError::InvalidFormat)
     }
 }
 
@@ -23680,13 +23768,13 @@ async fn handle_model_command(
         if has_agy {
             msg.push_str("\n<b>Agy (Antigravity):</b>\n");
             msg.push_str("<code>/model agy</code> — default\n");
-            let agy_models = agy::list_models();
-            for model_id in agy_models {
-                msg.push_str(&format!(
-                    "<code>/model agy:{}</code>\n",
-                    html_escape(&model_id)
-                ));
-            }
+            let catalog = tokio::task::spawn_blocking(agy::refresh_models)
+                .await
+                .unwrap_or_else(|_| agy::AgyModelCatalog {
+                    models: Vec::new(),
+                    stale: true,
+                });
+            msg.push_str(&format_agy_model_catalog(&catalog));
             msg.push_str("<i>Legacy /model gemini is accepted as an agy alias.</i>\n");
         }
         if has_opencode {
@@ -23738,7 +23826,11 @@ async fn handle_model_command(
     // Users should use `/model claude` or `/model codex` to switch to default models.
 
     // Set model
-    match resolve_model_name(arg) {
+    let selection = arg.to_string();
+    let resolved = tokio::task::spawn_blocking(move || resolve_model_name(&selection))
+        .await
+        .unwrap_or(Err(ModelNameError::LookupFailed));
+    match resolved {
         Ok(model_id) => {
             let (provider_changed, had_state, old_path, queue_cleared, persistence) = {
                 let mut data = state.lock().await;
@@ -23841,7 +23933,7 @@ async fn handle_model_command(
                     .await
             )?;
         }
-        Err(provider) if !provider.is_empty() => {
+        Err(ModelNameError::ProviderUnavailable(provider)) => {
             shared_rate_limit_wait(state, chat_id).await;
             tg!(
                 "send_message",
@@ -23849,7 +23941,15 @@ async fn handle_model_command(
                     .await
             )?;
         }
-        Err(_) => {
+        Err(ModelNameError::LookupFailed) => {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "Could not check model availability. Check the provider connection/sign-in and retry /model.")
+                    .await
+            )?;
+        }
+        Err(ModelNameError::InvalidFormat) => {
             shared_rate_limit_wait(state, chat_id).await;
             tg!(
                 "send_message",
