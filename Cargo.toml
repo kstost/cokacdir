@@ -1,6 +1,6 @@
 [package]
 name = "cokacdir"
-version = "0.8.22"
+version = "0.8.23"
 edition = "2021"
 rust-version = "1.96"
 authors = ["cokac <monogatree@gmail.com>"]

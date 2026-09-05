@@ -1,5 +1,11 @@
 # Changelog — cokacdir
 
+## 0.8.23 — 2026-09-05
+
+- **Codex now lists GPT-6 Astra.** Select it with `/model codex:gpt-6-astra`; `/effort` accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and shows `medium` as the model default. Existing model selections and saved effort overrides are preserved.
+
+---
+
 ## 0.8.22 — 2026-09-02
 
 - **DIFF comparison now supports directional deletion with `Delete`.** The focused item opens a four-action confirmation: Left deletes the left copy, Up cancels, Down deletes every copy currently present, and Right deletes the right copy. Exact targets, absent sides, parent directories, and complete selected-directory trees are revalidated before deletion; symlinks are removed without following them, late unapproved descendants are preserved in recovery staging, and partial two-sided failures are reported. Completion now reconciles only the operated path and its ancestors instead of rebuilding the whole comparison, preserving expansion, filters, selections, cursor focus, and viewport position.

@@ -3929,10 +3929,10 @@ fn expand_user_path(path: &str) -> String {
     path.to_string()
 }
 
-fn is_codex_sol_or_terra(model: Option<&str>) -> bool {
+fn is_codex_ultra_effort_model(model: Option<&str>) -> bool {
     matches!(
         model,
-        Some("codex:gpt-5.6-sol") | Some("codex:gpt-5.6-terra")
+        Some("codex:gpt-6-astra") | Some("codex:gpt-5.6-sol") | Some("codex:gpt-5.6-terra")
     )
 }
 
@@ -3951,13 +3951,14 @@ fn is_codex_low_to_xhigh_model(model: Option<&str>) -> bool {
 }
 
 fn is_codex_max_effort_model(model: Option<&str>) -> bool {
-    is_codex_sol_or_terra(model) || is_codex_luna(model)
+    is_codex_ultra_effort_model(model) || is_codex_luna(model)
 }
 
 fn codex_default_effort(model: Option<&str>) -> Option<&'static str> {
     match model {
         Some("codex:gpt-5.6-sol") => Some("low"),
-        Some("codex:gpt-5.6-terra")
+        Some("codex:gpt-6-astra")
+        | Some("codex:gpt-5.6-terra")
         | Some("codex:gpt-5.6-luna")
         | Some("codex:gpt-5.5")
         | Some("codex:gpt-5.4")
@@ -3969,7 +3970,7 @@ fn codex_default_effort(model: Option<&str>) -> Option<&'static str> {
 
 /// Validate a Codex reasoning_effort value for the selected model.
 fn is_valid_codex_effort(model: Option<&str>, v: &str) -> bool {
-    if is_codex_sol_or_terra(model) {
+    if is_codex_ultra_effort_model(model) {
         matches!(v, "low" | "medium" | "high" | "xhigh" | "max" | "ultra")
     } else if is_codex_luna(model) {
         matches!(v, "low" | "medium" | "high" | "xhigh" | "max")
@@ -3988,7 +3989,7 @@ fn is_valid_claude_effort(v: &str) -> bool {
 fn valid_effort_values(provider: &str, model: Option<&str>) -> &'static str {
     match provider {
         "claude" => "low, medium, high, xhigh, max",
-        "codex" if is_codex_sol_or_terra(model) => "low, medium, high, xhigh, max, ultra",
+        "codex" if is_codex_ultra_effort_model(model) => "low, medium, high, xhigh, max, ultra",
         "codex" if is_codex_luna(model) => "low, medium, high, xhigh, max",
         "codex" if is_codex_low_to_xhigh_model(model) => "low, medium, high, xhigh",
         "codex" => "minimal, low, medium, high, xhigh",
@@ -4006,11 +4007,21 @@ fn is_valid_effort_for_provider(provider: &str, model: Option<&str>, v: &str) ->
 
 #[cfg(test)]
 mod effort_validation_tests {
-    use super::{codex_default_effort, is_valid_codex_effort, valid_effort_values};
+    use super::{
+        codex_default_effort, get_codex_effort, is_codex_max_effort_model,
+        is_codex_ultra_effort_model, is_valid_codex_effort, valid_effort_values, BotSettings,
+        ChatId,
+    };
 
     #[test]
-    fn sol_and_terra_accept_extended_effort_values() {
-        for model in ["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"] {
+    fn astra_sol_and_terra_accept_extended_effort_values() {
+        for (model, default_effort) in [
+            ("codex:gpt-6-astra", "medium"),
+            ("codex:gpt-5.6-sol", "low"),
+            ("codex:gpt-5.6-terra", "medium"),
+        ] {
+            assert!(is_codex_max_effort_model(Some(model)));
+            assert!(is_codex_ultra_effort_model(Some(model)));
             for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
                 assert!(is_valid_codex_effort(Some(model), effort));
             }
@@ -4019,12 +4030,32 @@ mod effort_validation_tests {
                 valid_effort_values("codex", Some(model)),
                 "low, medium, high, xhigh, max, ultra"
             );
+            assert_eq!(codex_default_effort(Some(model)), Some(default_effort));
         }
-        assert_eq!(codex_default_effort(Some("codex:gpt-5.6-sol")), Some("low"));
-        assert_eq!(
-            codex_default_effort(Some("codex:gpt-5.6-terra")),
-            Some("medium")
-        );
+    }
+
+    #[test]
+    fn astra_effort_overrides_preserve_cli_defaults_and_saved_values() {
+        let mut settings = BotSettings::default();
+        let chat_id = ChatId(42);
+        let model = Some("codex:gpt-6-astra");
+        let key = chat_id.0.to_string();
+
+        assert_eq!(get_codex_effort(&settings, chat_id, model), None);
+        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            settings.effort.insert(key.clone(), effort.to_string());
+            assert_eq!(
+                get_codex_effort(&settings, chat_id, model).as_deref(),
+                Some(effort)
+            );
+        }
+        for effort in ["minimal", "unknown", ""] {
+            settings.effort.insert(key.clone(), effort.to_string());
+            assert_eq!(get_codex_effort(&settings, chat_id, model), None);
+            assert_eq!(settings.effort.get(&key).map(String::as_str), Some(effort));
+        }
+        settings.effort.remove(&key);
+        assert_eq!(get_codex_effort(&settings, chat_id, model), None);
     }
 
     #[test]
@@ -4048,7 +4079,7 @@ mod effort_validation_tests {
     }
 
     #[test]
-    fn listed_non_5_6_models_accept_only_low_through_xhigh() {
+    fn legacy_models_accept_only_low_through_xhigh() {
         for (model, default_effort) in [
             ("codex:gpt-5.5", "medium"),
             ("codex:gpt-5.4", "medium"),
@@ -23261,7 +23292,7 @@ async fn handle_effort_command(
                     default_marker("max")
                 ));
             }
-            if is_codex_sol_or_terra(current_model.as_deref()) {
+            if is_codex_ultra_effort_model(current_model.as_deref()) {
                 msg.push_str(
                     "<code>/effort ultra</code> — maximum reasoning with automatic task delegation\n",
                 );
@@ -23628,7 +23659,10 @@ async fn handle_model_command(
             msg.push_str("\n<b>Codex:</b>\n");
             msg.push_str("<code>/model codex</code> — default\n");
             msg.push_str(
-                "<code>/model codex:gpt-5.6-sol</code> — Latest frontier agentic coding model\n",
+                "<code>/model codex:gpt-6-astra</code> — Most capable model for complex, demanding work\n",
+            );
+            msg.push_str(
+                "<code>/model codex:gpt-5.6-sol</code> — Reliable agentic workhorse for everyday tasks\n",
             );
             msg.push_str(
                 "<code>/model codex:gpt-5.6-terra</code> — Balanced agentic coding model for everyday work\n",
