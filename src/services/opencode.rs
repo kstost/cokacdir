@@ -25,7 +25,14 @@ use crate::services::claude::{
 /// Substring that identifies the "server listening" line in stdout/stderr.
 const SERVE_READY_NEEDLE: &str = "listening on http://";
 /// Maximum time to wait for opencode serve to print its readiness line.
-const SERVE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// In real deployments the Node launcher + compiled `.opencode` child can take
+/// noticeably longer than a normal CLI cold start before the "listening on
+/// http://..." line appears, especially when multiple session directories are
+/// churning or the machine is under load. 30s was proving too aggressive and
+/// produced false "did not become ready" failures even though the server came
+/// up shortly afterwards.
+const SERVE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Base poll interval for completion detection. Matches oh-my-opencode run.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How many consecutive "looks complete" checks before we declare done.
@@ -36,6 +43,11 @@ const POLL_REQUIRED_CONSECUTIVE: u32 = 2;
 const POLL_MIN_STABILIZATION: Duration = Duration::from_secs(1);
 /// HTTP request timeout for individual poll endpoints.
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The very first `/session` creation on a fresh opencode serve instance can
+/// spend extra time in lazy bootstrap (DB open/migrations, project resolution,
+/// plugin loading, file watcher startup). Keep the steady-state poll timeout
+/// small, but allow a longer one-shot timeout for this cold-start path.
+const SESSION_CREATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 /// Maximum consecutive HTTP error iterations in poll_until_complete before we
 /// declare the turn dead. Covers the "opencode serve crashed mid-turn" case.
 /// 6 * 500ms = ~3s of grace before bailing out.
@@ -5113,6 +5125,23 @@ async fn execute_command_streaming_serve(
             return Ok(());
         }
     };
+    let session_create_client = match reqwest::Client::builder()
+        .timeout(SESSION_CREATE_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            opencode_debug(&format!("[serve] session-create client build failed: {}", e));
+            serve_child.shutdown().await;
+            let _ = sender.send(StreamMessage::Error {
+                message: format!("HTTP client init failed: {}", e),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            });
+            return Ok(());
+        }
+    };
     let sse_client = match reqwest::Client::builder()
         // No overall request timeout — the SSE stream is intentionally
         // long-lived — but keep a bounded connect timeout so a dead server
@@ -5140,7 +5169,7 @@ async fn execute_command_streaming_serve(
             opencode_debug(&format!("[serve] reusing session_id={}", sid));
             sid.to_string()
         }
-        _ => match create_session(&client, &base_url, working_dir, prompt).await {
+        _ => match create_session(&session_create_client, &base_url, working_dir, prompt).await {
             Ok(sid) => {
                 opencode_debug(&format!("[serve] created new session_id={}", sid));
                 sid
