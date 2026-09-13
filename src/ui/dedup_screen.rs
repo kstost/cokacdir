@@ -33,14 +33,17 @@ pub struct DedupScreenState {
 }
 
 impl DedupScreenState {
-    pub fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(
+        path: PathBuf,
+        authorization: crate::services::file_ops::DirectoryAuthorization,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = cancel_flag.clone();
         let path_clone = path.clone();
 
         std::thread::spawn(move || {
-            dedup::run_dedup(path_clone, tx, flag_clone);
+            dedup::run_dedup(path_clone, authorization, tx, flag_clone);
         });
 
         Self {

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use russh::{client, Disconnect};
+use russh::{client, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession as RusshSftpSession;
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 
@@ -61,10 +61,61 @@ fn remote_child_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn remote_removal_is_directory(metadata: &russh_sftp::protocol::FileAttributes) -> bool {
-    // LSTAT metadata for a symlink must always be treated as file-like. Calling
-    // READDIR on it could otherwise traverse and delete the link target.
-    metadata.is_dir() && !metadata.is_symlink()
+const REMOTE_DELETE_HELPER: &str = include_str!("remote_delete.py");
+
+fn remote_delete_command(request: &serde_json::Value) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    // Both substitutions contain only the base64 alphabet, so even filenames
+    // with quotes, newlines, backticks, or shell substitutions remain data.
+    let script = STANDARD.encode(REMOTE_DELETE_HELPER);
+    let request = STANDARD.encode(request.to_string());
+    format!("python3 -I -c 'import base64;exec(base64.b64decode(\"{script}\"))' '{request}'")
+}
+
+async fn run_remote_delete_helper(
+    ssh: &client::Handle<SshHandler>,
+    request: &serde_json::Value,
+) -> Result<(), String> {
+    let mut channel = ssh
+        .channel_open_session()
+        .await
+        .map_err(|error| format!("Cannot open safe deletion channel: {error}"))?;
+    channel
+        .exec(true, remote_delete_command(request))
+        .await
+        .map_err(|error| format!("Cannot run safe deletion helper: {error}"))?;
+    channel
+        .eof()
+        .await
+        .map_err(|error| format!("Cannot finish deletion request: {error}"))?;
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let mut status = None;
+    while let Some(message) = channel.wait().await {
+        let append = |buffer: &mut Vec<u8>, data: &[u8]| {
+            let remaining = 16_384usize.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&data[..remaining.min(data.len())]);
+        };
+        match message {
+            ChannelMsg::Data { data } => append(&mut output, &data),
+            ChannelMsg::ExtendedData { data, ext: 1 } => append(&mut errors, &data),
+            ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            _ => {}
+        }
+    }
+    if status == Some(0)
+        && String::from_utf8_lossy(&output)
+            .lines()
+            .any(|line| line == "COKACDIR_DELETE_OK")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Safe remote deletion requires an SSH command session and POSIX Python 3; completion was not confirmed (status {:?}): {}",
+            status, String::from_utf8_lossy(&errors).trim()
+        ))
+    }
 }
 
 fn remote_create_file_flags() -> OpenFlags {
@@ -1488,34 +1539,10 @@ impl SftpSession {
         })
     }
 
-    /// Remove a file or directory via SFTP. The listing-time type is retained
-    /// in the API for compatibility but is deliberately ignored: the current
-    /// object is inspected with LSTAT immediately before removal.
+    /// Remove a remote entry through the server's bound directory descriptors.
+    /// Listing-time type information is not trusted for recursive traversal.
     pub fn remove(&self, path: &str, _listing_said_directory: bool) -> Result<(), String> {
         self.remove_path(path)
-    }
-
-    /// Recursively remove directory
-    async fn remove_dir_recursive(sftp: &RusshSftpSession, path: &str) -> Result<(), String> {
-        let entries = sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| format!("Failed to read dir '{}': {}", path, e))?;
-
-        for entry in entries {
-            let name = entry.file_name();
-            if name == "." || name == ".." {
-                continue;
-            }
-            let child_path = format!("{}/{}", path.trim_end_matches('/'), name);
-            // Directory entries can become stale while a recursive delete is
-            // running. Re-LSTAT each child instead of trusting READDIR attrs.
-            Box::pin(Self::remove_path_current(sftp, &child_path)).await?;
-        }
-
-        sftp.remove_dir(path)
-            .await
-            .map_err(|e| format!("Failed to remove dir '{}': {}", path, e))
     }
 
     /// Rename file or directory via SFTP
@@ -1546,23 +1573,60 @@ impl SftpSession {
 
     pub(crate) fn remove_path(&self, path: &str) -> Result<(), String> {
         let sftp = self.sftp.as_ref().ok_or("Not connected")?;
-        let path = path.to_string();
-        self.runtime
-            .block_on(Self::remove_path_current(sftp, &path))
-    }
-
-    async fn remove_path_current(sftp: &RusshSftpSession, path: &str) -> Result<(), String> {
-        let metadata = sftp
-            .symlink_metadata(path)
-            .await
-            .map_err(|e| format!("Failed to inspect '{}': {}", path, e))?;
-        if remote_removal_is_directory(&metadata) {
-            Box::pin(Self::remove_dir_recursive(sftp, path)).await
-        } else {
-            sftp.remove_file(path)
-                .await
-                .map_err(|e| format!("Failed to remove '{}': {}", path, e))
+        let ssh = self.ssh_handle.as_ref().ok_or("Not connected")?;
+        let name = path.rsplit('/').next().unwrap_or("");
+        if name.is_empty() || name == "." || name == ".." || path.contains('\0') {
+            return Err("Remote deletion requires a normal file or directory name".into());
         }
+        self.runtime.block_on(async {
+            use tokio::io::AsyncWriteExt;
+
+            // Check availability before creating sidecars or moving any source.
+            run_remote_delete_helper(ssh, &serde_json::json!({"probe": true})).await?;
+            let parent = sftp.canonicalize(remote_upload_parent(path)?).await
+                .map_err(|error| format!("Cannot resolve deletion parent: {error}"))?;
+            let parent_identity = sftp_verify_staging_parent(sftp, &parent).await?;
+            let source = remote_child_path(&parent, name);
+            let metadata = sftp.symlink_metadata(&source).await
+                .map_err(|error| format!("Cannot inspect deletion source '{source}': {error}"))?;
+            let stage_path = sftp_allocate_upload_sidecar(sftp, &source, "delete").await?;
+            let stage_identity = sftp_create_private_directory(sftp, &stage_path).await?;
+            let proof_name = format!("proof-{:032x}", rand::random::<u128>());
+            let payload_name = format!("entry-{:032x}", rand::random::<u128>());
+            let proof = format!("{:032x}{:032x}", rand::random::<u128>(), rand::random::<u128>());
+            let operation = async {
+                let proof_path = remote_child_path(&stage_path, &proof_name);
+                let mut file = sftp.open_with_flags(&proof_path, remote_create_file_flags()).await
+                    .map_err(|error| format!("Cannot create deletion namespace proof: {error}"))?;
+                let mut private_attrs = russh_sftp::protocol::FileAttributes::empty();
+                private_attrs.permissions = Some(0o600);
+                file.set_metadata(private_attrs).await
+                    .map_err(|error| format!("Cannot restrict deletion namespace proof: {error}"))?;
+                file.write_all(proof.as_bytes()).await
+                    .map_err(|error| format!("Cannot write deletion namespace proof: {error}"))?;
+                file.flush().await.map_err(|error| format!("Cannot flush deletion proof: {error}"))?;
+                file.shutdown().await.map_err(|error| format!("Cannot close deletion proof: {error}"))?;
+                sftp_verify_staging_parent_identity(sftp, &parent, parent_identity).await?;
+                sftp_verify_private_directory(sftp, &stage_path, stage_identity).await?;
+                let request = serde_json::json!({
+                    "parent": parent,
+                    "name": name,
+                    "stage": stage_path.rsplit('/').next().ok_or("Invalid deletion stage")?,
+                    "proof_name": proof_name,
+                    "proof": proof,
+                    "payload": payload_name,
+                    "expected": {
+                        "uid": metadata.uid, "gid": metadata.gid,
+                        "size": metadata.size, "mtime": metadata.mtime,
+                        "permissions": metadata.permissions,
+                    },
+                });
+                run_remote_delete_helper(ssh, &request).await
+            }.await;
+            operation.map_err(|error| format!(
+                "{error}; inspect private recovery directory '{stage_path}'. No pathname-based recursive cleanup was attempted"
+            ))
+        })
     }
 
     pub(crate) fn staging_parent_identity(
@@ -2608,17 +2672,16 @@ mod tests {
     }
 
     #[test]
-    fn current_lstat_symlink_is_never_treated_as_stale_listed_directory() {
-        let mut listed_directory = russh_sftp::protocol::FileAttributes::empty();
-        listed_directory.permissions = Some(0o040755);
-        assert!(remote_removal_is_directory(&listed_directory));
-
-        // Simulate the same name being replaced by a symlink after READDIR.
-        // The deletion path uses this fresh LSTAT result and removes the link
-        // itself instead of calling READDIR through it.
-        let mut current_symlink = russh_sftp::protocol::FileAttributes::empty();
-        current_symlink.permissions = Some(0o120777);
-        assert!(!remote_removal_is_directory(&current_symlink));
+    fn remote_delete_command_keeps_shell_syntax_in_encoded_data() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let request = serde_json::json!({"name": "x'\n$(touch wrong)`oops`;name"});
+        let command = remote_delete_command(&request);
+        assert!(!command.contains("touch wrong"));
+        assert!(!command.contains("`oops`"));
+        let encoded = command.rsplit('\'').nth(1).unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]

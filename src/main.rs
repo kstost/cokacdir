@@ -3391,6 +3391,7 @@ fn main() -> io::Result<()> {
     // Setup panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = ui::mouse::disable_capture();
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -3402,6 +3403,7 @@ fn main() -> io::Result<()> {
     }));
 
     // Setup terminal
+    let _mouse_capture_guard = ui::mouse::CaptureGuard;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Clear screen before entering alternate screen
@@ -3509,6 +3511,10 @@ fn main() -> io::Result<()> {
     }
 
     // Run app
+    if let Err(error) = ui::mouse::enable_capture() {
+        let _ = ui::mouse::disable_capture();
+        app.show_message(&format!("Mouse input unavailable: {error}"));
+    }
     let result = run_app(&mut terminal, &mut app);
 
     // Save settings before exit — but only if the original file parsed. Otherwise we would
@@ -3538,6 +3544,7 @@ fn main() -> io::Result<()> {
     // Restore the terminal even when the application loop fails, then return
     // the original failure so shells and supervisors receive a non-zero exit.
     let restore_result = (|| -> io::Result<()> {
+        let mouse_result = ui::mouse::disable_capture();
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
@@ -3547,6 +3554,7 @@ fn main() -> io::Result<()> {
             crossterm::cursor::MoveTo(0, 0),
             crossterm::cursor::Show
         )?;
+        mouse_result?;
         Ok(())
     })();
 
@@ -3903,10 +3911,105 @@ fn new_tar_error_dialog(message: String) -> crate::ui::app::Dialog {
     }
 }
 
+/// Skip hover motion before returning to the draw loop. Preserve non-paste
+/// events consumed while detecting Windows keyboard paste bursts.
+fn next_tui_event(
+    pending: &mut std::collections::VecDeque<Event>,
+    timeout: Duration,
+) -> io::Result<Option<Event>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let event = if let Some(event) = pending.pop_front() {
+            event
+        } else {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !event::poll(remaining)? {
+                return Ok(None);
+            }
+            event::read()?
+        };
+        if !matches!(&event, Event::Mouse(mouse) if mouse.kind == crossterm::event::MouseEventKind::Moved)
+        {
+            return Ok(Some(event));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn append_windows_paste_event(
+    buffer: &mut String,
+    input: Event,
+    pending: &mut std::collections::VecDeque<Event>,
+) -> bool {
+    match input {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                buffer.push(c)
+            }
+            KeyCode::Enter => buffer.push('\n'),
+            _ => {
+                pending.push_back(Event::Key(key));
+                return false;
+            }
+        },
+        Event::Key(_) => {}
+        other => {
+            pending.push_back(other);
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod mouse_input_tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+
+    #[test]
+    fn windows_paste_probe_keeps_button_release_resize_and_shortcut_in_order() {
+        let release = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 4,
+            modifiers: KeyModifiers::SHIFT,
+        });
+        let shortcut = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        for interruption in [release, Event::Resize(100, 30), shortcut] {
+            let mut buffer = String::from("한");
+            let mut pending = std::collections::VecDeque::new();
+            assert!(append_windows_paste_event(
+                &mut buffer,
+                Event::Key(KeyEvent::new(KeyCode::Char('글'), KeyModifiers::NONE)),
+                &mut pending
+            ));
+            assert!(!append_windows_paste_event(
+                &mut buffer,
+                interruption.clone(),
+                &mut pending
+            ));
+            assert_eq!(buffer, "한글");
+            assert_eq!(
+                next_tui_event(&mut pending, Duration::ZERO).unwrap(),
+                Some(interruption)
+            );
+            assert!(pending.is_empty());
+        }
+    }
+}
+
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {
+    let mut pending_input = std::collections::VecDeque::new();
     loop {
         // Check if full redraw is needed (after terminal mode command like vim)
         if app.needs_full_redraw {
@@ -3949,7 +4052,7 @@ fn run_app<B: ratatui::backend::Backend>(
         let is_remote_spinner = app.remote_spinner.is_some();
         let is_directory_size_calculating = app.has_active_directory_size_calculation();
 
-        let poll_timeout = if is_progress_active || is_dedup_active {
+        let poll_timeout = if is_progress_active || is_dedup_active || ui::mouse::dragging(app) {
             Duration::from_millis(16) // ~60fps for smooth real-time updates
         } else if is_remote_spinner || is_directory_size_calculating {
             Duration::from_millis(100) // Fast polling for spinner animation
@@ -4228,11 +4331,13 @@ fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        // Check for key events with timeout
-        if event::poll(poll_timeout)? {
+        ui::mouse::tick(app);
+
+        // Check for input events with timeout
+        if let Some(ev) = next_tui_event(&mut pending_input, poll_timeout)? {
             // Block all input while remote spinner is active
             if app.remote_spinner.is_some() {
-                let ev = event::read()?;
+                ui::mouse::cancel_gesture(app);
                 if let Event::Key(key) = ev {
                     if key.kind != KeyEventKind::Press {
                         continue;
@@ -4243,8 +4348,6 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 continue;
             }
-            let ev = event::read()?;
-
             // Windows: crossterm의 bracketed paste 미지원 워크어라운드 (crossterm#737)
             // Windows Terminal이 Ctrl+V 시 클립보드 텍스트를 개별 키 이벤트로 전송함.
             // 연속으로 즉시 도착하는 문자 키 이벤트를 paste burst로 감지하여 처리.
@@ -4260,26 +4363,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                 // 즉시 도착하는 후속 이벤트가 있는지 확인 (paste burst)
                                 let mut paste_buf = String::new();
                                 paste_buf.push(first_c);
-                                while event::poll(Duration::ZERO)? {
-                                    match event::read()? {
-                                        Event::Key(nk) if nk.kind == KeyEventKind::Press => {
-                                            match nk.code {
-                                                KeyCode::Char(nc)
-                                                    if !nk.modifiers.intersects(
-                                                        KeyModifiers::CONTROL | KeyModifiers::ALT,
-                                                    ) =>
-                                                {
-                                                    paste_buf.push(nc);
-                                                }
-                                                KeyCode::Enter => paste_buf.push('\n'),
-                                                _ => break,
-                                            }
-                                        }
-                                        _ => continue, // Release 이벤트 등 무시
+                                while paste_buf.len() < 65536 && event::poll(Duration::ZERO)? {
+                                    if !append_windows_paste_event(
+                                        &mut paste_buf,
+                                        event::read()?,
+                                        &mut pending_input,
+                                    ) {
+                                        break;
                                     }
                                 }
-                                if paste_buf.len() > 1 {
+                                if paste_buf.chars().count() > 1 {
                                     // 멀티 문자 paste burst 감지 → paste로 처리
+                                    ui::mouse::cancel_gesture(app);
                                     handle_windows_paste(app, &paste_buf);
                                     continue;
                                 }
@@ -4292,6 +4387,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
             match ev {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    ui::mouse::before_key(app, key.code, key.modifiers);
                     match app.current_screen {
                         Screen::FilePanel => {
                             if handle_panel_input(app, key.code, key.modifiers) {
@@ -4407,7 +4503,12 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                 }
+                Event::Mouse(mouse) => ui::mouse::handle_input(app, mouse),
+                Event::Resize(_, _) | Event::FocusLost => {
+                    ui::mouse::cancel_gesture(app);
+                }
                 Event::Paste(text) => {
+                    ui::mouse::cancel_gesture(app);
                     match app.current_screen {
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {
@@ -4500,6 +4601,12 @@ fn handle_windows_paste(app: &mut App, text: &str) {
 }
 
 fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    // Modal input owns every key, including Tab and Escape while AI is visible.
+    // Switching panels here would change the target of a pending file operation.
+    if app.dialog.is_some() {
+        return ui::dialogs::handle_dialog_input(app, code, modifiers);
+    }
+
     // AI 모드일 때: active_panel이 AI 패널 쪽이면 AI로 입력 전달, 아니면 파일 패널 조작
     if app.is_ai_mode() {
         let ai_has_focus = app.ai_panel_index == Some(app.active_panel_index);
@@ -4534,11 +4641,6 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
             app.execute_advanced_search(&criteria);
         }
         return false;
-    }
-
-    // Handle dialog input first
-    if app.dialog.is_some() {
-        return ui::dialogs::handle_dialog_input(app, code, modifiers);
     }
 
     // Look up action from keybindings
@@ -5160,6 +5262,28 @@ mod file_operation_completion_tests {
     };
     use crate::services::file_ops::{FileOperationResult, FileOperationType};
     use crate::ui::app::{DialogType, FileOperationProgress};
+
+    #[test]
+    fn confirmation_keys_do_not_switch_panels_while_ai_is_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = crate::ui::app::App::new(temp.path().into(), temp.path().into());
+        app.panels
+            .push(crate::ui::app::PanelState::new(temp.path().into()));
+        app.ai_state = Some(crate::ui::ai_screen::AIScreenState::new(
+            temp.path().display().to_string(),
+        ));
+        app.ai_panel_index = Some(1);
+        app.show_dedup_screen();
+        assert!(app.is_ai_mode());
+
+        super::handle_panel_input(&mut app, super::KeyCode::Tab, super::KeyModifiers::NONE);
+        assert_eq!(app.active_panel_index, 0);
+        assert_eq!(app.dialog.as_ref().unwrap().selected_button, 0);
+        super::handle_panel_input(&mut app, super::KeyCode::Esc, super::KeyModifiers::NONE);
+        assert!(app.dialog.is_none());
+        app.execute_dedup();
+        assert!(app.dedup_screen_state.is_none());
+    }
 
     #[test]
     fn tar_failure_returns_status_and_modal_message_with_full_error() {

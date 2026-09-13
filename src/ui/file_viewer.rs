@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use regex::Regex;
@@ -35,6 +35,7 @@ pub struct SearchOptions {
 /// 뷰어 상태
 #[derive(Debug)]
 pub struct ViewerState {
+    pub(crate) mouse_area: Option<Rect>,
     pub file_path: PathBuf,
     pub lines: Vec<String>,
     pub raw_bytes: Vec<u8>,
@@ -90,6 +91,7 @@ pub struct ViewerState {
 impl ViewerState {
     pub fn new() -> Self {
         Self {
+            mouse_area: None,
             file_path: PathBuf::new(),
             lines: Vec::new(),
             raw_bytes: Vec::new(),
@@ -456,6 +458,13 @@ impl ViewerState {
         }
     }
 
+    pub(crate) fn mouse_scroll(&mut self, rows: i32) {
+        let maximum = self
+            .effective_line_count()
+            .saturating_sub(self.visible_height);
+        self.scroll = super::mouse::scroll_delta(self.scroll, rows).min(maximum);
+    }
+
     fn source_line_for_visual_row(&self, row: usize) -> usize {
         if self.word_wrap && !self.wrapped_line_origins.is_empty() {
             self.wrapped_line_origins
@@ -575,6 +584,7 @@ pub fn draw(
     theme: &Theme,
     kb: &crate::keybindings::Keybindings,
 ) {
+    state.mouse_area = None;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.viewer.border));
@@ -589,6 +599,14 @@ pub fn draw(
     // 화면 크기 업데이트 (스크롤 계산에 사용)
     let visible_lines = (inner.height - 2) as usize;
     state.visible_height = visible_lines;
+    if inner.width > 1 {
+        state.mouse_area = Some(Rect::new(
+            inner.x,
+            inner.y + 1,
+            inner.width - 1,
+            visible_lines as u16,
+        ));
+    }
 
     // Content dimensions are also needed to build the visual-row map used by
     // word-wrap navigation.
@@ -877,14 +895,13 @@ pub fn draw(
     }
 
     // 스크롤바
-    if total_lines > content_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_lines, content_height, state.scroll)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let max_scroll = total_lines.saturating_sub(content_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(state.scroll);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width.saturating_sub(1),

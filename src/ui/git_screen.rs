@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -773,7 +773,7 @@ fn draw_commit_tab(
     let file_area = chunks[0];
     let visible_height = file_area.height as usize;
 
-    if !state.commit_input_active {
+    if !state.commit_input_active && visible_height > 0 {
         // File list mode
         if state.commit_selected < state.commit_scroll {
             state.commit_scroll = state.commit_selected;
@@ -782,6 +782,9 @@ fn draw_commit_tab(
             state.commit_scroll = state.commit_selected - visible_height + 1;
         }
     }
+    state.commit_scroll = state
+        .commit_scroll
+        .min(state.status_files.len().saturating_sub(visible_height));
 
     if state.status_files.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
@@ -818,9 +821,11 @@ fn draw_commit_tab(
         frame.render_widget(Paragraph::new(lines), file_area);
 
         // Scrollbar
-        if state.status_files.len() > visible_height {
-            let mut scrollbar_state =
-                ScrollbarState::new(state.status_files.len()).position(state.commit_scroll);
+        if let Some(mut scrollbar_state) = super::scrollbar::viewport_state(
+            state.status_files.len(),
+            visible_height,
+            state.commit_scroll,
+        ) {
             let scrollbar_area = Rect::new(
                 file_area.x + file_area.width.saturating_sub(1),
                 file_area.y,
@@ -912,12 +917,18 @@ fn draw_log_list(
 ) {
     let visible_height = area.height as usize;
 
+    if visible_height == 0 {
+        return;
+    }
     if state.log_selected < state.log_scroll {
         state.log_scroll = state.log_selected;
     }
     if state.log_selected >= state.log_scroll + visible_height {
         state.log_scroll = state.log_selected - visible_height + 1;
     }
+    state.log_scroll = state
+        .log_scroll
+        .min(state.log_entries.len().saturating_sub(visible_height));
 
     let mut lines = Vec::new();
     let max_width = area.width as usize;
@@ -973,9 +984,9 @@ fn draw_log_list(
     frame.render_widget(Paragraph::new(lines), area);
 
     // Scrollbar
-    if state.log_entries.len() > visible_height {
-        let mut scrollbar_state =
-            ScrollbarState::new(state.log_entries.len()).position(state.log_scroll);
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(state.log_entries.len(), visible_height, state.log_scroll)
+    {
         let scrollbar_area = Rect::new(
             area.x + area.width.saturating_sub(1),
             area.y,
@@ -1046,9 +1057,9 @@ fn draw_diff_detail(
     }
 
     // Scrollbar
-    if diff_lines.len() > visible_height {
-        let mut scrollbar_state =
-            ScrollbarState::new(diff_lines.len()).position(state.log_detail_scroll);
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(diff_lines.len(), visible_height, state.log_detail_scroll)
+    {
         let scrollbar_area = Rect::new(
             area.x + area.width.saturating_sub(1),
             area.y,
@@ -1080,12 +1091,18 @@ fn draw_branch_tab(
 
     let visible_height = area.height as usize;
 
+    if visible_height == 0 {
+        return;
+    }
     if state.branch_selected < state.branch_scroll {
         state.branch_scroll = state.branch_selected;
     }
     if state.branch_selected >= state.branch_scroll + visible_height {
         state.branch_scroll = state.branch_selected - visible_height + 1;
     }
+    state.branch_scroll = state
+        .branch_scroll
+        .min(state.branches.len().saturating_sub(visible_height));
 
     let mut lines = Vec::new();
     let max_width = area.width as usize;
@@ -1125,9 +1142,9 @@ fn draw_branch_tab(
     frame.render_widget(Paragraph::new(lines), area);
 
     // Scrollbar
-    if state.branches.len() > visible_height {
-        let mut scrollbar_state =
-            ScrollbarState::new(state.branches.len()).position(state.branch_scroll);
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(state.branches.len(), visible_height, state.branch_scroll)
+    {
         let scrollbar_area = Rect::new(
             area.x + area.width.saturating_sub(1),
             area.y,
@@ -1953,6 +1970,86 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    #[test]
+    fn list_scrollbars_reach_the_bottom_and_follow_resized_viewports() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let mut state = GitScreenState::new(dir.path().into());
+        state.status_files = (0..30)
+            .map(|i| GitFileEntry {
+                path: format!("file-{i}"),
+                original_path: None,
+                index_status: ' ',
+                worktree_status: 'M',
+                staged: false,
+            })
+            .collect();
+        state.log_entries = (0..30)
+            .map(|i| GitLogEntry {
+                hash: format!("{i:040x}"),
+                message: format!("commit-{i}"),
+                author: String::from("Test"),
+                date: String::from("2026-01-01"),
+                refs: String::new(),
+            })
+            .collect();
+        state.branches = (0..30)
+            .map(|i| GitBranchEntry {
+                name: format!("branch-{i}"),
+                is_current: i == 0,
+                is_remote: false,
+            })
+            .collect();
+        let theme = super::super::theme::Theme::default();
+        let render = |state: &mut GitScreenState, visible: u16| {
+            let height = visible
+                + if state.current_tab == GitTab::Commit {
+                    3
+                } else {
+                    0
+                };
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = Rect::new(0, 0, 80, height);
+                    match state.current_tab {
+                        GitTab::Commit => draw_commit_tab(frame, state, area, &theme.git_screen),
+                        GitTab::Log => draw_log_list(frame, state, area, &theme.git_screen),
+                        GitTab::Branch => draw_branch_tab(frame, state, area, &theme.git_screen),
+                    }
+                })
+                .unwrap();
+            (0..visible)
+                .map(|y| terminal.backend().buffer()[(79, y)].symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for tab in [GitTab::Commit, GitTab::Log, GitTab::Branch] {
+            state.current_tab = tab;
+            let top = render(&mut state, 10);
+            match tab {
+                GitTab::Commit => state.commit_selected = 29,
+                GitTab::Log => state.log_selected = 29,
+                GitTab::Branch => state.branch_selected = 29,
+            }
+            let bottom = render(&mut state, 10);
+            assert_ne!(bottom[1], top[1]);
+            assert_eq!(bottom[bottom.len() - 2], top[1]);
+            // Resizing while typing must also clamp the commit file list.
+            state.commit_input_active = true;
+            render(&mut state, 20);
+            let (offset, selected) = match tab {
+                GitTab::Commit => (state.commit_scroll, state.commit_selected),
+                GitTab::Log => (state.log_scroll, state.log_selected),
+                GitTab::Branch => (state.branch_scroll, state.branch_selected),
+            };
+            assert_eq!(offset, 10);
+            assert_eq!(selected, 29);
+        }
     }
 
     #[test]

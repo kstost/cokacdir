@@ -21,6 +21,7 @@ use crate::services::remote;
 const APP_TITLE: &str = concat!("COKACDIR v", env!("CARGO_PKG_VERSION"));
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    super::mouse::begin_frame(app, frame.area());
     // Clone theme to avoid borrow conflict with mutable app
     let theme = app.theme.clone();
     let area = frame.area();

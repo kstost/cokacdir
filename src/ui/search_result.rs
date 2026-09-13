@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use std::fs;
@@ -94,6 +94,9 @@ impl SearchResultState {
         } else if self.selected_index >= self.scroll_offset + visible_height {
             self.scroll_offset = self.selected_index - visible_height + 1;
         }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.results.len().saturating_sub(visible_height));
     }
 }
 
@@ -210,6 +213,10 @@ pub fn draw(
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height < 2 {
+        return;
+    }
 
     if state.results.is_empty() {
         // 검색 결과 없음
@@ -339,14 +346,13 @@ pub fn draw(
     frame.render_widget(list_paragraph, list_area);
 
     // 스크롤바 (결과가 화면보다 많을 때)
-    if state.results.len() > visible_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(state.results.len(), visible_height, state.scroll_offset)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let mut scrollbar_state =
-            ScrollbarState::new(state.results.len()).position(state.selected_index);
 
         let scrollbar_area = Rect::new(inner.x + inner.width - 1, inner.y + 1, 1, list_area.height);
 

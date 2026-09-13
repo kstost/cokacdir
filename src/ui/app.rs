@@ -829,11 +829,19 @@ fn tar_create_arguments(
     if let Some(flag) = compression.flag() {
         arguments.push(flag.to_string());
     }
-    arguments.extend(
-        excluded_paths
-            .iter()
-            .map(|path| format!("--exclude=./{path}")),
-    );
+    arguments.extend(excluded_paths.iter().map(|path| {
+        // tar exclusions are glob patterns, even without a shell.
+        // Quote every metacharacter so an excluded name cannot match
+        // an unrelated file or leave its own unsafe link in the archive.
+        let mut literal = String::new();
+        for ch in path.chars() {
+            if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+                literal.push('\\');
+            }
+            literal.push(ch);
+        }
+        format!("--exclude=./{literal}")
+    }));
     // Keep -f adjacent to its argument. This is unambiguous in GNU tar,
     // bsdtar, and traditional short-option parsers.
     arguments.push("-f".to_string());
@@ -996,49 +1004,12 @@ fn validate_extracted_symlink(
     canonical_root: &Path,
     link_path: &Path,
 ) -> std::io::Result<()> {
-    use std::path::Component;
-
     let target = fs::read_link(link_path)?;
-    if target.is_absolute()
-        || target
-            .components()
-            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "archive created an absolute symlink: {} -> {}",
-                link_path.display(),
-                target.display()
-            ),
-        ));
-    }
-
-    let parent = link_path.parent().unwrap_or(root);
-    let mut depth = parent
+    let relative = link_path
         .strip_prefix(root)
-        .map_err(|_| std::io::Error::other("extracted symlink is outside the extraction root"))?
-        .components()
-        .filter(|component| matches!(component, Component::Normal(_)))
-        .count();
-    for component in target.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => depth = depth.saturating_add(1),
-            Component::ParentDir if depth > 0 => depth -= 1,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "archive symlink escapes the extraction root: {} -> {}",
-                        link_path.display(),
-                        target.display()
-                    ),
-                ))
-            }
-        }
-    }
-
+        .map_err(|_| std::io::Error::other("extracted symlink is outside the extraction root"))?;
+    file_ops::validate_tar_symlink_target(relative, &target)?;
+    let parent = link_path.parent().unwrap_or(root);
     let resolved = parent.join(&target).canonicalize().map_err(|error| {
         std::io::Error::new(
             error.kind(),
@@ -1064,6 +1035,13 @@ fn validate_extracted_symlink(
 }
 
 fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
+    sanitize_extracted_tree_with_cancel(root, None)
+}
+
+fn sanitize_extracted_tree_with_cancel(
+    root: &Path,
+    cancel_flag: Option<&AtomicBool>,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
@@ -1071,6 +1049,12 @@ fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
 
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
+        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Cancelled",
+            ));
+        }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
             validate_extracted_symlink(root, &canonical_root, &path)?;
@@ -1092,6 +1076,12 @@ fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
         }
         if metadata.is_dir() {
             for entry in fs::read_dir(&path)? {
+                if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Cancelled",
+                    ));
+                }
                 pending.push(entry?.path());
             }
         }
@@ -1120,6 +1110,93 @@ fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate the completed archive with the same backend and tree checks used
+/// by extraction. Source preflight cannot authorize the later bytes: a link may
+/// change while tar is running. Keep both archive and verification tree private
+/// until this round trip succeeds, including cleanup and cancellation checks.
+fn verify_created_tar_archive(
+    archive: &ReservedTarArchive,
+    tar_cmd: &str,
+    compression: TarCompression,
+    cancel_flag: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let check_cancelled = || {
+        if cancel_flag.load(Ordering::Relaxed) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    archive.verify_owned_path()?;
+    let before = archive.writer()?.metadata()?;
+    App::list_archive_contents(tar_cmd, archive.reader()?, compression, cancel_flag.clone())
+        .map_err(std::io::Error::other)?;
+    check_cancelled()?;
+    let capabilities = probe_tar_extraction_capabilities(tar_cmd);
+    let arguments =
+        tar_extract_arguments(compression, capabilities).map_err(std::io::Error::other)?;
+    let verification_path = archive.staging_dir.join("verification");
+    let mut directory = ReservedExtractDirectory::create(&verification_path)?;
+    let result = (|| {
+        check_cancelled()?;
+        let mut command = Command::new(tar_cmd);
+        command
+            .args(arguments)
+            .stdin(Stdio::from(archive.reader()?))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_tar_command(&mut command);
+        bind_command_to_extract_directory(&mut command, &directory)?;
+        crate::services::claude::detach_into_own_pgroup(&mut command);
+        let mut child = command.spawn()?;
+        let (watch_done, watch) = spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
+        let stderr = child.stderr.take().map(|stream| {
+            thread::spawn(move || read_bounded_tail(stream, MAX_TAR_ERROR_TAIL_BYTES))
+        });
+        let status = child.wait();
+        if status.is_err() {
+            crate::services::claude::kill_child_tree(&mut child);
+            let _ = child.wait();
+        }
+        watch_done.store(true, Ordering::Relaxed);
+        let _ = watch.join();
+        let errors = stderr
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        check_cancelled()?;
+        if !status?.success() {
+            return Err(std::io::Error::other(format!(
+                "Archive failed extraction verification: {}",
+                errors.trim()
+            )));
+        }
+        directory.secure()?;
+        sanitize_extracted_tree_with_cancel(&verification_path, Some(cancel_flag.as_ref()))?;
+        directory.secure()?;
+        archive.verify_owned_path()?;
+        if !file_ops::metadata_still_matches(&before, &archive.writer()?.metadata()?) {
+            return Err(std::io::Error::other("Archive changed during verification"));
+        }
+        check_cancelled()
+    })();
+    let cleanup = directory.cleanup();
+    match (result, cleanup) {
+        (Err(error), Err(cleanup_error)) => Err(std::io::Error::new(
+            error.kind(),
+            format!("{error}; archive verification cleanup failed: {cleanup_error}"),
+        )),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => check_cancelled(),
+    }
 }
 
 /// Replace handler placeholders with an environment-variable expansion while
@@ -1932,6 +2009,16 @@ enum PendingRenameOperation {
     },
 }
 
+#[derive(Debug)]
+struct PendingPanelOperation {
+    kind: DialogType,
+    panel_id: u64,
+    path: PathBuf,
+    remote: Option<String>,
+    directory: Option<file_ops::DirectoryAuthorization>,
+    files: Vec<String>,
+}
+
 fn capture_local_clipboard_authorizations(
     source_path: &Path,
     files: &[String],
@@ -2399,8 +2486,13 @@ pub struct ConnectSuccess {
 
 #[derive(Debug)]
 pub struct PanelState {
+    pub(crate) mouse_id: u64,
+    pub(crate) mouse_area: Option<ratatui::layout::Rect>,
+    pub(crate) mouse_scroll: bool,
+    pub(crate) listing_generation: u64,
     pub path: PathBuf,
     pub files: Vec<FileItem>,
+    pub listing_error: Option<String>,
     pub selected_index: usize,
     pub selected_files: HashSet<String>,
     pub sort_by: SortBy,
@@ -2451,6 +2543,11 @@ impl DirectorySizeScan {
 }
 
 impl PanelState {
+    fn next_mouse_id() -> u64 {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn new(path: PathBuf) -> Self {
         // Validate path and get a valid one
         let fallback = dirs::home_dir().unwrap_or_else(|| {
@@ -2463,8 +2560,13 @@ impl PanelState {
         let valid_path = get_valid_path(&path, &fallback);
 
         let mut state = Self {
+            mouse_id: Self::next_mouse_id(),
+            mouse_area: None,
+            mouse_scroll: false,
+            listing_generation: 0,
             path: valid_path,
             files: Vec::new(),
+            listing_error: None,
             selected_index: 0,
             selected_files: HashSet::new(),
             sort_by: SortBy::Name,
@@ -2498,8 +2600,13 @@ impl PanelState {
         let sort_order = parse_sort_order(&panel_settings.sort_order);
 
         let mut state = Self {
+            mouse_id: Self::next_mouse_id(),
+            mouse_area: None,
+            mouse_scroll: false,
+            listing_generation: 0,
             path: valid_path,
             files: Vec::new(),
+            listing_error: None,
             selected_index: 0,
             selected_files: HashSet::new(),
             sort_by,
@@ -2539,6 +2646,10 @@ impl PanelState {
     }
 
     pub fn load_files(&mut self) {
+        self.listing_error = None;
+        self.listing_generation = self.listing_generation.wrapping_add(1);
+        self.mouse_area = None;
+        self.mouse_scroll = false;
         self.cancel_directory_size_scan();
         if self.is_remote() {
             self.load_files_remote();
@@ -2564,13 +2675,22 @@ impl PanelState {
             });
         }
 
-        if let Ok(entries) = fs::read_dir(&self.path) {
+        let entries = match file_ops::read_dir_utf8(&self.path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.listing_error = Some(error.to_string());
+                self.selected_files.clear();
+                self.finalize_load();
+                self.update_disk_info();
+                return;
+            }
+        };
+        {
             // Estimate capacity based on typical directory size
-            let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
             let mut items: Vec<FileItem> = Vec::with_capacity(entries.len());
 
             items.extend(entries.into_iter().filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = entry.file_name().into_string().ok()?;
                 let path = entry.path();
 
                 // Check if it's a symlink first
@@ -2601,10 +2721,12 @@ impl PanelState {
                 #[cfg(not(unix))]
                 let permissions = String::new();
 
-                let display_name = if !is_directory && name.ends_with(crate::enc::naming::EXT) {
-                    std::fs::File::open(&path)
+                let display_name = if symlink_meta.file_type().is_file()
+                    && name.ends_with(crate::enc::naming::EXT)
+                {
+                    file_ops::open_regular_file_no_follow(&path)
                         .ok()
-                        .and_then(|f| {
+                        .and_then(|(f, _)| {
                             let mut reader = std::io::BufReader::new(f);
                             crate::enc::crypto::read_header(&mut reader).ok()
                         })
@@ -2705,6 +2827,10 @@ impl PanelState {
 
     /// Apply remote directory listing results (no network call)
     pub fn apply_remote_entries(&mut self, entries: Vec<SftpFileEntry>, path: &Path) {
+        self.listing_error = None;
+        self.listing_generation = self.listing_generation.wrapping_add(1);
+        self.mouse_area = None;
+        self.mouse_scroll = false;
         self.cancel_directory_size_scan();
         self.files.clear();
         self.path = path.to_path_buf();
@@ -2982,6 +3108,8 @@ impl PanelState {
     }
 
     fn sort_loaded_snapshot(&mut self, preserve_cursor: bool) {
+        self.listing_generation = self.listing_generation.wrapping_add(1);
+        self.mouse_area = None;
         let focused_name = if preserve_cursor {
             self.current_file().map(|file| file.name.clone())
         } else {
@@ -3035,6 +3163,7 @@ pub struct ProcessKillTarget {
 }
 
 pub struct App {
+    pub(crate) mouse: super::mouse::MouseState,
     pub panels: Vec<PanelState>,
     pub active_panel_index: usize,
     pub current_screen: Screen,
@@ -3150,6 +3279,7 @@ pub struct App {
     // Execution must never re-read the current cursor selection as authority.
     pending_delete_operation: Option<PendingDeleteOperation>,
     pending_rename_operation: Option<PendingRenameOperation>,
+    pending_panel_operation: Option<PendingPanelOperation>,
 
     // Cut clipboard retained until the asynchronous move reports success. A
     // failed or cancelled move must remain retryable instead of silently
@@ -3212,6 +3342,7 @@ pub struct App {
 impl App {
     pub fn new(first_path: PathBuf, second_path: PathBuf) -> Self {
         Self {
+            mouse: super::mouse::MouseState::default(),
             panels: vec![PanelState::new(first_path), PanelState::new(second_path)],
             active_panel_index: 0,
             current_screen: Screen::FilePanel,
@@ -3271,6 +3402,7 @@ impl App {
             clipboard: None,
             pending_delete_operation: None,
             pending_rename_operation: None,
+            pending_panel_operation: None,
             pending_cut_clipboard: None,
             file_operation_progress: None,
             pending_tar_archive: None,
@@ -3344,6 +3476,7 @@ impl App {
 
         Self {
             panels,
+            mouse: super::mouse::MouseState::default(),
             active_panel_index,
             current_screen: Screen::FilePanel,
             dialog: None,
@@ -3402,6 +3535,7 @@ impl App {
             clipboard: None,
             pending_delete_operation: None,
             pending_rename_operation: None,
+            pending_panel_operation: None,
             pending_cut_clipboard: None,
             file_operation_progress: None,
             pending_tar_archive: None,
@@ -4202,6 +4336,8 @@ impl App {
         use std::io::{stdout, Write};
 
         // Show cursor and leave alternate screen
+        super::mouse::cancel_gesture(self);
+        let _ = super::mouse::disable_capture();
         let _ = execute!(stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
 
@@ -4235,6 +4371,7 @@ impl App {
         // Restore: enable raw mode, enter alternate screen, hide cursor
         let _ = enable_raw_mode();
         let _ = execute!(stdout(), EnterAlternateScreen, Hide);
+        let _ = super::mouse::enable_capture();
 
         // Request full redraw on next frame
         self.needs_full_redraw = true;
@@ -4932,6 +5069,9 @@ impl App {
 
     pub fn get_operation_files(&self) -> Vec<String> {
         let panel = self.active_panel();
+        if panel.listing_error.is_some() {
+            return Vec::new();
+        }
         if !panel.selected_files.is_empty() {
             panel.selected_files.iter().cloned().collect()
         } else if let Some(file) = panel.current_file() {
@@ -5826,9 +5966,82 @@ impl App {
         self.pending_delete_operation = None;
     }
 
+    pub(crate) fn cancel_pending_panel_operation(&mut self) {
+        self.pending_panel_operation = None;
+    }
+
+    fn capture_panel_operation(&mut self, kind: DialogType) -> bool {
+        self.pending_panel_operation = None;
+        let panel = self.active_panel();
+        if let Some(error) = panel.listing_error.clone() {
+            self.show_message(&error);
+            return false;
+        }
+        let directory = if panel.is_remote() {
+            None
+        } else {
+            match file_ops::capture_directory_authorization(&panel.path) {
+                Ok(directory) => Some(directory),
+                Err(error) => {
+                    self.show_message(&format!("Cannot confirm operation directory: {error}"));
+                    return false;
+                }
+            }
+        };
+        self.pending_panel_operation = Some(PendingPanelOperation {
+            kind,
+            panel_id: panel.mouse_id,
+            path: panel.path.clone(),
+            remote: panel.is_remote().then(|| panel.display_path()),
+            directory,
+            files: self.get_operation_files(),
+        });
+        true
+    }
+
+    fn verified_panel_operation(&mut self, kind: DialogType) -> Option<(PathBuf, Vec<String>)> {
+        let result = (|| -> std::io::Result<(PathBuf, Vec<String>)> {
+            let pending = self.pending_panel_operation.as_ref().ok_or_else(|| {
+                std::io::Error::other("No confirmed operation directory; open the dialog again")
+            })?;
+            let panel = self.active_panel();
+            if pending.kind != kind
+                || pending.panel_id != panel.mouse_id
+                || pending.path != panel.path
+                || pending.remote != panel.is_remote().then(|| panel.display_path())
+            {
+                return Err(std::io::Error::other(
+                    "Operation panel changed after confirmation; open the dialog again",
+                ));
+            }
+            let path = if let Some(directory) = &pending.directory {
+                file_ops::verify_directory_authorization(
+                    &pending.path,
+                    directory,
+                    "Confirmed operation directory",
+                )?;
+                directory.resolved_path().to_path_buf()
+            } else {
+                pending.path.clone()
+            };
+            Ok((path, pending.files.clone()))
+        })();
+        match result {
+            Ok(target) => Some(target),
+            Err(error) => {
+                self.pending_panel_operation = None;
+                self.show_message(&error.to_string());
+                None
+            }
+        }
+    }
+
     pub fn show_encrypt_dialog(&mut self) {
         if self.active_panel().is_remote() {
             self.show_message("Encryption is not available on remote panels");
+            return;
+        }
+        if !self.capture_panel_operation(DialogType::EncryptConfirm) {
             return;
         }
 
@@ -5875,6 +6088,9 @@ impl App {
             self.show_message("Decryption is not available on remote panels");
             return;
         }
+        if !self.capture_panel_operation(DialogType::DecryptConfirm) {
+            return;
+        }
 
         let dir = self.active_panel().path.clone();
         let count = match fs::read_dir(&dir) {
@@ -5906,6 +6122,14 @@ impl App {
     }
 
     pub fn execute_encrypt(&mut self, split_size_mb: u64, use_md5: bool) {
+        if self.active_panel().is_remote() {
+            self.show_message("Encryption is not available on remote panels");
+            return;
+        }
+        let Some((dir, _)) = self.verified_panel_operation(DialogType::EncryptConfirm) else {
+            return;
+        };
+        self.pending_panel_operation = None;
         // Remember split size for next time
         self.settings.encrypt_split_size = split_size_mb;
 
@@ -5916,8 +6140,6 @@ impl App {
                 return;
             }
         };
-
-        let dir = self.active_panel().path.clone();
 
         let mut progress = FileOperationProgress::new(FileOperationType::Encrypt);
         progress.is_active = true;
@@ -5951,6 +6173,14 @@ impl App {
     }
 
     pub fn execute_decrypt(&mut self) {
+        if self.active_panel().is_remote() {
+            self.show_message("Decryption is not available on remote panels");
+            return;
+        }
+        let Some((dir, _)) = self.verified_panel_operation(DialogType::DecryptConfirm) else {
+            return;
+        };
+        self.pending_panel_operation = None;
         let key = match crate::enc::ensure_key() {
             Ok(key) => key,
             Err(e) => {
@@ -5958,8 +6188,6 @@ impl App {
                 return;
             }
         };
-
-        let dir = self.active_panel().path.clone();
 
         let mut progress = FileOperationProgress::new(FileOperationType::Decrypt);
         progress.is_active = true;
@@ -5986,6 +6214,9 @@ impl App {
     }
 
     pub fn show_mkdir_dialog(&mut self) {
+        if !self.capture_panel_operation(DialogType::Mkdir) {
+            return;
+        }
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Mkdir,
             input: String::new(),
@@ -5999,6 +6230,9 @@ impl App {
     }
 
     pub fn show_mkfile_dialog(&mut self) {
+        if !self.capture_panel_operation(DialogType::Mkfile) {
+            return;
+        }
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Mkfile,
             input: String::new(),
@@ -6102,6 +6336,13 @@ impl App {
     }
 
     pub fn show_tar_dialog(&mut self) {
+        if self.active_panel().is_remote() {
+            self.show_message("Archive creation is not supported on remote panels");
+            return;
+        }
+        if !self.capture_panel_operation(DialogType::Tar) {
+            return;
+        }
         let files = self.get_operation_files();
         if files.is_empty() {
             self.show_message("No files selected");
@@ -6230,6 +6471,13 @@ impl App {
     }
 
     pub fn show_dedup_screen(&mut self) {
+        if self.active_panel().is_remote() {
+            self.show_message("Duplicate removal is not available on remote panels");
+            return;
+        }
+        if !self.capture_panel_operation(DialogType::DedupConfirm) {
+            return;
+        }
         let path = self.active_panel().path.clone();
         self.dialog = Some(Dialog {
             dialog_type: DialogType::DedupConfirm,
@@ -6244,8 +6492,25 @@ impl App {
     }
 
     pub fn execute_dedup(&mut self) {
-        let path = self.active_panel().path.clone();
-        self.dedup_screen_state = Some(crate::ui::dedup_screen::DedupScreenState::new(path));
+        if self.active_panel().is_remote() {
+            self.show_message("Duplicate removal is not available on remote panels");
+            return;
+        }
+        let Some((path, _)) = self.verified_panel_operation(DialogType::DedupConfirm) else {
+            return;
+        };
+        let Some(authorization) = self
+            .pending_panel_operation
+            .take()
+            .and_then(|operation| operation.directory)
+        else {
+            self.show_message("Duplicate-removal directory confirmation expired");
+            return;
+        };
+        self.dedup_screen_state = Some(crate::ui::dedup_screen::DedupScreenState::new(
+            path,
+            authorization,
+        ));
         self.current_screen = Screen::DedupScreen;
     }
 
@@ -6518,13 +6783,15 @@ impl App {
                     self.refresh_panels();
                     return;
                 }
+                let mut entries = entries;
                 let total = entries.len();
                 let (tx, rx) = mpsc::channel();
                 thread::spawn(move || {
                     let mut success_count = 0;
                     let mut errors = Vec::new();
                     let mut warnings = Vec::new();
-                    for (path, source) in &entries {
+                    for index in 0..entries.len() {
+                        let (path, source) = entries[index].clone();
                         if let Err(error) = file_ops::verify_directory_authorization(
                             directory.resolved_path(),
                             &directory,
@@ -6533,9 +6800,18 @@ impl App {
                             errors.push(error.to_string());
                             break;
                         }
-                        match file_ops::delete_file_detailed_authorized(path, source) {
+                        match file_ops::delete_file_detailed_authorized(&path, &source) {
                             Ok(item_warnings) => {
                                 success_count += 1;
+                                for (pending_path, pending_source) in
+                                    entries.iter_mut().skip(index + 1)
+                                {
+                                    file_ops::refresh_path_authorization_after_alias_deletion(
+                                        pending_source,
+                                        &source,
+                                        pending_path,
+                                    );
+                                }
                                 warnings.extend(
                                     item_warnings
                                         .into_iter()
@@ -6578,6 +6854,36 @@ impl App {
     }
 
     // ========== Clipboard operations (Ctrl+C/X/V) ==========
+
+    /// Bind a drag to the same exact source objects as keyboard copy/cut,
+    /// without changing the clipboard until a drop has a valid destination.
+    pub(crate) fn capture_drag_clipboard(&self) -> Result<Clipboard, String> {
+        let files = self.get_operation_files();
+        if files.is_empty() {
+            return Err("No files selected".into());
+        }
+        let panel = self.active_panel();
+        let source_remote_profile = panel.remote_ctx.as_ref().map(|ctx| ctx.profile.clone());
+        let (source_authorizations, source_directory_authorization) =
+            capture_local_clipboard_authorizations(
+                &panel.path,
+                &files,
+                source_remote_profile.is_some(),
+            )
+            .map_err(|error| format!("Cannot start file drag: {error}"))?;
+        let source_path = source_directory_authorization
+            .as_ref()
+            .map(|authorization| authorization.resolved_path().to_path_buf())
+            .unwrap_or_else(|| panel.path.clone());
+        Ok(Clipboard {
+            files,
+            source_path,
+            operation: ClipboardOperation::Copy,
+            source_remote_profile,
+            source_authorizations,
+            source_directory_authorization,
+        })
+    }
 
     /// Copy selected files to clipboard (Ctrl+C)
     pub fn clipboard_copy(&mut self) {
@@ -6953,7 +7259,10 @@ impl App {
             if let (Some(ref target_canon), Ok(src_canon)) =
                 (&canonical_target, src.canonicalize().map(strip_unc_prefix))
             {
-                if src.is_dir() && target_canon.starts_with(&src_canon) {
+                let source_is_directory = fs::symlink_metadata(&src)
+                    .map(|metadata| metadata.file_type().is_dir())
+                    .unwrap_or(false);
+                if source_is_directory && target_canon.starts_with(&src_canon) {
                     self.show_message(&format!("Cannot copy '{}' into itself", file_name));
                     continue;
                 }
@@ -7655,6 +7964,29 @@ impl App {
     /// state.
     pub fn finish_pending_cut_operation(&mut self, succeeded: bool) {
         if let Some(mut clipboard) = self.pending_cut_clipboard.take() {
+            if clipboard.source_remote_profile.is_none() {
+                if let Some(progress) = &self.file_operation_progress {
+                    let committed: Vec<_> = progress
+                        .completed_item_names
+                        .iter()
+                        .filter_map(|name| clipboard.source_authorizations.get(name).copied())
+                        .collect();
+                    // Keep skipped/remaining hard links retryable after one
+                    // of their aliases was moved by this worker. Replacements
+                    // and content changes still fail the snapshot comparison.
+                    for (name, authorization) in &mut clipboard.source_authorizations {
+                        if !progress.completed_item_names.contains(name) {
+                            for before in &committed {
+                                file_ops::refresh_path_authorization_after_alias_deletion(
+                                    authorization,
+                                    before,
+                                    &clipboard.source_path.join(name),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if succeeded {
                 let skipped = self
                     .file_operation_progress
@@ -7740,6 +8072,10 @@ impl App {
     }
 
     pub fn execute_mkdir(&mut self, name: &str) {
+        let Some((operation_path, _)) = self.verified_panel_operation(DialogType::Mkdir) else {
+            return;
+        };
+        self.pending_panel_operation = None;
         // Validate filename to prevent path traversal attacks
         if let Err(e) = file_ops::is_valid_filename(name) {
             self.show_message(&format!("Error: {}", e));
@@ -7792,7 +8128,7 @@ impl App {
             return;
         }
 
-        let path = self.active_panel().path.join(name);
+        let path = operation_path.join(name);
 
         // Additional check: ensure the resulting path is within the current directory
         if let Ok(canonical_parent) = self
@@ -7826,6 +8162,10 @@ impl App {
     }
 
     pub fn execute_mkfile(&mut self, name: &str) {
+        let Some((operation_path, _)) = self.verified_panel_operation(DialogType::Mkfile) else {
+            return;
+        };
+        self.pending_panel_operation = None;
         // Validate filename to prevent path traversal attacks
         if let Err(e) = file_ops::is_valid_filename(name) {
             self.show_message(&format!("Error: {}", e));
@@ -7878,7 +8218,7 @@ impl App {
             return;
         }
 
-        let path = self.active_panel().path.join(name);
+        let path = operation_path.join(name);
 
         // Atomically create a new file.  A separate `exists` check followed by
         // `File::create` allowed another process to create the path in between,
@@ -8005,6 +8345,9 @@ impl App {
             self.show_message("Archive creation is not supported on remote panels");
             return;
         }
+        let Some((current_dir, files)) = self.verified_panel_operation(DialogType::Tar) else {
+            return;
+        };
         // Fast validations only (no I/O or external processes)
         if let Err(e) = file_ops::is_valid_filename(archive_name) {
             self.show_message(&format!("Error: {}", e));
@@ -8017,7 +8360,6 @@ impl App {
             return;
         }
 
-        let files = self.get_operation_files();
         if files.is_empty() {
             self.show_message("No files to archive");
             return;
@@ -8031,7 +8373,6 @@ impl App {
             }
         }
 
-        let current_dir = self.active_panel().path.clone();
         let archive_path = current_dir.join(archive_name);
 
         // Check if archive already exists (fast check)
@@ -8078,6 +8419,21 @@ impl App {
         use std::io::BufReader;
         use std::process::{Command, Stdio};
 
+        if self.active_panel().is_remote() {
+            self.show_message("Archive creation is not supported on remote panels");
+            return;
+        }
+        let Some((current_dir, confirmed_files)) = self.verified_panel_operation(DialogType::Tar)
+        else {
+            return;
+        };
+        if files != confirmed_files.as_slice() {
+            self.show_message(
+                "Archive selection changed after confirmation; open the dialog again",
+            );
+            return;
+        }
+
         if let Err(error) = file_ops::is_valid_filename(archive_name) {
             self.show_message(&format!("Error: {error}"));
             return;
@@ -8093,7 +8449,6 @@ impl App {
             }
         }
 
-        let current_dir = self.active_panel().path.clone();
         let archive_path = current_dir.join(archive_name);
 
         let (source_directory_guard, _, source_metadata) =
@@ -8113,6 +8468,7 @@ impl App {
             self.show_message("Error: archive source directory changed while it was opened");
             return;
         }
+        self.pending_panel_operation = None;
 
         // Reserve only a uniquely named file that we own. The final archive
         // path remains untouched until a successful no-clobber publish.
@@ -8379,6 +8735,23 @@ impl App {
                                 return;
                             }
                             if status.success() {
+                                let _ = tx.send(ProgressMessage::Preparing(
+                                    "Verifying archive...".to_string(),
+                                ));
+                                if let Err(error) = verify_created_tar_archive(
+                                    &temp_archive,
+                                    &tar_cmd,
+                                    compression,
+                                    cancel_flag.clone(),
+                                ) {
+                                    let _ = tx.send(ProgressMessage::Error(
+                                        archive_name_owned,
+                                        format!("Archive was not published: {error}"),
+                                    ));
+                                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                                    return;
+                                }
+                                let _ = tx.send(ProgressMessage::PrepareComplete);
                                 match publish_tar_archive(&temp_archive, &archive_path_clone) {
                                     Ok(()) => {
                                         let _ =
@@ -9828,6 +10201,166 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_listing_cannot_delete_or_copy_a_lossy_alias() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"\xff.txt".to_vec()));
+        let alias = temp.path().join("\u{fffd}.txt");
+        fs::write(&raw, b"original").unwrap();
+        fs::write(&alias, b"other file").unwrap();
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        assert!(app
+            .active_panel()
+            .listing_error
+            .as_deref()
+            .unwrap()
+            .contains("UTF-8"));
+        app.active_panel_mut()
+            .selected_files
+            .insert("\u{fffd}.txt".into());
+        assert!(app.get_operation_files().is_empty());
+        app.clipboard_copy();
+        assert!(app.clipboard.is_none());
+        app.show_delete_dialog();
+        app.execute_delete();
+        assert_eq!(fs::read(raw).unwrap(), b"original");
+        assert_eq!(fs::read(alias).unwrap(), b"other file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_fifo_listing_does_not_wait_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("pipe.cokacenc");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = temp.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let panel = PanelState::new(path);
+            let file = panel
+                .files
+                .iter()
+                .find(|file| file.name == "pipe.cokacenc")
+                .unwrap();
+            tx.send(file.display_name.is_none()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn remote_dedup_never_starts_a_local_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("first"), b"duplicate").unwrap();
+        fs::write(temp.path().join("second"), b"duplicate").unwrap();
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        app.active_panel_mut().remote_display = Some(("user".into(), "remote".into(), 22));
+        app.show_dedup_screen();
+        assert!(app.pending_panel_operation.is_none());
+        app.execute_dedup();
+        assert!(app.dedup_screen_state.is_none());
+        assert_eq!(app.current_screen, Screen::FilePanel);
+        assert!(temp.path().join("first").exists());
+        assert!(temp.path().join("second").exists());
+    }
+
+    #[test]
+    fn file_creation_rejects_a_panel_switch_after_confirmation() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let mut app = App::new(left.path().into(), right.path().into());
+        app.show_mkfile_dialog();
+        app.switch_panel();
+        app.execute_mkfile("must-not-exist");
+        assert!(!left.path().join("must-not-exist").exists());
+        assert!(!right.path().join("must-not-exist").exists());
+    }
+
+    #[test]
+    fn file_creation_rejects_a_replaced_confirmation_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let mut app = App::new(source.clone(), source.clone());
+        app.show_mkfile_dialog();
+        fs::rename(&source, temp.path().join("retained")).unwrap();
+        fs::create_dir(&source).unwrap();
+        app.execute_mkfile("must-not-exist");
+        assert!(!source.join("must-not-exist").exists());
+        assert!(!temp.path().join("retained/must-not-exist").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panel_delete_completes_all_selected_hardlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("first"), b"shared").unwrap();
+        fs::hard_link(temp.path().join("first"), temp.path().join("second")).unwrap();
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        app.active_panel_mut()
+            .selected_files
+            .extend(["first".into(), "second".into()]);
+        app.show_delete_dialog();
+        app.execute_delete();
+        wait_for_background_file_operation(&mut app);
+        assert!(!temp.path().join("first").exists());
+        assert!(!temp.path().join("second").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_exclusions_treat_glob_characters_as_literal_names() {
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+        let Some(tar) = select_tar_command(None) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let output = temp.path().join("output");
+        fs::create_dir_all(source.join("items")).unwrap();
+        fs::create_dir(&output).unwrap();
+        let bad_names = ["bad[1]", "star*", "question?", "back\\slash"];
+        for name in bad_names {
+            symlink("../../outside", source.join("items").join(name)).unwrap();
+        }
+        for name in ["bad1", "starX", "questionX", "backslash"] {
+            fs::write(source.join("items").join(name), b"keep").unwrap();
+        }
+        let (_, excluded) = file_ops::filter_symlinks_for_tar(&source, &["items".into()]);
+        let archive = temp.path().join("test.tar");
+        let status = Command::new(&tar)
+            .current_dir(&source)
+            .args(tar_create_arguments(
+                TarCompression::None,
+                &excluded,
+                &["items".into()],
+            ))
+            .stdout(Stdio::from(fs::File::create(&archive).unwrap()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(Command::new(&tar)
+            .current_dir(&output)
+            .arg("-xf")
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success());
+        for name in bad_names {
+            assert!(fs::symlink_metadata(output.join("items").join(name)).is_err());
+        }
+        for name in ["bad1", "starX", "questionX", "backslash"] {
+            assert_eq!(fs::read(output.join("items").join(name)).unwrap(), b"keep");
+        }
+    }
+
     #[test]
     fn filename_md5_candidates_require_one_maximal_32_digit_hex_run() {
         const HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
@@ -11252,11 +11785,21 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(temp_dir.path().join("payload.txt"), "round trip").unwrap();
+        std::os::unix::fs::symlink("payload.txt", temp_dir.path().join("safe-link")).unwrap();
         let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         app.active_panel_mut()
             .selected_files
             .insert("payload.txt".to_string());
+        app.active_panel_mut()
+            .selected_files
+            .insert("safe-link".into());
 
+        app.show_tar_dialog();
+        fs::write(temp_dir.path().join("not-selected.txt"), "not confirmed").unwrap();
+        app.active_panel_mut().selected_files.clear();
+        app.active_panel_mut()
+            .selected_files
+            .insert("not-selected.txt".into());
         app.execute_tar("roundtrip.tar");
         for _ in 0..500 {
             let active = app
@@ -11308,6 +11851,123 @@ mod tests {
             fs::read_to_string(temp_dir.path().join("roundtrip/payload.txt")).unwrap(),
             "round trip"
         );
+        assert_eq!(
+            fs::read_link(temp_dir.path().join("roundtrip/safe-link")).unwrap(),
+            PathBuf::from("payload.txt")
+        );
+        assert!(!temp_dir.path().join("roundtrip/not-selected.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_rejects_link_changed_after_exclusion_confirmation() {
+        if select_tar_command(None).is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let items = temp.path().join("items");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&items).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(items.join("target"), b"selected").unwrap();
+        fs::write(outside.join("keep"), b"outside").unwrap();
+        std::os::unix::fs::symlink("target", items.join("safe")).unwrap();
+        std::os::unix::fs::symlink(&outside, items.join("excluded")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        app.active_panel_mut().selected_files.insert("items".into());
+        app.show_tar_dialog();
+        app.execute_tar("result.tar");
+        let state = app
+            .tar_exclude_state
+            .take()
+            .expect("exclusion confirmation");
+        assert_eq!(state.excluded_paths, vec!["items/excluded"]);
+        fs::remove_file(items.join("safe")).unwrap();
+        std::os::unix::fs::symlink(&outside, items.join("safe")).unwrap();
+        app.execute_tar_with_excludes(&state.archive_name, &state.files, &state.excluded_paths);
+        for _ in 0..1000 {
+            if !app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("tar validation completed");
+        assert_eq!(result.failure_count, 1);
+        assert!(!temp.path().join("result.tar").exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(items.join("safe"))
+            .unwrap()
+            .is_symlink());
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            2,
+            "private verification data should be cleaned"
+        );
+    }
+
+    #[test]
+    fn cancelled_tar_verification_does_not_publish_or_create_an_extraction_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let final_path = temp.path().join("cancelled.tar");
+        let archive = ReservedTarArchive::create(&final_path).unwrap();
+        let error = verify_created_tar_archive(
+            &archive,
+            "unused-tar",
+            TarCompression::None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(!final_path.exists());
+        assert!(!archive.staging_dir.join("verification").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_verification_accepts_compressed_archives_and_safe_link_chains() {
+        use std::process::{Command, Stdio};
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        for compression in [
+            TarCompression::None,
+            TarCompression::Gzip,
+            TarCompression::Bzip2,
+            TarCompression::Xz,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let items = temp.path().join("items");
+            fs::create_dir(&items).unwrap();
+            fs::write(items.join("target"), b"selected").unwrap();
+            std::os::unix::fs::symlink("target", items.join("one")).unwrap();
+            std::os::unix::fs::symlink("one", items.join("two")).unwrap();
+            let archive = ReservedTarArchive::create(&temp.path().join("result.tar")).unwrap();
+            let mut command = Command::new(&tar_cmd);
+            command
+                .args(tar_create_arguments(compression, &[], &["items".into()]))
+                .current_dir(temp.path())
+                .stdout(Stdio::from(archive.writer().unwrap()))
+                .stderr(Stdio::null());
+            configure_tar_command(&mut command);
+            assert!(command.status().unwrap().success());
+            verify_created_tar_archive(
+                &archive,
+                &tar_cmd,
+                compression,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert!(!archive.staging_dir.join("verification").exists());
+        }
     }
 
     #[test]
@@ -11609,6 +12269,7 @@ mod tests {
         fs::write(&existing, "keep this content").unwrap();
         let mut app = App::new(temp_dir.clone(), temp_dir.clone());
 
+        app.show_mkfile_dialog();
         app.execute_mkfile("existing.txt");
 
         assert_eq!(fs::read_to_string(existing).unwrap(), "keep this content");
@@ -11882,6 +12543,54 @@ mod tests {
     }
 
     // ========== Clipboard tests ==========
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_can_copy_and_move_directory_links_into_their_referent_tree() {
+        for cut in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let referent = temp.path().join("referent");
+            let destination = referent.join("child");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(referent.join("keep"), b"unchanged").unwrap();
+            std::os::unix::fs::symlink(&referent, source.join("link")).unwrap();
+            let mut app = App::new(source.clone(), destination.clone());
+            app.active_panel_mut().selected_files.insert("link".into());
+            if cut {
+                app.clipboard_cut();
+            } else {
+                app.clipboard_copy();
+            }
+            app.switch_panel();
+            app.clipboard_paste();
+            assert!(
+                app.file_operation_progress.is_some(),
+                "a directory link must reach the worker"
+            );
+            for _ in 0..500 {
+                if !app
+                    .file_operation_progress
+                    .as_mut()
+                    .map(FileOperationProgress::poll)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let result = app
+                .file_operation_progress
+                .as_ref()
+                .and_then(|progress| progress.result.as_ref())
+                .expect("paste completed");
+            assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+            assert_eq!(fs::read_link(destination.join("link")).unwrap(), referent);
+            assert_eq!(fs::read(referent.join("keep")).unwrap(), b"unchanged");
+            assert_eq!(fs::symlink_metadata(source.join("link")).is_ok(), !cut);
+        }
+    }
 
     #[test]
     fn test_clipboard_copy() {
@@ -12247,6 +12956,44 @@ mod tests {
         );
         assert!(app.pending_cut_clipboard.is_none());
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_skipped_hardlink_can_be_moved_on_the_next_paste() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("first"), b"shared").unwrap();
+        fs::hard_link(source.path().join("first"), source.path().join("second")).unwrap();
+        let mut app = App::new(source.path().into(), target.path().into());
+        app.active_panel_mut()
+            .selected_files
+            .extend(["first".into(), "second".into()]);
+        app.clipboard_cut();
+        app.pending_cut_clipboard = app.clipboard.take();
+        fs::rename(source.path().join("first"), target.path().join("first")).unwrap();
+        let mut progress = FileOperationProgress::new(FileOperationType::Move);
+        progress.completed_item_names.insert("first".into());
+        progress.skipped_cut_item_names.insert("second".into());
+        app.file_operation_progress = Some(progress);
+        app.finish_pending_cut_operation(true);
+        app.switch_panel();
+        app.clipboard_paste();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.file_operation_progress.as_mut().unwrap().poll() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(result.success_count, 1);
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        assert!(!source.path().join("second").exists());
+        assert_eq!(fs::read(target.path().join("second")).unwrap(), b"shared");
     }
 
     #[test]

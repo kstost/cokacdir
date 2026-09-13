@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -104,6 +104,9 @@ impl Md5VerificationState {
         } else if self.selected_index >= self.scroll_offset + visible_height {
             self.scroll_offset = self.selected_index - visible_height + 1;
         }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.results.len().saturating_sub(visible_height));
     }
 }
 
@@ -315,13 +318,13 @@ pub fn draw(
     }
     frame.render_widget(Paragraph::new(lines), list_area);
 
-    if state.results.len() > visible_height && visible_height > 0 {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(state.results.len(), visible_height, state.scroll_offset)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-        let mut scrollbar_state =
-            ScrollbarState::new(state.results.len()).position(state.selected_index);
         let scrollbar_area = Rect::new(inner.x + inner.width - 1, list_area.y, 1, list_area.height);
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
@@ -387,6 +390,49 @@ mod tests {
         (0..width)
             .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol())
             .collect()
+    }
+
+    #[test]
+    fn scrollbar_stays_put_until_the_list_scrolls_and_resize_removes_bottom_gaps() {
+        let mut state = Md5VerificationState::new(
+            (0..30)
+                .map(|index| Md5VerificationResult {
+                    file_name: format!("file-{index:02}"),
+                    status: Md5VerificationStatus::NoHash,
+                })
+                .collect(),
+        );
+        let theme = Theme::default();
+        let kb = Keybindings::from_config(&KeybindingsConfig::default());
+        let render = |state: &mut Md5VerificationState, height: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, state, Rect::new(0, 0, 80, height), &theme, &kb);
+                })
+                .unwrap();
+            (3..height - 2)
+                .map(|y| terminal.backend().buffer()[(78, y)].symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let top = render(&mut state, 15);
+        state.selected_index = 8;
+        assert_eq!(render(&mut state, 15), top);
+        assert_eq!(state.scroll_offset, 0);
+        state.cursor_to_end();
+        let bottom = render(&mut state, 15);
+        assert_eq!(state.scroll_offset, 20);
+        assert_ne!(bottom[1], top[1]);
+        assert_eq!(bottom[bottom.len() - 2], top[1]);
+        render(&mut state, 25);
+        assert_eq!(state.scroll_offset, 10);
+        assert_eq!(state.selected_index, 29);
+        state.results.truncate(5);
+        state.selected_index = 4;
+        render(&mut state, 25);
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.selected_index, 4);
     }
 
     #[test]

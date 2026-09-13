@@ -510,6 +510,15 @@ impl DirectoryAccess {
     /// directory, so Unix callers do not have to reopen an attacker-swappable
     /// pathname while publishing a file.
     pub(crate) fn rename_noreplace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        self.rename_noreplace_to(source, self, destination)
+    }
+
+    pub(crate) fn rename_noreplace_to(
+        &self,
+        source: &OsStr,
+        destination_parent: &DirectoryAccess,
+        destination: &OsStr,
+    ) -> io::Result<()> {
         validate_directory_entry_name(source)?;
         validate_directory_entry_name(destination)?;
 
@@ -523,7 +532,7 @@ impl DirectoryAccess {
             return rustix::fs::renameat_with(
                 &self.directory,
                 source,
-                &self.directory,
+                &destination_parent.directory,
                 destination,
                 rustix::fs::RenameFlags::NOREPLACE,
             )
@@ -532,7 +541,10 @@ impl DirectoryAccess {
 
         #[cfg(windows)]
         {
-            return rename_noreplace(&self.path.join(source), &self.path.join(destination));
+            return rename_noreplace(
+                &self.path.join(source),
+                &destination_parent.path.join(destination),
+            );
         }
 
         #[cfg(not(any(
@@ -543,7 +555,7 @@ impl DirectoryAccess {
             windows
         )))]
         {
-            let _ = (source, destination);
+            let _ = (source, destination_parent, destination);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Atomic no-clobber directory-relative rename is not supported on this platform",
@@ -1012,8 +1024,14 @@ fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io
     }
     let canonical_src = src.canonicalize().ok();
 
+    // A destination link is replaced as a directory entry; its referent is
+    // not overwritten. Two different links to one target are not one object.
+    // Still reject replacing a real referent with a link to itself.
+    let destination_is_symlink = fs::symlink_metadata(dest)
+        .map(|metadata| metadata.is_symlink())
+        .unwrap_or(false);
     if let (Some(canonical_src), Ok(canonical_dest)) = (&canonical_src, dest.canonicalize()) {
-        if canonical_src == &canonical_dest {
+        if !destination_is_symlink && canonical_src == &canonical_dest {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Cannot {} a file onto itself", operation),
@@ -1061,7 +1079,7 @@ fn validate_destination_not_self(src: &Path, dest: &Path, operation: &str) -> io
                 "Cannot resolve the source directory",
             )
         })?;
-        let dest_anchor = if path_exists_no_follow(dest) {
+        let dest_anchor = if path_exists_no_follow(dest) && !destination_is_symlink {
             dest.canonicalize()
         } else {
             dest.parent()
@@ -1789,6 +1807,9 @@ pub(crate) fn refresh_path_authorization_after_alias_deletion(
     deleted_source: &PathAuthorization,
     pending_path: &Path,
 ) -> bool {
+    if *authorization != *deleted_source {
+        return false;
+    }
     let Ok(current) = capture_path_authorization(pending_path) else {
         return false;
     };
@@ -2197,7 +2218,7 @@ fn authorize_opened_directory(
     Ok(authorization)
 }
 
-fn open_authorized_directory(
+pub(crate) fn open_authorized_directory(
     authorization: &DirectoryAuthorization,
     role: &str,
 ) -> io::Result<(File, DirectoryAccess)> {
@@ -5258,6 +5279,28 @@ fn create_new_destination_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+/// String-based UI operations must never reconstruct a path from a lossy name.
+/// Reject the whole listing on an unsupported name instead of returning an
+/// apparently complete list which could alias another, valid UTF-8 filename.
+pub(crate) fn read_dir_utf8(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    fs::read_dir(path)?
+        .map(|entry| {
+            let entry = entry?;
+            if entry.file_name().to_str().is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cannot safely list '{}': filename {:?} is not valid UTF-8",
+                        path.display(),
+                        entry.file_name()
+                    ),
+                ));
+            }
+            Ok(entry)
+        })
+        .collect()
+}
+
 pub(crate) fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -5436,50 +5479,71 @@ fn lexically_normalized_absolute(path: &Path) -> io::Result<PathBuf> {
     Ok(normalized)
 }
 
-/// Resolve the deepest existing prefix and append any missing suffix without
-/// following it. This catches an existing symlink component even when the
-/// final logical destination tree or link target does not exist yet.
+/// Resolve links component by component, including existing prefixes of a
+/// dangling target. A `..` must be applied AFTER expanding the preceding link:
+/// normalizing `alias/../name` first can resolve to an entirely different tree.
 #[cfg(unix)]
 fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
-    let mut prefix = path.to_path_buf();
-    let mut missing_suffix = Vec::new();
+    use std::collections::VecDeque;
+    use std::path::Component;
 
-    loop {
-        match fs::symlink_metadata(&prefix) {
-            Ok(_) => {
-                let mut resolved = prefix.canonicalize().map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "Could not safely resolve existing symlink target prefix '{}': {}",
-                            prefix.display(),
-                            error
-                        ),
-                    )
-                })?;
-                for component in missing_suffix.iter().rev() {
-                    resolved.push(component);
-                }
-                return lexically_normalized_absolute(&resolved);
+    let mut pending: VecDeque<OsString> = path
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir()?.canonicalize()?
+    };
+    let mut links_followed = 0;
+    while let Some(component) = pending.pop_front() {
+        match Path::new(&component).components().next() {
+            Some(Component::RootDir) => resolved = PathBuf::from("/"),
+            Some(Component::CurDir) | None => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let component = prefix.file_name().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Could not resolve a path prefix for '{}'", path.display()),
-                    )
-                })?;
-                missing_suffix.push(component.to_os_string());
-                if !prefix.pop() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Could not resolve a path prefix for '{}'", path.display()),
-                    ));
+            Some(Component::Normal(name)) => {
+                let candidate = resolved.join(name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.is_symlink() => {
+                        links_followed += 1;
+                        if links_followed > 40 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Too many symbolic links in the copy target",
+                            ));
+                        }
+                        let target = fs::read_link(&candidate)?;
+                        for component in target.components().rev() {
+                            pending.push_front(component.as_os_str().to_os_string());
+                        }
+                    }
+                    Ok(metadata) => {
+                        if !pending.is_empty() && !metadata.is_dir() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotADirectory,
+                                "A symbolic link target traverses a non-directory",
+                            ));
+                        }
+                        resolved = candidate;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-            Err(error) => return Err(error),
+            Some(Component::Prefix(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Unexpected path prefix on Unix",
+                ));
+            }
         }
     }
+    Ok(resolved)
 }
 
 fn copy_symlink_to_new(
@@ -5534,7 +5598,7 @@ fn copy_symlink_to_new(
                 ),
             ));
         }
-        let resolved = resolve_existing_prefix(&lexical)?;
+        let resolved = resolve_existing_prefix(&target_path)?;
         let resolved = resolved.to_string_lossy();
         if target_is_sensitive(&resolved) {
             return Err(io::Error::new(
@@ -5604,7 +5668,7 @@ fn copy_open_symlink_to_new(
                 ),
             ));
         }
-        let resolved = resolve_existing_prefix(&lexical)?;
+        let resolved = resolve_existing_prefix(&target_path)?;
         let resolved = resolved.to_string_lossy();
         if target_is_sensitive(&resolved) {
             return Err(io::Error::new(
@@ -6891,7 +6955,15 @@ fn copy_files_with_progress_impl(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let dest = target_dir.join(&filename);
+        let Some(source_name) = src.file_name() else {
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(
+                filename,
+                "Source has no filename".to_string(),
+            ));
+            continue;
+        };
+        let dest = target_dir.join(source_name);
 
         if let Err(e) = validate_destination_not_self(&src, &dest, "copy") {
             failure_count += 1;
@@ -7021,6 +7093,14 @@ fn copy_files_with_progress_impl(
                     target_authorization.as_ref(),
                 ) {
                     Ok(warnings) => {
+                        if let Some(replaced) = overwrite_authorization.as_ref() {
+                            refresh_pending_path_aliases(
+                                replaced,
+                                &mut source_authorizations,
+                                &mut files_to_overwrite,
+                                target_dir,
+                            );
+                        }
                         send_operation_warnings(&progress_tx, &filename, warnings);
                         success_count += 1;
                         let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
@@ -7066,6 +7146,14 @@ fn copy_files_with_progress_impl(
                     target_authorization.as_ref(),
                 ) {
                     Ok(warnings) => {
+                        if let Some(replaced) = overwrite_authorization.as_ref() {
+                            refresh_pending_path_aliases(
+                                replaced,
+                                &mut source_authorizations,
+                                &mut files_to_overwrite,
+                                target_dir,
+                            );
+                        }
                         send_operation_warnings(&progress_tx, &filename, warnings);
                         completed_files += 1;
                         success_count += 1;
@@ -7124,6 +7212,14 @@ fn copy_files_with_progress_impl(
                     target_authorization.as_ref(),
                 ) {
                     Ok(warnings) => {
+                        if let Some(replaced) = overwrite_authorization.as_ref() {
+                            refresh_pending_path_aliases(
+                                replaced,
+                                &mut source_authorizations,
+                                &mut files_to_overwrite,
+                                target_dir,
+                            );
+                        }
                         send_operation_warnings(&progress_tx, &filename, warnings);
                         completed_bytes += file_size;
                         completed_files += 1;
@@ -7187,6 +7283,71 @@ fn copy_files_with_progress_impl(
         let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count + 1));
     } else {
         let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count));
+    }
+}
+
+type PendingCopyMove = (
+    PathBuf,
+    PathBuf,
+    u64,
+    bool,
+    PathIdentity,
+    Option<PathIdentity>,
+);
+
+/// An operation we committed can update the shared ctime of pending hard
+/// links. Advance only exact pre-operation snapshots whose stable identity
+/// and content metadata still match. All other changes stay unauthorized.
+fn refresh_pending_move_aliases(
+    changed: &PathAuthorization,
+    sources: &mut HashMap<PathBuf, PathAuthorization>,
+    destinations: &mut HashMap<PathBuf, PathAuthorization>,
+    target_dir: &Path,
+    queued: &mut std::collections::VecDeque<PendingCopyMove>,
+) {
+    if changed.is_directory {
+        return;
+    }
+    let before = *changed;
+    refresh_pending_path_aliases(changed, sources, destinations, target_dir);
+    let refresh_identity = |path: &Path, identity: &mut PathIdentity| {
+        let mut authorization = PathAuthorization::from_identity(identity);
+        if refresh_path_authorization_after_alias_deletion(&mut authorization, &before, path) {
+            if let Ok(current) =
+                authorized_current_identity(path, &authorization, "Pending move alias")
+            {
+                *identity = current;
+            }
+        }
+    };
+    for (source, destination, _, _, source_identity, destination_identity) in queued.iter_mut() {
+        refresh_identity(source, source_identity);
+        if let Some(identity) = destination_identity.as_mut() {
+            refresh_identity(destination, identity);
+        }
+    }
+}
+
+fn refresh_pending_path_aliases(
+    changed: &PathAuthorization,
+    sources: &mut HashMap<PathBuf, PathAuthorization>,
+    destinations: &mut HashMap<PathBuf, PathAuthorization>,
+    target_dir: &Path,
+) {
+    if changed.is_directory {
+        return;
+    }
+    for (path, authorization) in sources.iter_mut() {
+        refresh_path_authorization_after_alias_deletion(authorization, changed, path);
+    }
+    for (source, authorization) in destinations.iter_mut() {
+        if let Some(name) = source.file_name() {
+            refresh_path_authorization_after_alias_deletion(
+                authorization,
+                changed,
+                &target_dir.join(name),
+            );
+        }
     }
 }
 
@@ -7269,14 +7430,8 @@ pub fn move_files_with_progress(
     let mut completed_files: usize = 0;
 
     // First, try simple rename for each file (fast path for same filesystem)
-    let mut needs_copy: Vec<(
-        PathBuf,
-        PathBuf,
-        u64,
-        bool,
-        PathIdentity,
-        Option<PathIdentity>,
-    )> = Vec::new();
+    let mut needs_copy: std::collections::VecDeque<PendingCopyMove> =
+        std::collections::VecDeque::new();
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -7327,7 +7482,15 @@ pub fn move_files_with_progress(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let dest = target_dir.join(&filename);
+        let Some(source_name) = src.file_name() else {
+            failure_count += 1;
+            let _ = progress_tx.send(ProgressMessage::Error(
+                filename,
+                "Source has no filename".to_string(),
+            ));
+            continue;
+        };
+        let dest = target_dir.join(source_name);
 
         if let Err(e) = validate_destination_not_self(&src, &dest, "move") {
             failure_count += 1;
@@ -7443,6 +7606,7 @@ pub fn move_files_with_progress(
             let destination_identity =
                 destination_identity.expect("overwrite destination identity was captured");
             if source_identity.stable.namespace == destination_identity.stable.namespace {
+                let destination_before = PathAuthorization::from_identity(&destination_identity);
                 match move_entry_overwrite_same_filesystem(
                     &src,
                     &dest,
@@ -7450,6 +7614,20 @@ pub fn move_files_with_progress(
                     destination_identity,
                 ) {
                     Ok(warnings) => {
+                        refresh_pending_move_aliases(
+                            &PathAuthorization::from_identity(&source_identity),
+                            &mut source_authorizations,
+                            &mut files_to_overwrite,
+                            target_dir,
+                            &mut needs_copy,
+                        );
+                        refresh_pending_move_aliases(
+                            &destination_before,
+                            &mut source_authorizations,
+                            &mut files_to_overwrite,
+                            target_dir,
+                            &mut needs_copy,
+                        );
                         send_operation_warnings(&progress_tx, &filename, warnings);
                         success_count += 1;
                         completed_bytes += item_size;
@@ -7474,7 +7652,7 @@ pub fn move_files_with_progress(
                 }
                 continue;
             }
-            needs_copy.push((
+            needs_copy.push_back((
                 src,
                 dest,
                 item_size,
@@ -7502,6 +7680,13 @@ pub fn move_files_with_progress(
                     continue;
                 }
                 let mut warnings = Vec::new();
+                refresh_pending_move_aliases(
+                    &PathAuthorization::from_identity(&source_identity),
+                    &mut source_authorizations,
+                    &mut files_to_overwrite,
+                    target_dir,
+                    &mut needs_copy,
+                );
                 if let Err(error) = sync_parent(&dest) {
                     warnings.push(format!(
                         "Move committed at '{}', but destination-directory durability could not be confirmed: {}",
@@ -7532,7 +7717,7 @@ pub fn move_files_with_progress(
                 // Cross-device rename cannot publish directly. Unsupported
                 // no-replace primitives also use the safe copy/publish path.
                 if is_cross_device_error(&e) {
-                    needs_copy.push((
+                    needs_copy.push_back((
                         src,
                         dest,
                         item_size,
@@ -7541,7 +7726,7 @@ pub fn move_files_with_progress(
                         destination_identity,
                     ));
                 } else if e.kind() == io::ErrorKind::Unsupported {
-                    needs_copy.push((
+                    needs_copy.push_back((
                         src,
                         dest,
                         item_size,
@@ -7562,8 +7747,13 @@ pub fn move_files_with_progress(
     // This keeps pre-commit failures reversible and prevents a changed source
     // from being deleted after its copy was published.
     if !needs_copy.is_empty() && !cancelled {
-        for (src, dest, item_size, overwriting, source_identity, destination_identity) in needs_copy
+        while let Some((src, dest, item_size, overwriting, source_identity, destination_identity)) =
+            needs_copy.pop_front()
         {
+            let source_before = PathAuthorization::from_identity(&source_identity);
+            let destination_before = destination_identity
+                .as_ref()
+                .map(PathAuthorization::from_identity);
             if cancel_flag.load(Ordering::Relaxed) {
                 cancelled = true;
                 break;
@@ -7842,6 +8032,22 @@ pub fn move_files_with_progress(
                         target_authorization.as_ref(),
                     ) {
                         Ok(warnings) => {
+                            refresh_pending_move_aliases(
+                                &source_before,
+                                &mut source_authorizations,
+                                &mut files_to_overwrite,
+                                target_dir,
+                                &mut needs_copy,
+                            );
+                            if let Some(identity) = destination_before.as_ref() {
+                                refresh_pending_move_aliases(
+                                    identity,
+                                    &mut source_authorizations,
+                                    &mut files_to_overwrite,
+                                    target_dir,
+                                    &mut needs_copy,
+                                );
+                            }
                             send_operation_warnings(&progress_tx, &filename, warnings);
                             if !source_is_directory {
                                 completed_bytes += item_size;
@@ -8778,99 +8984,158 @@ fn check_symlink_recursive(
 /// Filter out unsafe symlinks from files to be archived
 /// Returns (files, excluded_paths) - original files and paths to exclude via tar --exclude
 pub fn filter_symlinks_for_tar(base_dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
-    use std::collections::HashSet;
     let mut excluded_paths = Vec::new();
-    let mut visited = HashSet::new();
-
-    for file in files {
-        let file_path = base_dir.join(file);
-        collect_unsafe_symlinks(
-            &file_path,
-            base_dir,
-            file,
-            &mut excluded_paths,
-            &mut visited,
-        );
+    let mut entries = BTreeMap::new();
+    let mut pending: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    while let Some(relative) = pending.pop() {
+        if entries.contains_key(&relative) {
+            continue;
+        }
+        let path = base_dir.join(&relative);
+        let kind = fs::symlink_metadata(&path).and_then(|metadata| {
+            if metadata.is_symlink() {
+                let target = fs::read_link(&path)?;
+                validate_tar_symlink_target(&relative, &target)?;
+                // Preserve the extractor's requirement that a link resolves.
+                // This also rejects malformed targets such as "regular-file/.",
+                // whose trailing dot Path::components would otherwise remove.
+                path.canonicalize()?;
+                Ok(TarEntry::Symlink(target))
+            } else if metadata.is_dir() {
+                // A partial listing must not make omitted children look safe.
+                for entry in read_dir_utf8(&path)? {
+                    pending.push(relative.join(entry.file_name()));
+                }
+                Ok(TarEntry::Directory)
+            } else if metadata.is_file() {
+                Ok(TarEntry::File)
+            } else {
+                Err(io::Error::other("Special files cannot be safely extracted"))
+            }
+        });
+        match kind {
+            Ok(kind) => {
+                entries.insert(relative, kind);
+            }
+            Err(_) => excluded_paths.push(tar_relative_name(&relative)),
+        }
     }
 
+    // Resolve links in the archive's own namespace, not against files that
+    // merely happen to exist on the source machine. This also validates every
+    // link in a chain and never follows a directory link while scanning.
+    for (relative, kind) in &entries {
+        if matches!(kind, TarEntry::Symlink(_))
+            && resolve_tar_entry(relative, &entries, 0).is_none()
+        {
+            excluded_paths.push(tar_relative_name(relative));
+        }
+    }
+    excluded_paths.sort();
+    excluded_paths.dedup();
     (files.to_vec(), excluded_paths)
 }
 
-/// Recursively collect unsafe symlinks paths for exclusion
-fn collect_unsafe_symlinks(
+enum TarEntry {
+    Directory,
+    File,
+    Symlink(PathBuf),
+}
+
+/// Shared by archive creation and extraction. Check the literal target before
+/// following any links, since a canonical path alone can hide lexical escapes.
+pub(crate) fn validate_tar_symlink_target(link: &Path, target: &Path) -> io::Result<()> {
+    use std::path::Component;
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive created an absolute symlink: {} -> {}",
+                link.display(),
+                target.display(),
+            ),
+        ));
+    }
+    let mut depth = link
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "archive symlink escapes the extraction root: {} -> {}",
+                        link.display(),
+                        target.display(),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tar_relative_name(path: &Path) -> String {
+    path.components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .expect("validated UTF-8 name")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn resolve_tar_entry(
     path: &Path,
-    base_dir: &Path,
-    relative_path: &str,
-    excluded: &mut Vec<String>,
-    visited: &mut std::collections::HashSet<std::path::PathBuf>,
-) {
-    // Detect symlink loops
-    if let Ok(canonical_path) = path.canonicalize().map(strip_unc_prefix) {
-        if !visited.insert(canonical_path.clone()) {
-            return; // Already visited, skip
-        }
+    entries: &BTreeMap<PathBuf, TarEntry>,
+    links_followed: usize,
+) -> Option<PathBuf> {
+    use std::path::Component;
+    if links_followed >= 40 || path.is_absolute() {
+        return None;
     }
-
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            // Can't access - exclude it
-            excluded.push(relative_path.to_string());
-            return;
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if !resolved.as_os_str().is_empty()
+            && !matches!(entries.get(&resolved), Some(TarEntry::Directory))
+        {
+            return None;
         }
-    };
-
-    if metadata.is_symlink() {
-        // Check if symlink is safe
-        let is_unsafe = match fs::read_link(path) {
-            Ok(link_target) => {
-                let resolved_target = if link_target.is_absolute() {
-                    link_target.clone()
-                } else {
-                    let parent = path.parent().unwrap_or(base_dir);
-                    parent.join(&link_target)
-                };
-
-                match resolved_target.canonicalize().map(strip_unc_prefix) {
-                    Ok(canonical) => {
-                        if let Ok(base_canonical) = base_dir.canonicalize().map(strip_unc_prefix) {
-                            !canonical.starts_with(&base_canonical)
-                        } else {
-                            true // Can't resolve base, unsafe
-                        }
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let TarEntry::Symlink(target) = entries.get(&resolved)? {
+                    let parent = resolved.parent()?;
+                    if target.is_absolute() {
+                        return None;
                     }
-                    Err(_) => true, // Can't resolve (dangling symlink)
+                    resolved =
+                        resolve_tar_entry(&parent.join(target), entries, links_followed + 1)?;
                 }
             }
-            Err(_) => true, // Can't read link
-        };
-
-        if is_unsafe {
-            excluded.push(relative_path.to_string());
-        }
-    } else if metadata.is_dir() {
-        // Recursively check directory contents. Fail-secure: if the directory
-        // cannot be enumerated, exclude the whole directory rather than letting
-        // its (unknown) contents into the archive.
-        match fs::read_dir(path) {
-            Ok(entries) => {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let entry_name = entry.file_name().to_string_lossy().to_string();
-                    let entry_relative = format!("{}/{}", relative_path, entry_name);
-                    collect_unsafe_symlinks(
-                        &entry.path(),
-                        base_dir,
-                        &entry_relative,
-                        excluded,
-                        visited,
-                    );
-                }
-            }
-            Err(_) => {
-                excluded.push(relative_path.to_string());
-            }
+            Component::Prefix(_) | Component::RootDir => return None,
         }
     }
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -9432,6 +9697,203 @@ mod tests {
             "compatibility move payload"
         );
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_move_hardlinks_completes_in_both_rename_and_copy_paths() {
+        for copy_fallback in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::create_dir(temp.path().join("source")).unwrap();
+            fs::create_dir(temp.path().join("target")).unwrap();
+            let source = temp.path().join("source").canonicalize().unwrap();
+            let target = temp.path().join("target").canonicalize().unwrap();
+            fs::write(source.join("first"), b"shared data").unwrap();
+            fs::hard_link(source.join("first"), source.join("second")).unwrap();
+            let authorizations = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    let path = source.join(name);
+                    let authorization = capture_path_authorization(&path).unwrap();
+                    (path, authorization)
+                })
+                .collect();
+            let (tx, rx) = mpsc::channel();
+            let run = || {
+                move_files_with_progress(
+                    vec!["first".into(), "second".into()],
+                    &source,
+                    &target,
+                    HashMap::new(),
+                    HashSet::new(),
+                    Some(capture_directory_authorization(&target).unwrap()),
+                    authorizations,
+                    Some(capture_directory_authorization(&source).unwrap()),
+                    MoveVerification::Standard,
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                )
+            };
+            if copy_fallback {
+                with_unsupported_rename_noreplace(run);
+            } else {
+                run();
+            }
+            let messages: Vec<_> = rx.try_iter().collect();
+            assert_eq!(completed_message(&messages), Some((2, 0)), "{messages:?}");
+            for name in ["first", "second"] {
+                assert!(!source.join(name).exists());
+                assert_eq!(fs::read(target.join(name)).unwrap(), b"shared data");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_refresh_does_not_authorize_a_content_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::write(&first, b"confirmed").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        let removed = capture_path_authorization(&first).unwrap();
+        let mut pending = capture_path_authorization(&second).unwrap();
+        delete_file_detailed_authorized(&first, &removed).unwrap();
+        fs::write(&second, b"externally modified").unwrap();
+        assert!(!refresh_path_authorization_after_alias_deletion(
+            &mut pending,
+            &removed,
+            &second
+        ));
+        assert!(delete_file_detailed_authorized(&second, &pending).is_err());
+        assert_eq!(fs::read(second).unwrap(), b"externally modified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_over_multiple_hardlink_destinations_completes() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("first"), b"first new data").unwrap();
+        fs::write(source.path().join("second"), b"second new data").unwrap();
+        fs::write(target.path().join("first"), b"old shared data").unwrap();
+        fs::hard_link(target.path().join("first"), target.path().join("second")).unwrap();
+        let overwrites = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                (
+                    source.path().join(name),
+                    capture_path_authorization(&target.path().join(name)).unwrap(),
+                )
+            })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec!["first".into(), "second".into()],
+            source.path(),
+            target.path(),
+            overwrites,
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((2, 0)), "{messages:?}");
+        for name in ["first", "second"] {
+            assert_eq!(
+                fs::read(target.path().join(name)).unwrap(),
+                fs::read(source.path().join(name)).unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moving_a_non_utf8_path_preserves_its_original_filename() {
+        use std::os::unix::ffi::OsStringExt;
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"\xff.txt".to_vec()));
+        fs::write(source.path().join(&raw), b"raw name").unwrap();
+        fs::write(target.path().join("\u{fffd}.txt"), b"must survive").unwrap();
+        let (tx, rx) = mpsc::channel();
+        move_files_with_progress(
+            vec![raw.clone()],
+            source.path(),
+            target.path(),
+            HashMap::new(),
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            MoveVerification::Standard,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert_eq!(fs::read(target.path().join(raw)).unwrap(), b"raw name");
+        assert_eq!(
+            fs::read(target.path().join("\u{fffd}.txt")).unwrap(),
+            b"must survive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_filter_requires_links_to_resolve_inside_the_selected_archive() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("items")).unwrap();
+        fs::write(temp.path().join("items/target"), b"payload").unwrap();
+        fs::write(temp.path().join("unselected"), b"not in archive").unwrap();
+        symlink("target", temp.path().join("items/safe")).unwrap();
+        symlink(
+            temp.path().join("items/target"),
+            temp.path().join("items/absolute"),
+        )
+        .unwrap();
+        symlink("../unselected", temp.path().join("items/missing")).unwrap();
+        symlink("absolute", temp.path().join("items/chain")).unwrap();
+        symlink("loop", temp.path().join("items/loop")).unwrap();
+        let (_, excluded) = filter_symlinks_for_tar(temp.path(), &["items".into()]);
+        assert_eq!(
+            excluded,
+            vec![
+                "items/absolute",
+                "items/chain",
+                "items/loop",
+                "items/missing"
+            ]
+        );
+        let (_, excluded) =
+            filter_symlinks_for_tar(temp.path(), &["items".into(), "unselected".into()]);
+        assert!(!excluded.iter().any(|name| name == "items/missing"));
+        assert!(!excluded.iter().any(|name| name == "items/safe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_filter_rejects_lexical_escapes_and_invalid_trailing_components() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("items/dir/sub")).unwrap();
+        fs::write(temp.path().join("target"), b"selected").unwrap();
+        symlink("dir/sub", temp.path().join("items/deep")).unwrap();
+        symlink("deep/../../../target", temp.path().join("items/escape")).unwrap();
+        symlink("target/.", temp.path().join("invalid")).unwrap();
+        assert_eq!(
+            temp.path().join("items/escape").canonicalize().unwrap(),
+            temp.path().join("target").canonicalize().unwrap()
+        );
+        let (_, excluded) = filter_symlinks_for_tar(
+            temp.path(),
+            &["items".into(), "target".into(), "invalid".into()],
+        );
+        assert_eq!(excluded, vec!["invalid", "items/escape"]);
     }
 
     #[test]
@@ -10880,6 +11342,128 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(fs::symlink_metadata(&physical_destination).is_err());
         cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_link_resolves_parent_components_after_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        fs::create_dir(target_dir.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/etc", target_dir.join("alias")).unwrap();
+        let source = source_dir.join("link");
+        std::os::unix::fs::symlink("alias/../etc", &source).unwrap();
+        let destination = target_dir.join("copied");
+        let error = copy_symlink_to_new(&source, &destination, &destination, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path_exists_no_follow(&destination));
+
+        let (_, access, _) = open_directory_for_read(&source_dir).unwrap();
+        let error = copy_open_symlink_to_new(
+            &access,
+            OsStr::new("link"),
+            &source,
+            &destination,
+            &destination,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path_exists_no_follow(&destination));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_link_preserves_a_safe_dangling_chain() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing-directory", temp.path().join("alias")).unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("copied");
+        std::os::unix::fs::symlink("alias/missing-file", &source).unwrap();
+        copy_file(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read_link(&destination).unwrap(),
+            PathBuf::from("alias/missing-file")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_distinct_link_to_the_same_target_preserves_the_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let referent = temp.path().join("referent");
+        fs::write(&referent, b"must remain").unwrap();
+        let source = source_dir.join("link");
+        let destination = target_dir.join("link");
+        std::os::unix::fs::symlink(&referent, &source).unwrap();
+        std::os::unix::fs::symlink(&referent, &destination).unwrap();
+        let overwrite = HashMap::from([(
+            source.clone(),
+            capture_path_authorization(&destination).unwrap(),
+        )]);
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("link")],
+            &source_dir,
+            &target_dir,
+            overwrite,
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert_eq!(fs::read_link(&destination).unwrap(), referent);
+        assert_eq!(fs::read(&referent).unwrap(), b"must remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_copy_replaces_destination_link_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        let target_dir = temp.path().join("target");
+        let source = source_dir.join("item");
+        fs::create_dir_all(source.join("child")).unwrap();
+        fs::write(source.join("child/keep"), b"original").unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let destination = target_dir.join("item");
+        std::os::unix::fs::symlink(source.join("child"), &destination).unwrap();
+        let overwrite = HashMap::from([(
+            source.clone(),
+            capture_path_authorization(&destination).unwrap(),
+        )]);
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("item")],
+            &source_dir,
+            &target_dir,
+            overwrite,
+            HashSet::new(),
+            None,
+            HashMap::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((1, 0)), "{messages:?}");
+        assert!(!fs::symlink_metadata(&destination).unwrap().is_symlink());
+        assert_eq!(
+            fs::read(destination.join("child/keep")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read(source.join("child/keep")).unwrap(), b"original");
     }
 
     // ========== move_file tests ==========

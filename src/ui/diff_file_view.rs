@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 
@@ -640,11 +640,10 @@ pub fn draw(
     frame.render_widget(right_paragraph, right_area);
 
     // Scrollbar
-    if total_visual_rows > visible_lines {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_visual_rows, visible_lines, state.scroll)
+    {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let mut scrollbar_state =
-            ScrollbarState::new(total_visual_rows.saturating_sub(visible_lines))
-                .position(state.scroll);
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }
 
@@ -1235,6 +1234,58 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrollbar_moves_when_the_diff_overflows_by_one_row() {
+        use crate::keybindings::{Keybindings, KeybindingsConfig};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = DiffFileViewState {
+            left_path: PathBuf::from("left"),
+            right_path: PathBuf::from("right"),
+            diff_lines: (1..=21)
+                .map(|line| DiffLine {
+                    left_line_no: Some(line),
+                    left_content: Some(format!("row {line}")),
+                    right_line_no: Some(line),
+                    right_content: Some(format!("row {line}")),
+                    line_status: DiffLineStatus::Same,
+                })
+                .collect(),
+            scroll: 0,
+            visible_height: 0,
+            left_total_lines: 21,
+            right_total_lines: 21,
+            change_positions: Vec::new(),
+            current_change: 0,
+            file_name: String::from("rows.txt"),
+            max_scroll: 0,
+            change_visual_offsets: Vec::new(),
+        };
+        let theme = Theme::default();
+        let kb = Keybindings::from_config(&KeybindingsConfig::default());
+        let render = |state: &mut DiffFileViewState| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 23)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, state, Rect::new(0, 0, 80, 23), &theme, &kb);
+                })
+                .unwrap();
+            (1..21)
+                .map(|y| terminal.backend().buffer()[(79, y)].symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+        let top = render(&mut state);
+        assert_eq!(state.visible_height, 20);
+        assert_eq!(state.max_scroll, 1);
+        state.scroll = 1;
+        let bottom = render(&mut state);
+        assert_ne!(bottom, top);
+        assert_ne!(bottom[1], top[1]);
+        assert_eq!(bottom[bottom.len() - 2], top[1]);
+        state.scroll = usize::MAX;
+        assert_eq!(render(&mut state), bottom);
+    }
 
     #[test]
     fn test_compute_lcs_identical() {

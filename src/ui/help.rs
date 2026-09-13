@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 
@@ -81,7 +81,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     frame.render_widget(paragraph, dialog_area);
 
     // Render scrollbar if content exceeds visible height
-    if total_lines > visible_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_lines, visible_height, app.help_state.scroll_offset)
+    {
         let scrollbar_area = Rect::new(
             dialog_area.x + dialog_area.width - 1,
             dialog_area.y + 1,
@@ -93,9 +95,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("^"))
             .end_symbol(Some("v"));
-
-        let mut scrollbar_state =
-            ScrollbarState::new(max_scroll + 1).position(app.help_state.scroll_offset);
 
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
@@ -191,6 +190,33 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
             Span::styled(desc.to_string(), desc_style),
         ])
     };
+
+    lines.push(section("Mouse Controls"));
+    lines.push(key_line(
+        "Wheel over list/text",
+        "Scroll without moving the keyboard cursor",
+    ));
+    lines.push(key_line(
+        "Click / double click",
+        "Focus file / open file or directory",
+    ));
+    lines.push(key_line(
+        "Ctrl / Shift + click",
+        "Toggle file mark / select file range",
+    ));
+    lines.push(key_line(
+        "Drag to another panel",
+        "Copy to its current directory; Shift on release moves",
+    ));
+    lines.push(key_line(
+        "Click / drag in editor",
+        "Place caret / select text",
+    ));
+    lines.push(key_line(
+        "Drag beyond editor edge",
+        "Select with automatic scrolling",
+    ));
+    lines.push(Line::from(""));
 
     // ═══════════════════════════════════════════════════════════════════════
     // Section 1: Navigation

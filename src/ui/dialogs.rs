@@ -2978,6 +2978,14 @@ pub fn handle_paste(app: &mut App, text: &str) {
 }
 
 pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    let quit = handle_dialog_input_inner(app, code, modifiers);
+    if app.dialog.is_none() {
+        app.cancel_pending_panel_operation();
+    }
+    quit
+}
+
+fn handle_dialog_input_inner(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
     if app
         .dialog
         .as_ref()

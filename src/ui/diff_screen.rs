@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -838,11 +838,7 @@ impl DiffState {
 
         // Load one level of children
         let dir_path = root.join(&relative_path);
-        let names = if strict_reads {
-            read_dir_names_checked(&dir_path)?
-        } else {
-            read_dir_names(&dir_path)
-        };
+        let names = read_dir_names_checked(&dir_path)?;
 
         let mut sorted_names = names;
         sort_names_one_side(&mut sorted_names, &dir_path);
@@ -1004,6 +1000,9 @@ impl DiffState {
         } else if self.selected_index >= self.scroll_offset + visible_height {
             self.scroll_offset = self.selected_index - visible_height + 1;
         }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.filtered_indices.len().saturating_sub(visible_height));
     }
 
     /// Toggle selection of the current item
@@ -1749,7 +1748,10 @@ fn make_build_frame(
                 )
             })
         } else {
-            Ok(read_dir_names(dir))
+            match read_dir_names_checked(dir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+                result => result,
+            }
         }
     };
     let left_names_vec = read_names(&left_dir)?;
@@ -2214,19 +2216,19 @@ fn sort_names_one_side(names: &mut Vec<String>, dir: &Path) {
 
 /// Read directory entry names, returning an empty vec on failure
 fn read_dir_names(dir: &Path) -> Vec<String> {
-    match fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    read_dir_names_checked(dir).unwrap_or_default()
 }
 
 fn read_dir_names_checked(dir: &Path) -> io::Result<Vec<String>> {
-    fs::read_dir(dir)?
-        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().to_string()))
-        .collect()
+    Ok(file_ops::read_dir_utf8(dir)?
+        .into_iter()
+        .map(|entry| {
+            entry
+                .file_name()
+                .into_string()
+                .expect("validated UTF-8 name")
+        })
+        .collect())
 }
 
 /// Build DiffFileInfo from a path, returning None if the path doesn't exist
@@ -2694,14 +2696,15 @@ pub fn draw(
     draw_content_side(frame, state, right_area, theme, false);
 
     // ── Scrollbar ───────────────────────────────────────────────────────────
-    if state.filtered_indices.len() > visible_height {
+    if let Some(mut scrollbar_state) = super::scrollbar::viewport_state(
+        state.filtered_indices.len(),
+        visible_height,
+        state.scroll_offset,
+    ) {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let mut scrollbar_state =
-            ScrollbarState::new(state.filtered_indices.len()).position(state.selected_index);
 
         frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
     }

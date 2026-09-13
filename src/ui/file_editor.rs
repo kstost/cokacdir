@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use regex::Regex;
@@ -21,6 +21,12 @@ use super::{
     theme::Theme,
 };
 use crate::keybindings::EditorAction;
+
+#[path = "file_editor_mouse.rs"]
+mod mouse;
+
+#[path = "file_editor_scroll.rs"]
+mod scroll;
 
 /// Undo/Redo 액션 유형
 #[derive(Debug, Clone)]
@@ -250,6 +256,7 @@ thread_local! {
 /// 편집기 상태
 #[derive(Debug)]
 pub struct EditorState {
+    pub(crate) mouse: mouse::EditorMouseState,
     pub file_path: PathBuf,
     pub lines: Vec<String>,
     pub cursor_line: usize,
@@ -324,6 +331,7 @@ pub struct EditorState {
     // Word wrap 모드
     pub word_wrap: bool,
     wrap_scroll_offset: usize,
+    wrap_layout: scroll::WrapLayout,
 
     // 화면 크기 (렌더링 시 업데이트)
     pub visible_height: usize,
@@ -378,6 +386,7 @@ impl EditorState {
 
     pub fn new() -> Self {
         Self {
+            mouse: mouse::EditorMouseState::default(),
             file_path: PathBuf::new(),
             lines: vec![String::new()],
             cursor_line: 0,
@@ -429,6 +438,7 @@ impl EditorState {
             exit_confirm_selected: 2,
             word_wrap: false,
             wrap_scroll_offset: 0,
+            wrap_layout: scroll::WrapLayout::default(),
             visible_height: 20, // 기본값, 렌더링 시 업데이트됨
             visible_width: 80,  // 기본값, 렌더링 시 업데이트됨
             message: None,
@@ -1782,6 +1792,7 @@ impl EditorState {
 
     /// 파일 로드
     pub fn load_file(&mut self, path: &PathBuf) -> Result<(), String> {
+        self.mouse = mouse::EditorMouseState::default();
         let (actual_path, exists) = Self::resolve_load_target(path)?;
         let (content, loaded_save_state) = if exists {
             let mut file = Self::open_regular_nofollow(&actual_path)?;
@@ -1824,6 +1835,7 @@ impl EditorState {
         self.scroll = 0;
         self.horizontal_scroll = 0;
         self.wrap_scroll_offset = 0;
+        self.wrap_layout = scroll::WrapLayout::default();
         self.modified = false;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -2101,6 +2113,7 @@ impl EditorState {
 
     /// Undo 액션 추가 (with memory limit enforcement)
     pub fn push_undo(&mut self, action: EditAction) {
+        self.wrap_layout.invalidate(&action);
         // Clear redo stack and its memory tracking
         self.redo_stack.clear();
         self.redo_memory_usage = 0;
@@ -2254,6 +2267,7 @@ impl EditorState {
 
     /// 액션 적용
     fn apply_action(&mut self, action: &EditAction, _record: bool) {
+        self.wrap_layout.invalidate(action);
         match action {
             EditAction::Insert { line, col, text } => {
                 if *line < self.lines.len() {
@@ -3541,14 +3555,9 @@ impl EditorState {
 
     /// Word wrap 모드에서 논리적 줄이 차지하는 시각적 행 수 계산
     fn count_wrapped_rows(&self, line_idx: usize) -> usize {
-        if line_idx >= self.lines.len() || self.visible_width == 0 {
-            return 1;
-        }
-        let (expanded, _) = self.expand_tabs_with_mapping(&self.lines[line_idx]);
-        if expanded.is_empty() {
-            return 1;
-        }
-        Self::compute_wrap_segments(&expanded, self.visible_width).len()
+        self.lines.get(line_idx).map_or(1, |line| {
+            scroll::wrapped_row_count(line, self.visible_width, self.tab_size)
+        })
     }
 
     /// 확장된 줄을 visual column 기준으로 세그먼트로 분할
@@ -4943,6 +4952,8 @@ pub fn draw(
     theme: &Theme,
     kb: &crate::keybindings::Keybindings,
 ) {
+    state.mouse.area = None;
+    state.mouse.rows.clear();
     let border_color = if state.modified {
         theme.editor.modified_mark
     } else {
@@ -4956,7 +4967,7 @@ pub fn draw(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 3 {
+    if inner.height < 3 || inner.width == 0 {
         return;
     }
 
@@ -5027,10 +5038,15 @@ pub fn draw(
 
     // visible_width 업데이트
     state.visible_width = inner.width.saturating_sub(line_num_col_width as u16 + 1) as usize;
-    if state.word_wrap && state.scroll < state.lines.len() {
-        let max_offset = state.count_wrapped_rows(state.scroll).saturating_sub(1);
-        state.wrap_scroll_offset = state.wrap_scroll_offset.min(max_offset);
+    if state.visible_width > 0 {
+        state.mouse.area = Some(Rect::new(
+            inner.x + line_num_col_width as u16,
+            inner.y + 1,
+            state.visible_width as u16,
+            content_height as u16,
+        ));
     }
+    let (total_visual_rows, visual_scroll) = state.scrollbar_viewport();
 
     // 선택 영역 정규화
     let selection = state
@@ -5133,6 +5149,7 @@ pub fn draw(
                     content_width,
                     Some(&orig_styles),
                 );
+                state.mouse.rows.push((line_idx, seg_start_visual));
 
                 let mut spans = vec![line_num_span];
                 spans.extend(content_spans);
@@ -5192,6 +5209,8 @@ pub fn draw(
                 None,
             );
 
+            state.mouse.rows.push((line_num, state.horizontal_scroll));
+
             let mut spans = vec![line_num_span];
             spans.extend(content_spans);
 
@@ -5203,15 +5222,13 @@ pub fn draw(
     }
 
     // 스크롤바
-    let total_lines = state.lines.len();
-    if total_lines > content_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_visual_rows, content_height, visual_scroll)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let max_scroll = total_lines.saturating_sub(content_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(state.scroll);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,

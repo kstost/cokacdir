@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 
@@ -21,7 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 5 {
+    if inner.height < 5 || inner.width == 0 {
         return;
     }
 
@@ -154,14 +154,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     // 스크롤바
     let total_processes = app.processes.len();
-    if total_processes > list_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_processes, list_height, start_index)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let mut scrollbar_state =
-            ScrollbarState::new(total_processes).position(app.process_selected_index);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,
@@ -464,6 +463,35 @@ mod tests {
             command: "test".to_string(),
             start_time_ticks,
         }
+    }
+
+    #[test]
+    fn scrollbar_tracks_the_centered_viewport_instead_of_the_selected_process() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+
+        let dir = tempdir().unwrap();
+        let mut app = App::new(dir.path().into(), dir.path().into());
+        app.processes = (0..30).map(|pid| process_info(pid, None)).collect();
+        let theme = crate::ui::theme::Theme::default();
+        let render = |app: &App| {
+            let mut terminal = Terminal::new(TestBackend::new(80, 17)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::draw(frame, app, Rect::new(0, 0, 80, 17), &theme);
+                })
+                .unwrap();
+            (3..13)
+                .map(|y| terminal.backend().buffer()[(78, y)].symbol().to_string())
+                .collect::<Vec<_>>()
+        };
+        let top = render(&app);
+        app.process_selected_index = 4;
+        assert_eq!(render(&app), top);
+        app.process_selected_index = 29;
+        let bottom = render(&app);
+        assert_ne!(bottom[1], top[1]);
+        assert_eq!(bottom[bottom.len() - 2], top[1]);
+        assert_eq!(app.process_selected_index, 29);
     }
 
     #[test]

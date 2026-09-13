@@ -34,13 +34,14 @@ That’s it — open your chat app and start chatting with your bot.
 * **AI-powered commands**: Natural-language coding and file management powered by Claude, Codex, Agy, and OpenCode. Press `.` and describe what you want done.
 * **Multi-panel navigation**: A dynamic multi-panel interface for efficient file management
 * **Keyboard-first**: Full keyboard navigation for power users
+* **Mouse controls**: Scroll, click files, drag files between panels, and select editor text by dragging
 * **Built-in editor**: File editing with syntax highlighting for more than 20 languages
 * **Image viewer**: View images directly in the terminal (Kitty, iTerm2, Sixel protocols), with zoom and pan support
 * **Process manager**: Monitor and manage system processes with sortable columns
 * **File search**: Recursive file search by name pattern
 * **Diff**: Side-by-side comparison of folders and files
 * **Git integration**: Built-in git status, commit, log, branch management, and diff between commits
-* **Remote SSH/SFTP**: Explore remote servers over SSH/SFTP with saved profiles. Ed25519 and ECDSA private authentication keys are supported. RSA private authentication keys are rejected because the Rust RSA timing issue affects secret-key operations; RSA host-key verification may still be accepted by the SSH backend.
+* **Remote SSH/SFTP**: Explore remote servers over SSH/SFTP with saved profiles. Safe remote deletion requires SSH command access and POSIX Python 3 on the server; directory traversal uses open handles so a replaced symlink cannot redirect deletion. Ed25519 and ECDSA private authentication keys are supported. RSA private authentication keys are rejected because the Rust RSA timing issue affects secret-key operations; RSA host-key verification may still be accepted by the SSH backend.
 * **File encryption**: AES-256 encryption with configurable chunk splitting
 * **Duplicate file detection**: Detect and manage duplicate files using hash-based comparison
 * **Chat bots**: Remotely control AI coding sessions through Telegram, Discord, or Slack with streaming output, queued requests, scheduled tasks, rich Telegram responses, and companion mode
@@ -55,6 +56,8 @@ Telegram group for tips, updates, and support:
 
 For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 **[https://cokacdir.cokac.com](https://cokacdir.cokac.com)**
+
+For file-panel, editor, and viewer mouse gestures, see [Mouse Controls](docs/mouse-controls.md).
 
 For the measured Antigravity CLI integration contract, see [How cokacdir Uses Antigravity CLI (`agy`)](docs/how-to-use-agy-antigravity.md).
 

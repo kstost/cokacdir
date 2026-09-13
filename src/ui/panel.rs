@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -22,6 +22,7 @@ pub fn draw(
     diff_selected: bool,
     theme: &Theme,
 ) {
+    panel.mouse_area = None;
     let inner_width = area.width.saturating_sub(2) as usize;
 
     // Build path display (truncate if too long, using display width)
@@ -139,6 +140,8 @@ pub fn draw(
     let start_index = if total_files <= visible_height {
         // 파일 개수가 화면보다 적으면 스크롤 없음
         0
+    } else if panel.mouse_scroll {
+        current_scroll.min(total_files.saturating_sub(visible_height))
     } else if panel.selected_index >= current_scroll
         && panel.selected_index < current_scroll + visible_height
     {
@@ -161,6 +164,12 @@ pub fn draw(
 
     // scroll_offset 업데이트 (패널 전환 시 사용)
     panel.scroll_offset = start_index;
+    panel.mouse_area = Some(Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width.saturating_sub(1),
+        visible_height as u16,
+    ));
 
     let visible_files = panel.files.iter().skip(start_index).take(visible_height);
     let directory_size_spinner = directory_size_spinner_frame();
@@ -204,14 +213,28 @@ pub fn draw(
         );
     }
 
+    if let Some(error) = &panel.listing_error {
+        // Keep the parent entry usable, and never present a failed listing as
+        // an empty directory that is safe to operate on.
+        frame.render_widget(
+            Paragraph::new(error.as_str()).wrap(ratatui::widgets::Wrap { trim: false }),
+            Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(3),
+            ),
+        );
+    }
+
     // 스크롤바 (파일이 화면보다 많을 때)
-    if total_files > visible_height {
+    if let Some(mut scrollbar_state) =
+        super::scrollbar::viewport_state(total_files, visible_height, start_index)
+    {
         let scrollbar = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"));
-
-        let mut scrollbar_state = ScrollbarState::new(total_files).position(panel.selected_index);
 
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,

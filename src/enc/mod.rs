@@ -28,6 +28,49 @@ use error::CokacencError;
 const READ_BUF_SIZE: usize = 64 * 1024; // 64KB
 const MAX_METADATA_LEN: usize = 1024 * 1024; // metadata is normally well below 1KB
 
+fn check_cancelled(cancel_flag: &AtomicBool) -> Result<(), CokacencError> {
+    if cancel_flag.load(Ordering::Relaxed) {
+        Err(CokacencError::Other("Cancelled".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+struct CancellableReader<'a, R> {
+    inner: R,
+    cancel_flag: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            // read_exact retries Interrupted errors, so cancellation must be
+            // a terminal read error rather than an endlessly retried signal.
+            return Err(std::io::Error::other("Cancelled"));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+fn complete_directory_operation(
+    tx: &Sender<ProgressMessage>,
+    cancel_flag: &AtomicBool,
+    successes: usize,
+    failures: usize,
+) {
+    let cancelled = cancel_flag.load(Ordering::Relaxed);
+    if cancelled {
+        let _ = tx.send(ProgressMessage::Error(
+            String::new(),
+            "Cancelled".to_string(),
+        ));
+    }
+    let _ = tx.send(ProgressMessage::Completed(
+        successes,
+        failures + usize::from(cancelled),
+    ));
+}
+
 // ─── Chunk metadata (embedded inside each encrypted chunk) ─────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,7 +173,12 @@ impl<W: Write> Write for Sha256Writer<W> {
     }
 }
 
-fn gather_file_info(file: &mut File, use_md5: bool) -> Result<FileInfo, CokacencError> {
+fn gather_file_info(
+    file: &mut File,
+    use_md5: bool,
+    cancel_flag: &AtomicBool,
+) -> Result<FileInfo, CokacencError> {
+    check_cancelled(cancel_flag)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(CokacencError::Other(
@@ -160,6 +208,7 @@ fn gather_file_info(file: &mut File, use_md5: bool) -> Result<FileInfo, Cokacenc
         let mut hasher = Md5::new();
         let mut buf = [0u8; READ_BUF_SIZE];
         loop {
+            check_cancelled(cancel_flag)?;
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -408,15 +457,19 @@ pub fn pack_directory_with_progress(
     split_size_mb: u64,
     use_md5: bool,
 ) {
+    if cancel_flag.load(Ordering::Relaxed) {
+        complete_directory_operation(&tx, &cancel_flag, 0, 0);
+        return;
+    }
     let split_size = if split_size_mb == 0 {
         u64::MAX
     } else {
         split_size_mb.checked_mul(1024 * 1024).unwrap_or(u64::MAX)
     };
 
-    let mut entries: Vec<_> = match fs::read_dir(dir) {
+    let mut entries: Vec<_> = match crate::services::file_ops::read_dir_utf8(dir) {
         Ok(rd) => rd
-            .filter_map(|e| e.ok())
+            .into_iter()
             .filter(|e| {
                 let path = e.path();
                 if !fs::symlink_metadata(&path)
@@ -425,7 +478,7 @@ pub fn pack_directory_with_progress(
                 {
                     return false;
                 }
-                let name = e.file_name().to_string_lossy().to_string();
+                let name = e.file_name().into_string().expect("validated UTF-8 name");
                 !name.ends_with(naming::EXT) && !name.starts_with('.')
             })
             .collect(),
@@ -442,7 +495,7 @@ pub fn pack_directory_with_progress(
     entries.sort_by_key(|e| e.file_name());
 
     if entries.is_empty() {
-        let _ = tx.send(ProgressMessage::Completed(0, 0));
+        complete_directory_operation(&tx, &cancel_flag, 0, 0);
         return;
     }
 
@@ -458,18 +511,29 @@ pub fn pack_directory_with_progress(
         }
 
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("validated UTF-8 name");
 
         let _ = tx.send(ProgressMessage::FileStarted(name.clone()));
 
-        match pack_file(&path, &name, dir, password, split_size, use_md5) {
-            Ok(packed_source) => match remove_packed_source(&path, packed_source) {
+        match pack_file(
+            &path,
+            &name,
+            dir,
+            password,
+            split_size,
+            use_md5,
+            &cancel_flag,
+        ) {
+            Ok(packed_source) => match remove_packed_source(&path, packed_source, &cancel_flag) {
                 Ok(PackedSourceRemoval::Removed) => {
                     success_count += 1;
                     let _ = tx.send(ProgressMessage::FileCompleted(name));
                 }
                 Ok(PackedSourceRemoval::RemovedButDirectorySyncFailed(error)) => {
-                    failure_count += 1;
+                    failure_count += usize::from(!cancel_flag.load(Ordering::Relaxed));
                     let _ = tx.send(ProgressMessage::Error(
                         name,
                         format!(
@@ -479,7 +543,7 @@ pub fn pack_directory_with_progress(
                     ));
                 }
                 Err(e) => {
-                    failure_count += 1;
+                    failure_count += usize::from(!cancel_flag.load(Ordering::Relaxed));
                     let _ = tx.send(ProgressMessage::Error(
                         name,
                         format!("Encrypted but retained source: {}", e),
@@ -487,7 +551,9 @@ pub fn pack_directory_with_progress(
                 }
             },
             Err(e) => {
-                failure_count += 1;
+                // Completion accounts for cancellation once, including when
+                // it was first observed while reading or verifying this file.
+                failure_count += usize::from(!cancel_flag.load(Ordering::Relaxed));
                 let _ = tx.send(ProgressMessage::Error(name, e.to_string()));
             }
         }
@@ -495,7 +561,7 @@ pub fn pack_directory_with_progress(
         let _ = tx.send(ProgressMessage::TotalProgress(i + 1, total_files, 0, 0));
     }
 
-    let _ = tx.send(ProgressMessage::Completed(success_count, failure_count));
+    complete_directory_operation(&tx, &cancel_flag, success_count, failure_count);
 }
 
 /// Pack a single file using 2-pass approach.
@@ -528,6 +594,7 @@ fn pack_file(
     password: &[u8],
     split_size: u64,
     use_md5: bool,
+    cancel_flag: &AtomicBool,
 ) -> Result<PackedSource, CokacencError> {
     // Shift+E must emit the original cokacdir v2 archive format. The visible
     // behavior is bigger than "can this process decrypt its own output": old
@@ -536,7 +603,7 @@ fn pack_file(
     // contract. Do not silently switch this writer to a new format.
     // ── Pass 1: gather info ──
     let mut file = open_source_file(file_path)?;
-    let info = gather_file_info(&mut file, use_md5)?;
+    let info = gather_file_info(&mut file, use_md5, cancel_flag)?;
 
     let group_id = loop {
         let id = naming::generate_group_id();
@@ -563,6 +630,7 @@ fn pack_file(
 
     let result = (|| -> Result<(), CokacencError> {
         for chunk_idx in 0..total_chunks {
+            check_cancelled(cancel_flag)?;
             let chunk_offset = chunk_idx as u64 * split_size;
             let chunk_data_size = if info.size == 0 {
                 0
@@ -632,6 +700,7 @@ fn pack_file(
             // Write file data portion
             let mut remaining = chunk_data_size;
             while remaining > 0 {
+                check_cancelled(cancel_flag)?;
                 let to_read = (READ_BUF_SIZE as u64).min(remaining) as usize;
                 let n = reader.read(&mut read_buf[..to_read])?;
                 if n == 0 {
@@ -661,11 +730,11 @@ fn pack_file(
 
             let created = created_chunks.last_mut().expect("chunk was just recorded");
             created.expected_sha256 = Some(intended_sha256);
-            verify_packed_chunk(created)?;
+            verify_packed_chunk(created, cancel_flag)?;
         }
 
         sync_directory(out_dir)?;
-        verify_packed_chunks(&mut created_chunks)?;
+        verify_packed_chunks(&mut created_chunks, cancel_flag)?;
 
         let mut extra = [0u8; 1];
         if reader.read(&mut extra)? != 0 {
@@ -802,11 +871,12 @@ fn content_metadata_unchanged(before: &fs::Metadata, after: &fs::Metadata) -> bo
     }
 }
 
-fn sha256_file(file: &mut File) -> Result<[u8; 32], CokacencError> {
+fn sha256_file(file: &mut File, cancel_flag: &AtomicBool) -> Result<[u8; 32], CokacencError> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; READ_BUF_SIZE];
     loop {
+        check_cancelled(cancel_flag)?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -816,7 +886,10 @@ fn sha256_file(file: &mut File) -> Result<[u8; 32], CokacencError> {
     Ok(hasher.finalize().into())
 }
 
-fn verify_packed_chunk(chunk: &mut PackedChunk) -> Result<(), CokacencError> {
+fn verify_packed_chunk(
+    chunk: &mut PackedChunk,
+    cancel_flag: &AtomicBool,
+) -> Result<(), CokacencError> {
     let expected_sha256 = chunk.expected_sha256.ok_or_else(|| {
         CokacencError::Other(format!(
             "Encrypted output chunk was not completely sealed: '{}'",
@@ -835,7 +908,7 @@ fn verify_packed_chunk(chunk: &mut PackedChunk) -> Result<(), CokacencError> {
     }
 
     let before = chunk.handle.metadata()?;
-    let actual_sha256 = sha256_file(&mut chunk.handle)?;
+    let actual_sha256 = sha256_file(&mut chunk.handle, cancel_flag)?;
     let after = chunk.handle.metadata()?;
     if !content_metadata_unchanged(&before, &after)
         || !after.file_type().is_file()
@@ -851,9 +924,12 @@ fn verify_packed_chunk(chunk: &mut PackedChunk) -> Result<(), CokacencError> {
     Ok(())
 }
 
-fn verify_packed_chunks(chunks: &mut [PackedChunk]) -> Result<(), CokacencError> {
+fn verify_packed_chunks(
+    chunks: &mut [PackedChunk],
+    cancel_flag: &AtomicBool,
+) -> Result<(), CokacencError> {
     for chunk in chunks {
-        verify_packed_chunk(chunk)?;
+        verify_packed_chunk(chunk, cancel_flag)?;
     }
     Ok(())
 }
@@ -909,6 +985,7 @@ fn verify_quarantined_packed_source(
     handle: &mut File,
     info: &FileInfo,
     encrypted_sha256: &[u8; 32],
+    cancel_flag: &AtomicBool,
 ) -> Result<(), CokacencError> {
     let path_metadata = fs::symlink_metadata(path)?;
     if !metadata_matches_packed_source(path, &path_metadata, info)
@@ -920,7 +997,7 @@ fn verify_quarantined_packed_source(
     }
 
     let before = handle.metadata()?;
-    let actual_sha256 = sha256_file(handle)?;
+    let actual_sha256 = sha256_file(handle, cancel_flag)?;
     let after = handle.metadata()?;
     if !content_metadata_unchanged(&before, &after)
         || after.len() != info.size
@@ -981,18 +1058,21 @@ fn restore_quarantined_source_after_failure(
 fn remove_packed_source(
     path: &Path,
     packed: PackedSource,
+    cancel_flag: &AtomicBool,
 ) -> Result<PackedSourceRemoval, CokacencError> {
-    remove_packed_source_impl(path, packed, |_| {})
+    remove_packed_source_impl(path, packed, cancel_flag, |_| {})
 }
 
 fn remove_packed_source_impl<F>(
     path: &Path,
     packed: PackedSource,
+    cancel_flag: &AtomicBool,
     after_initial_verification: F,
 ) -> Result<PackedSourceRemoval, CokacencError>
 where
     F: FnOnce(&Path),
 {
+    check_cancelled(cancel_flag)?;
     let parent = path.parent().ok_or_else(|| {
         CokacencError::Other(format!("Source path has no parent: {}", path.display()))
     })?;
@@ -1025,9 +1105,13 @@ where
         mut chunks,
         mut handle,
     } = packed;
-    if let Err(error) =
-        verify_quarantined_packed_source(&quarantine_path, &mut handle, &info, &encrypted_sha256)
-    {
+    if let Err(error) = verify_quarantined_packed_source(
+        &quarantine_path,
+        &mut handle,
+        &info,
+        &encrypted_sha256,
+        cancel_flag,
+    ) {
         return Err(restore_quarantined_source_after_failure(
             path,
             &quarantine_path,
@@ -1035,7 +1119,7 @@ where
             error,
         ));
     }
-    if let Err(error) = verify_packed_chunks(&mut chunks) {
+    if let Err(error) = verify_packed_chunks(&mut chunks, cancel_flag) {
         return Err(restore_quarantined_source_after_failure(
             path,
             &quarantine_path,
@@ -1064,9 +1148,13 @@ where
     // closes the former final-check -> quarantine window and also catches a
     // writer that raced the first quarantined verification.
     after_initial_verification(&quarantine_path);
-    if let Err(error) =
-        verify_quarantined_packed_source(&quarantine_path, &mut handle, &info, &encrypted_sha256)
-    {
+    if let Err(error) = verify_quarantined_packed_source(
+        &quarantine_path,
+        &mut handle,
+        &info,
+        &encrypted_sha256,
+        cancel_flag,
+    ) {
         drop(deletion);
         return Err(restore_quarantined_source_after_failure(
             path,
@@ -1075,7 +1163,7 @@ where
             error,
         ));
     }
-    if let Err(error) = verify_packed_chunks(&mut chunks) {
+    if let Err(error) = verify_packed_chunks(&mut chunks, cancel_flag) {
         drop(deletion);
         return Err(restore_quarantined_source_after_failure(
             path,
@@ -1085,6 +1173,15 @@ where
         ));
     }
 
+    if let Err(error) = check_cancelled(cancel_flag) {
+        drop(deletion);
+        return Err(restore_quarantined_source_after_failure(
+            path,
+            &quarantine_path,
+            &quarantine_dir,
+            error,
+        ));
+    }
     drop(handle);
     if let Err(error) = deletion.delete() {
         return Err(restore_quarantined_source_after_failure(
@@ -1120,7 +1217,10 @@ struct QuarantinedChunk {
     read_sha256: [u8; 32],
 }
 
-fn verify_quarantined_chunk(chunk: &QuarantinedChunk) -> Result<(), CokacencError> {
+fn verify_quarantined_chunk(
+    chunk: &QuarantinedChunk,
+    cancel_flag: &AtomicBool,
+) -> Result<(), CokacencError> {
     let (mut file, _) = open_regular_file_no_follow(&chunk.quarantined)?;
     if stable_file_identity(&file)? != chunk.identity {
         return Err(CokacencError::Other(format!(
@@ -1129,7 +1229,7 @@ fn verify_quarantined_chunk(chunk: &QuarantinedChunk) -> Result<(), CokacencErro
         )));
     }
     let before = file.metadata()?;
-    let sha256 = sha256_file(&mut file)?;
+    let sha256 = sha256_file(&mut file, cancel_flag)?;
     let after = file.metadata()?;
     if !content_metadata_unchanged(&before, &after)
         || stable_file_identity(&file)? != chunk.identity
@@ -1227,22 +1327,33 @@ fn rollback_chunk_quarantine(
 fn quarantine_chunks(
     dir: &Path,
     chunks: &[ChunkSource],
+    cancel_flag: &AtomicBool,
 ) -> Result<(PathBuf, Vec<QuarantinedChunk>), CokacencError> {
-    quarantine_chunks_impl(dir, chunks, |_, _| {})
+    quarantine_chunks_impl(dir, chunks, cancel_flag, |_, _| {})
 }
 
 fn quarantine_chunks_impl<F>(
     dir: &Path,
     chunks: &[ChunkSource],
+    cancel_flag: &AtomicBool,
     mut after_move: F,
 ) -> Result<(PathBuf, Vec<QuarantinedChunk>), CokacencError>
 where
     F: FnMut(usize, &Path),
 {
+    check_cancelled(cancel_flag)?;
     let quarantine_dir = create_quarantine_dir(dir)?;
     let mut moved = Vec::with_capacity(chunks.len());
 
     for (index, chunk) in chunks.iter().enumerate() {
+        if let Err(error) = check_cancelled(cancel_flag) {
+            return Err(rollback_chunk_quarantine(
+                dir,
+                &quarantine_dir,
+                &moved,
+                error,
+            ));
+        }
         if stable_path_identity(&chunk.original).ok() != Some(chunk.identity) {
             return Err(rollback_chunk_quarantine(
                 dir,
@@ -1276,7 +1387,9 @@ where
         });
         after_move(index, &quarantined);
 
-        if let Err(error) = verify_quarantined_chunk(moved.last().expect("just pushed")) {
+        if let Err(error) =
+            verify_quarantined_chunk(moved.last().expect("just pushed"), cancel_flag)
+        {
             return Err(rollback_chunk_quarantine(
                 dir,
                 &quarantine_dir,
@@ -1306,13 +1419,14 @@ fn delete_quarantined_chunks(
     dir: &Path,
     quarantine_dir: &Path,
     chunks: Vec<QuarantinedChunk>,
+    cancel_flag: &AtomicBool,
 ) -> Result<(), CokacencError> {
     // Bind every deletion before committing the first one. A preparation
     // failure is still fully rollbackable because no archive object has yet
     // been deleted.
     let mut deletions = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        if let Err(error) = verify_quarantined_chunk(chunk) {
+        if let Err(error) = verify_quarantined_chunk(chunk, cancel_flag) {
             drop(deletions);
             return Err(rollback_chunk_quarantine(
                 dir,
@@ -1343,6 +1457,17 @@ fn delete_quarantined_chunks(
         }
     }
 
+    if let Err(error) = check_cancelled(cancel_flag) {
+        drop(deletions);
+        return Err(rollback_chunk_quarantine(
+            dir,
+            quarantine_dir,
+            &chunks,
+            error,
+        ));
+    }
+    // Once the first deletion commits, finish this small metadata-only batch.
+    // Stopping midway would leave an unusable partial encrypted group.
     for (index, deletion) in deletions.into_iter().enumerate() {
         if let Err(error) = deletion.delete() {
             let quarantine_sync_error = sync_directory(quarantine_dir).err();
@@ -1432,6 +1557,10 @@ pub fn unpack_directory_with_progress(
     tx: Sender<ProgressMessage>,
     cancel_flag: Arc<AtomicBool>,
 ) {
+    if cancel_flag.load(Ordering::Relaxed) {
+        complete_directory_operation(&tx, &cancel_flag, 0, 0);
+        return;
+    }
     let groups = match naming::group_enc_files(dir) {
         Ok(g) => g,
         Err(e) => {
@@ -1445,7 +1574,7 @@ pub fn unpack_directory_with_progress(
     };
 
     if groups.is_empty() {
-        let _ = tx.send(ProgressMessage::Completed(0, 0));
+        complete_directory_operation(&tx, &cancel_flag, 0, 0);
         return;
     }
 
@@ -1465,13 +1594,13 @@ pub fn unpack_directory_with_progress(
             &group_id[..8.min(group_id.len())]
         )));
 
-        match unpack_file_group(dir, chunks, password, &tx) {
+        match unpack_file_group(dir, chunks, password, &tx, &cancel_flag) {
             Ok(original_name) => {
                 success_count += 1;
                 let _ = tx.send(ProgressMessage::FileCompleted(original_name));
             }
             Err(e) => {
-                failure_count += 1;
+                failure_count += usize::from(!cancel_flag.load(Ordering::Relaxed));
                 let _ = tx.send(ProgressMessage::Error(group_id.clone(), e.to_string()));
             }
         }
@@ -1479,7 +1608,7 @@ pub fn unpack_directory_with_progress(
         let _ = tx.send(ProgressMessage::TotalProgress(i + 1, total_groups, 0, 0));
     }
 
-    let _ = tx.send(ProgressMessage::Completed(success_count, failure_count));
+    complete_directory_operation(&tx, &cancel_flag, success_count, failure_count);
 }
 
 /// Decrypt and merge a group of chunk files into the original file.
@@ -1489,7 +1618,9 @@ fn unpack_file_group(
     chunks: &[naming::EncFileInfo],
     password: &[u8],
     tx: &Sender<ProgressMessage>,
+    cancel_flag: &AtomicBool,
 ) -> Result<String, CokacencError> {
+    check_cancelled(cancel_flag)?;
     // Shift+D is the counterpart to the old Shift+E writer above. It expects
     // the v2 chunk stream: header salt/iv/original name, then encrypted
     // `[metadata length][metadata][file bytes]`. Keep this reader aligned with
@@ -1525,9 +1656,13 @@ fn unpack_file_group(
     let mut chunk_sources = Vec::with_capacity(chunks.len());
 
     for (i, chunk_info) in chunks.iter().enumerate() {
+        check_cancelled(cancel_flag)?;
         let (enc_file, chunk_identity) = open_encrypted_chunk(&chunk_info.path)?;
         let chunk_metadata_before = enc_file.metadata()?;
-        let mut reader = BufReader::new(Sha256Reader::new(enc_file));
+        let mut reader = BufReader::new(CancellableReader {
+            inner: Sha256Reader::new(enc_file),
+            cancel_flag,
+        });
 
         let (salt, iv, header_filename) = read_header(&mut reader)?;
         let key = derive_key(password, &salt);
@@ -1593,7 +1728,7 @@ fn unpack_file_group(
             }
         }
 
-        let digesting_reader = reader.into_inner();
+        let digesting_reader = reader.into_inner().inner;
         let (enc_file, read_sha256) = digesting_reader.finish();
         let chunk_metadata_after = enc_file.metadata()?;
         if !content_metadata_unchanged(&chunk_metadata_before, &chunk_metadata_after)
@@ -1673,7 +1808,15 @@ fn unpack_file_group(
     // First relocate every exact archive object into one private recovery
     // directory. Any failure before plaintext publication rolls all prior
     // moves back, so callers never receive a half-consumed archive group.
-    let (quarantine_dir, quarantined_chunks) = quarantine_chunks(dir, &chunk_sources)?;
+    let (quarantine_dir, quarantined_chunks) = quarantine_chunks(dir, &chunk_sources, cancel_flag)?;
+    if let Err(error) = check_cancelled(cancel_flag) {
+        return Err(rollback_chunk_quarantine(
+            dir,
+            &quarantine_dir,
+            &quarantined_chunks,
+            error,
+        ));
+    }
 
     // Publish the completed temporary plaintext atomically without replacing a
     // path that appeared while decryption was in progress. If publication or
@@ -1700,7 +1843,7 @@ fn unpack_file_group(
         ));
     }
 
-    delete_quarantined_chunks(dir, &quarantine_dir, quarantined_chunks)?;
+    delete_quarantined_chunks(dir, &quarantine_dir, quarantined_chunks, cancel_flag)?;
 
     Ok(safe_name.to_string())
 }
@@ -1948,6 +2091,132 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_a_directory_operation_is_not_success() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("payload"), b"keep original").unwrap();
+        for decrypt in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let cancelled = Arc::new(AtomicBool::new(true));
+            if decrypt {
+                unpack_directory_with_progress(temp.path(), b"key", tx, cancelled);
+            } else {
+                pack_directory_with_progress(temp.path(), b"key", tx, cancelled, 0, true);
+            }
+            let messages: Vec<_> = rx.try_iter().collect();
+            assert_eq!(completed_message(&messages), Some((0, 1)));
+            assert!(messages.iter().any(|message| matches!(message, ProgressMessage::Error(_, error) if error == "Cancelled")));
+            assert_eq!(
+                fs::read(temp.path().join("payload")).unwrap(),
+                b"keep original"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_stream_read_is_terminal_even_for_read_exact() {
+        struct CancelAfterRead<'a>(&'a AtomicBool);
+        impl Read for CancelAfterRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer[0] = 1;
+                self.0.store(true, Ordering::Relaxed);
+                Ok(1)
+            }
+        }
+        let cancelled = AtomicBool::new(false);
+        let mut reader = CancellableReader {
+            inner: CancelAfterRead(&cancelled),
+            cancel_flag: &cancelled,
+        };
+        let error = reader.read_exact(&mut [0u8; 2]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("Cancelled"));
+    }
+
+    #[test]
+    fn cancellation_during_final_encryption_verification_restores_the_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload");
+        fs::write(&path, b"keep original").unwrap();
+        let cancelled = AtomicBool::new(false);
+        let packed = pack_file(
+            &path,
+            "payload",
+            temp.path(),
+            b"key",
+            u64::MAX,
+            true,
+            &cancelled,
+        )
+        .unwrap();
+        let error = remove_packed_source_impl(&path, packed, &cancelled, |_| {
+            cancelled.store(true, Ordering::Relaxed);
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Cancelled"));
+        assert_eq!(fs::read(&path).unwrap(), b"keep original");
+        assert!(first_chunk_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn cancellation_during_decryption_quarantine_restores_every_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut sources = Vec::new();
+        for name in ["first.cokacenc", "second.cokacenc"] {
+            let path = temp.path().join(name);
+            fs::write(&path, name.as_bytes()).unwrap();
+            let (mut file, _) = open_regular_file_no_follow(&path).unwrap();
+            sources.push(ChunkSource {
+                original: path,
+                identity: stable_file_identity(&file).unwrap(),
+                read_sha256: sha256_file(&mut file, &cancelled).unwrap(),
+            });
+        }
+        let error = quarantine_chunks_impl(temp.path(), &sources, &cancelled, |_, _| {
+            cancelled.store(true, Ordering::Relaxed);
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Cancelled"));
+        for source in sources {
+            let expected = source
+                .original
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes();
+            assert_eq!(fs::read(&source.original).unwrap(), expected);
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encryption_rejects_non_utf8_names_before_modifying_any_files() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"\xff.txt".to_vec()));
+        fs::write(&path, b"keep exact name").unwrap();
+        fs::write(temp.path().join("valid"), b"also keep").unwrap();
+        let (tx, rx) = mpsc::channel();
+        pack_directory_with_progress(
+            temp.path(),
+            b"key",
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            0,
+            true,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(completed_message(&messages), Some((0, 1)));
+        assert_eq!(fs::read(path).unwrap(), b"keep exact name");
+        assert_eq!(fs::read(temp.path().join("valid")).unwrap(), b"also keep");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
     fn source_replacement_after_pack_is_restored_instead_of_deleted() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("payload.txt");
@@ -1961,6 +2230,7 @@ mod tests {
             b"test-key",
             u64::MAX,
             true,
+            &AtomicBool::new(false),
         )
         .unwrap();
         fs::rename(&file_path, &retained_original).unwrap();
@@ -1973,7 +2243,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_packed_source(&file_path, packed).unwrap_err();
+        let error = remove_packed_source(&file_path, packed, &AtomicBool::new(false)).unwrap_err();
         assert!(error.to_string().contains("replaced during encryption"));
         assert_eq!(fs::read(&file_path).unwrap(), b"other payload");
         assert_eq!(fs::read(&retained_original).unwrap(), b"archived data");
@@ -2000,6 +2270,7 @@ mod tests {
             b"test-key",
             u64::MAX,
             false,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let original_metadata = fs::metadata(&file_path).unwrap();
@@ -2011,7 +2282,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_packed_source(&file_path, packed).unwrap_err();
+        let error = remove_packed_source(&file_path, packed, &AtomicBool::new(false)).unwrap_err();
         assert!(error.to_string().contains("Source bytes changed"));
         assert_eq!(fs::read(&file_path).unwrap(), b"modified-content");
         assert!(first_chunk_path(temp_dir.path()).exists());
@@ -2031,19 +2302,21 @@ mod tests {
             b"test-key",
             u64::MAX,
             false,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let original_metadata = fs::metadata(&file_path).unwrap();
-        let error = remove_packed_source_impl(&file_path, packed, |quarantined| {
-            fs::write(quarantined, b"modified-content").unwrap();
-            filetime::set_file_times(
-                quarantined,
-                filetime::FileTime::from_last_access_time(&original_metadata),
-                filetime::FileTime::from_last_modification_time(&original_metadata),
-            )
-            .unwrap();
-        })
-        .unwrap_err();
+        let error =
+            remove_packed_source_impl(&file_path, packed, &AtomicBool::new(false), |quarantined| {
+                fs::write(quarantined, b"modified-content").unwrap();
+                filetime::set_file_times(
+                    quarantined,
+                    filetime::FileTime::from_last_access_time(&original_metadata),
+                    filetime::FileTime::from_last_modification_time(&original_metadata),
+                )
+                .unwrap();
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("Source bytes changed"));
         assert_eq!(fs::read(&file_path).unwrap(), b"modified-content");
@@ -2064,13 +2337,14 @@ mod tests {
             b"test-key",
             u64::MAX,
             false,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let chunk_path = first_chunk_path(temp_dir.path());
         fs::rename(&chunk_path, &retained_chunk).unwrap();
         fs::write(&chunk_path, b"racing replacement").unwrap();
 
-        let error = remove_packed_source(&file_path, packed).unwrap_err();
+        let error = remove_packed_source(&file_path, packed, &AtomicBool::new(false)).unwrap_err();
         assert!(error.to_string().contains("changed identity"));
         assert_eq!(fs::read(&file_path).unwrap(), b"original-content");
         assert_eq!(fs::read(&chunk_path).unwrap(), b"racing replacement");
@@ -2090,10 +2364,11 @@ mod tests {
             b"test-key",
             u64::MAX,
             false,
+            &AtomicBool::new(false),
         )
         .unwrap();
         let chunk_path = first_chunk_path(temp_dir.path());
-        let error = remove_packed_source_impl(&file_path, packed, |_| {
+        let error = remove_packed_source_impl(&file_path, packed, &AtomicBool::new(false), |_| {
             fs::write(&chunk_path, b"modified archive bytes").unwrap();
         })
         .unwrap_err();
@@ -2143,8 +2418,8 @@ mod tests {
 
         let (mut first_file, first_identity) = open_encrypted_chunk(&first).unwrap();
         let (mut second_file, second_identity) = open_encrypted_chunk(&second).unwrap();
-        let first_sha256 = sha256_file(&mut first_file).unwrap();
-        let second_sha256 = sha256_file(&mut second_file).unwrap();
+        let first_sha256 = sha256_file(&mut first_file, &AtomicBool::new(false)).unwrap();
+        let second_sha256 = sha256_file(&mut second_file, &AtomicBool::new(false)).unwrap();
         drop((first_file, second_file));
         let sources = vec![
             ChunkSource {
@@ -2159,12 +2434,17 @@ mod tests {
             },
         ];
 
-        let error = quarantine_chunks_impl(temp_dir.path(), &sources, |index, _| {
-            if index == 0 {
-                fs::rename(&second, &retained_second).unwrap();
-                fs::write(&second, b"path replacement").unwrap();
-            }
-        })
+        let error = quarantine_chunks_impl(
+            temp_dir.path(),
+            &sources,
+            &AtomicBool::new(false),
+            |index, _| {
+                if index == 0 {
+                    fs::rename(&second, &retained_second).unwrap();
+                    fs::write(&second, b"path replacement").unwrap();
+                }
+            },
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("chunks were restored"));
@@ -2186,7 +2466,7 @@ mod tests {
         let chunk = temp_dir.path().join("chunk.cokacenc");
         fs::write(&chunk, b"archive-before").unwrap();
         let (mut file, identity) = open_encrypted_chunk(&chunk).unwrap();
-        let read_sha256 = sha256_file(&mut file).unwrap();
+        let read_sha256 = sha256_file(&mut file, &AtomicBool::new(false)).unwrap();
         drop(file);
         let sources = vec![ChunkSource {
             original: chunk.clone(),
@@ -2194,9 +2474,14 @@ mod tests {
             read_sha256,
         }];
 
-        let error = quarantine_chunks_impl(temp_dir.path(), &sources, |_, quarantined| {
-            fs::write(quarantined, b"archive-after!").unwrap();
-        })
+        let error = quarantine_chunks_impl(
+            temp_dir.path(),
+            &sources,
+            &AtomicBool::new(false),
+            |_, quarantined| {
+                fs::write(quarantined, b"archive-after!").unwrap();
+            },
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("bytes changed"));
