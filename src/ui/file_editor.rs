@@ -5485,11 +5485,17 @@ pub fn draw(
     }
 
     if state.exit_confirm_open {
-        draw_unsaved_exit_dialog(frame, state, area, theme);
+        draw_unsaved_exit_dialog(frame, state, area, theme, kb);
     }
 }
 
-fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, theme: &Theme) {
+fn draw_unsaved_exit_dialog(
+    frame: &mut Frame,
+    state: &EditorState,
+    area: Rect,
+    theme: &Theme,
+    kb: &crate::keybindings::Keybindings,
+) {
     if area.width < 24 || area.height < 7 {
         return;
     }
@@ -5508,6 +5514,51 @@ fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, 
         .title_style(Style::default().fg(cd.title).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(cd.bg));
     let inner = block.inner(dialog_area);
+    let content_width = inner.width.saturating_sub(2);
+    let button_label = |name: &str, index: usize, keys: &[(KeyCode, &str)]| {
+        // User-configured Save keys keep precedence. Do not advertise a
+        // conflicting mnemonic on a different button.
+        let keys = keys
+            .iter()
+            .filter(|(code, _)| {
+                [KeyModifiers::NONE, KeyModifiers::SHIFT]
+                    .into_iter()
+                    .all(|modifiers| exit_confirm_shortcut(*code, modifiers, kb) == Some(index))
+            })
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>()
+            .join("/");
+        if keys.is_empty() {
+            format!(" {name} ")
+        } else {
+            format!(" {name} {keys} ")
+        }
+    };
+    let labels = [
+        button_label(
+            "Save",
+            0,
+            &[(KeyCode::Char('s'), "S"), (KeyCode::Char('y'), "Y")],
+        ),
+        button_label(
+            "Don't Save",
+            1,
+            &[(KeyCode::Char('d'), "D"), (KeyCode::Char('n'), "N")],
+        ),
+        button_label(
+            "Cancel",
+            2,
+            &[(KeyCode::Char('c'), "C"), (KeyCode::Esc, "Esc")],
+        ),
+    ];
+    // These labels are ASCII. Stack the buttons when their complete shortcuts
+    // do not fit on one row, including at the minimum supported dialog size.
+    let inline_buttons =
+        labels.iter().map(String::len).sum::<usize>() + 6 <= content_width as usize;
+    let buttons_y = inner.y
+        + inner
+            .height
+            .saturating_sub(if inline_buttons { 2 } else { 3 });
 
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(block, dialog_area);
@@ -5526,12 +5577,15 @@ fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, 
         Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 1),
     );
 
-    frame.render_widget(
-        Paragraph::new("Esc cancels and returns to the editor")
-            .style(Style::default().fg(cd.message_text))
-            .alignment(ratatui::layout::Alignment::Center),
-        Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), 1),
-    );
+    let hint = "Arrows/Tab select; Enter/Space confirm";
+    if inner.y + 2 < buttons_y && hint.len() <= content_width as usize {
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(cd.message_text))
+                .alignment(ratatui::layout::Alignment::Center),
+            Rect::new(inner.x + 1, inner.y + 2, content_width, 1),
+        );
+    }
 
     let selected_style = Style::default()
         .fg(cd.button_selected_text)
@@ -5545,23 +5599,27 @@ fn draw_unsaved_exit_dialog(frame: &mut Frame, state: &EditorState, area: Rect, 
         }
     };
 
-    let buttons = Line::from(vec![
-        Span::styled(" Save ", button_style(0)),
-        Span::styled("   ", Style::default().bg(cd.bg)),
-        Span::styled(" Don't Save ", button_style(1)),
-        Span::styled("   ", Style::default().bg(cd.bg)),
-        Span::styled(" Cancel ", button_style(2)),
-    ]);
-
-    frame.render_widget(
-        Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
-        Rect::new(
-            inner.x + 1,
-            inner.y + inner.height.saturating_sub(2),
-            inner.width.saturating_sub(2),
-            1,
-        ),
-    );
+    if inline_buttons {
+        let buttons = Line::from(vec![
+            Span::styled(labels[0].clone(), button_style(0)),
+            Span::styled("   ", Style::default().bg(cd.bg)),
+            Span::styled(labels[1].clone(), button_style(1)),
+            Span::styled("   ", Style::default().bg(cd.bg)),
+            Span::styled(labels[2].clone(), button_style(2)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
+            Rect::new(inner.x + 1, buttons_y, content_width, 1),
+        );
+    } else {
+        for (index, label) in labels.into_iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, button_style(index)))
+                    .alignment(ratatui::layout::Alignment::Center),
+                Rect::new(inner.x + 1, buttons_y + index as u16, content_width, 1),
+            );
+        }
+    }
 }
 
 /// 편집기 라인 렌더링
@@ -6025,23 +6083,69 @@ fn cancel_exit_confirm(state: &mut EditorState) {
     state.exit_confirm_selected = 2;
 }
 
-fn handle_exit_confirm_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn exit_confirm_shortcut(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kb: &crate::keybindings::Keybindings,
+) -> Option<usize> {
     if code == KeyCode::Esc {
-        if let Some(ref mut state) = app.editor_state {
-            cancel_exit_confirm(state);
-        }
-        return;
+        return Some(2);
     }
+    // Preserve the existing Save binding, even when a user assigns a letter
+    // that would otherwise discard changes or cancel this dialog.
+    if kb.editor_action(code, modifiers) == Some(EditorAction::Save) {
+        return Some(0);
+    }
+    if !modifiers.is_empty() && modifiers != KeyModifiers::SHIFT {
+        return None;
+    }
+    match code {
+        KeyCode::Char('s' | 'S' | 'y' | 'Y') => Some(0),
+        KeyCode::Char('d' | 'D' | 'n' | 'N') => Some(1),
+        KeyCode::Char('c' | 'C') => Some(2),
+        _ => None,
+    }
+}
 
-    if app.keybindings.editor_action(code, modifiers) == Some(EditorAction::Save) {
-        if save_current_editor(app) {
-            close_file_editor(app, true);
+fn activate_exit_confirm_button(app: &mut App, selected: usize) {
+    match selected {
+        0 => {
+            if save_current_editor(app) {
+                close_file_editor(app, true);
+            }
         }
+        1 => close_file_editor(app, false),
+        _ => {
+            if let Some(ref mut state) = app.editor_state {
+                cancel_exit_confirm(state);
+            }
+        }
+    }
+}
+
+fn handle_exit_confirm_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let selected = exit_confirm_shortcut(code, modifiers, &app.keybindings).or_else(|| {
+        if code == KeyCode::Enter
+            || (code == KeyCode::Char(' ')
+                && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT))
+        {
+            Some(
+                app.editor_state
+                    .as_ref()
+                    .map(|state| state.exit_confirm_selected)
+                    .unwrap_or(2),
+            )
+        } else {
+            None
+        }
+    });
+    if let Some(selected) = selected {
+        activate_exit_confirm_button(app, selected);
         return;
     }
 
     match code {
-        KeyCode::Left | KeyCode::BackTab => {
+        KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
             if let Some(ref mut state) = app.editor_state {
                 state.exit_confirm_selected = if state.exit_confirm_selected == 0 {
                     2
@@ -6050,7 +6154,7 @@ fn handle_exit_confirm_input(app: &mut App, code: KeyCode, modifiers: KeyModifie
                 };
             }
         }
-        KeyCode::Right | KeyCode::Tab => {
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
             if let Some(ref mut state) = app.editor_state {
                 state.exit_confirm_selected = (state.exit_confirm_selected + 1) % 3;
             }
@@ -6063,28 +6167,6 @@ fn handle_exit_confirm_input(app: &mut App, code: KeyCode, modifiers: KeyModifie
         KeyCode::End => {
             if let Some(ref mut state) = app.editor_state {
                 state.exit_confirm_selected = 2;
-            }
-        }
-        KeyCode::Enter => {
-            let selected = app
-                .editor_state
-                .as_ref()
-                .map(|state| state.exit_confirm_selected)
-                .unwrap_or(2);
-            match selected {
-                0 => {
-                    if save_current_editor(app) {
-                        close_file_editor(app, true);
-                    }
-                }
-                1 => {
-                    close_file_editor(app, false);
-                }
-                _ => {
-                    if let Some(ref mut state) = app.editor_state {
-                        cancel_exit_confirm(state);
-                    }
-                }
             }
         }
         _ => {}
@@ -7526,6 +7608,180 @@ mod tests {
 
         assert_eq!(app.current_screen, Screen::FilePanel);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+    }
+
+    fn app_with_unsaved_file(path: &Path) -> App {
+        std::fs::write(path, "original").unwrap();
+        let directory = path.parent().unwrap();
+        let mut app = App::new(directory.into(), directory.into());
+        let mut editor = EditorState::new();
+        editor.load_file(&path.to_path_buf()).unwrap();
+        editor.lines[0] = "edited".to_string();
+        editor.modified = true;
+        app.editor_state = Some(editor);
+        app.current_screen = Screen::FileEditor;
+        handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app
+    }
+
+    #[test]
+    fn unsaved_exit_letters_save_discard_or_cancel_with_either_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        for (letters, saves, closes) in [
+            ("sSyY", true, true),
+            ("dDnN", false, true),
+            ("cC", false, false),
+        ] {
+            for letter in letters.chars() {
+                for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                    let mut app = app_with_unsaved_file(&path);
+                    handle_input(&mut app, KeyCode::Char(letter), modifiers);
+
+                    assert_eq!(
+                        app.current_screen,
+                        if closes {
+                            Screen::FilePanel
+                        } else {
+                            Screen::FileEditor
+                        },
+                        "{letter:?} {modifiers:?}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&path).unwrap(),
+                        if saves { "edited" } else { "original" }
+                    );
+                    let editor = app.editor_state.as_ref().unwrap();
+                    assert_eq!(editor.lines, ["edited"]);
+                    assert_eq!(editor.modified, !saves);
+                    if !closes {
+                        assert!(!editor.exit_confirm_open);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsaved_exit_ignores_command_modified_letters_and_paste() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        let mut app = app_with_unsaved_file(&path);
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for letter in "dDnNcCyY".chars() {
+                handle_input(&mut app, KeyCode::Char(letter), modifiers);
+                assert_eq!(app.current_screen, Screen::FileEditor);
+                assert!(app.editor_state.as_ref().unwrap().exit_confirm_open);
+            }
+        }
+        handle_paste(&mut app, "dnycs");
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        assert!(app.editor_state.as_ref().unwrap().exit_confirm_open);
+        assert_eq!(app.editor_state.as_ref().unwrap().lines, ["edited"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+
+        handle_input(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+        handle_input(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        assert_eq!(app.editor_state.as_ref().unwrap().lines, ["dedited"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn unsaved_exit_preserves_custom_save_bindings_and_save_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        let mut config = crate::keybindings::KeybindingsConfig::default();
+        config
+            .file_editor
+            .insert(EditorAction::Save, vec!["d".into(), "ctrl+d".into()]);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            let mut app = app_with_unsaved_file(&path);
+            app.keybindings = crate::keybindings::Keybindings::from_config(&config);
+            handle_input(&mut app, KeyCode::Char('d'), modifiers);
+            assert_eq!(app.current_screen, Screen::FilePanel);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+        }
+
+        let mut app = app_with_unsaved_file(&path);
+        std::fs::write(&path, "external change").unwrap();
+        handle_input(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        let editor = app.editor_state.as_ref().unwrap();
+        assert!(editor.exit_confirm_open);
+        assert!(editor.modified);
+        assert_eq!(editor.lines, ["edited"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external change");
+    }
+
+    #[test]
+    fn unsaved_exit_vertical_navigation_and_space_activate_the_selected_button() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        for (direction, expected) in [(KeyCode::Up, "original"), (KeyCode::Down, "edited")] {
+            let mut app = app_with_unsaved_file(&path);
+            handle_input(&mut app, direction, KeyModifiers::NONE);
+            handle_input(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert_eq!(app.current_screen, Screen::FilePanel);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn unsaved_exit_shortcuts_remain_visible_at_supported_terminal_sizes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        fn rendered_dialog(
+            width: u16,
+            height: u16,
+            kb: &crate::keybindings::Keybindings,
+        ) -> String {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let state = EditorState::new();
+            let theme = Theme::default();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_unsaved_exit_dialog(frame, &state, area, &theme, kb);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        let mut config = crate::keybindings::KeybindingsConfig::default();
+        let kb = crate::keybindings::Keybindings::from_config(&config);
+        for (width, height) in [(24, 7), (40, 10), (80, 24), (120, 40)] {
+            let rendered = rendered_dialog(width, height, &kb);
+            for label in ["Save S/Y", "Don't Save D/N", "Cancel C/Esc"] {
+                assert!(
+                    rendered.contains(label),
+                    "{width}x{height}: missing {label}"
+                );
+            }
+        }
+
+        for keys in [["d", "c"], ["shift+d", "c"]] {
+            config.file_editor.insert(
+                EditorAction::Save,
+                keys.into_iter().map(|key| key.to_string()).collect(),
+            );
+            let kb = crate::keybindings::Keybindings::from_config(&config);
+            let rendered = rendered_dialog(80, 24, &kb);
+            assert!(rendered.contains("Don't Save N"));
+            assert!(rendered.contains("Cancel Esc"));
+            assert!(!rendered.contains("Don't Save D/N"));
+            assert!(!rendered.contains("Cancel C/Esc"));
+        }
     }
 
     #[test]

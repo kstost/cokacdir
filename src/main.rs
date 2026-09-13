@@ -3480,6 +3480,7 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
+    let editor_only = startup_editor.is_some();
 
     // Setup panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -3611,20 +3612,21 @@ fn main() -> io::Result<()> {
         let _ = ui::mouse::disable_capture();
         app.show_message(&format!("Mouse input unavailable: {error}"));
     }
-    let result = run_app(&mut terminal, &mut app);
+    let result = run_app(&mut terminal, &mut app, editor_only);
 
     // Save settings before exit — but only if the original file parsed. Otherwise we would
-    // clobber the user's existing (unparseable) settings with defaults.
-    let settings_save_result = if !settings_load_failed {
+    // clobber the user's existing (unparseable) settings with defaults. An editor-only
+    // session does not persist its temporary file-manager panel location.
+    let settings_save_result = if !settings_load_failed && !editor_only {
         app.save_settings()
     } else {
         Ok(())
     };
 
-    // Save last directory for shell cd (skip remote paths). When launched via
+    // Save last directory for shell cd (skip editor-only sessions and remote paths). When launched via
     // the shell wrapper, write to a per-run file so non-TUI commands cannot
     // accidentally reuse a stale ~/.cokacdir/lastdir value.
-    if !app.active_panel().is_remote() {
+    if !editor_only && !app.active_panel().is_remote() {
         let last_dir = app.active_panel().path.display().to_string();
         if let Some(path) = shell_lastdir_output_path() {
             let _ = write_shell_lastdir_output(&path, &last_dir);
@@ -4104,9 +4106,17 @@ mod mouse_input_tests {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    editor_only: bool,
 ) -> io::Result<()> {
     let mut pending_input = std::collections::VecDeque::new();
     loop {
+        // All editor close paths (including mouse confirmation buttons) change
+        // screens only after save/discard is resolved. Exit before drawing the
+        // file panel, then let main restore the terminal through normal cleanup.
+        if editor_only && app.current_screen != Screen::FileEditor {
+            return Ok(());
+        }
+
         // Check if full redraw is needed (after terminal mode command like vim)
         if app.needs_full_redraw {
             terminal.clear()?;
@@ -4816,13 +4826,26 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
 #[cfg(test)]
 mod edit_cli_tests {
-    use super::{load_cli_editor, parse_edit_cli_path, start_cli_editor, App, Screen};
+    use super::{load_cli_editor, parse_edit_cli_path, run_app, start_cli_editor, App, Screen};
     use crate::ui::file_editor::{handle_input, handle_paste};
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
     use std::path::PathBuf;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn assert_editor_session_exits_without_drawing_file_panel(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("last editor frame"), frame.area()))
+            .unwrap();
+        let last_frame = terminal.backend().buffer().clone();
+
+        run_app(&mut terminal, app, true).unwrap();
+
+        assert_eq!(terminal.backend().buffer(), &last_frame);
     }
 
     #[test]
@@ -4873,6 +4896,7 @@ mod edit_cli_tests {
                 std::fs::read_to_string(&path).unwrap(),
                 "// let answer = 42;\r\n"
             );
+            assert_editor_session_exits_without_drawing_file_panel(&mut app);
         }
     }
 
@@ -4903,6 +4927,47 @@ mod edit_cli_tests {
         );
         handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(app.current_screen, Screen::FilePanel);
+        assert_editor_session_exits_without_drawing_file_panel(&mut app);
+    }
+
+    #[test]
+    fn cancel_and_failed_save_keep_editor_open_until_explicit_discard() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let editor = load_cli_editor(path.clone()).unwrap();
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        start_cli_editor(&mut app, editor);
+        handle_paste(&mut app, "edited ");
+
+        handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.editor_state.as_ref().unwrap().exit_confirm_open);
+        // Cancel is selected by default; it must not finish an editor-only session.
+        handle_input(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        assert!(!app.editor_state.as_ref().unwrap().exit_confirm_open);
+        assert!(app.editor_state.as_ref().unwrap().modified);
+
+        std::fs::write(&path, "changed by another process").unwrap();
+        handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        handle_input(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        assert!(app.editor_state.as_ref().unwrap().exit_confirm_open);
+        assert!(app.editor_state.as_ref().unwrap().modified);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed by another process"
+        );
+
+        // Choose Discard and exit without replacing the external modification.
+        handle_input(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        handle_input(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current_screen, Screen::FilePanel);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "changed by another process"
+        );
+        assert_editor_session_exits_without_drawing_file_panel(&mut app);
     }
 
     #[test]

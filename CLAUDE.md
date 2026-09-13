@@ -21,7 +21,8 @@ You can get Rust build methods from build_manual.md file
 
 - Version is defined in `Cargo.toml` (line 3: `version = "x.x.x"`)
 - All version displays use `env!("CARGO_PKG_VERSION")` macro to read from Cargo.toml
-- To update version: only modify `Cargo.toml`, all other locations reflect automatically
+- To update version: modify `Cargo.toml` and synchronize the root `cokacdir` package version in `Cargo.lock`; version displays reflect `Cargo.toml` automatically
+- Keep `Cargo.lock` in version control because release builds use `--locked`. A version-only bump must preserve all dependency versions; do not remove `--locked` to bypass a stale lock file
 - Never hardcode version strings in source code
 
 ## Theme Color System

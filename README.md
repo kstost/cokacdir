@@ -58,8 +58,15 @@ Pass one file path, relative to the current working directory or absolute. Quote
 paths containing spaces; use `cokacdir -e -- -file.txt` for names starting with
 `-`. A missing file opens as a new document and is created when saved; its parent
 directory must already exist. With the default keybindings, `Ctrl+S` saves and
-`Esc` closes the editor, with confirmation for unsaved changes, returning to the
-file list in that file's directory.
+`Esc` closes the editor and exits the app, with confirmation for unsaved changes.
+These editor-only commands preserve the saved file-manager panel layout and do
+not change the calling shell's working directory.
+
+In the unsaved-changes dialog, press `S` or `Y` to save and close, `D` or `N` to
+close without saving, or `C` / `Esc` to cancel. Letter shortcuts accept either
+case. Arrow keys and `Tab` / `Shift+Tab` select a button; `Enter` or `Space`
+activates it. The configured editor Save shortcut (normally `Ctrl+S`) also works
+and takes precedence if it overlaps a dialog letter shortcut.
 
 ## Community
 
