@@ -444,6 +444,70 @@ fn parse_content_md5_cli_paths(
     }
 }
 
+/// Parse a single editor target without treating a missing operand as a panel path.
+fn parse_edit_cli_path(args: &[String]) -> Result<std::path::PathBuf, String> {
+    let Some((flag, operands)) = args.split_first() else {
+        return Err("--edit requires <FILE>".to_string());
+    };
+    if !matches!(flag.as_str(), "--edit" | "-e") {
+        return Err("--edit / -e must be the first argument".to_string());
+    }
+
+    let (operands, options_ended) = match operands.split_first() {
+        Some((first, rest)) if first == "--" => (rest, true),
+        _ => (operands, false),
+    };
+    let [path] = operands else {
+        return Err(format!("{flag} requires exactly one <FILE>"));
+    };
+    if path.is_empty() {
+        return Err(format!("{flag} requires a non-empty file path"));
+    }
+    if !options_ended && path.starts_with('-') {
+        return Err(format!(
+            "{flag} requires a file path; use {flag} -- <FILE> for names starting with '-'"
+        ));
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// Load before entering raw mode so failures remain visible in the calling shell.
+fn load_cli_editor(path: std::path::PathBuf) -> Result<ui::file_editor::EditorState, String> {
+    let path = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .map_err(|error| format!("Cannot resolve the current directory: {error}"))?
+            .join(path)
+    };
+    let mut editor = ui::file_editor::EditorState::new();
+    editor
+        .load_file(&path)
+        .map_err(|error| format!("Cannot open {:?}: {}", path, cli_single_line(&error)))?;
+    Ok(editor)
+}
+
+fn start_cli_editor(app: &mut App, mut editor: ui::file_editor::EditorState) {
+    // A successfully loaded absolute file path has an existing parent. Use
+    // the saved active panel for that directory, preserving the other panels.
+    if let Some(parent) = editor.file_path.parent() {
+        app.goto_directory_with_focus(parent, None);
+        let panel = app.active_panel_mut();
+        if let Some(name) = editor.file_path.file_name().and_then(|name| name.to_str()) {
+            if let Some(index) = panel.files.iter().position(|file| file.name == name) {
+                panel.selected_index = index;
+            } else {
+                // New files appear on the existing post-save panel refresh.
+                panel.pending_focus = Some(name.to_string());
+            }
+        }
+    }
+    editor.set_syntax_colors(app.theme.syntax);
+    app.previous_screen = None;
+    app.editor_state = Some(editor);
+    app.current_screen = Screen::FileEditor;
+}
+
 fn cli_single_line(text: &str) -> String {
     text.escape_debug().to_string()
 }
@@ -601,6 +665,8 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("    cokacdir [OPTIONS] [PATH...]");
+    println!("    cokacdir --edit <FILE>");
+    println!("    cokacdir -e <FILE>");
     println!();
     println!("ARGS:");
     println!("    [PATH...]               Open panels at given paths (max 10)");
@@ -609,6 +675,7 @@ fn print_help() {
     println!("    -h, --help              Print help information");
     println!("    -v, --version           Print version information");
     println!("    --licenses              Print project license and third-party notices");
+    println!("    -e, --edit <FILE>       Open a file directly in the built-in editor");
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
@@ -2704,9 +2771,16 @@ fn main() -> io::Result<()> {
     deploy_docs();
 
     // Handle command line arguments
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = match env::args_os().map(|arg| arg.into_string()).collect() {
+        Ok(args) => args,
+        Err(_) => {
+            eprintln!("Error: Command-line arguments must be valid UTF-8");
+            std::process::exit(2);
+        }
+    };
     let mut design_mode = false;
     let mut start_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut edit_path = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -2722,6 +2796,17 @@ fn main() -> io::Result<()> {
             "--licenses" => {
                 print_licenses();
                 return Ok(());
+            }
+            "--edit" | "-e" => {
+                edit_path = match parse_edit_cli_path(&args[1..]) {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        eprintln!("Usage: cokacdir --edit <FILE> (or cokacdir -e <FILE>)");
+                        std::process::exit(2);
+                    }
+                };
+                break;
             }
             "--prompt" => {
                 if i + 1 >= args.len() {
@@ -3388,6 +3473,14 @@ fn main() -> io::Result<()> {
         i += 1;
     }
 
+    let startup_editor = match edit_path.map(load_cli_editor).transpose() {
+        Ok(editor) => editor,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+
     // Setup panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -3490,6 +3583,9 @@ fn main() -> io::Result<()> {
     // Override panels with command-line paths if provided
     if !start_paths.is_empty() {
         app.set_panels_from_paths(start_paths);
+    }
+    if let Some(editor) = startup_editor {
+        start_cli_editor(&mut app, editor);
     }
 
     // Show settings load error if any
@@ -4716,6 +4812,143 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod edit_cli_tests {
+    use super::{load_cli_editor, parse_edit_cli_path, start_cli_editor, App, Screen};
+    use crate::ui::file_editor::{handle_input, handle_paste};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use std::path::PathBuf;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn both_aliases_open_the_requested_file_and_preserve_save_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("dir");
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("코드 file.rs");
+
+        for flag in ["--edit", "-e"] {
+            std::fs::write(&path, "let answer = 42;\r\n").unwrap();
+            let target = parse_edit_cli_path(&args(&[flag, path.to_str().unwrap()])).unwrap();
+            let editor = load_cli_editor(target).unwrap();
+            let mut app = App::new(temp.path().into(), temp.path().into());
+            app.active_panel_index = 1;
+            start_cli_editor(&mut app, editor);
+
+            assert_eq!(app.current_screen, Screen::FileEditor);
+            assert_eq!(app.panels.len(), 2);
+            assert_eq!(app.active_panel_index, 1);
+            assert_eq!(app.panels[0].path, temp.path());
+            assert_eq!(app.editor_state.as_ref().unwrap().file_path, path);
+            assert_eq!(
+                app.editor_state.as_ref().unwrap().lines,
+                ["let answer = 42;", ""]
+            );
+            assert_eq!(
+                std::fs::canonicalize(&app.active_panel().path).unwrap(),
+                std::fs::canonicalize(&directory).unwrap()
+            );
+            assert_eq!(
+                app.active_panel().current_file().unwrap().name,
+                "코드 file.rs"
+            );
+
+            handle_paste(&mut app, "// ");
+            handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.current_screen, Screen::FileEditor);
+            assert!(app.editor_state.as_ref().unwrap().exit_confirm_open);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "let answer = 42;\r\n"
+            );
+
+            handle_input(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert_eq!(app.current_screen, Screen::FilePanel);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "// let answer = 42;\r\n"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_new_file_is_created_only_when_saved() {
+        // Do not change the process-wide cwd: other tests may run concurrently.
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&cwd).unwrap();
+        let relative = PathBuf::from(".")
+            .join(temp.path().file_name().unwrap())
+            .join("new file.txt");
+        let path = temp.path().join("new file.txt");
+        let target = parse_edit_cli_path(&args(&["-e", relative.to_str().unwrap()])).unwrap();
+        let editor = load_cli_editor(target).unwrap();
+        assert!(editor.file_path.is_absolute());
+        assert_eq!(editor.file_path, cwd.join(&relative));
+        assert!(!path.exists());
+
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        start_cli_editor(&mut app, editor);
+        handle_paste(&mut app, "new contents");
+        assert!(!path.exists());
+        handle_input(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new contents");
+        assert_eq!(
+            app.active_panel().current_file().unwrap().name,
+            "new file.txt"
+        );
+        handle_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.current_screen, Screen::FilePanel);
+    }
+
+    #[test]
+    fn rejects_missing_or_ambiguous_targets_and_accepts_literal_dash_names() {
+        for values in [
+            vec![],
+            vec!["--edit"],
+            vec!["-e", ""],
+            vec!["--edit", "--"],
+            vec!["-e", "--help"],
+            vec!["--edit", "one.txt", "two.txt"],
+            vec!["--edit", "one.txt", "-e", "two.txt"],
+            vec!["--edit", "one.txt", "--encrypt", "dir"],
+            vec!["dir", "-e", "one.txt"],
+        ] {
+            assert!(parse_edit_cli_path(&args(&values)).is_err(), "{values:?}");
+        }
+        assert_eq!(
+            parse_edit_cli_path(&args(&["-e", "--", "-file.txt"])).unwrap(),
+            PathBuf::from("-file.txt")
+        );
+    }
+
+    #[test]
+    fn invalid_targets_fail_without_creating_or_replacing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_parent = temp.path().join("missing");
+        let binary = temp.path().join("binary.bin");
+        std::fs::write(&binary, [0xff, 0xfe]).unwrap();
+
+        assert!(load_cli_editor(temp.path().into()).is_err());
+        assert!(load_cli_editor(missing_parent.join("file.txt")).is_err());
+        assert!(load_cli_editor(binary.clone()).is_err());
+        assert!(!missing_parent.exists());
+        assert_eq!(std::fs::read(&binary).unwrap(), [0xff, 0xfe]);
+
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("dangling.txt");
+            let missing = temp.path().join("missing.txt");
+            std::os::unix::fs::symlink(&missing, &link).unwrap();
+            assert!(load_cli_editor(link.clone()).is_err());
+            assert_eq!(std::fs::read_link(&link).unwrap(), missing);
+            assert!(!missing.exists());
+        }
+    }
 }
 
 #[cfg(test)]

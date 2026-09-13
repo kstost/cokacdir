@@ -47,6 +47,20 @@ That’s it — open your chat app and start chatting with your bot.
 * **Chat bots**: Remotely control AI coding sessions through Telegram, Discord, or Slack with streaming output, queued requests, scheduled tasks, rich Telegram responses, and companion mode
 * **Customizable themes**: Light and dark themes with full JSON-based color customization
 
+Open a file directly in the built-in editor with either command:
+
+```bash
+cokacdir --edit ./dir/file.txt
+cokacdir -e ./dir/file.txt
+```
+
+Pass one file path, relative to the current working directory or absolute. Quote
+paths containing spaces; use `cokacdir -e -- -file.txt` for names starting with
+`-`. A missing file opens as a new document and is created when saved; its parent
+directory must already exist. With the default keybindings, `Ctrl+S` saves and
+`Esc` closes the editor, with confirmation for unsaved changes, returning to the
+file list in that file's directory.
+
 ## Community
 
 Telegram group for tips, updates, and support:
