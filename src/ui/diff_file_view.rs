@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -285,18 +285,29 @@ impl DiffFileViewState {
         // Guard against reading multi-GB files fully into memory (the text path below
         // also duplicates the contents several times). Mirror the file viewer's cap.
         const MAX_DIFF_FILE_BYTES: u64 = 100 * 1024 * 1024;
-        let file_too_large = |p: &PathBuf| {
-            fs::metadata(p)
-                .map(|m| m.len() > MAX_DIFF_FILE_BYTES)
-                .unwrap_or(false)
+        let read_side = |path: &PathBuf| -> io::Result<Option<Vec<u8>>> {
+            if path.as_os_str().is_empty() {
+                // An empty path denotes a side absent from the comparison.
+                return Ok(None);
+            }
+            crate::services::file_ops::read_regular_file_with_limit(path, MAX_DIFF_FILE_BYTES)
+                .map(Some)
         };
-        if file_too_large(&left_path) || file_too_large(&right_path) {
+        let left_data = read_side(&left_path);
+        let right_data = read_side(&right_path);
+        if left_data.is_err() || right_data.is_err() {
             let diff_lines = vec![DiffLine {
                 left_line_no: None,
-                left_content: Some("File too large to diff".to_string()),
+                left_content: left_data
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("Cannot read file: {e}")),
                 right_line_no: None,
-                right_content: Some("File too large to diff".to_string()),
-                line_status: DiffLineStatus::Same,
+                right_content: right_data
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("Cannot read file: {e}")),
+                line_status: DiffLineStatus::Modified,
             }];
             return Self {
                 left_path,
@@ -314,8 +325,8 @@ impl DiffFileViewState {
             };
         }
 
-        let left_data = fs::read(&left_path).ok();
-        let right_data = fs::read(&right_path).ok();
+        let left_data = left_data.ok().flatten();
+        let right_data = right_data.ok().flatten();
 
         // Check for binary files
         let left_is_binary = left_data.as_ref().map_or(false, |d| is_binary(d));
@@ -1234,6 +1245,20 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_link_is_reported_as_a_read_error_instead_of_empty_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink("missing", &link).unwrap();
+        let view = DiffFileViewState::new(link, PathBuf::new(), "link".into());
+        assert!(view.diff_lines[0]
+            .left_content
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Cannot read file:")));
+        assert_eq!(view.diff_lines[0].line_status, DiffLineStatus::Modified);
+    }
 
     #[test]
     fn scrollbar_moves_when_the_diff_overflows_by_one_row() {

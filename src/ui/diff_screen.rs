@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2510,7 +2510,12 @@ pub fn compare_files(left: &DiffFileInfo, right: &DiffFileInfo, method: CompareM
     }
     // If both are symlinks, compare their target paths
     if left.is_symlink && right.is_symlink {
-        return fs::read_link(&left.full_path).ok() == fs::read_link(&right.full_path).ok();
+        return match (fs::read_link(&left.full_path), fs::read_link(&right.full_path)) {
+            // Path equality normalizes trailing slashes and dots, although
+            // "file" and "file/." can resolve differently as link targets.
+            (Ok(left), Ok(right)) => left.as_os_str() == right.as_os_str(),
+            _ => false,
+        };
     }
     match method {
         CompareMethod::Content => {
@@ -2534,12 +2539,12 @@ pub fn compare_files(left: &DiffFileInfo, right: &DiffFileInfo, method: CompareM
 /// Byte-by-byte comparison of two files using buffered 8KB reads.
 /// Returns true if files are identical.
 pub fn byte_compare(path_a: &Path, path_b: &Path) -> bool {
-    let file_a = match File::open(path_a) {
-        Ok(f) => f,
+    let file_a = match file_ops::open_regular_file_for_read(path_a) {
+        Ok((file, _)) => file,
         Err(_) => return false,
     };
-    let file_b = match File::open(path_b) {
-        Ok(f) => f,
+    let file_b = match file_ops::open_regular_file_for_read(path_b) {
+        Ok((file, _)) => file,
         Err(_) => return false,
     };
 
@@ -4902,6 +4907,29 @@ mod tests {
         let left = make_file_info(&link, "link").unwrap();
         let right = make_file_info(&regular, "regular").unwrap();
 
+        assert!(!compare_files(&left, &right, CompareMethod::Content));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_comparison_preserves_literal_targets_and_read_errors_are_not_equal() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::write(temp.path().join("target"), b"contents").unwrap();
+        std::os::unix::fs::symlink("target", &first).unwrap();
+        std::os::unix::fs::symlink("target", &second).unwrap();
+        let left = make_file_info(&first, "first").unwrap();
+        let mut right = make_file_info(&second, "second").unwrap();
+        assert!(compare_files(&left, &right, CompareMethod::Content));
+
+        fs::remove_file(&second).unwrap();
+        std::os::unix::fs::symlink("target/.", &second).unwrap();
+        right = make_file_info(&second, "second").unwrap();
+        assert!(!compare_files(&left, &right, CompareMethod::Content));
+
+        fs::remove_file(&first).unwrap();
+        fs::remove_file(&second).unwrap();
         assert!(!compare_files(&left, &right, CompareMethod::Content));
     }
 

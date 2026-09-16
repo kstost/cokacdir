@@ -2594,7 +2594,7 @@ fn draw_tar_exclude_confirm_dialog(
     theme: &Theme,
 ) {
     let block = Block::default()
-        .title(" Exclude Unsafe Symlinks ")
+        .title(" Exclude Unsupported Entries ")
         .title_style(
             Style::default()
                 .fg(theme.dialog.tar_exclude_title)
@@ -2609,7 +2609,7 @@ fn draw_tar_exclude_confirm_dialog(
 
     // Message line
     let msg = format!(
-        "Found {} unsafe symlink(s) that will be excluded:",
+        "Exclude {} unsupported or unreadable entries:",
         state.excluded_paths.len()
     );
     let msg_area = Rect::new(inner.x + 2, inner.y + 1, inner.width - 4, 1);

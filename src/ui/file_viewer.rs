@@ -152,18 +152,9 @@ impl ViewerState {
         self.wrap_width = 0;
         self.pending_wrap_source_line = None;
 
-        // Check file size before loading to prevent memory exhaustion
-        let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
-        if metadata.len() > Self::MAX_FILE_SIZE {
-            return Err(format!(
-                "File too large ({:.1} MB). Maximum size is {} MB.",
-                metadata.len() as f64 / 1024.0 / 1024.0,
-                Self::MAX_FILE_SIZE / 1024 / 1024
-            ));
-        }
-
-        // 파일 읽기
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let bytes =
+            crate::services::file_ops::read_regular_file_with_limit(path, Self::MAX_FILE_SIZE)
+                .map_err(|e| e.to_string())?;
         self.file_size = bytes.len() as u64;
 
         // 바이너리 파일 감지
@@ -507,6 +498,39 @@ impl ViewerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_reads_file_links_and_rejects_fifo_links_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link.txt");
+        std::fs::write(&target, b"linked contents").unwrap();
+        symlink(&target, &link).unwrap();
+        let mut viewer = ViewerState::new();
+        viewer.load_file(&link).unwrap();
+        assert_eq!(viewer.raw_bytes, b"linked contents");
+
+        let fifo = temp.path().join("pipe");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        std::fs::remove_file(&link).unwrap();
+        symlink(&fifo, &link).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ViewerState::new().load_file(&link));
+        });
+        let error = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("viewer must not wait for a FIFO writer")
+            .unwrap_err();
+        assert!(error.contains("regular file"));
+    }
 
     #[test]
     fn edit_from_viewer_clamps_cursor_after_reload() {

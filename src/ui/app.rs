@@ -695,32 +695,29 @@ fn create_private_extract_directory(path: &Path) -> std::io::Result<()> {
     ReservedExtractDirectory::create(path)?.commit()
 }
 
-const MAX_TAR_LIST_LINE_BYTES: usize = 256 * 1024;
+const MAX_TAR_OUTPUT_LINE_BYTES: usize = 64 * 1024;
 const MAX_TAR_ERROR_TAIL_BYTES: usize = 64 * 1024;
-const MAX_TAR_ENTRY_COUNT: usize = 1_000_000;
 
-fn read_bounded_line<R: std::io::BufRead>(
+/// Verbose tar output is for display only. Truncate very long records while
+/// draining the entire line, and accept arbitrary bytes in filenames.
+fn read_tar_output_line<R: std::io::BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
-    max_bytes: usize,
 ) -> std::io::Result<bool> {
     line.clear();
+    let mut saw_bytes = false;
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(!line.is_empty());
+            return Ok(saw_bytes);
         }
+        saw_bytes = true;
         let chunk_len = available
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position + 1);
-        if line.len().saturating_add(chunk_len) > max_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "archive listing contains an excessively long entry name",
-            ));
-        }
-        line.extend_from_slice(&available[..chunk_len]);
+        let retained = chunk_len.min(MAX_TAR_OUTPUT_LINE_BYTES.saturating_sub(line.len()));
+        line.extend_from_slice(&available[..retained]);
         let found_newline = available[chunk_len - 1] == b'\n';
         reader.consume(chunk_len);
         if found_newline {
@@ -729,50 +726,136 @@ fn read_bounded_line<R: std::io::BufRead>(
     }
 }
 
-fn read_bounded_tail<R: std::io::Read>(mut reader: R, max_bytes: usize) -> String {
-    let mut tail = Vec::with_capacity(max_bytes.min(8192));
-    let mut chunk = [0u8; 8192];
-    loop {
-        let count = match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => count,
-        };
-        if count >= max_bytes {
-            tail.clear();
-            tail.extend_from_slice(&chunk[count - max_bytes..count]);
-            continue;
-        }
-        let overflow = tail.len().saturating_add(count).saturating_sub(max_bytes);
-        if overflow > 0 {
-            tail.drain(..overflow);
-        }
-        tail.extend_from_slice(&chunk[..count]);
-    }
-    String::from_utf8_lossy(&tail).into_owned()
+struct TarCommandResult {
+    status: std::process::ExitStatus,
+    completed_files: usize,
+    diagnostics: String,
 }
 
-fn validate_archive_entry_path(entry: &[u8]) -> Result<(), String> {
-    if entry.is_empty() {
-        return Err("Archive contains an empty entry name".to_string());
+/// GNU tar reports extracted names on stdout; bsdtar uses "x " on stderr.
+/// Creation uses stderr because stdout carries the archive itself.
+fn run_tar_command(
+    mut command: std::process::Command,
+    cancel_flag: Arc<AtomicBool>,
+    progress: &mpsc::Sender<ProgressMessage>,
+    size_map: &HashMap<String, u64>,
+    extracting: bool,
+) -> std::io::Result<TarCommandResult> {
+    use std::io::BufReader;
+
+    crate::services::claude::detach_into_own_pgroup(&mut command);
+    let mut child = command.spawn()?;
+    let (watch_done, watch) = spawn_process_cancel_watchdog(cancel_flag, child.id());
+    let (output_tx, output_rx) = mpsc::sync_channel(16);
+    let mut readers = Vec::new();
+    let streams: Vec<(bool, Box<dyn std::io::Read + Send>)> = [
+        child.stdout.take().map(|stream| {
+            (false, Box::new(stream) as Box<dyn std::io::Read + Send>)
+        }),
+        child.stderr.take().map(|stream| {
+            (true, Box::new(stream) as Box<dyn std::io::Read + Send>)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for (is_stderr, stream) in streams {
+        let sender = output_tx.clone();
+        readers.push(thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            loop {
+                match read_tar_output_line(&mut reader, &mut line) {
+                    Ok(false) => break,
+                    Ok(true) => {
+                        if sender
+                            .send(Ok((is_stderr, std::mem::take(&mut line))))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        }));
     }
-    if matches!(entry.first(), Some(b'/' | b'\\'))
-        || (entry.len() >= 2 && entry[0].is_ascii_alphabetic() && entry[1] == b':')
-    {
-        return Err(format!(
-            "Archive contains an absolute path: {}",
-            String::from_utf8_lossy(entry)
-        ));
+    drop(output_tx);
+
+    let total_files = size_map.len();
+    let total_bytes = size_map.values().copied().sum();
+    let mut completed_files = 0usize;
+    let mut completed_bytes = 0u64;
+    let mut diagnostics = Vec::new();
+    let mut read_error = None;
+    for record in output_rx.iter() {
+        let (is_stderr, line) = match record {
+            Ok(record) => record,
+            Err(error) => {
+                read_error = Some(error);
+                crate::services::claude::kill_child_tree(&mut child);
+                break;
+            }
+        };
+        if is_stderr {
+            diagnostics.extend_from_slice(&line);
+            let excess = diagnostics.len().saturating_sub(MAX_TAR_ERROR_TAIL_BYTES);
+            if excess > 0 {
+                diagnostics.drain(..excess);
+            }
+        }
+        let displayed = String::from_utf8_lossy(&line);
+        let displayed = displayed.trim_end_matches(['\r', '\n']);
+        let name = if !is_stderr {
+            Some(displayed)
+        } else if extracting {
+            displayed.strip_prefix("x ")
+        } else {
+            displayed
+                .strip_prefix("a ")
+                .or_else(|| displayed.starts_with("./").then_some(displayed))
+        };
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            completed_files += 1;
+            completed_bytes += size_map
+                .get(name.trim_end_matches('/'))
+                .copied()
+                .unwrap_or(0);
+            let _ = progress.send(ProgressMessage::FileStarted(name.to_string()));
+            let _ = progress.send(ProgressMessage::FileCompleted(name.to_string()));
+            let _ = progress.send(ProgressMessage::TotalProgress(
+                completed_files,
+                total_files,
+                completed_bytes,
+                total_bytes,
+            ));
+        }
     }
-    if entry
-        .split(|byte| matches!(*byte, b'/' | b'\\'))
-        .any(|component| component == b"..")
-    {
-        return Err(format!(
-            "Archive contains a parent-directory path: {}",
-            String::from_utf8_lossy(entry)
-        ));
+    drop(output_rx);
+    for reader in readers {
+        if reader.join().is_err() {
+            read_error = Some(std::io::Error::other("Cannot read tar process output"));
+            crate::services::claude::kill_child_tree(&mut child);
+        }
     }
-    Ok(())
+    let status = child.wait();
+    if status.is_err() {
+        crate::services::claude::kill_child_tree(&mut child);
+        let _ = child.wait();
+    }
+    watch_done.store(true, Ordering::Relaxed);
+    let _ = watch.join();
+    if let Some(error) = read_error {
+        return Err(error);
+    }
+    Ok(TarCommandResult {
+        status: status?,
+        completed_files,
+        diagnostics: String::from_utf8_lossy(&diagnostics).into_owned(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,6 +903,20 @@ fn archive_extract_directory_name(archive_name: &str) -> Option<String> {
     None
 }
 
+fn validate_tar_source_name(name: &str) -> Result<(), &'static str> {
+    use std::path::Component;
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None)
+            if component == std::ffi::OsStr::new(name) && !name.contains('\0') =>
+        {
+            Ok(())
+        }
+        _ => Err("Archive input must be a single entry name"),
+    }
+}
+
 fn tar_create_arguments(
     compression: TarCompression,
     excluded_paths: &[String],
@@ -832,7 +929,7 @@ fn tar_create_arguments(
     arguments.extend(excluded_paths.iter().map(|path| {
         // tar exclusions are glob patterns, even without a shell.
         // Quote every metacharacter so an excluded name cannot match
-        // an unrelated file or leave its own unsafe link in the archive.
+        // an unrelated file or fail to exclude the intended entry.
         let mut literal = String::new();
         for ch in path.chars() {
             if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
@@ -850,15 +947,6 @@ fn tar_create_arguments(
     arguments
 }
 
-fn tar_list_arguments(compression: TarCompression) -> Vec<String> {
-    let mut arguments = vec!["-t".to_string()];
-    if let Some(flag) = compression.flag() {
-        arguments.push(flag.to_string());
-    }
-    arguments.push("-f".to_string());
-    arguments.push("-".to_string());
-    arguments
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TarExtractionCapabilities {
@@ -966,238 +1054,7 @@ fn tar_extract_arguments(
     Ok(arguments)
 }
 
-fn snapshot_archive_for_extraction(
-    source_path: &Path,
-    cancel_flag: &AtomicBool,
-) -> std::io::Result<ReservedTarArchive> {
-    use std::io::{Read, Write};
 
-    let (mut source, before) = file_ops::open_regular_file_no_follow(source_path)?;
-    let snapshot = ReservedTarArchive::create(source_path)?;
-    let mut output = snapshot.writer()?;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Cancelled",
-            ));
-        }
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        output.write_all(&buffer[..count])?;
-    }
-    output.sync_all()?;
-    if !file_ops::metadata_still_matches(&before, &source.metadata()?) {
-        return Err(std::io::Error::other(
-            "Archive changed while its private extraction snapshot was being created",
-        ));
-    }
-    snapshot.verify_owned_path()?;
-    Ok(snapshot)
-}
-
-fn validate_extracted_symlink(
-    root: &Path,
-    canonical_root: &Path,
-    link_path: &Path,
-) -> std::io::Result<()> {
-    let target = fs::read_link(link_path)?;
-    let relative = link_path
-        .strip_prefix(root)
-        .map_err(|_| std::io::Error::other("extracted symlink is outside the extraction root"))?;
-    file_ops::validate_tar_symlink_target(relative, &target)?;
-    let parent = link_path.parent().unwrap_or(root);
-    let resolved = parent.join(&target).canonicalize().map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "archive created an unresolvable symlink: {} -> {}: {}",
-                link_path.display(),
-                target.display(),
-                error
-            ),
-        )
-    })?;
-    if !resolved.starts_with(canonical_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "archive symlink resolves outside the extraction root: {} -> {}",
-                link_path.display(),
-                target.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn sanitize_extracted_tree(root: &Path) -> std::io::Result<()> {
-    sanitize_extracted_tree_with_cancel(root, None)
-}
-
-fn sanitize_extracted_tree_with_cancel(
-    root: &Path,
-    cancel_flag: Option<&AtomicBool>,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-
-    let canonical_root = root.canonicalize()?;
-
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Cancelled",
-            ));
-        }
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            validate_extracted_symlink(root, &canonical_root, &path)?;
-            continue;
-        }
-        let file_type = metadata.file_type();
-        #[cfg(unix)]
-        let is_special = file_type.is_block_device()
-            || file_type.is_char_device()
-            || file_type.is_fifo()
-            || file_type.is_socket();
-        #[cfg(not(unix))]
-        let is_special = !metadata.is_file() && !metadata.is_dir();
-        if is_special {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("archive created a special file: {}", path.display()),
-            ));
-        }
-        if metadata.is_dir() {
-            for entry in fs::read_dir(&path)? {
-                if cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "Cancelled",
-                    ));
-                }
-                pending.push(entry?.path());
-            }
-        }
-        #[cfg(unix)]
-        {
-            let mode = metadata.permissions().mode();
-            if mode & 0o6000 != 0 {
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(mode & !0o6000);
-                if metadata.is_dir() {
-                    let (directory, _, opened) = file_ops::open_directory_for_read(&path)?;
-                    if !opened.is_dir()
-                        || file_ops::stable_file_identity(&directory)?
-                            != file_ops::stable_path_identity(&path)?
-                    {
-                        return Err(std::io::Error::other(
-                            "archive directory changed before permission cleanup",
-                        ));
-                    }
-                    directory.set_permissions(permissions)?;
-                } else if metadata.is_file() {
-                    let (file, _) = file_ops::open_regular_file_no_follow(&path)?;
-                    file.set_permissions(permissions)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validate the completed archive with the same backend and tree checks used
-/// by extraction. Source preflight cannot authorize the later bytes: a link may
-/// change while tar is running. Keep both archive and verification tree private
-/// until this round trip succeeds, including cleanup and cancellation checks.
-fn verify_created_tar_archive(
-    archive: &ReservedTarArchive,
-    tar_cmd: &str,
-    compression: TarCompression,
-    cancel_flag: Arc<AtomicBool>,
-) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
-
-    let check_cancelled = || {
-        if cancel_flag.load(Ordering::Relaxed) {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "Cancelled",
-            ))
-        } else {
-            Ok(())
-        }
-    };
-    check_cancelled()?;
-    archive.verify_owned_path()?;
-    let before = archive.writer()?.metadata()?;
-    App::list_archive_contents(tar_cmd, archive.reader()?, compression, cancel_flag.clone())
-        .map_err(std::io::Error::other)?;
-    check_cancelled()?;
-    let capabilities = probe_tar_extraction_capabilities(tar_cmd);
-    let arguments =
-        tar_extract_arguments(compression, capabilities).map_err(std::io::Error::other)?;
-    let verification_path = archive.staging_dir.join("verification");
-    let mut directory = ReservedExtractDirectory::create(&verification_path)?;
-    let result = (|| {
-        check_cancelled()?;
-        let mut command = Command::new(tar_cmd);
-        command
-            .args(arguments)
-            .stdin(Stdio::from(archive.reader()?))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        configure_tar_command(&mut command);
-        bind_command_to_extract_directory(&mut command, &directory)?;
-        crate::services::claude::detach_into_own_pgroup(&mut command);
-        let mut child = command.spawn()?;
-        let (watch_done, watch) = spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-        let stderr = child.stderr.take().map(|stream| {
-            thread::spawn(move || read_bounded_tail(stream, MAX_TAR_ERROR_TAIL_BYTES))
-        });
-        let status = child.wait();
-        if status.is_err() {
-            crate::services::claude::kill_child_tree(&mut child);
-            let _ = child.wait();
-        }
-        watch_done.store(true, Ordering::Relaxed);
-        let _ = watch.join();
-        let errors = stderr
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default();
-        check_cancelled()?;
-        if !status?.success() {
-            return Err(std::io::Error::other(format!(
-                "Archive failed extraction verification: {}",
-                errors.trim()
-            )));
-        }
-        directory.secure()?;
-        sanitize_extracted_tree_with_cancel(&verification_path, Some(cancel_flag.as_ref()))?;
-        directory.secure()?;
-        archive.verify_owned_path()?;
-        if !file_ops::metadata_still_matches(&before, &archive.writer()?.metadata()?) {
-            return Err(std::io::Error::other("Archive changed during verification"));
-        }
-        check_cancelled()
-    })();
-    let cleanup = directory.cleanup();
-    match (result, cleanup) {
-        (Err(error), Err(cleanup_error)) => Err(std::io::Error::new(
-            error.kind(),
-            format!("{error}; archive verification cleanup failed: {cleanup_error}"),
-        )),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => check_cancelled(),
-    }
-}
 
 /// Replace handler placeholders with an environment-variable expansion while
 /// preserving the surrounding shell quote context.  The actual path is never
@@ -1944,7 +1801,7 @@ pub struct TarExcludeState {
     pub archive_name: String,
     /// Files to archive
     pub files: Vec<String>,
-    /// Paths to exclude (unsafe symlinks)
+    /// Special or unreadable entries to exclude
     pub excluded_paths: Vec<String>,
     /// Scroll offset for viewing excluded paths
     pub scroll_offset: usize,
@@ -6048,7 +5905,10 @@ impl App {
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     let path = e.path();
-                    if !path.is_file() {
+                    if !fs::symlink_metadata(&path)
+                        .map(|metadata| metadata.is_file())
+                        .unwrap_or(false)
+                    {
                         return false;
                     }
                     let name = e.file_name().to_string_lossy().to_string();
@@ -6095,7 +5955,10 @@ impl App {
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     let path = e.path();
-                    path.is_file() && e.file_name().to_string_lossy().ends_with(".cokacenc")
+                    fs::symlink_metadata(&path)
+                        .map(|metadata| metadata.is_file())
+                        .unwrap_or(false)
+                        && e.file_name().to_string_lossy().ends_with(".cokacenc")
                 })
                 .count(),
             Err(_) => 0,
@@ -8362,9 +8225,10 @@ impl App {
             return;
         }
 
-        // Validate each filename to prevent argument injection
+        // Each selected entry becomes a ./-prefixed argument. Preserve valid
+        // names instead of imposing rules intended for newly created files.
         for file in &files {
-            if let Err(e) = file_ops::is_valid_filename(file) {
+            if let Err(e) = validate_tar_source_name(file) {
                 self.show_message(&format!("Invalid filename '{}': {}", file, e));
                 return;
             }
@@ -8373,13 +8237,13 @@ impl App {
         let archive_path = current_dir.join(archive_name);
 
         // Check if archive already exists (fast check)
-        if archive_path.exists() {
+        if fs::symlink_metadata(&archive_path).is_ok() {
             self.show_message(&format!("Error: {} already exists", archive_name));
             return;
         }
 
-        // Check for unsafe symlinks BEFORE starting background work
-        let (_, excluded_paths) = file_ops::filter_symlinks_for_tar(&current_dir, &files);
+        // Find unsupported or unreadable entries before starting background work
+        let (_, excluded_paths) = file_ops::filter_tar_entries(&current_dir, &files);
 
         // If there are files to exclude, show confirmation dialog
         if !excluded_paths.is_empty() {
@@ -8413,7 +8277,6 @@ impl App {
         files: &[String],
         excluded_paths: &[String],
     ) {
-        use std::io::BufReader;
         use std::process::{Command, Stdio};
 
         if self.active_panel().is_remote() {
@@ -8440,7 +8303,7 @@ impl App {
             return;
         }
         for file in files {
-            if let Err(error) = file_ops::is_valid_filename(file) {
+            if let Err(error) = validate_tar_source_name(file) {
                 self.show_message(&format!("Invalid filename '{file}': {error}"));
                 return;
             }
@@ -8644,336 +8507,82 @@ impl App {
                 let _ = tx.send(ProgressMessage::Completed(0, 1));
                 return;
             }
-            crate::services::claude::detach_into_own_pgroup(&mut command);
-            let child = command.spawn();
-
-            match child {
-                Ok(mut child) => {
-                    let (cancel_watch_done, cancel_watch) =
-                        spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-                    let stderr = child.stderr.take();
-                    let mut completed_files = 0usize;
-                    let mut completed_bytes = 0u64;
-                    let mut stdout_error_lines: Vec<String> = Vec::new();
-
-                    // When the archive itself goes to stdout, common tar
-                    // implementations send verbose progress and diagnostics
-                    // to stderr. Consume it continuously so the child cannot
-                    // block on a full pipe.
-                    if let Some(stderr) = stderr {
-                        use std::io::BufRead;
-                        let mut reader = BufReader::with_capacity(64, stderr);
-                        let mut line = String::new();
-
-                        loop {
-                            // Check for cancellation
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                crate::services::claude::kill_child_tree(&mut child);
-                                let _ = child.wait();
-                                cancel_watch_done.store(true, Ordering::Relaxed);
-                                let _ = cancel_watch.join();
-                                let _ = tx.send(ProgressMessage::Error(
-                                    archive_name_owned.clone(),
-                                    "Cancelled".to_string(),
-                                ));
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
-                                return;
-                            }
-
-                            line.clear();
-                            match reader.read_line(&mut line) {
-                                Ok(0) => break, // EOF
-                                Ok(_) => {
-                                    let filename = line.trim_end();
-                                    // Check if this looks like an error line (starts with "tar:")
-                                    if filename.starts_with("tar:") || filename.starts_with("gtar:")
-                                    {
-                                        if stdout_error_lines.len() < 16 {
-                                            stdout_error_lines
-                                                .push(filename.chars().take(4096).collect());
-                                        }
-                                    } else if !filename.is_empty() {
-                                        completed_files += 1;
-                                        // Look up file size from the map
-                                        if let Some(&file_size) = size_map.get(filename) {
-                                            completed_bytes += file_size;
-                                        }
-                                        let _ = tx.send(ProgressMessage::FileStarted(
-                                            filename.to_string(),
-                                        ));
-                                        let _ = tx.send(ProgressMessage::FileCompleted(
-                                            filename.to_string(),
-                                        ));
-                                        let _ = tx.send(ProgressMessage::TotalProgress(
-                                            completed_files,
-                                            total_file_count,
-                                            completed_bytes,
-                                            total_bytes,
-                                        ));
-                                    }
+            let result = run_tar_command(command, cancel_flag.clone(), &tx, &size_map, false);
+            let publication = if cancel_flag.load(Ordering::Relaxed) {
+                Err("Cancelled".to_string())
+            } else {
+                match result {
+                    Ok(result) if result.status.success() => {
+                        publish_tar_archive(&temp_archive, &archive_path_clone)
+                            .map(|()| result.completed_files)
+                            .map_err(|error| {
+                                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                                    format!("{} already exists", archive_name_owned)
+                                } else {
+                                    format!("Cannot publish archive: {error}")
                                 }
-                                Err(_) => break,
-                            }
-                        }
+                            })
                     }
-
-                    // Wait for completion
-                    let wait_result = child.wait();
-                    cancel_watch_done.store(true, Ordering::Relaxed);
-                    let _ = cancel_watch.join();
-                    match wait_result {
-                        Ok(status) => {
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                let _ = tx.send(ProgressMessage::Error(
-                                    archive_name_owned.clone(),
-                                    "Cancelled".to_string(),
-                                ));
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
-                                return;
-                            }
-                            if status.success() {
-                                let _ = tx.send(ProgressMessage::Preparing(
-                                    "Verifying archive...".to_string(),
-                                ));
-                                if let Err(error) = verify_created_tar_archive(
-                                    &temp_archive,
-                                    &tar_cmd,
-                                    compression,
-                                    cancel_flag.clone(),
-                                ) {
-                                    let _ = tx.send(ProgressMessage::Error(
-                                        archive_name_owned,
-                                        format!("Archive was not published: {error}"),
-                                    ));
-                                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                                    return;
-                                }
-                                let _ = tx.send(ProgressMessage::PrepareComplete);
-                                match publish_tar_archive(&temp_archive, &archive_path_clone) {
-                                    Ok(()) => {
-                                        let _ =
-                                            tx.send(ProgressMessage::Completed(completed_files, 0));
-                                    }
-                                    Err(error) => {
-                                        let message =
-                                            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                                                format!("{} already exists", archive_name_owned)
-                                            } else {
-                                                format!("Cannot publish archive: {}", error)
-                                            };
-                                        let _ = tx.send(ProgressMessage::Error(
-                                            archive_name_owned,
-                                            message,
-                                        ));
-                                        let _ = tx.send(ProgressMessage::Completed(0, 1));
-                                    }
-                                }
-                            } else {
-                                let error_msg = Self::process_error_message(
-                                    None,
-                                    &stdout_error_lines,
-                                    "tar command failed",
-                                );
-                                let _ =
-                                    tx.send(ProgressMessage::Error(archive_name_owned, error_msg));
-                                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                            }
-                        }
-                        Err(e) => {
-                            let _ =
-                                tx.send(ProgressMessage::Error(archive_name_owned, e.to_string()));
-                            let _ = tx.send(ProgressMessage::Completed(0, 1));
-                        }
-                    }
+                    Ok(result) => Err(Self::process_error_message(
+                        Some(result.diagnostics),
+                        &[],
+                        "tar command failed",
+                    )),
+                    Err(error) => Err(format!("Failed to run tar: {error}")),
                 }
-                Err(e) => {
-                    let _ = tx.send(ProgressMessage::Error(
-                        archive_name_owned,
-                        format!("Failed to run tar: {}", e),
-                    ));
+            };
+            // Finish removing our temporary file before reporting completion.
+            drop(temp_archive);
+            match publication {
+                Ok(count) => {
+                    let _ = tx.send(ProgressMessage::Completed(count, 0));
+                }
+                Err(error) => {
+                    let _ = tx.send(ProgressMessage::Error(archive_name_owned, error));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                 }
             }
         });
     }
 
-    /// List archive contents to get total file count and sizes
-    fn list_archive_contents(
-        tar_cmd: &str,
-        archive_input: fs::File,
-        compression: TarCompression,
-        cancel_flag: Arc<AtomicBool>,
-    ) -> Result<(usize, u64, std::collections::HashMap<String, u64>), String> {
-        use std::collections::HashMap;
-        use std::io::BufReader;
+    /// Extract directly from an opened archive, including a selected symlink.
+    /// The backend handles member paths; verbose names are display text only.
+    pub fn execute_untar(&mut self, archive_path: &Path) {
         use std::process::{Command, Stdio};
 
-        // A non-verbose listing gives one entry name per record across GNU tar,
-        // bsdtar, and common platform tar implementations. Byte totals are
-        // intentionally omitted: retaining every verbose entry in a HashMap
-        // made the preflight itself an OOM vector for hostile archives.
-        let mut total_files = 0usize;
-        let mut stdout_error_lines = Vec::new();
-
-        let mut cmd = Command::new(tar_cmd);
-        cmd.args(tar_list_arguments(compression))
-            .stdin(Stdio::from(archive_input))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_tar_command(&mut cmd);
-        crate::services::claude::detach_into_own_pgroup(&mut cmd);
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => return Err(format!("Failed to list archive contents: {}", e)),
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                crate::services::claude::kill_child_tree(&mut child);
-                let _ = child.wait();
-                return Err("Failed to capture archive listing".to_string());
-            }
-        };
-        let stderr_handle = child.stderr.take().map(|stderr| {
-            thread::spawn(move || read_bounded_tail(stderr, MAX_TAR_ERROR_TAIL_BYTES))
-        });
-        let (cancel_watch_done, cancel_watch) =
-            spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-
-        let parse_result = (|| -> Result<(), String> {
-            let mut reader = BufReader::with_capacity(8192, stdout);
-            let mut line = Vec::new();
-            loop {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Cancelled".to_string());
-                }
-                let has_line =
-                    read_bounded_line(&mut reader, &mut line, MAX_TAR_LIST_LINE_BYTES)
-                        .map_err(|error| format!("Failed to read archive contents: {}", error))?;
-                if !has_line {
-                    break;
-                }
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-
-                validate_archive_entry_path(&line)?;
-                total_files = total_files
-                    .checked_add(1)
-                    .ok_or_else(|| "Archive contains too many entries".to_string())?;
-                if total_files > MAX_TAR_ENTRY_COUNT {
-                    return Err(format!(
-                        "Archive contains more than {MAX_TAR_ENTRY_COUNT} entries"
-                    ));
-                }
-
-                if (line.starts_with(b"tar:") || line.starts_with(b"gtar:"))
-                    && stdout_error_lines.len() < 16
-                {
-                    let truncated = &line[..line.len().min(4096)];
-                    stdout_error_lines.push(String::from_utf8_lossy(truncated).into_owned());
-                }
-            }
-            Ok(())
-        })();
-
-        if parse_result.is_err() {
-            crate::services::claude::kill_child_tree(&mut child);
-        }
-        let wait_result = child.wait();
-        cancel_watch_done.store(true, Ordering::Relaxed);
-        let _ = cancel_watch.join();
-        let stderr = stderr_handle
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-
-        if cancel_flag.load(Ordering::Relaxed) {
-            return Err("Cancelled".to_string());
-        }
-        parse_result?;
-
-        let status = wait_result.map_err(|e| format!("Failed to list archive contents: {}", e))?;
-
-        if !status.success() {
-            return Err(Self::process_error_message(
-                Some(stderr),
-                &stdout_error_lines,
-                "Failed to read archive contents",
-            ));
-        }
-
-        if stderr.contains("Removing leading") || stderr.contains("Member name contains") {
-            return Err("Archive contains an unsafe absolute or parent-directory path".to_string());
-        }
-
-        Ok((total_files, 0, HashMap::new()))
-    }
-
-    /// Execute archive extraction with progress display
-    pub fn execute_untar(&mut self, archive_path: &std::path::Path) {
         if self.active_panel().is_remote() {
             self.show_message("Archive extraction is not supported on remote panels");
             return;
         }
-        use std::io::BufReader;
-        use std::process::{Command, Stdio};
-
-        let archive_name = match archive_path.file_name() {
-            Some(name) => name.to_string_lossy().to_string(),
-            None => {
-                self.show_message("Invalid archive path");
-                return;
-            }
+        let Some(archive_name) = archive_path.file_name().and_then(|name| name.to_str()) else {
+            self.show_message("Invalid archive path");
+            return;
         };
-
-        let current_dir = match archive_path.parent() {
-            Some(dir) => dir.to_path_buf(),
-            None => {
-                self.show_message("Invalid archive path");
-                return;
-            }
+        let Some(current_dir) = archive_path.parent() else {
+            self.show_message("Invalid archive path");
+            return;
         };
-
-        let extract_dir_name = match archive_extract_directory_name(&archive_name) {
-            Some(name) => name,
-            None => {
-                self.show_message("Unsupported or invalid tar archive name");
-                return;
-            }
+        let Some(extract_dir_name) = archive_extract_directory_name(archive_name) else {
+            self.show_message("Unsupported or invalid tar archive name");
+            return;
         };
-
         let extract_path = current_dir.join(&extract_dir_name);
-
-        // Check if extraction directory already exists (fast check)
-        if extract_path.exists() {
+        if fs::symlink_metadata(&extract_path).is_ok() {
             self.show_message(&format!("Error: {} already exists", extract_dir_name));
             return;
         }
 
-        let compression = TarCompression::from_archive_name(&archive_name);
-
-        let archive_path_owned = archive_path.to_path_buf();
-        let extract_dir_owned = extract_dir_name.clone();
-        let extract_path_clone = extract_path.clone();
-
-        // Create progress state with preparing flag - show dialog immediately
+        let compression = TarCompression::from_archive_name(archive_name);
+        let archive_path = archive_path.to_path_buf();
         let mut progress = FileOperationProgress::new(FileOperationType::Untar);
         progress.is_active = true;
         progress.is_preparing = true;
         progress.preparing_message = "Preparing...".to_string();
         let cancel_flag = progress.cancel_flag.clone();
-
-        // Create channel for progress messages
         let (tx, rx) = mpsc::channel();
         progress.receiver = Some(rx);
-
-        // Store progress state and show dialog IMMEDIATELY
         self.file_operation_progress = Some(progress);
-        self.pending_extract_dir = Some(extract_dir_name);
+        self.pending_extract_dir = Some(extract_dir_name.clone());
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Progress,
             input: String::new(),
@@ -8984,320 +8593,93 @@ impl App {
             selection: None,
             use_md5: false,
         });
-
-        // Clone tar_path from settings for use in background thread
         let tar_path = self.settings.tar_path.clone();
 
-        // Start all preparation and execution in background thread
         thread::spawn(move || {
-            if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    "Cancelled".to_string(),
+            let prepare = || -> Result<(Command, ReservedExtractDirectory), String> {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Cancelled".to_string());
+                }
+                // Hold the selected file open; replacing or retargeting its
+                // pathname cannot redirect the backend to another archive.
+                let (input, _) = file_ops::open_regular_file_for_read(&archive_path)
+                    .map_err(|error| format!("Cannot open archive: {error}"))?;
+                let _ = tx.send(ProgressMessage::Preparing(
+                    "Checking tar command...".to_string(),
                 ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-
-            let _ = tx.send(ProgressMessage::Preparing(
-                "Checking tar command...".to_string(),
-            ));
-            let tar_cmd = match select_tar_command(tar_path.as_deref()) {
-                Some(cmd) => cmd,
-                None => {
-                    let _ = tx.send(ProgressMessage::Error(
-                        extract_dir_owned,
-                        "tar command not found".to_string(),
+                let tar_cmd = select_tar_command(tar_path.as_deref())
+                    .ok_or_else(|| "tar command not found".to_string())?;
+                let arguments = tar_extract_arguments(
+                    compression,
+                    probe_tar_extraction_capabilities(&tar_cmd),
+                )?;
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Cancelled".to_string());
+                }
+                let directory = ReservedExtractDirectory::create(&extract_path)
+                    .map_err(|error| format!("Cannot create extraction directory: {error}"))?;
+                let mut command = Command::new(tar_cmd);
+                command
+                    .args(arguments)
+                    .stdin(Stdio::from(input))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                configure_tar_command(&mut command);
+                if let Err(error) = bind_command_to_extract_directory(&mut command, &directory) {
+                    return Err(extraction_error_with_cleanup(
+                        directory,
+                        format!("Cannot open extraction directory: {error}"),
                     ));
-                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                    return;
                 }
+                Ok((command, directory))
             };
-            let capabilities = probe_tar_extraction_capabilities(&tar_cmd);
-            let tar_args = match tar_extract_arguments(compression, capabilities) {
-                Ok(arguments) => arguments,
+            let (command, directory) = match prepare() {
+                Ok(prepared) => prepared,
                 Err(error) => {
-                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, error));
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_name, error));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                     return;
                 }
             };
-
-            if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    "Cancelled".to_string(),
-                ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-
-            let _ = tx.send(ProgressMessage::Preparing(
-                "Creating private archive snapshot...".to_string(),
-            ));
-            let archive_snapshot =
-                match snapshot_archive_for_extraction(&archive_path_owned, cancel_flag.as_ref()) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        let message = if error.kind() == std::io::ErrorKind::Interrupted {
-                            "Cancelled".to_string()
-                        } else {
-                            format!("Cannot prepare archive snapshot: {error}")
-                        };
-                        let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
-                        let _ = tx.send(ProgressMessage::Completed(0, 1));
-                        return;
-                    }
-                };
-
-            let _ = tx.send(ProgressMessage::Preparing(
-                "Reading archive contents...".to_string(),
-            ));
-            let list_input = match archive_snapshot.reader() {
-                Ok(input) => input,
-                Err(error) => {
-                    let _ = tx.send(ProgressMessage::Error(
-                        extract_dir_owned,
-                        format!("Cannot read private archive snapshot: {error}"),
-                    ));
-                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                    return;
-                }
-            };
-            let (total_file_count, total_bytes, size_map) = match Self::list_archive_contents(
-                &tar_cmd,
-                list_input,
-                compression,
-                cancel_flag.clone(),
-            ) {
-                Ok(contents) => contents,
-                Err(e) => {
-                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, e));
-                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                    return;
-                }
-            };
-
-            // Check for cancellation after listing
-            if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(ProgressMessage::Error(
-                    extract_dir_owned,
-                    "Cancelled".to_string(),
-                ));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-
-            let mut extract_directory = match ReservedExtractDirectory::create(&extract_path_clone)
-            {
-                Ok(directory) => directory,
-                Err(error) => {
-                    let _ = tx.send(ProgressMessage::Error(
-                        extract_dir_owned,
-                        format!("Failed to create private extraction directory: {error}"),
-                    ));
-                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                    return;
-                }
-            };
-
             let _ = tx.send(ProgressMessage::PrepareComplete);
-            let _ = tx.send(ProgressMessage::TotalProgress(
-                0,
-                total_file_count,
-                0,
-                total_bytes,
-            ));
-
-            let extract_input = match archive_snapshot.reader() {
-                Ok(input) => input,
-                Err(error) => {
-                    let message = extraction_error_with_cleanup(
-                        extract_directory,
-                        format!("Cannot rewind private archive snapshot: {error}"),
-                    );
-                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
-                    let _ = tx.send(ProgressMessage::Completed(0, 1));
-                    return;
+            // Totals are unknown until extraction completes. The existing
+            // progress display supports this without another archive read.
+            let result = run_tar_command(
+                command,
+                cancel_flag.clone(),
+                &tx,
+                &HashMap::new(),
+                true,
+            );
+            let extraction = if cancel_flag.load(Ordering::Relaxed) {
+                Err("Cancelled".to_string())
+            } else {
+                match result {
+                    Ok(result) if result.status.success() => Ok(result.completed_files),
+                    Ok(result) => Err(Self::process_error_message(
+                        Some(result.diagnostics),
+                        &[],
+                        "tar extraction failed",
+                    )),
+                    Err(error) => Err(format!("Failed to run tar: {error}")),
                 }
             };
-
-            let mut command = Command::new(&tar_cmd);
-            command
-                .args(&tar_args)
-                .stdin(Stdio::from(extract_input))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            configure_tar_command(&mut command);
-            if let Err(error) = bind_command_to_extract_directory(&mut command, &extract_directory)
-            {
-                let message = extraction_error_with_cleanup(
-                    extract_directory,
-                    format!("Cannot bind tar to the private extraction directory: {error}"),
-                );
-                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
-                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                return;
-            }
-            crate::services::claude::detach_into_own_pgroup(&mut command);
-            let child = command.spawn();
-
-            match child {
-                Ok(mut child) => {
-                    let (cancel_watch_done, cancel_watch) =
-                        spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
-                    let stdout = child.stdout.take();
-                    let stderr = child.stderr.take();
-                    let mut completed_files = 0usize;
-                    let mut completed_bytes = 0u64;
-                    let mut stdout_error_lines: Vec<String> = Vec::new();
-
-                    // Collect stderr in background for error messages
-                    let stderr_handle = stderr.map(|stderr| {
-                        thread::spawn(move || read_bounded_tail(stderr, MAX_TAR_ERROR_TAIL_BYTES))
-                    });
-
-                    // Read stdout line by line for progress updates
-                    if let Some(stdout) = stdout {
-                        use std::io::BufRead;
-                        let mut reader = BufReader::with_capacity(256, stdout);
-                        let mut line = String::new();
-
-                        loop {
-                            // Check for cancellation
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                crate::services::claude::kill_child_tree(&mut child);
-                                let _ = child.wait();
-                                cancel_watch_done.store(true, Ordering::Relaxed);
-                                let _ = cancel_watch.join();
-                                let message =
-                                    extraction_error_with_cleanup(extract_directory, "Cancelled");
-                                let _ = tx.send(ProgressMessage::Error(
-                                    extract_dir_owned.clone(),
-                                    message,
-                                ));
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
-                                return;
-                            }
-
-                            line.clear();
-                            match reader.read_line(&mut line) {
-                                Ok(0) => break, // EOF
-                                Ok(_) => {
-                                    let filename = line.trim_end();
-                                    if filename.starts_with("tar:") || filename.starts_with("gtar:")
-                                    {
-                                        if stdout_error_lines.len() < 16 {
-                                            stdout_error_lines
-                                                .push(filename.chars().take(4096).collect());
-                                        }
-                                    } else if !filename.is_empty() {
-                                        completed_files += 1;
-                                        // Look up file size from the map
-                                        if let Some(&file_size) = size_map.get(filename) {
-                                            completed_bytes += file_size;
-                                        }
-                                        let _ = tx.send(ProgressMessage::FileStarted(
-                                            filename.to_string(),
-                                        ));
-                                        let _ = tx.send(ProgressMessage::FileCompleted(
-                                            filename.to_string(),
-                                        ));
-                                        let _ = tx.send(ProgressMessage::TotalProgress(
-                                            completed_files,
-                                            total_file_count,
-                                            completed_bytes,
-                                            total_bytes,
-                                        ));
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
+            match extraction {
+                Ok(count) => match directory.commit() {
+                    Ok(()) => {
+                        let _ = tx.send(ProgressMessage::Completed(count, 0));
                     }
-
-                    // Wait for completion
-                    let wait_result = child.wait();
-                    cancel_watch_done.store(true, Ordering::Relaxed);
-                    let _ = cancel_watch.join();
-                    let stderr = stderr_handle
-                        .and_then(|handle| handle.join().ok())
-                        .unwrap_or_default();
-                    match wait_result {
-                        Ok(status) => {
-                            if cancel_flag.load(Ordering::Relaxed) {
-                                let message =
-                                    extraction_error_with_cleanup(extract_directory, "Cancelled");
-                                let _ = tx.send(ProgressMessage::Error(
-                                    extract_dir_owned.clone(),
-                                    message,
-                                ));
-                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
-                                return;
-                            }
-                            if status.success() {
-                                let sanitize_result = extract_directory
-                                    .secure()
-                                    .and_then(|_| sanitize_extracted_tree(&extract_path_clone))
-                                    .and_then(|_| extract_directory.secure());
-                                match sanitize_result {
-                                    Ok(()) => match extract_directory.commit() {
-                                        Ok(()) => {
-                                            let _ = tx.send(ProgressMessage::Completed(
-                                                total_file_count,
-                                                0,
-                                            ));
-                                        }
-                                        Err(error) => {
-                                            let _ = tx.send(ProgressMessage::Error(
-                                                    extract_dir_owned,
-                                                    format!(
-                                                        "Extracted data could not be committed safely: {error}"
-                                                    ),
-                                                ));
-                                            let _ = tx.send(ProgressMessage::Completed(0, 1));
-                                        }
-                                    },
-                                    Err(error) => {
-                                        let message = extraction_error_with_cleanup(
-                                            extract_directory,
-                                            format!("Failed to validate extracted data: {error}"),
-                                        );
-                                        let _ = tx.send(ProgressMessage::Error(
-                                            extract_dir_owned,
-                                            message,
-                                        ));
-                                        let _ = tx.send(ProgressMessage::Completed(0, 1));
-                                    }
-                                }
-                            } else {
-                                let error_msg = Self::process_error_message(
-                                    Some(stderr),
-                                    &stdout_error_lines,
-                                    "tar extraction failed",
-                                );
-                                let message =
-                                    extraction_error_with_cleanup(extract_directory, error_msg);
-                                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
-                                let _ = tx.send(ProgressMessage::Completed(0, 1));
-                            }
-                        }
-                        Err(e) => {
-                            let message = extraction_error_with_cleanup(
-                                extract_directory,
-                                format!("Failed to wait for tar extraction: {e}"),
-                            );
-                            let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
-                            let _ = tx.send(ProgressMessage::Completed(0, 1));
-                        }
+                    Err(error) => {
+                        let _ = tx.send(ProgressMessage::Error(
+                            extract_dir_name,
+                            format!("Cannot finish extraction: {error}"),
+                        ));
+                        let _ = tx.send(ProgressMessage::Completed(0, 1));
                     }
-                }
-                Err(e) => {
-                    let message = extraction_error_with_cleanup(
-                        extract_directory,
-                        format!("Failed to run tar: {e}"),
-                    );
-                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, message));
+                },
+                Err(error) => {
+                    let message = extraction_error_with_cleanup(directory, error);
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_name, message));
                     let _ = tx.send(ProgressMessage::Completed(0, 1));
                 }
             }
@@ -10330,7 +9712,12 @@ mod tests {
         for name in ["bad1", "starX", "questionX", "backslash"] {
             fs::write(source.join("items").join(name), b"keep").unwrap();
         }
-        let (_, excluded) = file_ops::filter_symlinks_for_tar(&source, &["items".into()]);
+        // Explicit exclusions still need literal matching; links themselves
+        // no longer cause an exclusion during preflight.
+        let excluded: Vec<String> = bad_names
+            .iter()
+            .map(|name| format!("items/{name}"))
+            .collect();
         let archive = temp.path().join("test.tar");
         let status = Command::new(&tar)
             .current_dir(&source)
@@ -11273,6 +10660,35 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn encryption_dialog_counts_match_link_excluding_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("files");
+        fs::create_dir(&directory).unwrap();
+        let target = temp.path().join("target");
+        fs::write(&target, b"contents").unwrap();
+        std::os::unix::fs::symlink(&target, directory.join("linked.txt")).unwrap();
+        std::os::unix::fs::symlink(&target, directory.join("linked.cokacenc")).unwrap();
+        let mut app = App::new(directory.clone(), directory.clone());
+
+        app.show_encrypt_dialog();
+        assert!(app.dialog.is_none());
+        assert_eq!(app.message.as_deref(), Some("No files to encrypt"));
+        app.show_decrypt_dialog();
+        assert!(app.dialog.is_none());
+        assert_eq!(app.message.as_deref(), Some("No .cokacenc files to decrypt"));
+
+        fs::write(directory.join("regular.txt"), b"contents").unwrap();
+        app.show_encrypt_dialog();
+        assert!(app
+            .dialog
+            .as_ref()
+            .unwrap()
+            .message
+            .starts_with("Encrypt 1 file(s)?"));
+    }
+
     #[test]
     fn test_show_tar_dialog_defaults_to_tar_archive() {
         let temp_dir = create_temp_dir();
@@ -11460,49 +10876,74 @@ mod tests {
         );
     }
 
-    #[test]
     #[cfg(unix)]
-    fn test_list_archive_contents_reports_tar_stderr_on_failure() {
-        use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn tar_runner_drains_both_streams_and_keeps_failure_details() {
+        use std::process::{Command, Stdio};
 
-        let temp_dir = create_temp_dir();
-        let fake_tar = temp_dir.join("fake_tar");
-        let archive = temp_dir.join("bad.tar");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf './gnu-name\\n'; printf 'x bsd-name\\n' >&2; i=0; while [ \"$i\" -lt 2048 ]; do printf '%0100d\\n' 0 >&2; i=$((i+1)); done; printf '\\377bsdtar: creation failed\\n' >&2; exit 2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (tx, rx) = mpsc::channel();
+        let result = run_tar_command(
+            command, Arc::new(AtomicBool::new(false)), &tx, &HashMap::new(), true,
+        ).unwrap();
 
-        fs::write(
-            &fake_tar,
-            "#!/bin/sh\necho 'tar: bad archive' >&2\necho 'tar: missing end marker' >&2\nexit 2\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(&archive, "not a tar archive").unwrap();
+        assert!(!result.status.success());
+        assert_eq!(result.completed_files, 2);
+        assert!(result.diagnostics.ends_with("bsdtar: creation failed\n"));
+        assert!(result.diagnostics.contains('\u{fffd}'));
+        assert!(result.diagnostics.len() <= MAX_TAR_ERROR_TAIL_BYTES + 2);
+        let names: Vec<_> = rx.try_iter().filter_map(|message| match message {
+            ProgressMessage::FileCompleted(name) => Some(name),
+            _ => None,
+        }).collect();
+        assert!(names.contains(&"./gnu-name".to_string()));
+        assert!(names.contains(&"bsd-name".to_string()));
+    }
 
-        let err = App::list_archive_contents(
-            fake_tar.to_str().unwrap(),
-            fs::File::open(&archive).unwrap(),
-            TarCompression::None,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap_err();
+    #[cfg(unix)]
+    #[test]
+    fn tar_runner_cancels_when_the_backend_stops_producing_output() {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
 
-        assert!(err.contains("tar: bad archive"));
-        assert!(err.contains("tar: missing end marker"));
-
-        cleanup_temp_dir(&temp_dir);
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf './ready\\n'; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = flag.clone();
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = run_tar_command(command, worker_flag, &tx, &HashMap::new(), true);
+            let _ = done_tx.send(result);
+        });
+        let started = rx.recv_timeout(Duration::from_secs(5));
+        flag.store(true, Ordering::Relaxed);
+        assert!(started.is_ok(), "backend did not start");
+        let result = done_rx.recv_timeout(Duration::from_secs(5))
+            .expect("cancellation must stop a silent backend").unwrap();
+        worker.join().unwrap();
+        assert!(!result.status.success());
     }
 
     #[test]
-    fn archive_entry_validation_rejects_paths_outside_the_extract_root() {
-        for unsafe_path in [
-            b"/etc/passwd".as_slice(),
-            b"../escape",
-            b"safe/../../escape",
-            br"C:\Windows\system.ini",
-            br"\\server\share\file",
-        ] {
-            assert!(validate_archive_entry_path(unsafe_path).is_err());
+    fn tar_source_names_preserve_valid_names_and_reject_path_traversal() {
+        for name in ["-report", " leading space", "trailing space ", "tab\tname", "line\nname"] {
+            assert!(validate_tar_source_name(name).is_ok(), "{name:?}");
         }
-        assert!(validate_archive_entry_path(b"./safe/directory/file.txt").is_ok());
+        for name in ["", ".", "..", "../escape", "/absolute", "dir/child", "nul\0name"] {
+            assert!(validate_tar_source_name(name).is_err(), "{name:?}");
+        }
+        #[cfg(unix)]
+        assert!(validate_tar_source_name(r"left\..\right").is_ok());
+        #[cfg(windows)]
+        assert!(validate_tar_source_name(r"left\..\right").is_err());
     }
 
     #[test]
@@ -11602,23 +11043,19 @@ mod tests {
     }
 
     #[test]
-    fn archive_snapshot_remains_bound_when_the_source_name_is_replaced() {
+    fn opened_archive_remains_bound_when_the_source_name_is_replaced() {
         use std::io::Read;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let source = temp_dir.path().join("archive.tar");
         let retained = temp_dir.path().join("retained.tar");
         fs::write(&source, "validated archive bytes").unwrap();
-        let snapshot = snapshot_archive_for_extraction(&source, &AtomicBool::new(false)).unwrap();
+        let (mut input, _) = file_ops::open_regular_file_for_read(&source).unwrap();
 
         fs::rename(&source, &retained).unwrap();
         fs::write(&source, "replacement bytes").unwrap();
         let mut contents = String::new();
-        snapshot
-            .reader()
-            .unwrap()
-            .read_to_string(&mut contents)
-            .unwrap();
+        input.read_to_string(&mut contents).unwrap();
 
         assert_eq!(contents, "validated archive bytes");
         assert_eq!(fs::read_to_string(source).unwrap(), "replacement bytes");
@@ -11691,7 +11128,6 @@ mod tests {
         bind_command_to_extract_directory(&mut command, &extraction).unwrap();
         let status = command.status().unwrap();
         assert!(status.success());
-        sanitize_extracted_tree(&extract_path).unwrap();
         extraction.commit().unwrap();
 
         assert_eq!(
@@ -11702,65 +11138,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn execute_untar_end_to_end_uses_snapshot_and_modern_arguments() {
+    fn execute_untar_reads_once_without_copying_or_parsing_displayed_names() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
         let Some(tar_cmd) = select_tar_command(None) else {
             return;
         };
-        if tar_extract_arguments(
-            TarCompression::None,
-            probe_tar_extraction_capabilities(&tar_cmd),
-        )
-        .is_err()
-        {
-            return;
-        }
-
         let temp_dir = tempfile::tempdir().unwrap();
         let source_dir = temp_dir.path().join("source");
         fs::create_dir(&source_dir).unwrap();
-        fs::write(source_dir.join("payload.txt"), "snapshot payload").unwrap();
+        let names = [
+            "payload.txt", "-report", " leading", "trailing ",
+            "tab\tname", "line\nname", r"left\..\right",
+        ];
+        for name in names {
+            fs::write(source_dir.join(name), b"single pass payload").unwrap();
+        }
+        let raw_name = std::ffi::OsStr::from_bytes(b"raw-\xff");
+        fs::write(source_dir.join(raw_name), b"raw name payload").unwrap();
         let archive_path = temp_dir.path().join("bundle.tar");
-        let archive_output = fs::File::create(&archive_path).unwrap();
         let mut create = Command::new(&tar_cmd);
         create
             .current_dir(&source_dir)
-            .args(tar_create_arguments(
-                TarCompression::None,
-                &[],
-                &["payload.txt".to_string()],
-            ))
-            .stdout(Stdio::from(archive_output))
+            .args(["-c", "-f", "-", "."])
+            .stdout(Stdio::from(fs::File::create(&archive_path).unwrap()))
             .stderr(Stdio::null());
         configure_tar_command(&mut create);
         assert!(create.status().unwrap().success());
 
+        let backend_dir = tempfile::tempdir().unwrap();
+        let backend = backend_dir.path().join("traced-tar");
+        let quoted_tar = tar_cmd.replace('\'', "'\\''");
+        fs::write(&backend, format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >>\"$0.calls\"\nif [ \"$1\" = -x ] && [ \"$2\" = -v ]; then\n  for stage in ../.cokacdir-tar-*; do\n    if [ -d \"$stage\" ]; then printf 'tar: unexpected archive copy\\n' >&2; exit 2; fi\n  done\nfi\nexec '{quoted_tar}' \"$@\"\n"
+        )).unwrap();
+        fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
         let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.settings.tar_path = Some(backend.to_str().unwrap().to_string());
         app.execute_untar(&archive_path);
         for _ in 0..500 {
-            let active = app
-                .file_operation_progress
-                .as_mut()
-                .map(FileOperationProgress::poll)
-                .unwrap_or(false);
-            if !active {
+            if !app.file_operation_progress.as_mut()
+                .map(FileOperationProgress::poll).unwrap_or(false) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
 
-        let result = app
-            .file_operation_progress
-            .as_ref()
+        let result = app.file_operation_progress.as_ref()
             .and_then(|progress| progress.result.as_ref())
             .expect("untar worker should complete");
         assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
-        assert_eq!(
-            fs::read_to_string(temp_dir.path().join("bundle/payload.txt")).unwrap(),
-            "snapshot payload"
-        );
+        let extracted = temp_dir.path().join("bundle");
+        for name in names {
+            assert_eq!(fs::read(extracted.join(name)).unwrap(), b"single pass payload");
+        }
+        assert_eq!(fs::read(extracted.join(raw_name)).unwrap(), b"raw name payload");
+        let calls = fs::read_to_string(backend_dir.path().join("traced-tar.calls")).unwrap();
+        assert_eq!(calls.lines().filter(|line| line.starts_with("-t ")).count(), 1,
+            "only the empty backend probe may list an archive");
+        assert_eq!(calls.lines().filter(|line| *line == "-x -v").count(), 1);
     }
 
     #[cfg(unix)]
@@ -11783,6 +11222,10 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::write(temp_dir.path().join("payload.txt"), "round trip").unwrap();
         std::os::unix::fs::symlink("payload.txt", temp_dir.path().join("safe-link")).unwrap();
+        let unusual_names = ["-report", " leading", "trailing ", "tab\tname", r"left\..\right"];
+        for name in unusual_names {
+            fs::write(temp_dir.path().join(name), b"ordinary file").unwrap();
+        }
         let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         app.active_panel_mut()
             .selected_files
@@ -11790,6 +11233,9 @@ mod tests {
         app.active_panel_mut()
             .selected_files
             .insert("safe-link".into());
+        for name in unusual_names {
+            app.active_panel_mut().selected_files.insert(name.into());
+        }
 
         app.show_tar_dialog();
         fs::write(temp_dir.path().join("not-selected.txt"), "not confirmed").unwrap();
@@ -11853,11 +11299,17 @@ mod tests {
             PathBuf::from("payload.txt")
         );
         assert!(!temp_dir.path().join("roundtrip/not-selected.txt").exists());
+        for name in unusual_names {
+            assert_eq!(
+                fs::read(temp_dir.path().join("roundtrip").join(name)).unwrap(),
+                b"ordinary file"
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn tar_rejects_link_changed_after_exclusion_confirmation() {
+    fn tar_preserves_link_changed_after_special_file_exclusion_confirmation() {
         if select_tar_command(None).is_none() {
             return;
         }
@@ -11869,7 +11321,7 @@ mod tests {
         fs::write(items.join("target"), b"selected").unwrap();
         fs::write(outside.join("keep"), b"outside").unwrap();
         std::os::unix::fs::symlink("target", items.join("safe")).unwrap();
-        std::os::unix::fs::symlink(&outside, items.join("excluded")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(items.join("excluded")).unwrap();
         let mut app = App::new(temp.path().to_path_buf(), temp.path().to_path_buf());
         app.active_panel_mut().selected_files.insert("items".into());
         app.show_tar_dialog();
@@ -11897,73 +11349,162 @@ mod tests {
             .file_operation_progress
             .as_ref()
             .and_then(|progress| progress.result.as_ref())
-            .expect("tar validation completed");
-        assert_eq!(result.failure_count, 1);
-        assert!(!temp.path().join("result.tar").exists());
+            .expect("tar creation completed");
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        assert!(temp.path().join("result.tar").is_file());
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"outside");
         assert!(fs::symlink_metadata(items.join("safe"))
             .unwrap()
             .is_symlink());
         assert_eq!(
             fs::read_dir(temp.path()).unwrap().count(),
-            2,
-            "private verification data should be cleaned"
+            3,
+            "temporary archive data should be cleaned"
         );
-    }
-
-    #[test]
-    fn cancelled_tar_verification_does_not_publish_or_create_an_extraction_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let final_path = temp.path().join("cancelled.tar");
-        let archive = ReservedTarArchive::create(&final_path).unwrap();
-        let error = verify_created_tar_archive(
-            &archive,
-            "unused-tar",
-            TarCompression::None,
-            Arc::new(AtomicBool::new(true)),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-        assert!(!final_path.exists());
-        assert!(!archive.staging_dir.join("verification").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn tar_verification_accepts_compressed_archives_and_safe_link_chains() {
+    fn execute_tar_failure_does_not_publish_partial_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("payload.txt"), b"selected").unwrap();
+        let backend_dir = tempfile::tempdir().unwrap();
+        let backend = backend_dir.path().join("failing-tar");
+        fs::write(
+            &backend,
+            "#!/bin/sh\ncase \"$1\" in\n  -t) cat >/dev/null ;;\n  -c) printf 'partial archive'; printf 'tar: creation failed\\n' >&2; exit 2 ;;\n  *) exit 2 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        app.settings.tar_path = Some(backend.to_str().unwrap().to_string());
+        app.active_panel_mut()
+            .selected_files
+            .insert("payload.txt".into());
+        app.show_tar_dialog();
+        app.execute_tar("failed.tar");
+        for _ in 0..500 {
+            if !app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("tar worker should complete");
+        assert_eq!(result.failure_count, 1);
+        assert!(result
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("creation failed"));
+        assert!(!temp.path().join("failed.tar").exists());
+        assert_eq!(fs::read(temp.path().join("payload.txt")).unwrap(), b"selected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_tar_does_not_list_or_extract_its_completed_output() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
+
         let Some(tar_cmd) = select_tar_command(None) else {
             return;
         };
-        for compression in [
-            TarCompression::None,
-            TarCompression::Gzip,
-            TarCompression::Bzip2,
-            TarCompression::Xz,
-        ] {
+        for archive_name in ["result.tar", "result.tar.gz", "result.tar.bz2", "result.tar.xz"] {
+            let compression = TarCompression::from_archive_name(archive_name);
             let temp = tempfile::tempdir().unwrap();
             let items = temp.path().join("items");
             fs::create_dir(&items).unwrap();
             fs::write(items.join("target"), b"selected").unwrap();
-            std::os::unix::fs::symlink("target", items.join("one")).unwrap();
-            std::os::unix::fs::symlink("one", items.join("two")).unwrap();
-            let archive = ReservedTarArchive::create(&temp.path().join("result.tar")).unwrap();
-            let mut command = Command::new(&tar_cmd);
-            command
-                .args(tar_create_arguments(compression, &[], &["items".into()]))
-                .current_dir(temp.path())
-                .stdout(Stdio::from(archive.writer().unwrap()))
-                .stderr(Stdio::null());
-            configure_tar_command(&mut command);
-            assert!(command.status().unwrap().success());
-            verify_created_tar_archive(
-                &archive,
-                &tar_cmd,
-                compression,
-                Arc::new(AtomicBool::new(false)),
+            let links = [
+                ("one", "target"),
+                ("two", "one"),
+                ("dangling", "missing"),
+                ("cycle", "cycle"),
+                ("absolute", "/etc"),
+                ("external", "../../outside"),
+            ];
+            for (name, target) in links {
+                std::os::unix::fs::symlink(target, items.join(name)).unwrap();
+            }
+
+            let backend_dir = tempfile::tempdir().unwrap();
+            let backend = backend_dir.path().join("create-only-tar");
+            let quoted_tar = tar_cmd.replace('\'', "'\\''");
+            fs::write(
+                &backend,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$1\" >>\"$0.calls\"\ncase \"$1\" in\n  -t) test ! -e \"$0.created\" || exit 2; cat >/dev/null ;;\n  -c) : >\"$0.created\"; exec '{quoted_tar}' \"$@\" ;;\n  *) printf 'tar: unexpected validation operation\\n' >&2; exit 2 ;;\nesac\n"
+                ),
             )
             .unwrap();
-            assert!(!archive.staging_dir.join("verification").exists());
+            fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut app = App::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+            app.settings.tar_path = Some(backend.to_str().unwrap().to_string());
+            app.active_panel_mut().selected_files.insert("items".into());
+            app.show_tar_dialog();
+            app.execute_tar(archive_name);
+            for _ in 0..500 {
+                if !app
+                    .file_operation_progress
+                    .as_mut()
+                    .map(FileOperationProgress::poll)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let result = app
+                .file_operation_progress
+                .as_ref()
+                .and_then(|progress| progress.result.as_ref())
+                .expect("tar worker should complete");
+            assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+            assert_eq!(
+                fs::read_to_string(backend_dir.path().join("create-only-tar.calls")).unwrap(),
+                "-t\n-c\n",
+                "creation should only probe the backend and create the archive"
+            );
+
+            // Read back in the test only, using the real backend, to verify
+            // that all four published formats preserve contents and link text.
+            let extracted = tempfile::tempdir().unwrap();
+            let mut extract = Command::new(&tar_cmd);
+            extract.arg("-x");
+            if let Some(flag) = compression.flag() {
+                extract.arg(flag);
+            }
+            extract
+                .arg("-f")
+                .arg(temp.path().join(archive_name))
+                .current_dir(extracted.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_tar_command(&mut extract);
+            assert!(extract.status().unwrap().success());
+            assert_eq!(
+                fs::read(extracted.path().join("items/target")).unwrap(),
+                b"selected"
+            );
+            for (name, target) in links {
+                assert_eq!(
+                    fs::read_link(extracted.path().join("items").join(name))
+                        .unwrap()
+                        .as_os_str(),
+                    std::ffi::OsStr::new(target)
+                );
+            }
         }
     }
 
@@ -12013,91 +11554,88 @@ mod tests {
     }
 
     #[test]
-    fn archive_listing_line_reader_rejects_unbounded_names() {
-        let input = vec![b'a'; 33];
+    fn tar_output_reader_drains_long_records_and_accepts_non_utf8_bytes() {
+        let mut input = vec![b'a'; MAX_TAR_OUTPUT_LINE_BYTES + 100];
+        input.extend_from_slice(b"\n\xffnext\n");
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
         let mut line = Vec::new();
 
-        let error = read_bounded_line(&mut reader, &mut line, 32).unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(line.len() <= 32);
+        assert!(read_tar_output_line(&mut reader, &mut line).unwrap());
+        assert_eq!(line.len(), MAX_TAR_OUTPUT_LINE_BYTES);
+        assert!(read_tar_output_line(&mut reader, &mut line).unwrap());
+        assert_eq!(line, b"\xffnext\n");
+        assert!(!read_tar_output_line(&mut reader, &mut line).unwrap());
     }
 
-    #[test]
-    fn tar_error_capture_keeps_only_a_bounded_tail() {
-        let input = vec![b'x'; MAX_TAR_ERROR_TAIL_BYTES + 100];
-        let tail = read_bounded_tail(std::io::Cursor::new(input), MAX_TAR_ERROR_TAIL_BYTES);
-        assert_eq!(tail.len(), MAX_TAR_ERROR_TAIL_BYTES);
+
+
+    #[cfg(unix)]
+    fn write_test_tar(path: &Path, entries: &[(&str, u8, u32, &str, &[u8])]) {
+        let mut archive = Vec::new();
+        for &(name, kind, mode, target, contents) in entries {
+            let mut header = [0u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            header[124..136].copy_from_slice(format!("{:011o}\0", contents.len()).as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = kind;
+            header[157..157 + target.len()].copy_from_slice(target.as_bytes());
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend_from_slice(&header);
+            archive.extend_from_slice(contents);
+            archive.resize(archive.len().div_ceil(512) * 512, 0);
+        }
+        archive.extend_from_slice(&[0u8; 1024]);
+        fs::write(path, archive).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn archive_listing_fails_closed_on_parent_path_entries() {
-        use std::os::unix::fs::PermissionsExt;
+    fn execute_untar_accepts_fifo_and_restricted_directory_metadata() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let fake_tar = temp_dir.path().join("fake_tar");
-        let archive = temp_dir.path().join("bad.tar");
-        fs::write(&fake_tar, "#!/bin/sh\nprintf '../escape\\n'\n").unwrap();
-        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(&archive, "placeholder").unwrap();
-
-        let error = App::list_archive_contents(
-            fake_tar.to_str().unwrap(),
-            fs::File::open(&archive).unwrap(),
-            TarCompression::None,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap_err();
-
-        assert!(error.contains("parent-directory"));
+        if select_tar_command(None).is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("nodes.tar");
+        write_test_tar(&archive, &[
+            ("program", b'0', 0o6755, "", b"payload"),
+            ("closed/", b'5', 0, "", b""),
+            ("pipe", b'6', 0o600, "", b""),
+        ]);
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        app.execute_untar(&archive);
+        for _ in 0..500 {
+            if !app.file_operation_progress.as_mut()
+                .map(FileOperationProgress::poll).unwrap_or(false) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = app.file_operation_progress.as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .expect("untar worker should complete");
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        let extracted = temp.path().join("nodes");
+        assert_eq!(fs::read(extracted.join("program")).unwrap(), b"payload");
+        assert_eq!(fs::metadata(extracted.join("program")).unwrap().permissions().mode() & 0o6000, 0);
+        assert!(fs::symlink_metadata(extracted.join("pipe")).unwrap().file_type().is_fifo());
+        let closed = extracted.join("closed");
+        let mode = fs::metadata(&closed).unwrap().permissions().mode() & 0o777;
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode, 0, "the app must not reject a restored restrictive directory");
     }
 
     #[cfg(unix)]
     #[test]
-    fn extracted_tree_sanitizer_rejects_external_symlinks_without_following_them() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let root = temp_dir.path().join("extract");
-        fs::create_dir(&root).unwrap();
-        let extracted = root.join("program");
-        let outside = temp_dir.path().join("outside");
-        fs::write(&extracted, "inside").unwrap();
-        fs::write(&outside, "outside").unwrap();
-        fs::set_permissions(&extracted, fs::Permissions::from_mode(0o6755)).unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o6755)).unwrap();
-        symlink(&outside, root.join("outside-link")).unwrap();
-
-        let error = sanitize_extracted_tree(&root).unwrap_err();
-
-        assert!(error.to_string().contains("symlink"));
-        assert_eq!(
-            fs::metadata(&outside).unwrap().permissions().mode() & 0o6000,
-            0o6000
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn extracted_tree_sanitizer_accepts_resolvable_internal_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let root = temp_dir.path().join("extract");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("target"), "inside").unwrap();
-        symlink("target", root.join("link")).unwrap();
-
-        sanitize_extracted_tree(&root).unwrap();
-
-        assert_eq!(fs::read_to_string(root.join("link")).unwrap(), "inside");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_untar_rejects_external_symlink_and_cleans_only_its_owned_directory() {
+    fn execute_untar_preserves_links_when_archive_itself_is_a_symlink() {
         use std::os::unix::fs::symlink;
         use std::process::{Command, Stdio};
         use std::time::Duration;
@@ -12105,62 +11643,118 @@ mod tests {
         let Some(tar_cmd) = select_tar_command(None) else {
             return;
         };
-        if tar_extract_arguments(
-            TarCompression::None,
-            probe_tar_extraction_capabilities(&tar_cmd),
-        )
-        .is_err()
-        {
-            return;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"outside must remain").unwrap();
+        let links = [
+            ("external", PathBuf::from("../outside")),
+            ("absolute", outside.clone()),
+            ("dangling", PathBuf::from("missing")),
+            ("cycle", PathBuf::from("cycle")),
+            ("invalid-target", PathBuf::from("payload/.")),
+        ];
+        fs::write(source.join("payload"), b"contents").unwrap();
+        for (name, target) in &links {
+            symlink(target, source.join(name)).unwrap();
         }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_dir = temp_dir.path().join("source");
-        fs::create_dir(&source_dir).unwrap();
-        let outside = temp_dir.path().join("outside");
-        fs::write(&outside, "outside must remain").unwrap();
-        symlink("../outside", source_dir.join("escape")).unwrap();
-        let archive_path = temp_dir.path().join("unsafe.tar");
-        let archive_output = fs::File::create(&archive_path).unwrap();
+        let archive_path = temp.path().join("original.tar");
+        let mut files: Vec<String> = links.iter().map(|(name, _)| (*name).into()).collect();
+        files.push("payload".into());
         let mut create = Command::new(&tar_cmd);
         create
-            .current_dir(&source_dir)
-            .args(tar_create_arguments(
-                TarCompression::None,
-                &[],
-                &["escape".to_string()],
-            ))
-            .stdout(Stdio::from(archive_output))
+            .current_dir(&source)
+            .args(tar_create_arguments(TarCompression::None, &[], &files))
+            .stdout(Stdio::from(fs::File::create(&archive_path).unwrap()))
             .stderr(Stdio::null());
         configure_tar_command(&mut create);
         assert!(create.status().unwrap().success());
+        let archive_link = temp.path().join("linked.tar");
+        symlink("original.tar", &archive_link).unwrap();
 
-        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
-        app.execute_untar(&archive_path);
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        app.execute_untar(&archive_link);
         for _ in 0..500 {
-            let active = app
+            if !app
                 .file_operation_progress
                 .as_mut()
                 .map(FileOperationProgress::poll)
-                .unwrap_or(false);
-            if !active {
+                .unwrap_or(false)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-
         let result = app
             .file_operation_progress
             .as_ref()
             .and_then(|progress| progress.result.as_ref())
-            .expect("unsafe untar worker should complete");
-        assert_eq!(result.failure_count, 1);
-        assert!(result
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("symlink")));
-        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside must remain");
-        assert!(!temp_dir.path().join("unsafe").exists());
+            .expect("untar worker should complete");
+        assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+        for (name, target) in &links {
+            let extracted = temp.path().join("linked").join(name);
+            assert!(fs::symlink_metadata(&extracted).unwrap().is_symlink());
+            assert_eq!(
+                fs::read_link(extracted).unwrap().as_os_str(),
+                target.as_os_str()
+            );
+        }
+        assert_eq!(
+            fs::read(temp.path().join("linked/payload")).unwrap(),
+            b"contents"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside must remain");
+        assert!(fs::symlink_metadata(&archive_link).unwrap().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_untar_does_not_write_through_an_external_directory_link() {
+        use std::time::Duration;
+        let Some(tar_cmd) = select_tar_command(None) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"original").unwrap();
+
+        // Encode a link followed by a member that tries to write through it.
+        // Ordinary tar creation never descends into the link, so this fixture
+        // deliberately supplies the two headers in extraction order.
+        let archive_path = temp.path().join("attempt.tar");
+        write_test_tar(&archive_path, &[
+            ("gateway", b'2', 0o777, "../outside", b""),
+            ("gateway/keep", b'0', 0o644, "", b"replacement"),
+        ]);
+        let listing = std::process::Command::new(&tar_cmd)
+            .args(["-t", "-f"])
+            .arg(&archive_path)
+            .output()
+            .unwrap();
+        assert!(listing.status.success(), "fixture must be a valid archive");
+        assert_eq!(listing.stdout.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty()).count(), 2);
+        let mut app = App::new(temp.path().into(), temp.path().into());
+        app.execute_untar(&archive_path);
+        for _ in 0..500 {
+            if !app
+                .file_operation_progress
+                .as_mut()
+                .map(FileOperationProgress::poll)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app
+            .file_operation_progress
+            .as_ref()
+            .and_then(|progress| progress.result.as_ref())
+            .is_some());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"original");
     }
 
     #[test]

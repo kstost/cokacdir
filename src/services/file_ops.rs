@@ -1108,7 +1108,7 @@ pub(crate) fn validate_copy_destination(src: &Path, dest: &Path) -> io::Result<(
 }
 
 fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
-    copy_symlink_detailed(src, dest, dest, None).map(|_| ())
+    copy_symlink_detailed(src, dest, None).map(|_| ())
 }
 
 pub(crate) fn copy_symlink_authorized(
@@ -1116,20 +1116,19 @@ pub(crate) fn copy_symlink_authorized(
     dest: &Path,
     expected_source: &PathAuthorization,
 ) -> io::Result<Vec<String>> {
-    copy_symlink_detailed(src, dest, dest, Some(expected_source))
+    copy_symlink_detailed(src, dest, Some(expected_source))
         .map(|published| published.warnings)
 }
 
 fn copy_symlink_detailed(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
 ) -> io::Result<PublishedStage> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     let staging = PrivateStagingDirectory::create(parent, "copy-link")?;
     let temp = staging.payload();
-    if let Err(error) = copy_symlink_to_new(src, &temp, logical_destination, expected_source) {
+    if let Err(error) = copy_symlink_to_new(src, &temp, expected_source) {
         return Err(error_with_staging_cleanup(error, staging));
     }
     let stage = OwnedStage::bind(staging)?;
@@ -1455,9 +1454,9 @@ pub(crate) struct PreparedFileDeletion {
     expected: StablePathIdentity,
 }
 
-/// Bind a future deletion to the exact non-directory object currently named by
-/// `path`. Callers with an existing identity handle can keep it alive during
-/// this step, then close it before `delete` sets Windows disposition.
+/// Bind a future deletion to the exact leaf entry currently named by `path`,
+/// including a Windows directory link. Callers can keep an identity handle
+/// alive during this step, then close it before `delete` sets Windows disposition.
 pub(crate) fn prepare_file_deletion(
     path: &Path,
     expected: StablePathIdentity,
@@ -1465,9 +1464,12 @@ pub(crate) fn prepare_file_deletion(
     #[cfg(windows)]
     {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
         let file = open_windows_path_for_delete(path)?;
         let information = windows_handle_info(&file)?;
-        if information.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        if information.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            && information.attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Handle-bound file deletion does not accept directories",
@@ -1547,7 +1549,7 @@ impl PreparedFileDeletion {
     }
 }
 
-/// Remove exactly the non-directory filesystem object identified by
+/// Remove exactly the leaf filesystem entry identified by
 /// `expected`. Windows deletion is committed through a verified handle rather
 /// than by reopening the pathname at the remove call.
 pub(crate) fn remove_file_by_identity(path: &Path, expected: StablePathIdentity) -> io::Result<()> {
@@ -2677,7 +2679,10 @@ fn path_identity(path: &Path) -> io::Result<PathIdentity> {
         let information = windows_handle_info(&handle)?;
         Ok(PathIdentity {
             stable: information.identity,
-            is_directory: information.attributes & 0x0010 != 0,
+            // Directory links are leaf entries, just as on Unix. Their raw
+            // directory attribute is only relevant when selecting an unlink API.
+            is_directory: information.attributes & 0x0010 != 0
+                && information.attributes & 0x0400 == 0,
             _handle: handle,
             creation_time: information.creation_time,
             last_write_time: information.last_write_time,
@@ -3244,7 +3249,6 @@ impl OwnedStage {
             if let Err(error) = copy_symlink_to_new(
                 &source_path,
                 destination,
-                destination,
                 Some(&source_authorization),
             ) {
                 return Err(StagePublishFailure { error, stage: self });
@@ -3352,7 +3356,6 @@ impl OwnedStage {
             let mut visited = HashSet::new();
             if let Err(error) = copy_dir_recursive_inner(
                 &source_path,
-                destination,
                 destination,
                 Some(&source_authorization),
                 &mut visited,
@@ -5301,6 +5304,48 @@ pub(crate) fn read_dir_utf8(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
         .collect()
 }
 
+/// Open a selected file's contents, following links as ordinary file readers do.
+/// Check the opened object so a link to a FIFO or device cannot block a viewer.
+pub(crate) fn open_regular_file_for_read(path: &Path) -> io::Result<(File, fs::Metadata)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Selected path does not point to a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+pub(crate) fn read_regular_file_with_limit(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let (file, metadata) = open_regular_file_for_read(path)?;
+    let too_large = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("File too large. Maximum size is {} MB.", limit / 1024 / 1024),
+        )
+    };
+    if metadata.len() > limit {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    // Enforce the limit on actual reads too: metadata can underreport length
+    // for virtual files, and a regular file can grow after the initial check.
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::Metadata)> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -5451,105 +5496,9 @@ fn preserve_directory_metadata_no_follow(path: &Path, metadata: &fs::Metadata) -
     Ok(())
 }
 
-#[cfg(unix)]
-fn lexically_normalized_absolute(path: &Path) -> io::Result<PathBuf> {
-    use std::path::Component;
-
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::from("/");
-    for component in absolute.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(value) => normalized.push(value),
-            Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Unexpected path prefix on Unix",
-                ))
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-/// Resolve links component by component, including existing prefixes of a
-/// dangling target. A `..` must be applied AFTER expanding the preceding link:
-/// normalizing `alias/../name` first can resolve to an entirely different tree.
-#[cfg(unix)]
-fn resolve_existing_prefix(path: &Path) -> io::Result<PathBuf> {
-    use std::collections::VecDeque;
-    use std::path::Component;
-
-    let mut pending: VecDeque<OsString> = path
-        .components()
-        .map(|component| component.as_os_str().to_os_string())
-        .collect();
-    let mut resolved = if path.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        std::env::current_dir()?.canonicalize()?
-    };
-    let mut links_followed = 0;
-    while let Some(component) = pending.pop_front() {
-        match Path::new(&component).components().next() {
-            Some(Component::RootDir) => resolved = PathBuf::from("/"),
-            Some(Component::CurDir) | None => {}
-            Some(Component::ParentDir) => {
-                resolved.pop();
-            }
-            Some(Component::Normal(name)) => {
-                let candidate = resolved.join(name);
-                match fs::symlink_metadata(&candidate) {
-                    Ok(metadata) if metadata.is_symlink() => {
-                        links_followed += 1;
-                        if links_followed > 40 {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "Too many symbolic links in the copy target",
-                            ));
-                        }
-                        let target = fs::read_link(&candidate)?;
-                        for component in target.components().rev() {
-                            pending.push_front(component.as_os_str().to_os_string());
-                        }
-                    }
-                    Ok(metadata) => {
-                        if !pending.is_empty() && !metadata.is_dir() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::NotADirectory,
-                                "A symbolic link target traverses a non-directory",
-                            ));
-                        }
-                        resolved = candidate;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        resolved = candidate;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Some(Component::Prefix(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Unexpected path prefix on Unix",
-                ));
-            }
-        }
-    }
-    Ok(resolved)
-}
-
 fn copy_symlink_to_new(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
 ) -> io::Result<()> {
     let metadata = fs::symlink_metadata(src)?;
@@ -5578,38 +5527,9 @@ fn copy_symlink_to_new(
             )));
         }
 
-        let target_path = if target.is_absolute() {
-            target.clone()
-        } else {
-            logical_destination
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&target)
-        };
-        let lexical = lexically_normalized_absolute(&target_path)?;
-        let lexical_text = lexical.to_string_lossy();
-        if target_is_sensitive(&lexical_text) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "Symlink '{}' would point to sensitive system path: {}",
-                    logical_destination.display(),
-                    lexical_text
-                ),
-            ));
-        }
-        let resolved = resolve_existing_prefix(&target_path)?;
-        let resolved = resolved.to_string_lossy();
-        if target_is_sensitive(&resolved) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "Symlink '{}' would resolve through an existing path component to sensitive system path: {}",
-                    logical_destination.display(),
-                    resolved
-                ),
-            ));
-        }
+        // As with cp -R and mv, reproduce the link text without resolving or
+        // reading its referent. Dangling, cyclic, and system-path links are
+        // valid entries; copying them must not depend on the target's state.
         std::os::unix::fs::symlink(target, dest)
     }
     #[cfg(not(unix))]
@@ -5627,7 +5547,6 @@ fn copy_open_symlink_to_new(
     name: &OsStr,
     source_display: &Path,
     dest: &Path,
-    logical_destination: &Path,
 ) -> io::Result<()> {
     let before = access.child_metadata(name)?;
     if !before.is_symlink() {
@@ -5648,43 +5567,13 @@ fn copy_open_symlink_to_new(
             )));
         }
 
-        let target_path = if target.is_absolute() {
-            target.clone()
-        } else {
-            logical_destination
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&target)
-        };
-        let lexical = lexically_normalized_absolute(&target_path)?;
-        let lexical_text = lexical.to_string_lossy();
-        if target_is_sensitive(&lexical_text) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "Symlink '{}' would point to sensitive system path: {}",
-                    logical_destination.display(),
-                    lexical_text
-                ),
-            ));
-        }
-        let resolved = resolve_existing_prefix(&target_path)?;
-        let resolved = resolved.to_string_lossy();
-        if target_is_sensitive(&resolved) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "Symlink '{}' would resolve through an existing path component to sensitive system path: {}",
-                    logical_destination.display(),
-                    resolved
-                ),
-            ));
-        }
+        // Recursive copies use the same verbatim link semantics as top-level
+        // copies. Only real directories are traversed by the caller.
         std::os::unix::fs::symlink(target, dest)
     }
     #[cfg(not(unix))]
     {
-        let _ = (source_display, dest, logical_destination);
+        let _ = (source_display, dest);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Copying symbolic links is not supported safely on this platform",
@@ -6352,7 +6241,6 @@ pub fn copy_dir_recursive_with_progress(
     copy_dir_recursive_with_progress_detailed(
         src,
         dest,
-        dest,
         None,
         cancel_flag,
         progress_tx,
@@ -6378,7 +6266,6 @@ pub(crate) fn copy_dir_recursive_with_progress_authorized(
 ) -> io::Result<Vec<String>> {
     copy_dir_recursive_with_progress_detailed(
         src,
-        dest,
         dest,
         Some(expected_source),
         cancel_flag,
@@ -6445,7 +6332,6 @@ pub(crate) fn copy_path_authorized(
 fn copy_dir_recursive_with_progress_detailed(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
     cancel_flag: &Arc<AtomicBool>,
     progress_tx: &Sender<ProgressMessage>,
@@ -6473,7 +6359,6 @@ fn copy_dir_recursive_with_progress_detailed(
     let result = copy_dir_recursive_with_progress_inner(
         src,
         &temp,
-        logical_destination,
         expected_source,
         cancel_flag,
         progress_tx,
@@ -6512,7 +6397,6 @@ fn copy_dir_recursive_with_progress_detailed(
 fn copy_dir_recursive_with_progress_inner(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
     cancel_flag: &Arc<AtomicBool>,
     progress_tx: &Sender<ProgressMessage>,
@@ -6588,7 +6472,6 @@ fn copy_dir_recursive_with_progress_inner(
             let name = name?;
             let src_path = src.join(&name);
             let dest_path = dest.join(&name);
-            let logical_dest_path = logical_destination.join(&name);
 
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
@@ -6600,13 +6483,7 @@ fn copy_dir_recursive_with_progress_inner(
             if metadata.is_symlink() {
                 // Copy the link itself; never dereference it on platforms where
                 // that cannot be done safely and unambiguously.
-                copy_open_symlink_to_new(
-                    &source_access,
-                    &name,
-                    &src_path,
-                    &dest_path,
-                    &logical_dest_path,
-                )?;
+                copy_open_symlink_to_new(&source_access, &name, &src_path, &dest_path)?;
 
                 *completed_files += 1;
                 let _ = progress_tx.send(ProgressMessage::TotalProgress(
@@ -6685,7 +6562,6 @@ fn copy_dir_recursive_with_progress_inner(
             }
             let src_path = src.join(&name);
             let dest_path = dest.join(&name);
-            let logical_dest_path = logical_destination.join(&name);
             let opened_child = source_access.open_directory(&name)?;
             if stable_file_identity(&opened_child.0)? != expected_identity {
                 return Err(io::Error::other(format!(
@@ -6696,7 +6572,6 @@ fn copy_dir_recursive_with_progress_inner(
             copy_dir_recursive_with_progress_inner(
                 &src_path,
                 &dest_path,
-                &logical_dest_path,
                 None,
                 cancel_flag,
                 progress_tx,
@@ -7072,7 +6947,6 @@ fn copy_files_with_progress_impl(
             match copy_dir_recursive_with_progress_detailed(
                 &src,
                 &copy_dest,
-                &dest,
                 source_authorization.as_ref(),
                 &cancel_flag,
                 &progress_tx,
@@ -7135,7 +7009,7 @@ fn copy_files_with_progress_impl(
                 }
             }
         } else if source_metadata.is_symlink() {
-            match copy_symlink_detailed(&src, &copy_dest, &dest, source_authorization.as_ref()) {
+            match copy_symlink_detailed(&src, &copy_dest, source_authorization.as_ref()) {
                 Ok(warnings) => match finish_copied_item(
                     overwrite_staging.take(),
                     &dest,
@@ -7844,7 +7718,6 @@ pub fn move_files_with_progress(
                 copy_dir_recursive_with_progress_detailed(
                     &src,
                     &copy_dest,
-                    &dest,
                     Some(&copy_source_authorization),
                     &cancel_flag,
                     &progress_tx,
@@ -7855,7 +7728,7 @@ pub fn move_files_with_progress(
                 )
                 .map(|published| (published, None))
             } else if source_metadata.is_symlink() {
-                copy_symlink_detailed(&src, &copy_dest, &dest, Some(&copy_source_authorization))
+                copy_symlink_detailed(&src, &copy_dest, Some(&copy_source_authorization))
                     .map(|published| (published, None))
             } else if source_metadata.is_file() {
                 let file_completed_bytes = completed_bytes;
@@ -8136,13 +8009,12 @@ const MAX_COPY_DEPTH: usize = 256;
 
 /// Copy directory recursively with symlink loop detection
 pub fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
-    copy_dir_recursive_detailed(src, dest, dest, None).map(drop)
+    copy_dir_recursive_detailed(src, dest, None).map(drop)
 }
 
 fn copy_dir_recursive_detailed(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
 ) -> io::Result<PublishedStage> {
     let metadata = fs::symlink_metadata(src)?;
@@ -8163,7 +8035,6 @@ fn copy_dir_recursive_detailed(
     match copy_dir_recursive_inner(
         src,
         &temp,
-        logical_destination,
         expected_source,
         &mut visited,
         0,
@@ -8189,7 +8060,6 @@ fn copy_dir_recursive_detailed(
 fn copy_dir_recursive_inner(
     src: &Path,
     dest: &Path,
-    logical_destination: &Path,
     expected_source: Option<&PathAuthorization>,
     visited: &mut HashSet<StablePathIdentity>,
     depth: usize,
@@ -8251,19 +8121,12 @@ fn copy_dir_recursive_inner(
             let name = name?;
             let src_path = src.join(&name);
             let dest_path = dest.join(&name);
-            let logical_dest_path = logical_destination.join(&name);
 
             // Get metadata without following symlinks
             let metadata = source_access.child_metadata(&name)?;
 
             if metadata.is_symlink() {
-                copy_open_symlink_to_new(
-                    &source_access,
-                    &name,
-                    &src_path,
-                    &dest_path,
-                    &logical_dest_path,
-                )?;
+                copy_open_symlink_to_new(&source_access, &name, &src_path, &dest_path)?;
             } else if metadata.is_dir() {
                 child_directories.push((name, metadata.identity()));
             } else if metadata.is_file() {
@@ -8288,7 +8151,6 @@ fn copy_dir_recursive_inner(
         for (name, expected_identity) in child_directories {
             let src_path = src.join(&name);
             let dest_path = dest.join(&name);
-            let logical_dest_path = logical_destination.join(&name);
             let opened_child = source_access.open_directory(&name)?;
             if stable_file_identity(&opened_child.0)? != expected_identity {
                 return Err(io::Error::other(format!(
@@ -8299,7 +8161,6 @@ fn copy_dir_recursive_inner(
             copy_dir_recursive_inner(
                 &src_path,
                 &dest_path,
-                &logical_dest_path,
                 None,
                 visited,
                 depth + 1,
@@ -8385,10 +8246,10 @@ fn move_file_via_copy(src: &Path, dest: &Path, source_identity: PathIdentity) ->
     let source_is_directory = metadata.is_dir() && !metadata.is_symlink();
     let copy_source_authorization = PathAuthorization::from_identity(&source_identity);
     let published = if metadata.is_symlink() {
-        copy_symlink_detailed(src, &copy_dest, dest, Some(&copy_source_authorization))
+        copy_symlink_detailed(src, &copy_dest, Some(&copy_source_authorization))
             .map(|published| (published, None))
     } else if source_is_directory {
-        copy_dir_recursive_detailed(src, &copy_dest, dest, Some(&copy_source_authorization))
+        copy_dir_recursive_detailed(src, &copy_dest, Some(&copy_source_authorization))
             .map(|published| (published, None))
     } else if metadata.is_file() {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -8613,9 +8474,10 @@ fn delete_path_unchecked(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return if metadata.is_dir() {
+            return if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
                 fs::remove_dir(path)
             } else {
                 fs::remove_file(path)
@@ -8794,296 +8656,52 @@ pub fn is_valid_filename(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Sensitive paths that symlinks should not point to
-#[cfg(unix)]
-const SENSITIVE_PATHS: &[&str] = &[
-    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log", "/home", "/dev", "/run", "/var/run",
-];
-
-#[cfg(windows)]
-const SENSITIVE_PATHS: &[&str] = &[
-    "C:\\Windows",
-    "C:\\Program Files",
-    "C:\\Program Files (x86)",
-];
-
-/// True iff `target` equals or is contained within one of `SENSITIVE_PATHS`.
-/// Matches on path-segment boundaries, so "/etc" does not match "/etcd/foo".
-fn target_is_sensitive(target: &str) -> bool {
-    #[cfg(unix)]
-    const SEP: char = '/';
-    #[cfg(windows)]
-    const SEP: char = '\\';
-    for sensitive in SENSITIVE_PATHS {
-        if target == *sensitive {
-            return true;
-        }
-        let mut boundary = String::with_capacity(sensitive.len() + 1);
-        boundary.push_str(sensitive);
-        boundary.push(SEP);
-        if target.starts_with(&boundary) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check symlinks in files to be archived for security
-/// Returns an error if any symlink points outside base_dir or to sensitive system paths
-pub fn check_symlinks_for_tar(base_dir: &Path, files: &[String]) -> io::Result<()> {
-    use std::collections::HashSet;
-    // Compute base canonical once and fail-secure if it cannot be resolved.
-    let base_canonical = base_dir.canonicalize().map(strip_unc_prefix).map_err(|e| {
-        io::Error::other(format!(
-            "Cannot canonicalize base directory '{}': {}",
-            base_dir.display(),
-            e
-        ))
-    })?;
-    let mut visited = HashSet::new();
-    for file in files {
-        let file_path = base_dir.join(file);
-        check_symlink_recursive(&file_path, &base_canonical, &mut visited)?;
-    }
-    Ok(())
-}
-
-/// Recursively check symlinks in a file or directory.
-/// `base_canonical` is the canonicalised archive root and is used as the
-/// containment boundary; computing it once also closes the prior fail-open
-/// behaviour where a transient base canonicalize failure bypassed all checks.
-fn check_symlink_recursive(
-    path: &Path,
-    base_canonical: &Path,
-    visited: &mut std::collections::HashSet<std::path::PathBuf>,
-) -> io::Result<()> {
-    // Detect symlink loops using visited set
-    if let Ok(canonical_path) = path.canonicalize().map(strip_unc_prefix) {
-        if !visited.insert(canonical_path.clone()) {
-            // Already visited - symlink loop detected, skip to avoid infinite recursion
-            return Ok(());
-        }
-    }
-
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) => {
-            // File doesn't exist - this is a dangling symlink if parent exists
-            if path.parent().map(|p| p.exists()).unwrap_or(false) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Dangling symlink or inaccessible file: {}", path.display()),
-                ));
-            }
-            return Err(e);
-        }
-    };
-
-    if metadata.is_symlink() {
-        let link_target = fs::read_link(path)?;
-
-        // Absolute symlinks pointing outside base_dir are always rejected
-        if link_target.is_absolute() {
-            match link_target.canonicalize().map(strip_unc_prefix) {
-                Ok(target_canonical) => {
-                    if !target_canonical.starts_with(base_canonical) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Symlink '{}' points outside archive directory: {}",
-                                path.display(),
-                                link_target.display()
-                            ),
-                        ));
-                    }
-                }
-                Err(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Symlink '{}' points to unresolvable absolute path: {}",
-                            path.display(),
-                            link_target.display()
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Resolve the symlink target to check where it actually points
-        let resolved_target = if link_target.is_absolute() {
-            link_target.clone()
-        } else {
-            // Relative symlink - resolve from the symlink's parent directory
-            let parent = path.parent().unwrap_or(base_canonical);
-            parent.join(&link_target)
-        };
-
-        // Get canonical path to resolve all symlinks and ".." components
-        match resolved_target.canonicalize().map(strip_unc_prefix) {
-            Ok(canonical) => {
-                let target_str = canonical.to_string_lossy();
-                if !canonical.starts_with(base_canonical) {
-                    // Use the more specific sensitive-path message when applicable.
-                    if target_is_sensitive(&target_str) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Symlink '{}' points to sensitive system path: {}",
-                                path.display(),
-                                target_str
-                            ),
-                        ));
-                    }
-                    // Otherwise reject any symlink pointing outside base_dir.
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Symlink '{}' points outside archive directory: {}",
-                            path.display(),
-                            target_str
-                        ),
-                    ));
-                }
-            }
-            Err(_) => {
-                // Cannot resolve the target - this could be a dangling symlink
-                // or circular reference. Reject for safety.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "Symlink '{}' has unresolvable target: {}",
-                        path.display(),
-                        link_target.display()
-                    ),
-                ));
-            }
-        }
-    } else if metadata.is_dir() {
-        // Recursively check directory contents. Fail-secure: if the directory
-        // cannot be enumerated we cannot prove its contents are safe, so error.
-        let entries = fs::read_dir(path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "Cannot read directory '{}' for symlink check: {}",
-                    path.display(),
-                    e
-                ),
-            )
-        })?;
-        for entry in entries {
-            let entry = entry?;
-            check_symlink_recursive(&entry.path(), base_canonical, visited)?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Filter out unsafe symlinks from files to be archived
-/// Returns (files, excluded_paths) - original files and paths to exclude via tar --exclude
-pub fn filter_symlinks_for_tar(base_dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
+/// Find entries tar cannot store (sockets or unreadable entries).
+/// Symlinks are archived as stored, without inspecting or
+/// traversing their targets, including external, dangling, and cyclic links.
+pub fn filter_tar_entries(base_dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
     let mut excluded_paths = Vec::new();
-    let mut entries = BTreeMap::new();
+    let mut visited = HashSet::new();
     let mut pending: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     while let Some(relative) = pending.pop() {
-        if entries.contains_key(&relative) {
+        if !visited.insert(relative.clone()) {
             continue;
         }
         let path = base_dir.join(&relative);
-        let kind = fs::symlink_metadata(&path).and_then(|metadata| {
-            if metadata.is_symlink() {
-                let target = fs::read_link(&path)?;
-                validate_tar_symlink_target(&relative, &target)?;
-                // Preserve the extractor's requirement that a link resolves.
-                // This also rejects malformed targets such as "regular-file/.",
-                // whose trailing dot Path::components would otherwise remove.
-                path.canonicalize()?;
-                Ok(TarEntry::Symlink(target))
-            } else if metadata.is_dir() {
-                // A partial listing must not make omitted children look safe.
-                for entry in read_dir_utf8(&path)? {
-                    pending.push(relative.join(entry.file_name()));
+        let result = fs::symlink_metadata(&path).and_then(|metadata| {
+            if metadata.is_symlink() || metadata.is_file() {
+                return Ok(());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                let kind = metadata.file_type();
+                if kind.is_fifo() || kind.is_block_device() || kind.is_char_device() {
+                    return Ok(());
                 }
-                Ok(TarEntry::Directory)
-            } else if metadata.is_file() {
-                Ok(TarEntry::File)
-            } else {
-                Err(io::Error::other("Special files cannot be safely extracted"))
             }
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path)? {
+                    pending.push(relative.join(entry?.file_name()));
+                }
+                return Ok(());
+            }
+            Err(io::Error::other("File type is not supported by tar"))
         });
-        match kind {
-            Ok(kind) => {
-                entries.insert(relative, kind);
+        if result.is_err() {
+            // tar reads ordinary native filenames itself. If an unsupported
+            // entry cannot be represented in the exclusion dialog, confirm
+            // excluding its nearest representable parent instead.
+            let mut excluded = relative.as_path();
+            while excluded.to_str().is_none() {
+                excluded = excluded.parent().expect("selected root has a UTF-8 name");
             }
-            Err(_) => excluded_paths.push(tar_relative_name(&relative)),
-        }
-    }
-
-    // Resolve links in the archive's own namespace, not against files that
-    // merely happen to exist on the source machine. This also validates every
-    // link in a chain and never follows a directory link while scanning.
-    for (relative, kind) in &entries {
-        if matches!(kind, TarEntry::Symlink(_))
-            && resolve_tar_entry(relative, &entries, 0).is_none()
-        {
-            excluded_paths.push(tar_relative_name(relative));
+            excluded_paths.push(tar_relative_name(excluded));
         }
     }
     excluded_paths.sort();
     excluded_paths.dedup();
     (files.to_vec(), excluded_paths)
-}
-
-enum TarEntry {
-    Directory,
-    File,
-    Symlink(PathBuf),
-}
-
-/// Shared by archive creation and extraction. Check the literal target before
-/// following any links, since a canonical path alone can hide lexical escapes.
-pub(crate) fn validate_tar_symlink_target(link: &Path, target: &Path) -> io::Result<()> {
-    use std::path::Component;
-    if target.is_absolute()
-        || target
-            .components()
-            .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "archive created an absolute symlink: {} -> {}",
-                link.display(),
-                target.display(),
-            ),
-        ));
-    }
-    let mut depth = link
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .components()
-        .filter(|component| matches!(component, Component::Normal(_)))
-        .count();
-    for component in target.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => depth = depth.saturating_add(1),
-            Component::ParentDir if depth > 0 => depth -= 1,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "archive symlink escapes the extraction root: {} -> {}",
-                        link.display(),
-                        target.display(),
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn tar_relative_name(path: &Path) -> String {
@@ -9096,46 +8714,6 @@ fn tar_relative_name(path: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn resolve_tar_entry(
-    path: &Path,
-    entries: &BTreeMap<PathBuf, TarEntry>,
-    links_followed: usize,
-) -> Option<PathBuf> {
-    use std::path::Component;
-    if links_followed >= 40 || path.is_absolute() {
-        return None;
-    }
-    let mut resolved = PathBuf::new();
-    for component in path.components() {
-        if !resolved.as_os_str().is_empty()
-            && !matches!(entries.get(&resolved), Some(TarEntry::Directory))
-        {
-            return None;
-        }
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !resolved.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(name) => {
-                resolved.push(name);
-                if let TarEntry::Symlink(target) = entries.get(&resolved)? {
-                    let parent = resolved.parent()?;
-                    if target.is_absolute() {
-                        return None;
-                    }
-                    resolved =
-                        resolve_tar_entry(&parent.join(target), entries, links_followed + 1)?;
-                }
-            }
-            Component::Prefix(_) | Component::RootDir => return None,
-        }
-    }
-    Some(resolved)
 }
 
 #[cfg(test)]
@@ -9341,6 +8919,224 @@ mod tests {
     }
 
     // ========== copy_file tests ==========
+
+    #[cfg(unix)]
+    fn create_link_copy_fixture(root: &Path) -> Vec<(&'static str, PathBuf)> {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("payload"), b"original contents").unwrap();
+        symlink("/etc", root.join("nested/system-link")).unwrap();
+        let links = vec![
+            ("file-link", PathBuf::from("payload")),
+            ("directory-link", PathBuf::from("nested")),
+            ("dangling", PathBuf::from("missing")),
+            ("system-link", PathBuf::from("/etc")),
+            ("self-loop", PathBuf::from("self-loop")),
+            ("loop-a", PathBuf::from("loop-b")),
+            ("loop-b", PathBuf::from("loop-a")),
+            ("absolute-loop", root.join("self-loop")),
+            ("non-directory-prefix", root.join("payload/child")),
+            ("parent-components", PathBuf::from("system-link/../etc")),
+            (
+                "raw-target",
+                PathBuf::from(OsString::from_vec(b"missing-\xff".to_vec())),
+            ),
+        ];
+        for (name, target) in &links {
+            symlink(target, root.join(name)).unwrap();
+        }
+        links
+    }
+
+    #[cfg(unix)]
+    fn assert_link_copy_fixture(root: &Path, links: &[(&str, PathBuf)]) {
+        for (name, target) in links {
+            let path = root.join(name);
+            assert!(fs::symlink_metadata(&path).unwrap().is_symlink(), "{path:?}");
+            assert_eq!(
+                fs::read_link(&path).unwrap().as_os_str(),
+                target.as_os_str(),
+                "{path:?}"
+            );
+        }
+        assert_eq!(fs::read(root.join("payload")).unwrap(), b"original contents");
+        assert_eq!(
+            fs::read_link(root.join("nested/system-link")).unwrap(),
+            PathBuf::from("/etc")
+        );
+        assert_eq!(fs::read_dir(root).unwrap().count(), links.len() + 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_and_move_apis_preserve_link_text_without_resolving_targets() {
+        for operation in ["copy", "move", "copy-based-move"] {
+            for directory in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let source = root.join("source");
+                let destination = root.join("destination");
+                let links = create_link_copy_fixture(&source);
+                let pairs = if directory {
+                    vec![(source.clone(), destination.clone())]
+                } else {
+                    fs::create_dir(&destination).unwrap();
+                    fs::read_dir(&source)
+                        .unwrap()
+                        .map(|entry| {
+                            let entry = entry.unwrap();
+                            (entry.path(), destination.join(entry.file_name()))
+                        })
+                        .collect()
+                };
+                for (src, dest) in pairs {
+                    match operation {
+                        "copy" => copy_file(&src, &dest).unwrap(),
+                        "move" => move_file(&src, &dest).unwrap(),
+                        _ => move_file_via_copy(&src, &dest, path_identity(&src).unwrap()).unwrap(),
+                    }
+                    assert_eq!(path_exists_no_follow(&src), operation == "copy");
+                }
+                assert_link_copy_fixture(&destination, &links);
+                if operation == "copy" {
+                    assert_link_copy_fixture(&source, &links);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_progress_copy_preserves_links_with_and_without_overwrite() {
+        for directory in [false, true] {
+            for overwrite in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let source_dir = root.join("source");
+                let target_dir = root.join("target");
+                let source = if directory {
+                    source_dir.join("item")
+                } else {
+                    source_dir.clone()
+                };
+                let links = create_link_copy_fixture(&source);
+                fs::create_dir(&target_dir).unwrap();
+                let files: Vec<PathBuf> = fs::read_dir(&source_dir)
+                    .unwrap()
+                    .map(|entry| PathBuf::from(entry.unwrap().file_name()))
+                    .collect();
+                let expected_count = files.len();
+                let mut overwrites = HashMap::new();
+                let mut sources = HashMap::new();
+                for name in &files {
+                    let src = source_dir.join(name);
+                    sources.insert(src.clone(), capture_path_authorization(&src).unwrap());
+                    if overwrite {
+                        let dest = target_dir.join(name);
+                        std::os::unix::fs::symlink("old-missing-target", &dest).unwrap();
+                        overwrites.insert(src, capture_path_authorization(&dest).unwrap());
+                    }
+                }
+                let (tx, rx) = mpsc::channel();
+                copy_files_with_progress(
+                    files,
+                    &source_dir,
+                    &target_dir,
+                    overwrites,
+                    HashSet::new(),
+                    Some(capture_directory_authorization(&target_dir).unwrap()),
+                    sources,
+                    Some(capture_directory_authorization(&source_dir).unwrap()),
+                    Arc::new(AtomicBool::new(false)),
+                    tx,
+                );
+                let messages: Vec<_> = rx.try_iter().collect();
+                assert_eq!(
+                    completed_message(&messages),
+                    Some((expected_count, 0)),
+                    "{messages:?}"
+                );
+                let destination = if directory {
+                    target_dir.join("item")
+                } else {
+                    target_dir
+                };
+                assert_link_copy_fixture(&destination, &links);
+                assert_link_copy_fixture(&source, &links);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_progress_move_preserves_links_in_rename_and_copy_paths() {
+        for directory in [false, true] {
+            for copy_fallback in [false, true] {
+                for verification in [MoveVerification::Standard, MoveVerification::Strict] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path().canonicalize().unwrap();
+                    let source_dir = root.join("source");
+                    let target_dir = root.join("target");
+                    let source = if directory {
+                        source_dir.join("item")
+                    } else {
+                        source_dir.clone()
+                    };
+                    let links = create_link_copy_fixture(&source);
+                    fs::create_dir(&target_dir).unwrap();
+                    let files: Vec<PathBuf> = fs::read_dir(&source_dir)
+                        .unwrap()
+                        .map(|entry| PathBuf::from(entry.unwrap().file_name()))
+                        .collect();
+                    let expected_count = files.len();
+                    let sources = files
+                        .iter()
+                        .map(|name| {
+                            let path = source_dir.join(name);
+                            let authorization = capture_path_authorization(&path).unwrap();
+                            (path, authorization)
+                        })
+                        .collect();
+                    let (tx, rx) = mpsc::channel();
+                    let run = || {
+                        move_files_with_progress(
+                            files,
+                            &source_dir,
+                            &target_dir,
+                            HashMap::new(),
+                            HashSet::new(),
+                            Some(capture_directory_authorization(&target_dir).unwrap()),
+                            sources,
+                            Some(capture_directory_authorization(&source_dir).unwrap()),
+                            verification,
+                            Arc::new(AtomicBool::new(false)),
+                            tx,
+                        );
+                    };
+                    if copy_fallback {
+                        with_unsupported_rename_noreplace(run);
+                    } else {
+                        run();
+                    }
+                    let messages: Vec<_> = rx.try_iter().collect();
+                    assert_eq!(
+                        completed_message(&messages),
+                        Some((expected_count, 0)),
+                        "{messages:?}"
+                    );
+                    assert_eq!(fs::read_dir(&source_dir).unwrap().count(), 0);
+                    let destination = if directory {
+                        target_dir.join("item")
+                    } else {
+                        target_dir
+                    };
+                    assert_link_copy_fixture(&destination, &links);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_copy_file_basic() {
@@ -9842,9 +9638,118 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn create_windows_directory_link(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "Skipping symlink test: enable Windows Developer Mode or symlink privileges"
+                );
+                false
+            }
+            Err(error) => panic!("Cannot create test directory link: {error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_links_are_leaf_entries_for_deletion_and_tree_capture() {
+        for nested in [false, true] {
+            for dangling in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let target = temp.path().join("target");
+                if !dangling {
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("keep"), b"target data").unwrap();
+                }
+                let selected = temp.path().join("selected");
+                let link = if nested {
+                    fs::create_dir(&selected).unwrap();
+                    selected.join("link")
+                } else {
+                    selected.clone()
+                };
+                if !create_windows_directory_link(&target, &link) {
+                    return;
+                }
+                assert!(!capture_path_authorization(&link).unwrap().is_directory());
+                let source = capture_path_authorization(&selected).unwrap();
+                let tree = capture_tree_authorization(&selected, &source, "test selection").unwrap();
+                assert_eq!(tree.entries.len(), if nested { 2 } else { 1 });
+
+                delete_file_detailed_authorized_tree(&selected, &source, &tree).unwrap();
+
+                assert!(fs::symlink_metadata(&selected).is_err());
+                if !dangling {
+                    assert_eq!(fs::read(target.join("keep")).unwrap(), b"target data");
+                }
+                assert_eq!(
+                    fs::read_dir(temp.path()).unwrap().count(),
+                    usize::from(!dangling)
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_link_cleanup_uses_directory_unlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"target data").unwrap();
+        let link = temp.path().join("link");
+        if !create_windows_directory_link(&target, &link) {
+            return;
+        }
+
+        delete_path_unchecked(&link).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"target data");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_limit_applies_to_virtual_file_contents_with_zero_reported_size() {
+        let path = Path::new("/proc/version");
+        if !path.is_file() {
+            return;
+        }
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
+        assert_eq!(
+            read_regular_file_with_limit(path, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn tar_filter_requires_links_to_resolve_inside_the_selected_archive() {
+    fn tar_filter_preserves_native_names_below_a_selected_directory() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let items = temp.path().join("items");
+        fs::create_dir(&items).unwrap();
+        let raw_name = std::ffi::OsStr::from_bytes(b"raw-\xff");
+        fs::write(items.join(raw_name), b"payload").unwrap();
+        symlink(raw_name, items.join("link")).unwrap();
+        let fifo_name = std::ffi::CString::new(items.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let (_, excluded) = filter_tar_entries(temp.path(), &["items".into()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
+
+        let socket_name = std::ffi::OsStr::from_bytes(b"socket-\xff");
+        let _socket = std::os::unix::net::UnixListener::bind(items.join(socket_name)).unwrap();
+        let (_, excluded) = filter_tar_entries(temp.path(), &["items".into()]);
+        assert_eq!(excluded, vec!["items"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_filter_keeps_links_without_requiring_selected_targets() {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("items")).unwrap();
@@ -9859,25 +9764,17 @@ mod tests {
         symlink("../unselected", temp.path().join("items/missing")).unwrap();
         symlink("absolute", temp.path().join("items/chain")).unwrap();
         symlink("loop", temp.path().join("items/loop")).unwrap();
-        let (_, excluded) = filter_symlinks_for_tar(temp.path(), &["items".into()]);
-        assert_eq!(
-            excluded,
-            vec![
-                "items/absolute",
-                "items/chain",
-                "items/loop",
-                "items/missing"
-            ]
-        );
+        let (_, excluded) = filter_tar_entries(temp.path(), &["items".into()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
         let (_, excluded) =
-            filter_symlinks_for_tar(temp.path(), &["items".into(), "unselected".into()]);
+            filter_tar_entries(temp.path(), &["items".into(), "unselected".into()]);
         assert!(!excluded.iter().any(|name| name == "items/missing"));
         assert!(!excluded.iter().any(|name| name == "items/safe"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn tar_filter_rejects_lexical_escapes_and_invalid_trailing_components() {
+    fn tar_filter_keeps_literal_parent_and_trailing_dot_targets() {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir_all(temp.path().join("items/dir/sub")).unwrap();
@@ -9889,11 +9786,29 @@ mod tests {
             temp.path().join("items/escape").canonicalize().unwrap(),
             temp.path().join("target").canonicalize().unwrap()
         );
-        let (_, excluded) = filter_symlinks_for_tar(
+        let (_, excluded) = filter_tar_entries(
             temp.path(),
             &["items".into(), "target".into(), "invalid".into()],
         );
-        assert_eq!(excluded, vec!["invalid", "items/escape"]);
+        assert!(excluded.is_empty(), "{excluded:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_filter_keeps_all_link_kinds_and_does_not_walk_directory_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let links = create_link_copy_fixture(&source);
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let _socket = create_socket(&outside.join("socket"));
+        std::os::unix::fs::symlink(&outside, source.join("outside-directory")).unwrap();
+        let _local_socket = create_socket(&source.join("local-socket"));
+
+        let (_, excluded) = filter_tar_entries(temp.path(), &["source".into()]);
+
+        assert_eq!(excluded, vec!["source/local-socket"]);
+        assert_link_copy_fixture(&source, &links);
     }
 
     #[test]
@@ -10863,6 +10778,7 @@ mod tests {
         fs::create_dir_all(&target_dir).unwrap();
         fs::write(source.join("root.txt"), "root").unwrap();
         fs::write(source.join("nested/child.txt"), "child").unwrap();
+        let links = create_link_copy_fixture(&source.join("links"));
 
         let (tx, rx) = mpsc::channel();
         move_files_with_progress(
@@ -10896,6 +10812,7 @@ mod tests {
             "child"
         );
         assert!(destination.join("empty").is_dir());
+        assert_link_copy_fixture(&destination.join("links"), &links);
     }
 
     #[cfg(unix)]
@@ -11003,6 +10920,7 @@ mod tests {
         let destination = target_root.path().join("item");
         fs::create_dir_all(source.join("nested")).unwrap();
         fs::write(source.join("nested/data"), "verified").unwrap();
+        let links = create_link_copy_fixture(&source.join("links"));
 
         move_file(&source, &destination).unwrap();
 
@@ -11011,6 +10929,7 @@ mod tests {
             fs::read_to_string(destination.join("nested/data")).unwrap(),
             "verified"
         );
+        assert_link_copy_fixture(&destination.join("links"), &links);
     }
 
     #[cfg(unix)]
@@ -11308,45 +11227,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_sensitive_path_symlink_rejected() {
+    fn test_copy_preserves_system_path_symlink() {
         let temp_dir = create_temp_dir();
         let src_dir = temp_dir.join("src_dir");
         let dest_dir = temp_dir.join("dest_dir");
 
         fs::create_dir_all(&src_dir).unwrap();
 
-        // Create symlink pointing to /etc (sensitive path)
+        // Copying this entry must not read or copy anything from /etc.
         std::os::unix::fs::symlink("/etc", src_dir.join("sensitive_link")).unwrap();
 
-        let result = copy_file(&src_dir, &dest_dir);
-        assert!(result.is_err());
+        copy_file(&src_dir, &dest_dir).unwrap();
+        assert!(fs::symlink_metadata(dest_dir.join("sensitive_link"))
+            .unwrap()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(dest_dir.join("sensitive_link")).unwrap(),
+            PathBuf::from("/etc")
+        );
 
         cleanup_temp_dir(&temp_dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_sensitive_path_symlink_via_existing_prefix_is_rejected() {
+    fn test_copy_preserves_link_through_system_path_prefix() {
         let temp_dir = create_temp_dir();
         let source = temp_dir.join("source-link");
-        let physical_destination = temp_dir.join("copied-link");
-        let logical_destination = temp_dir.join("new/a/link");
+        let destination = temp_dir.join("new/a/link");
         let external = temp_dir.join("external");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::create_dir(&external).unwrap();
         std::os::unix::fs::symlink("/etc", external.join("alias")).unwrap();
         std::os::unix::fs::symlink("../../external/alias/passwd", &source).unwrap();
 
-        let error = copy_symlink_to_new(&source, &physical_destination, &logical_destination, None)
-            .unwrap_err();
+        copy_file(&source, &destination).unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(fs::symlink_metadata(&physical_destination).is_err());
+        assert_eq!(
+            fs::read_link(&destination).unwrap(),
+            PathBuf::from("../../external/alias/passwd")
+        );
         cleanup_temp_dir(&temp_dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn copied_link_resolves_parent_components_after_symlinks() {
+    fn copied_link_preserves_parent_components_without_resolving_them() {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = temp.path().join("source");
         let target_dir = temp.path().join("target");
@@ -11357,21 +11283,19 @@ mod tests {
         let source = source_dir.join("link");
         std::os::unix::fs::symlink("alias/../etc", &source).unwrap();
         let destination = target_dir.join("copied");
-        let error = copy_symlink_to_new(&source, &destination, &destination, None).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(!path_exists_no_follow(&destination));
+        copy_symlink_to_new(&source, &destination, None).unwrap();
+        assert_eq!(
+            fs::read_link(&destination).unwrap(),
+            PathBuf::from("alias/../etc")
+        );
 
         let (_, access, _) = open_directory_for_read(&source_dir).unwrap();
-        let error = copy_open_symlink_to_new(
-            &access,
-            OsStr::new("link"),
-            &source,
-            &destination,
-            &destination,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(!path_exists_no_follow(&destination));
+        let destination = target_dir.join("copied-via-directory");
+        copy_open_symlink_to_new(&access, OsStr::new("link"), &source, &destination).unwrap();
+        assert_eq!(
+            fs::read_link(&destination).unwrap(),
+            PathBuf::from("alias/../etc")
+        );
     }
 
     #[cfg(unix)]
@@ -11902,159 +11826,4 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
     }
 
-    // ========== check_symlinks_for_tar tests ==========
-
-    #[test]
-    fn test_check_symlinks_for_tar_regular_files() {
-        let temp_dir = create_temp_dir();
-
-        File::create(temp_dir.join("file1.txt")).unwrap();
-        File::create(temp_dir.join("file2.txt")).unwrap();
-
-        let files = vec!["file1.txt".to_string(), "file2.txt".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_ok());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_safe_symlink() {
-        let temp_dir = create_temp_dir();
-
-        // Create a file and a symlink pointing to it (safe - within the directory)
-        let target = temp_dir.join("target.txt");
-        File::create(&target).unwrap();
-        std::os::unix::fs::symlink("target.txt", temp_dir.join("link")).unwrap();
-
-        let files = vec!["link".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_ok());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_sensitive_symlink_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink pointing to /etc (sensitive path)
-        std::os::unix::fs::symlink("/etc/passwd", temp_dir.join("sensitive_link")).unwrap();
-
-        let files = vec!["sensitive_link".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_nested_symlink() {
-        let temp_dir = create_temp_dir();
-
-        // Create a subdirectory with a file and a safe symlink
-        fs::create_dir_all(temp_dir.join("subdir")).unwrap();
-        File::create(temp_dir.join("subdir/file.txt")).unwrap();
-        std::os::unix::fs::symlink("file.txt", temp_dir.join("subdir/link")).unwrap();
-
-        let files = vec!["subdir".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_ok());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_nested_sensitive_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a subdirectory with a sensitive symlink inside
-        fs::create_dir_all(temp_dir.join("subdir")).unwrap();
-        std::os::unix::fs::symlink("/etc", temp_dir.join("subdir/etc_link")).unwrap();
-
-        let files = vec!["subdir".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_dangling_symlink_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink pointing to non-existent path
-        std::os::unix::fs::symlink("/nonexistent/path/file", temp_dir.join("dangling")).unwrap();
-
-        let files = vec!["dangling".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_outside_basedir_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink pointing outside base_dir (to /usr which is not sensitive but outside)
-        std::os::unix::fs::symlink("/usr", temp_dir.join("usr_link")).unwrap();
-
-        let files = vec!["usr_link".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_home_symlink_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink pointing to /home (now in SENSITIVE_PATHS)
-        std::os::unix::fs::symlink("/home", temp_dir.join("home_link")).unwrap();
-
-        let files = vec!["home_link".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_dev_symlink_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink pointing to /dev (now in SENSITIVE_PATHS)
-        std::os::unix::fs::symlink("/dev/null", temp_dir.join("dev_link")).unwrap();
-
-        let files = vec!["dev_link".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_symlinks_for_tar_relative_escape_rejected() {
-        let temp_dir = create_temp_dir();
-
-        // Create a symlink using relative path to escape base_dir
-        std::os::unix::fs::symlink("../../etc/passwd", temp_dir.join("relative_escape")).unwrap();
-
-        let files = vec!["relative_escape".to_string()];
-        let result = check_symlinks_for_tar(&temp_dir, &files);
-        assert!(result.is_err());
-
-        cleanup_temp_dir(&temp_dir);
-    }
 }
