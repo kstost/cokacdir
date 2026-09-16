@@ -25,9 +25,15 @@ impl WrapLayout {
             | EditAction::Replace { line, .. } => {
                 self.dirty_lines.insert(*line);
             }
-            EditAction::SwapLines { line1, line2 } => {
-                self.dirty_lines.insert(*line1);
-                self.dirty_lines.insert(*line2);
+            EditAction::MoveLines {
+                first_line,
+                last_line,
+                up,
+                ..
+            } => {
+                let first = if *up { first_line - 1 } else { *first_line };
+                let last = if *up { *last_line } else { last_line + 1 };
+                self.dirty_lines.extend(first..=last);
             }
             EditAction::SetLineEnding { .. } => {}
             EditAction::Batch { actions } => {
@@ -311,6 +317,35 @@ mod tests {
         state.word_wrap = true;
         state.scroll = 1;
         assert_eq!(state.scrollbar_viewport(), (7, 4));
+    }
+
+    #[test]
+    fn selected_block_moves_refresh_wrapped_offsets_through_undo_and_redo() {
+        let mut state = wrapped_editor(&["a", "abcdefgh", "b", "abcdefghijkl", "z"]);
+        state.visible_height = 1;
+        state.selection = Some(Selection {
+            start_line: 1,
+            start_col: 0,
+            end_line: 2,
+            end_col: 1,
+        });
+        state.cursor_line = 2;
+        state.cursor_col = 1;
+        state.scroll = 1;
+        assert_eq!(state.scrollbar_viewport(), (8, 1));
+
+        state.move_line_up();
+        state.scroll = 1;
+        state.wrap_scroll_offset = 0;
+        assert_eq!(state.scrollbar_viewport(), (8, 2));
+        state.undo();
+        state.scroll = 1;
+        state.wrap_scroll_offset = 0;
+        assert_eq!(state.scrollbar_viewport(), (8, 1));
+        state.redo();
+        state.scroll = 1;
+        state.wrap_scroll_offset = 0;
+        assert_eq!(state.scrollbar_viewport(), (8, 2));
     }
 
     #[test]

@@ -1424,6 +1424,7 @@ pub struct HelpState {
     pub scroll_offset: usize,
     pub max_scroll: usize,
     pub visible_height: usize,
+    pub(crate) mouse_area: Option<ratatui::layout::Rect>,
 }
 
 impl Default for HelpState {
@@ -1432,6 +1433,7 @@ impl Default for HelpState {
             scroll_offset: 0,
             max_scroll: 0,
             visible_height: 0,
+            mouse_area: None,
         }
     }
 }

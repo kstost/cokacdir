@@ -71,9 +71,14 @@ pub enum EditAction {
         old_content: String,
         new_content: String,
     },
-    SwapLines {
-        line1: usize,
-        line2: usize,
+    MoveLines {
+        first_line: usize,
+        last_line: usize,
+        up: bool,
+        cursor_before: (usize, usize),
+        cursor_after: (usize, usize),
+        selection_before: Option<Selection>,
+        selection_after: Option<Selection>,
     },
     Batch {
         actions: Vec<EditAction>,
@@ -373,7 +378,7 @@ impl EditorState {
                 new_content,
                 ..
             } => old_content.len() + new_content.len() + 32,
-            EditAction::SwapLines { .. } => 24,
+            EditAction::MoveLines { .. } => std::mem::size_of::<EditAction>(),
             EditAction::Batch { actions } => {
                 actions
                     .iter()
@@ -2152,12 +2157,12 @@ impl EditorState {
             self.undo_memory_usage = self.undo_memory_usage.saturating_sub(action_size);
 
             let reverse = self.reverse_action(&action);
+            self.selection = None;
+            self.clear_multi_cursor_state();
             self.apply_action(&reverse, false);
 
             self.redo_memory_usage += action_size;
             self.redo_stack.push_back(action);
-            self.selection = None;
-            self.clear_multi_cursor_state();
             self.clamp_cursor();
             self.update_scroll();
             self.find_matching_bracket();
@@ -2171,12 +2176,12 @@ impl EditorState {
             let action_size = Self::estimate_action_size(&action);
             self.redo_memory_usage = self.redo_memory_usage.saturating_sub(action_size);
 
+            self.selection = None;
+            self.clear_multi_cursor_state();
             self.apply_action(&action, false);
 
             self.undo_memory_usage += action_size;
             self.undo_stack.push_back(action);
-            self.selection = None;
-            self.clear_multi_cursor_state();
             self.clamp_cursor();
             self.update_scroll();
             self.find_matching_bracket();
@@ -2251,9 +2256,22 @@ impl EditorState {
                 old_content: new_content.clone(),
                 new_content: old_content.clone(),
             },
-            EditAction::SwapLines { line1, line2 } => EditAction::SwapLines {
-                line1: *line1,
-                line2: *line2,
+            EditAction::MoveLines {
+                first_line,
+                last_line,
+                up,
+                cursor_before,
+                cursor_after,
+                selection_before,
+                selection_after,
+            } => EditAction::MoveLines {
+                first_line: if *up { first_line - 1 } else { first_line + 1 },
+                last_line: if *up { last_line - 1 } else { last_line + 1 },
+                up: !up,
+                cursor_before: *cursor_after,
+                cursor_after: *cursor_before,
+                selection_before: *selection_after,
+                selection_after: *selection_before,
             },
             EditAction::Batch { actions } => EditAction::Batch {
                 actions: actions
@@ -2354,10 +2372,17 @@ impl EditorState {
                     self.lines[*line] = new_content.clone();
                 }
             }
-            EditAction::SwapLines { line1, line2 } => {
-                if *line1 < self.lines.len() && *line2 < self.lines.len() {
-                    self.lines.swap(*line1, *line2);
-                }
+            EditAction::MoveLines {
+                first_line,
+                last_line,
+                up,
+                cursor_after,
+                selection_after,
+                ..
+            } => {
+                self.rotate_lines(*first_line, *last_line, *up);
+                (self.cursor_line, self.cursor_col) = *cursor_after;
+                self.selection = *selection_after;
             }
             EditAction::Batch { actions } => {
                 for a in actions {
@@ -3368,26 +3393,132 @@ impl EditorState {
 
     /// 줄 위로 이동
     pub fn move_line_up(&mut self) {
-        if self.cursor_line > 0 {
-            let line1 = self.cursor_line - 1;
-            let line2 = self.cursor_line;
-            self.lines.swap(line1, line2);
-            self.push_undo(EditAction::SwapLines { line1, line2 });
-            self.cursor_line -= 1;
-            self.update_scroll();
-        }
+        self.move_lines(true);
     }
 
     /// 줄 아래로 이동
     pub fn move_line_down(&mut self) {
-        if self.cursor_line + 1 < self.lines.len() {
-            let line1 = self.cursor_line;
-            let line2 = self.cursor_line + 1;
-            self.lines.swap(line1, line2);
-            self.push_undo(EditAction::SwapLines { line1, line2 });
-            self.cursor_line += 1;
-            self.update_scroll();
+        self.move_lines(false);
+    }
+
+    fn rotate_lines(&mut self, first_line: usize, last_line: usize, up: bool) {
+        // Separators stay at their document positions, including the missing
+        // separator at EOF. Moving them with the text could merge two lines.
+        if up {
+            self.lines[first_line - 1..=last_line].rotate_left(1);
+        } else {
+            self.lines[first_line..=last_line + 1].rotate_right(1);
         }
+    }
+
+    fn move_lines(&mut self, up: bool) {
+        if self.lines.is_empty() {
+            return;
+        }
+
+        let selection_range = self
+            .selection
+            .and_then(|selection| self.clamped_selection_range(selection));
+        let (first_line, last_line) = if let Some((first, _, last, end_col)) = selection_range {
+            // A half-open selection ending at the next line's start does not
+            // select that line's contents.
+            (
+                first,
+                if last > first && end_col == 0 {
+                    last - 1
+                } else {
+                    last
+                },
+            )
+        } else {
+            let line = self.cursor_line.min(self.lines.len() - 1);
+            (line, line)
+        };
+
+        let mut last_movable_line = self.lines.len() - 1;
+        if selection_range.is_some()
+            && last_movable_line > 0
+            && self.lines[last_movable_line].is_empty()
+        {
+            // The final empty row represents a trailing newline. A selection
+            // reaching EOF must not rotate through it and remove that newline.
+            last_movable_line -= 1;
+        }
+        if (up && first_line == 0) || (!up && last_line >= last_movable_line) {
+            return;
+        }
+
+        let cursor_before = (self.cursor_line, self.cursor_col);
+        let selection_before = self.selection;
+        self.rotate_lines(first_line, last_line, up);
+
+        let shift_position = |line: usize, col: usize| {
+            let line = line.min(self.lines.len() - 1);
+            let shifted = if up { line.saturating_sub(1) } else { line + 1 };
+            if shifted >= self.lines.len() {
+                // A next-line-start endpoint becomes EOF when the block moves
+                // below the last line of a file without a trailing newline.
+                let last = self.lines.len() - 1;
+                (last, self.lines[last].chars().count())
+            } else {
+                (shifted, col)
+            }
+        };
+        let cursor_after = shift_position(cursor_before.0, cursor_before.1);
+        let selection_after = selection_range.map(|(sl, sc, el, ec)| {
+            let (start_line, start_col) = shift_position(sl, sc);
+            let (end_line, end_col) = shift_position(el, ec);
+            let normalized = Selection {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            };
+
+            // Preserve the anchor direction for subsequent Shift navigation.
+            // At EOF an inclusive keyboard anchor may have been clamped to an
+            // empty row; use the actual half-open range if shifting that anchor
+            // would otherwise start selecting text outside the moved block.
+            if let Some(selection) = selection_before {
+                let (start_line, start_col) =
+                    shift_position(selection.start_line, selection.start_col);
+                let (end_line, end_col) = shift_position(selection.end_line, selection.end_col);
+                let shifted = Selection {
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                };
+                if self.clamped_selection_range(shifted)
+                    == Some((
+                        normalized.start_line,
+                        normalized.start_col,
+                        normalized.end_line,
+                        normalized.end_col,
+                    ))
+                {
+                    return shifted;
+                }
+            }
+            normalized
+        });
+
+        (self.cursor_line, self.cursor_col) = cursor_after;
+        self.selection = selection_after;
+        self.clear_multi_cursor_state();
+        self.push_undo(EditAction::MoveLines {
+            first_line,
+            last_line,
+            up,
+            cursor_before,
+            cursor_after,
+            selection_before,
+            selection_after,
+        });
+        self.clamp_cursor();
+        self.update_scroll();
+        self.find_matching_bracket();
+        self.update_modified();
     }
 
     /// 커서 이동
@@ -6951,6 +7082,268 @@ mod tests {
 
         editor.redo();
         assert_eq!(editor.serialize_content(), "b\na");
+    }
+
+    #[test]
+    fn alt_arrows_move_selected_lines_from_either_cursor_end_and_restore_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let forward = Selection {
+            start_line: 1,
+            start_col: 0,
+            end_line: 2,
+            end_col: 3,
+        };
+        let backward = Selection {
+            start_line: 2,
+            start_col: 2,
+            end_line: 1,
+            end_col: 1,
+        };
+        for (selection, cursor) in [
+            (forward, (2, 3)),
+            (forward, (1, 0)), // Backward mouse drag stores a normalized range.
+            (backward, (1, 0)),
+        ] {
+            for key in [KeyCode::Up, KeyCode::Down] {
+                let mut app =
+                    App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+                let mut editor = editor_with_lines(&["AAA", "bb", "가나다", "D", "EE"]);
+                editor.selection = Some(selection);
+                (editor.cursor_line, editor.cursor_col) = cursor;
+                assert_eq!(editor.get_selected_text(), "bb\n가나다");
+                app.editor_state = Some(editor);
+                app.current_screen = Screen::FileEditor;
+
+                handle_input(&mut app, key, KeyModifiers::ALT);
+
+                let editor = app.editor_state.as_mut().unwrap();
+                let (expected, shifted_cursor, range) = if key == KeyCode::Up {
+                    (
+                        vec!["bb", "가나다", "AAA", "D", "EE"],
+                        (cursor.0 - 1, cursor.1),
+                        (0, 0, 1, 3),
+                    )
+                } else {
+                    (
+                        vec!["AAA", "D", "bb", "가나다", "EE"],
+                        (cursor.0 + 1, cursor.1),
+                        (2, 0, 3, 3),
+                    )
+                };
+                assert_eq!(editor.lines, expected);
+                assert_eq!((editor.cursor_line, editor.cursor_col), shifted_cursor);
+                assert_eq!(editor.selection.unwrap().normalized(), range);
+                assert_eq!(editor.get_selected_text(), "bb\n가나다");
+                editor.copy();
+                assert_eq!(editor.clipboard, "bb\n가나다");
+                assert_eq!(editor.undo_stack.len(), 1);
+                assert!(editor.modified);
+                let moved_selection = editor.selection;
+
+                editor.undo();
+                assert_eq!(editor.lines, vec!["AAA", "bb", "가나다", "D", "EE"]);
+                assert_eq!((editor.cursor_line, editor.cursor_col), cursor);
+                assert_eq!(editor.selection, Some(selection));
+                assert_eq!(editor.redo_stack.len(), 1);
+                assert!(!editor.modified);
+
+                editor.redo();
+                assert_eq!(editor.lines, expected);
+                assert_eq!((editor.cursor_line, editor.cursor_col), shifted_cursor);
+                assert_eq!(editor.selection, moved_selection);
+                assert_eq!(editor.get_selected_text(), "bb\n가나다");
+                assert_eq!(editor.undo_stack.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn moving_selected_lines_preserves_partial_columns_and_keyboard_anchor() {
+        for backward in [false, true] {
+            let mut editor = editor_with_lines(&["top", "한글abc", "xyz끝", "tail"]);
+            if backward {
+                editor.cursor_line = 2;
+                editor.cursor_col = 1;
+                editor.move_cursor(-1, 0, true);
+            } else {
+                editor.cursor_line = 1;
+                editor.cursor_col = 1;
+                editor.move_cursor(1, 0, true);
+                editor.move_cursor(0, 1, true);
+            }
+            assert_eq!(editor.get_selected_text(), "글abc\nxy");
+            let before = editor.selection.unwrap();
+
+            editor.move_line_up();
+
+            assert_eq!(editor.lines, vec!["한글abc", "xyz끝", "top", "tail"]);
+            assert_eq!(editor.get_selected_text(), "글abc\nxy");
+            assert_eq!(
+                editor.selection,
+                Some(Selection {
+                    start_line: before.start_line - 1,
+                    end_line: before.end_line - 1,
+                    ..before
+                })
+            );
+            editor.move_cursor(0, -1, true);
+            let selected_after_extension = if backward {
+                "한글abc\nxy"
+            } else {
+                "글abc\nx"
+            };
+            assert_eq!(editor.get_selected_text(), selected_after_extension);
+        }
+    }
+
+    #[test]
+    fn moving_selection_ending_at_line_start_excludes_that_line_and_can_reach_eof() {
+        let mut editor = editor_with_lines(&["a", "b", "c", "d", "e"]);
+        editor.selection = Some(Selection {
+            start_line: 1,
+            start_col: 0,
+            end_line: 3,
+            end_col: 0,
+        });
+        editor.cursor_line = 3;
+        let original_selection = editor.selection;
+
+        editor.move_line_up();
+        assert_eq!(editor.lines, vec!["b", "c", "a", "d", "e"]);
+        assert_eq!(editor.get_selected_text(), "b\nc\n");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (2, 0));
+        editor.undo();
+        assert_eq!(editor.selection, original_selection);
+
+        editor.move_line_down();
+        assert_eq!(editor.lines, vec!["a", "d", "b", "c", "e"]);
+        assert_eq!(editor.get_selected_text(), "b\nc\n");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (4, 0));
+        let before_eof_selection = editor.selection;
+
+        editor.move_line_down();
+        assert_eq!(editor.lines, vec!["a", "d", "e", "b", "c"]);
+        assert_eq!(editor.get_selected_text(), "b\nc");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (4, 1));
+        assert_eq!(editor.selection.unwrap().normalized(), (3, 0, 4, 1));
+        let undo_count = editor.undo_stack.len();
+        editor.move_line_down();
+        assert_eq!(editor.undo_stack.len(), undo_count);
+
+        editor.undo();
+        assert_eq!(editor.lines, vec!["a", "d", "b", "c", "e"]);
+        assert_eq!(editor.selection, before_eof_selection);
+        assert_eq!((editor.cursor_line, editor.cursor_col), (4, 0));
+        editor.redo();
+        assert_eq!(editor.get_selected_text(), "b\nc");
+        assert_eq!((editor.cursor_line, editor.cursor_col), (4, 1));
+    }
+
+    #[test]
+    fn selected_line_moves_stop_at_block_boundaries_without_changing_history() {
+        let mut editor = editor_with_lines(&["a", "b", "c", "d"]);
+        editor.selection = Some(Selection {
+            start_line: 1,
+            start_col: 0,
+            end_line: 2,
+            end_col: 1,
+        });
+        editor.cursor_line = 2;
+        editor.cursor_col = 1;
+        editor.move_line_up();
+        let selection_at_top = editor.selection;
+        editor.move_line_up();
+        assert_eq!(editor.lines, vec!["b", "c", "a", "d"]);
+        assert_eq!(editor.selection, selection_at_top);
+        assert_eq!((editor.cursor_line, editor.cursor_col), (1, 1));
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        editor.move_line_down();
+        assert_eq!(editor.lines, vec!["a", "b", "c", "d"]);
+        assert!(!editor.modified);
+        editor.move_line_down();
+        let selection_at_bottom = editor.selection;
+        editor.move_line_down();
+        assert_eq!(editor.lines, vec!["a", "d", "b", "c"]);
+        assert_eq!(editor.selection, selection_at_bottom);
+        assert_eq!(editor.undo_stack.len(), 3);
+
+        editor.undo();
+        editor.select_all();
+        let all = editor.selection;
+        editor.move_line_up();
+        editor.move_line_down();
+        assert_eq!(editor.lines, vec!["a", "b", "c", "d"]);
+        assert_eq!(editor.selection, all);
+        assert_eq!(editor.undo_stack.len(), 2);
+        assert_eq!(editor.redo_stack.len(), 1);
+        assert!(!editor.modified);
+    }
+
+    #[test]
+    fn moving_selected_lines_preserves_file_separators_and_trailing_newline() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        for (original, expected) in [
+            ("a\nb\nc", "b\nc\na"),
+            ("a\r\nb\r\nc\r\n", "b\r\nc\r\na\r\n"),
+            ("a\r\nb\nc\r\n", "b\r\nc\na\r\n"),
+        ] {
+            let path = temp_dir.path().join("move-block.txt");
+            std::fs::write(&path, original).unwrap();
+            let mut editor = EditorState::new();
+            editor.load_file(&path).unwrap();
+            editor.selection = Some(Selection {
+                start_line: 1,
+                start_col: 0,
+                end_line: 2,
+                end_col: 1,
+            });
+            editor.cursor_line = 2;
+            editor.cursor_col = 1;
+            let original_endings = editor.line_endings.clone();
+            editor.move_line_down();
+            assert!(editor.undo_stack.is_empty());
+            assert_eq!(editor.serialize_content(), original);
+            editor.move_line_up();
+            assert_eq!(editor.serialize_content(), expected);
+            assert_eq!(editor.line_endings, original_endings);
+            editor.undo();
+            assert_eq!(editor.serialize_content(), original);
+            editor.redo();
+            editor.save_file().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn moving_selection_with_empty_eof_endpoint_keeps_only_the_selected_text() {
+        for backward in [false, true] {
+            let mut editor = editor_with_lines(&["a", "b", "c", ""]);
+            if backward {
+                editor.cursor_line = 3;
+                editor.move_cursor(-2, 0, true);
+            } else {
+                editor.cursor_line = 1;
+                editor.move_cursor(2, 0, true);
+            }
+            assert_eq!(editor.get_selected_text(), "b\nc\n");
+            let original_selection = editor.selection;
+            editor.move_line_down();
+            assert!(!editor.modified);
+            assert!(editor.undo_stack.is_empty());
+            editor.move_line_up();
+            assert_eq!(editor.lines, vec!["b", "c", "a", ""]);
+            assert_eq!(editor.get_selected_text(), "b\nc\n");
+            editor.undo();
+            assert_eq!(editor.selection, original_selection);
+            editor.select_all();
+            let all = editor.selection;
+            editor.move_line_up();
+            editor.move_line_down();
+            assert_eq!(editor.lines, vec!["a", "b", "c", ""]);
+            assert_eq!(editor.selection, all);
+            assert!(!editor.modified);
+        }
     }
 
     #[test]

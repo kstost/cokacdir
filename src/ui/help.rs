@@ -20,6 +20,7 @@ use crate::keybindings::{
 
 /// Draw the help screen
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
+    app.help_state.mouse_area = None;
     // First draw the panels in background
     draw_panel_background(frame, app, area, theme);
 
@@ -57,13 +58,18 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
+    app.help_state.mouse_area = Some(dialog_area);
 
     // Clear the area
     frame.render_widget(Clear, dialog_area);
 
     // Create block
     let block = Block::default()
-        .title(" Help ")
+        .title(concat!(
+            " Help - COKACDIR v",
+            env!("CARGO_PKG_VERSION"),
+            " "
+        ))
         .title_style(
             Style::default()
                 .fg(theme.help.title)
@@ -196,6 +202,7 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
         "Wheel over list/text",
         "Scroll without moving the keyboard cursor",
     ));
+    lines.push(key_line("Wheel over help", "Scroll help by three lines"));
     lines.push(key_line(
         "Click / double click",
         "Focus file / open file or directory",

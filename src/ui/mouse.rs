@@ -92,6 +92,7 @@ pub(crate) fn begin_frame(app: &mut App, area: Rect) {
         cancel_gesture(app);
     }
     app.mouse.frame = Some((app.current_screen, area));
+    app.help_state.mouse_area = None;
     for panel in &mut app.panels {
         panel.mouse_area = None;
     }
@@ -154,6 +155,21 @@ pub(crate) fn handle_input(app: &mut App, event: MouseEvent) {
     }
     match app.current_screen {
         Screen::FilePanel => handle_panel(app, event),
+        Screen::Help => {
+            let state = &mut app.help_state;
+            if !state
+                .mouse_area
+                .is_some_and(|area| contains(area, event.column, event.row))
+            {
+                return;
+            }
+            let delta = match event.kind {
+                MouseEventKind::ScrollUp => -3,
+                MouseEventKind::ScrollDown => 3,
+                _ => return,
+            };
+            state.scroll_offset = scroll_delta(state.scroll_offset, delta).min(state.max_scroll);
+        }
         Screen::FileEditor => {
             if let Some(editor) = app.editor_state.as_mut() {
                 let inside = editor

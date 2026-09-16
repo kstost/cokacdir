@@ -1,6 +1,6 @@
 # Mouse Controls
 
-The file manager, built-in code editor, and text viewer accept mouse input in terminals that provide mouse reporting. Mouse capture starts with the TUI and is released on exit and while an external terminal command runs.
+The file manager, built-in code editor, text viewer, and help window accept mouse input in terminals that provide mouse reporting. Mouse capture starts with the TUI and is released on exit and while an external terminal command runs.
 
 ## File panels
 
@@ -33,9 +33,11 @@ The file-list header, border, and scrollbar are outside the mouse target. Scroll
 
 Coordinates account for line numbers, tabs, wide characters such as Korean text, horizontal scrolling, and wrapped lines. Drag selection works with the existing copy/cut/paste and editing commands. Mouse gestures themselves do not change the document or undo history. Find/replace, Go to Line, and exit confirmation keep their keyboard controls.
 
-## Text viewer and other screens
+## Text viewer, help, and other screens
 
-The text viewer supports vertical wheel scrolling and horizontal wheel scrolling with wrapping off. Its search and Go to Line prompts keep their keyboard controls. Other screens and dialogs continue to use their existing keyboard controls.
+The text viewer supports vertical wheel scrolling and horizontal wheel scrolling with wrapping off. Its search and Go to Line prompts keep their keyboard controls.
+
+The help window opened with `?` scrolls three lines per vertical wheel step while the pointer is inside the window, including its scrollbar. Scrolling stops at the first and last help lines. The title displays the app version and stays visible while scrolling. Other screens and dialogs continue to use their existing keyboard controls.
 
 ## Running inside cokacmux
 
