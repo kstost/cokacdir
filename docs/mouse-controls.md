@@ -6,7 +6,7 @@ The file manager, built-in code editor, text viewer, and help window accept mous
 
 | Gesture | Action |
 | --- | --- |
-| Vertical wheel over a file list | Scroll that list three rows; keep the keyboard focus and file cursor |
+| Vertical wheel over a file list | Scroll that list and move its file cursor by three rows; keep the keyboard focus |
 | Left click a file | Focus its panel and place the file cursor on that row |
 | Double click a file or directory | Run the existing Open action |
 | Ctrl + left click | Toggle the file's selection mark |
@@ -18,7 +18,7 @@ Dragging a marked file includes the marked files. Dragging an unmarked file uses
 
 Drops use the existing clipboard/paste operation, including overwrite dialogs, progress, cancellation, local source identity checks, and cross-volume move settings. A valid drop replaces the application's file clipboard. Remote copies use the existing SSH/SFTP transfer support; remote moves retain the same restrictions as keyboard Cut/Paste.
 
-The file-list header, border, and scrollbar are outside the mouse target. Scrolling alone does not select files. Keyboard navigation brings the file cursor back into view. Escape, other keys, a screen or terminal-size change, and focus loss cancel a pending drag. Dialogs and active operations block background mouse actions.
+The file-list header, border, and scrollbar are outside the mouse target. Wheel scrolling moves the file cursor without changing selection marks. The cursor stays visible and stops at the first or last entry; it can keep moving when the list reaches its scroll limit or fits on screen. Escape, other keys, a screen or terminal-size change, and focus loss cancel a pending drag. Dialogs and active operations block background mouse actions.
 
 ## Code editor
 

@@ -4493,7 +4493,8 @@ fn run_app<B: ratatui::backend::Backend>(
 
             match ev {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    ui::mouse::before_key(app, key.code, key.modifiers);
+                    // End a gesture so a delayed release cannot act on a newly opened screen.
+                    ui::mouse::cancel_gesture(app);
                     match app.current_screen {
                         Screen::FilePanel => {
                             if handle_panel_input(app, key.code, key.modifiers) {

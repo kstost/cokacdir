@@ -1,5 +1,61 @@
 # Changelog — cokacdir
 
+## 0.8.29 — 2026-09-16
+
+- **File-panel wheel scrolling now moves the file cursor with the list.** Each vertical wheel step moves the cursor and viewport by three rows in the pointed-at panel, preserving keyboard focus and selection marks. The cursor stops at the first or last entry and can continue moving when the viewport reaches its scroll limit or the entire list fits on screen.
+
+- **Sorting after wheel scrolling keeps the file cursor visible.** File panels now use the same cursor-following viewport rules for mouse and keyboard navigation, eliminating the separate scroll state that could leave the cursor outside the visible list after sorting. The Help screen and mouse-controls guide describe the updated behavior.
+
+---
+
+## 0.8.28 — 2026-09-16
+
+- **The editor can move a selected block of lines with `Alt+Up` and `Alt+Down`.** The cursor and selection move with the block, preserving selection direction, line separators, and the trailing newline. A selection ending at the start of the next line excludes that line, document boundaries prevent invalid moves, and undo/redo restores the moved block and its selection while updating wrapped-line scrolling.
+
+- **The Help window now supports vertical wheel scrolling and displays the app version.** Scrolling moves three lines per step while the pointer is over the window, including its scrollbar, and stops at the first and last help lines. The version remains visible in the window title.
+
+---
+
+## 0.8.26 — 2026-09-13
+
+- **Direct editor sessions now exit the application when the editor closes.** `cokacdir --edit <FILE>` and `cokacdir -e <FILE>` return to the calling shell after save or discard, preserving the saved file-manager panel layout and the shell's working directory. Cancelling the exit dialog or encountering a save failure keeps the editor open.
+
+- **The unsaved-changes dialog now exposes save, discard, and cancel shortcuts.** `S`/`Y` saves and closes, `D`/`N` closes without saving, and `C`/`Esc` cancels; letter shortcuts accept either case. Arrow keys and `Tab`/`Shift+Tab` select a button, and `Enter` or `Space` activates it. Configured Save bindings take precedence over overlapping letter shortcuts, and the displayed hints reflect those bindings.
+
+---
+
+## 0.8.25 — 2026-09-13
+
+- **Mouse input is available again in the file manager, built-in editor, and text viewer.** File panels support wheel scrolling, click-to-focus, double-click-to-open, Ctrl-click selection toggles, and Shift-click range selection. Dragging files to another panel copies them into its current directory; holding Shift on release moves them through the existing Cut/Paste workflow. At introduction, file-panel wheel scrolling preserved the file cursor; version 0.8.29 changes it to move with the list.
+
+- **Editor mouse selection accounts for wrapped lines, tabs, and wide characters.** Clicking places the caret, dragging selects text with automatic scrolling beyond the text area, and Shift-click extends the selection. Editor and viewer wheels scroll three visual rows; horizontal scrolling is available with wrapping off. Mouse capture is released on exit and while external terminal commands run, and modal dialogs block background gestures. See [Mouse Controls](docs/mouse-controls.md).
+
+- **Scrollbars now track the visible content instead of just the selected item.** File panels, the editor, viewer, Git screens, diff screens, search results, MD5 results, and process lists use viewport-based scrollbar positions, with corrected bottom limits and resize handling.
+
+- **Files can be opened directly in the built-in editor with `--edit` or `-e`.** The command accepts one relative or absolute file path, including names beginning with `-` through `--`. A missing file opens as a new document and is created only when saved; its parent directory must exist. Invalid targets are reported before entering the TUI. This initial implementation returned to the file panel on close; version 0.8.26 introduces editor-only exit behavior.
+
+- **Local file operations now distinguish symbolic-link entries from their targets more consistently.** Copy and move preserve link text, while duplicate removal skips links and verifies scanned files and directory ancestry before hashing or deletion. Confirmed panel operations reject switched or replaced directories, and invalid UTF-8 directory entries produce an explicit listing error instead of exposing a lossy filename alias to file operations.
+
+- **Safe remote deletion now requires SSH command access and POSIX Python 3 on the server.** An embedded helper checks that SSH and SFTP refer to the same directory, isolates the selected entry, and traverses through directory handles without following replaced symlinks. Partial failures identify a recovery directory. SFTP-only servers remain browsable but cannot perform this deletion workflow.
+
+- **TAR creation validates the completed archive before publishing it.** Verification extracts the temporary archive privately and applies the normal link checks, catching links changed after source confirmation. This adds an extraction pass and requires space for the extracted contents; cancellation or validation failure prevents publication. See [File Operation Safety](docs/file-operation-safety.md).
+
+- **Directory encryption and decryption handle cancellation during reads, hashing, and verification.** Cancellation is also checked before committing source deletion, and cancelled runs report a failure rather than success. Encryption rejects non-UTF-8 filenames before modifying files in the directory.
+
+---
+
+## 0.8.24 — 2026-09-05
+
+- **Agy model selection now uses the CLI's model IDs and display labels.** Discovery prefers the JSON catalog and falls back to text output, while copyable `/model agy:<id>` commands contain only the ID. Existing display-label selections are resolved to current IDs. Opening `/model` refreshes the catalog; failed refreshes retain the last successful list and identify it as cached.
+
+- **Agy requests now use structured `stream-json` output.** Completion is determined from the terminal result and process status instead of matching error-like text in an answer or guessing replayed output. Session IDs come from the request's own result, and resumed requests reject a replacement conversation. Hook-backed and resumed responses are held until protocol and hook checks succeed. The transport was validated with Agy 1.1.27 on Linux and requires stream-json support introduced in Agy 1.1.8.
+
+- **Agy timeouts and captured output are bounded by cokacdir.** `COKAC_AGY_PRINT_TIMEOUT` defaults to `1h` and is enforced from process startup through exit, independently of Agy's own timer. Private file-backed input/output avoids waiting for unread stdin or inherited pipe handles; cancellation and output-limit failures terminate the request. Model discovery has a separate 30-second lookup budget.
+
+- **Scheduled Agy conversation clones now update their internal conversation ID.** SQLite backup still preserves committed WAL data, and the clone's `trajectory_meta.cascade_id` is updated to match its new filename ID so Agy 1.1.27 can resume it. Ambiguous metadata aborts the clone without changing the source conversation. See [How cokacdir Uses Antigravity CLI](docs/how-to-use-agy-antigravity.md).
+
+---
+
 ## 0.8.23 — 2026-09-05
 
 - **Codex now lists GPT-6 Astra.** Select it with `/model codex:gpt-6-astra`; `/effort` accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`, and shows `medium` as the model default. Existing model selections and saved effort overrides are preserved.

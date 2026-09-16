@@ -199,7 +199,11 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
 
     lines.push(section("Mouse Controls"));
     lines.push(key_line(
-        "Wheel over list/text",
+        "Wheel over file list",
+        "Scroll and move the file cursor by three rows",
+    ));
+    lines.push(key_line(
+        "Wheel over text",
         "Scroll without moving the keyboard cursor",
     ));
     lines.push(key_line("Wheel over help", "Scroll help by three lines"));

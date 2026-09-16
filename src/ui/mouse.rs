@@ -1,9 +1,8 @@
 //! Mouse routing uses content rectangles from the last draw, never inferred panel widths.
 use super::app::{App, Clipboard, ClipboardOperation, Screen};
-use crate::keybindings::PanelAction;
 use crossterm::{
     event::{
-        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, KeyCode,
+        DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
@@ -101,29 +100,6 @@ pub(crate) fn begin_frame(app: &mut App, area: Rect) {
     }
     if let Some(viewer) = app.viewer_state.as_mut() {
         viewer.mouse_area = None;
-    }
-}
-
-pub(crate) fn before_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
-    // Modifier-only events do not reach here. Escape or any actual key ends a
-    // gesture so a delayed release cannot operate on a newly opened screen.
-    cancel_gesture(app);
-    if app.current_screen == Screen::FilePanel
-        && matches!(
-            app.keybindings.panel_action(code, modifiers),
-            Some(
-                PanelAction::MoveUp
-                    | PanelAction::MoveDown
-                    | PanelAction::PageUp
-                    | PanelAction::PageDown
-                    | PanelAction::GoHome
-                    | PanelAction::GoEnd
-                    | PanelAction::SelectUp
-                    | PanelAction::SelectDown
-            )
-        )
-    {
-        app.active_panel_mut().mouse_scroll = false;
     }
 }
 
@@ -236,7 +212,8 @@ fn handle_panel(app: &mut App, event: MouseEvent) {
             };
             panel.scroll_offset = scroll_delta(panel.scroll_offset, delta)
                 .min(panel.files.len().saturating_sub(height));
-            panel.mouse_scroll = true;
+            panel.selected_index =
+                scroll_delta(panel.selected_index, delta).min(panel.files.len().saturating_sub(1));
             app.mouse.click = None;
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -372,13 +349,15 @@ mod tests {
     }
 
     #[test]
-    fn wheel_updates_scrollbar_and_preserves_focus_and_cursor_after_redraw() {
+    fn wheel_moves_cursor_and_scrollbar_and_preserves_focus_after_redraw() {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
         for n in 0..25 {
             std::fs::write(right.path().join(format!("{n:02}.txt")), "test").unwrap();
         }
         let mut app = App::new(left.path().into(), right.path().into());
+        app.panels[1].selected_index = 5;
+        app.panels[1].selected_files.insert("12.txt".into());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| super::super::draw::draw(frame, &mut app))
@@ -399,7 +378,8 @@ mod tests {
             .draw(|frame| super::super::draw::draw(frame, &mut app))
             .unwrap();
         assert_eq!(app.active_panel_index, 0);
-        assert_eq!(app.panels[1].selected_index, 0);
+        assert_eq!(app.panels[0].selected_index, 0);
+        assert_eq!(app.panels[1].selected_index, 8);
         assert_eq!(app.panels[1].scroll_offset, 3);
         assert_ne!(scrollbar_cells(&terminal), top_scrollbar);
         handle_input(
@@ -407,6 +387,15 @@ mod tests {
             event(MouseEventKind::ScrollDown, area.x, area.y - 1),
         );
         assert_eq!(app.panels[1].scroll_offset, 3);
+        assert_eq!(app.panels[1].selected_index, 8);
+
+        handle_input(&mut app, event(MouseEventKind::ScrollUp, area.x, area.y));
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.panels[1].scroll_offset, 0);
+        assert_eq!(app.panels[1].selected_index, 5);
+        assert_eq!(scrollbar_cells(&terminal), top_scrollbar);
 
         for _ in 0..app.panels[1].files.len() {
             handle_input(&mut app, event(MouseEventKind::ScrollDown, area.x, area.y));
@@ -418,6 +407,7 @@ mod tests {
             app.panels[1].scroll_offset,
             app.panels[1].files.len() - area.height as usize
         );
+        assert_eq!(app.panels[1].selected_index, app.panels[1].files.len() - 1);
         let bottom_scrollbar = scrollbar_cells(&terminal);
         let last_track_cell = top_scrollbar.len() - 2;
         assert_ne!(top_scrollbar[1], top_scrollbar[last_track_cell]);
@@ -434,6 +424,81 @@ mod tests {
         assert_eq!(scrollbar_cells(&terminal), top_scrollbar);
         assert_eq!(app.active_panel_index, 0);
         assert_eq!(app.panels[1].selected_index, 0);
+        assert_eq!(app.panels[1].selected_files.len(), 1);
+        assert!(app.panels[1].selected_files.contains("12.txt"));
+    }
+
+    #[test]
+    fn wheel_moves_cursor_when_list_fits_and_handles_an_empty_list() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for n in 0..5 {
+            std::fs::write(left.path().join(format!("{n}.txt")), "test").unwrap();
+        }
+        let mut app = App::new(left.path().into(), right.path().into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        let area = app.panels[0].mouse_area.unwrap();
+        assert!(app.panels[0].files.len() <= area.height as usize);
+
+        for (kind, expected_cursor) in [
+            (MouseEventKind::ScrollDown, 3),
+            (MouseEventKind::ScrollDown, 5),
+            (MouseEventKind::ScrollDown, 5),
+            (MouseEventKind::ScrollUp, 2),
+            (MouseEventKind::ScrollUp, 0),
+            (MouseEventKind::ScrollUp, 0),
+        ] {
+            handle_input(&mut app, event(kind, area.x, area.y));
+            terminal
+                .draw(|frame| super::super::draw::draw(frame, &mut app))
+                .unwrap();
+            assert_eq!(app.panels[0].selected_index, expected_cursor);
+            assert_eq!(app.panels[0].scroll_offset, 0);
+        }
+
+        app.panels[0].files.clear();
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+            handle_input(&mut app, event(kind, area.x, area.y));
+            terminal
+                .draw(|frame| super::super::draw::draw(frame, &mut app))
+                .unwrap();
+            assert_eq!(app.panels[0].selected_index, 0);
+            assert_eq!(app.panels[0].scroll_offset, 0);
+        }
+    }
+
+    #[test]
+    fn sorting_after_wheel_scroll_keeps_the_cursor_visible() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for n in 0..25 {
+            std::fs::write(left.path().join(format!("{n:02}.txt")), "test").unwrap();
+        }
+        let mut app = App::new(left.path().into(), right.path().into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        let area = app.panels[0].mouse_area.unwrap();
+        handle_input(&mut app, event(MouseEventKind::ScrollDown, area.x, area.y));
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.panels[0].selected_index, 3);
+        assert_eq!(app.panels[0].scroll_offset, 3);
+
+        app.toggle_sort_by_name();
+        terminal
+            .draw(|frame| super::super::draw::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.panels[0].selected_index, 0);
+        assert_eq!(app.panels[0].scroll_offset, 0);
     }
 
     #[test]

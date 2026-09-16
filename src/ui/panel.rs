@@ -140,8 +140,6 @@ pub fn draw(
     let start_index = if total_files <= visible_height {
         // 파일 개수가 화면보다 적으면 스크롤 없음
         0
-    } else if panel.mouse_scroll {
-        current_scroll.min(total_files.saturating_sub(visible_height))
     } else if panel.selected_index >= current_scroll
         && panel.selected_index < current_scroll + visible_height
     {

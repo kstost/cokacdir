@@ -2490,7 +2490,6 @@ pub struct ConnectSuccess {
 pub struct PanelState {
     pub(crate) mouse_id: u64,
     pub(crate) mouse_area: Option<ratatui::layout::Rect>,
-    pub(crate) mouse_scroll: bool,
     pub(crate) listing_generation: u64,
     pub path: PathBuf,
     pub files: Vec<FileItem>,
@@ -2564,7 +2563,6 @@ impl PanelState {
         let mut state = Self {
             mouse_id: Self::next_mouse_id(),
             mouse_area: None,
-            mouse_scroll: false,
             listing_generation: 0,
             path: valid_path,
             files: Vec::new(),
@@ -2604,7 +2602,6 @@ impl PanelState {
         let mut state = Self {
             mouse_id: Self::next_mouse_id(),
             mouse_area: None,
-            mouse_scroll: false,
             listing_generation: 0,
             path: valid_path,
             files: Vec::new(),
@@ -2651,7 +2648,6 @@ impl PanelState {
         self.listing_error = None;
         self.listing_generation = self.listing_generation.wrapping_add(1);
         self.mouse_area = None;
-        self.mouse_scroll = false;
         self.cancel_directory_size_scan();
         if self.is_remote() {
             self.load_files_remote();
@@ -2832,7 +2828,6 @@ impl PanelState {
         self.listing_error = None;
         self.listing_generation = self.listing_generation.wrapping_add(1);
         self.mouse_area = None;
-        self.mouse_scroll = false;
         self.cancel_directory_size_scan();
         self.files.clear();
         self.path = path.to_path_buf();
