@@ -223,6 +223,7 @@ get_shell_config() {
 
 # Setup shell wrapper function
 setup_shell() {
+    local install_dir="$1"
     local config_file
     config_file="$(get_shell_config)"
 
@@ -230,15 +231,28 @@ setup_shell() {
         return
     fi
 
-    # Append the repaired definition after any legacy function so re-running
-    # the installer upgrades existing shell profiles.
-    if [ -f "$config_file" ] && grep -Fq "BEGIN COKACCTL SAFE SHELL WRAPPER" "$config_file"; then
-        return
-    fi
-
     # Create file if not exists
     if [ ! -f "$config_file" ]; then
         touch "$config_file"
+    fi
+
+    # Add PATH when installed under ~/.local/bin
+    if [ "$install_dir" = "$HOME/.local/bin" ] &&
+       ! grep -Fq "# cokacctl PATH (added by installer)" "$config_file"; then
+        cat >> "$config_file" <<'EOF'
+
+# cokacctl PATH (added by installer)
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+    fi
+
+    # Append the repaired definition after any legacy function so re-running
+    # the installer upgrades existing shell profiles.
+    if grep -Fq "BEGIN COKACCTL SAFE SHELL WRAPPER" "$config_file"; then
+        return
     fi
 
     # Add function
@@ -317,7 +331,7 @@ main() {
         esac
 
         # Setup shell wrapper
-        setup_shell
+        setup_shell "$install_dir"
 
         success "Installed!"
 
