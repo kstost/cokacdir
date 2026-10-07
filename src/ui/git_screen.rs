@@ -100,14 +100,21 @@ pub struct GitScreenState {
     pub confirm_selected_button: usize, // 0: Yes, 1: No
     pub message: Option<String>,
     pub message_timer: u8,
+
+    /// Commit whose tree matches the current index (log tab marker)
+    index_matching_commit: Option<String>,
 }
 
 impl GitScreenState {
-    pub fn new(repo_path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
+        // Porcelain paths are relative to the repository root, so every
+        // command must run there rather than in the panel's subdirectory.
+        let repo_path = get_repo_root(&path).unwrap_or(path);
         let branch_name = get_current_branch(&repo_path);
         let status_files = get_status(&repo_path);
         let log_entries = get_log(&repo_path, 200);
         let branches = get_branches(&repo_path);
+        let index_matching_commit = get_index_matching_commit(&repo_path);
 
         Self {
             repo_path,
@@ -134,12 +141,14 @@ impl GitScreenState {
             confirm_selected_button: 1, // Default: No
             message: None,
             message_timer: 0,
+            index_matching_commit,
         }
     }
 
     fn refresh_status(&mut self) {
         self.branch_name = get_current_branch(&self.repo_path);
         self.status_files = get_status(&self.repo_path);
+        self.index_matching_commit = get_index_matching_commit(&self.repo_path);
         let len = self.status_files.len();
         if self.status_selected >= len {
             self.status_selected = len.saturating_sub(1);
@@ -229,7 +238,26 @@ pub fn get_repo_root(path: &Path) -> Option<PathBuf> {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .and_then(|o| {
+            // Strip only the line terminator: a directory name may legitimately
+            // end with whitespace, and must not be lossily re-encoded.
+            let mut bytes = o.stdout;
+            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                bytes.pop();
+            }
+            if bytes.is_empty() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            }
+            #[cfg(not(unix))]
+            {
+                String::from_utf8(bytes).ok().map(PathBuf::from)
+            }
+        })
 }
 
 /// Public wrapper for git_cmd() - for external checkout operations
@@ -376,6 +404,8 @@ fn get_commit_diff(path: &Path, hash: &str) -> String {
 
 fn get_file_diff(path: &Path, file: &str, staged: bool) -> String {
     let mut cmd = git_cmd(path);
+    // Status paths are file names, not glob patterns.
+    cmd.arg("--literal-pathspecs");
     cmd.arg("diff");
     if staged {
         cmd.arg("--cached");
@@ -425,6 +455,8 @@ fn get_branches(path: &Path) -> Vec<GitBranchEntry> {
 
 fn stage_file(path: &Path, file: &str, original_file: Option<&str>) -> Result<(), String> {
     let mut command = git_cmd(path);
+    // Status paths are file names, not glob patterns.
+    command.arg("--literal-pathspecs");
     command.args(["add", "--"]);
     if let Some(original) = original_file {
         command.arg(original);
@@ -447,6 +479,8 @@ fn unstage_file(path: &Path, file: &str, original_file: Option<&str>) -> Result<
         .unwrap_or(false);
 
     let mut command = git_cmd(path);
+    // Status paths are file names, not glob patterns.
+    command.arg("--literal-pathspecs");
     if has_head {
         command.args(["reset", "HEAD", "--"]);
         if let Some(original) = original_file {
@@ -455,8 +489,9 @@ fn unstage_file(path: &Path, file: &str, original_file: Option<&str>) -> Result<
         command.arg(file);
     } else {
         // `git reset HEAD` is invalid before the first commit.  Removing the
-        // path from the index leaves the working-tree file untouched.
-        command.args(["rm", "--cached", "--", file]);
+        // path from the index leaves the working-tree file untouched; `-f`
+        // is needed when the staged content differs from the working tree.
+        command.args(["rm", "--cached", "-f", "--", file]);
     }
     let output = command.output().map_err(|e| e.to_string())?;
 
@@ -934,7 +969,7 @@ fn draw_log_list(
     let max_width = area.width as usize;
 
     // Detect if files have been restored to a different commit
-    let restored = get_index_matching_commit(&state.repo_path);
+    let restored = state.index_matching_commit.clone();
 
     for (i, entry) in state
         .log_entries
@@ -1437,6 +1472,7 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
         KeyCode::Char('2') => {
             state.current_tab = GitTab::Log;
+            state.index_matching_commit = get_index_matching_commit(&state.repo_path);
             return;
         }
         KeyCode::Char('3') => {
@@ -1451,6 +1487,8 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             };
             if matches!(state.current_tab, GitTab::Commit) {
                 state.refresh_status();
+            } else if matches!(state.current_tab, GitTab::Log) {
+                state.index_matching_commit = get_index_matching_commit(&state.repo_path);
             }
             return;
         }
@@ -1462,6 +1500,8 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             };
             if matches!(state.current_tab, GitTab::Commit) {
                 state.refresh_status();
+            } else if matches!(state.current_tab, GitTab::Log) {
+                state.index_matching_commit = get_index_matching_commit(&state.repo_path);
             }
             return;
         }
@@ -1590,8 +1630,16 @@ fn handle_commit_tab_input(state: &mut GitScreenState, code: KeyCode, modifiers:
             if let Some(entry) = state.status_files.get(state.commit_selected) {
                 let diff = get_file_diff(&state.repo_path, &entry.path, entry.staged);
                 if diff.is_empty() {
+                    // Same cap as the file viewer; also rejects FIFOs/devices.
+                    const MAX_PREVIEW_BYTES: u64 = 100 * 1024 * 1024;
                     let full_path = state.repo_path.join(&entry.path);
-                    if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    if let Some(content) = crate::services::file_ops::read_regular_file_with_limit(
+                        &full_path,
+                        MAX_PREVIEW_BYTES,
+                    )
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    {
                         state.log_detail = Some(content);
                     } else {
                         state.show_msg("Cannot display file");

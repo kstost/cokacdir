@@ -22,7 +22,7 @@ pub struct ActionMap<A> {
     display: HashMap<A, Vec<String>>,
 }
 
-impl<A: Copy + Eq + Hash> ActionMap<A> {
+impl<A: Copy + Eq + Hash + std::fmt::Debug> ActionMap<A> {
     /// Build an `ActionMap` by merging user overrides on top of defaults.
     ///
     /// - Actions present in `overrides` completely replace the default bindings
@@ -52,7 +52,11 @@ impl<A: Copy + Eq + Hash> ActionMap<A> {
                 }
             }
         }
-        for (action, key_strings) in overrides {
+        // Apply overrides in a stable (action name) order so that two overridden
+        // actions claiming the same key resolve to the same winner on every launch.
+        let mut ordered_overrides: Vec<(&A, &Vec<String>)> = overrides.iter().collect();
+        ordered_overrides.sort_by_cached_key(|(action, _)| format!("{:?}", action));
+        for (action, key_strings) in ordered_overrides {
             // KeybindingsConfig::default() contains a complete copy of every
             // default binding.  Only entries whose value actually differs are
             // user overrides and need the second-pass precedence.

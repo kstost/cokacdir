@@ -1479,14 +1479,18 @@ fn draw_history(
         let display_position = (effective_scroll + visible_height).min(total_lines);
         let scroll_info = format!(" [{}/{}] ", display_position, total_lines);
         let info_len = scroll_info.len() as u16;
-        let indicator_x = inner.x + inner.width.saturating_sub(info_len + 1);
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                scroll_info,
-                Style::default().fg(theme.ai_screen.history_scroll_info),
-            )),
-            Rect::new(indicator_x, inner.y, info_len, 1),
-        );
+        // Skip the indicator if it doesn't fit inside the panel
+        // (rendering outside the buffer area panics)
+        if info_len <= inner.width && inner.height > 0 {
+            let indicator_x = inner.x + inner.width.saturating_sub(info_len + 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    scroll_info,
+                    Style::default().fg(theme.ai_screen.history_scroll_info),
+                )),
+                Rect::new(indicator_x, inner.y, info_len, 1),
+            );
+        }
     }
 }
 

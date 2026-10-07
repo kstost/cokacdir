@@ -152,6 +152,7 @@ Sets the effort level for the current chat's active Claude or Codex provider.
 - **Claude**: `low`, `medium`, `high`, `xhigh`, `max`
 - **Other/default Codex models**: `minimal`, `low`, `medium`, `high`, `xhigh`
 - **Codex `gpt-6-astra`**: `low`, `medium` (default), `high`, `xhigh`, `max`, `ultra`
+- **Codex `gpt-6.1-sol`**: `low`, `medium` (default), `high`, `xhigh`, `max`, `ultra`
 - **Codex `gpt-5.6-sol`**: `low` (default), `medium`, `high`, `xhigh`, `max`, `ultra`
 - **Codex `gpt-5.6-terra`**: `low`, `medium` (default), `high`, `xhigh`, `max`, `ultra`
 - **Codex `gpt-5.6-luna`**: `low`, `medium` (default), `high`, `xhigh`, `max`
@@ -160,10 +161,10 @@ Sets the effort level for the current chat's active Claude or Codex provider.
 - Without arguments, shows the current provider's value and accepted levels.
 - `reset`, `clear`, or `default` removes the override for the current provider.
 
-Select Astra with `/model codex:gpt-6-astra`.
+Select Astra with `/model codex:gpt-6-astra` and GPT-6.1 Sol with `/model codex:gpt-6.1-sol`.
 
 For every explicitly listed model, `xhigh` selects extra-high reasoning.
-`gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` additionally support `max`
+`gpt-6-astra`, `gpt-6.1-sol`, `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` additionally support `max`
 for maximum reasoning depth; Astra, Sol, and Terra support `ultra` for automatic
 task delegation at the maximum reasoning level. Effort values that are not
 supported by the active Codex model are retained for later model switches but

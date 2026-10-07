@@ -8,8 +8,8 @@ use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
 use crate::services::claude::{
-    create_private_temp_file, debug_log_to, kill_child_tree, send_success_terminal, CancelToken,
-    PrivateTempFile, StreamMessage,
+    cli_binary_stamp, cli_help_text, create_private_temp_file, debug_log_to, kill_child_tree,
+    send_success_terminal, CancelToken, CliBinaryStamp, PrivateTempFile, StreamMessage,
 };
 
 /// Context required to detect images that Codex's built-in `image_gen` tool
@@ -176,15 +176,17 @@ fn send_or_abort_child(
 
 /// Verify whether a Codex session's task has been fully completed.
 ///
-/// Mirrors the high-level contract of `claude::verify_completion`, but the
-/// mechanics differ because Codex has no non-interactive `--fork-session`:
-/// instead of forking the live session, we read the full-fidelity archive
-/// produced by `session_archive` (which is kept up to date by the normal
-/// convert-and-save flow), synthesize a transcript, and dispatch a fresh
-/// `codex exec --ephemeral` call that is completely independent of the
-/// original session — no `resume`, no `thread_id` passed in, no rollout
-/// file written. This guarantees the user-facing Codex session is not
-/// modified by the verification call.
+/// Mirrors `claude::verify_completion`. When this Codex has `codex exec
+/// fork`, an ephemeral fork of the session judges completeness from its real
+/// history, tool output included; `--ephemeral` writes no rollout and no
+/// thread row, and the source session is never written. Codex versions
+/// without a non-interactive fork (and a fork that fails) fall back to the
+/// full-fidelity archive produced by `session_archive` (kept up to date by
+/// the normal convert-and-save flow): it is rendered as a transcript and
+/// judged by a fresh `codex exec --ephemeral` call that is completely
+/// independent of the original session — no `resume`, no `thread_id`
+/// passed in, no rollout file written. Either way the user-facing Codex
+/// session is not modified by the verification call.
 ///
 /// Contract:
 /// - Returns `complete=true` iff the response contains `mission_complete`
@@ -202,159 +204,45 @@ pub fn verify_completion_codex(
     codex_debug_log(&format!("  session_id: {}", session_id));
     codex_debug_log(&format!("  working_dir: {}", working_dir));
 
-    // 1. Load the archive (full fidelity, deduplicated, provider-agnostic).
-    let transcript = crate::services::session_archive::build_verification_transcript(session_id)?;
-    codex_debug_log(&format!("  transcript: {} chars", transcript.len()));
-    // Forensic log: pair this sha with the transcript sha in session_archive.log
-    // — if they differ between consecutive iterations the input is fresh.
-    codex_debug_log(&format!(
-        "[loop-verify input] sid={} transcript_len={} transcript_sha={}",
-        session_id,
-        transcript.len(),
-        short_sha(&transcript)
-    ));
-
     let codex_bin = get_codex_path().ok_or_else(|| {
         codex_debug_log("  ERROR: Codex CLI not found");
         "Codex CLI not found".to_string()
     })?;
 
-    // 2. Build verification prompt. Read-only sandbox + "no tools" directive
-    //    is the best Codex offers in place of Claude's `--tools ""`.
-    let verify_prompt = format!(
-        "Review the task transcript below. \
-         Do NOT call any tools, do NOT read files, do NOT run commands — \
-         judge purely from the transcript.\n\n\
-         If the task appears fully and safely complete, respond with ONLY the single word: mission_complete\n\n\
-         Otherwise respond with: mission_pending\n\
-         followed by ONE short follow-up instruction (1–2 sentences).\n\n\
-         CRITICAL — what this follow-up instruction IS:\n\
-         The text you write after `mission_pending` will be taken verbatim and \
-         delivered as the NEXT USER MESSAGE to the very same working agent that \
-         produced the transcript. That agent will read it as if the user typed \
-         it into the chat. Therefore write it as a direct, second-person \
-         request from the user, not as a review/verdict/analysis.\n\n\
-         The instruction should ask the agent to re-examine, re-verify, or \
-         double-check whatever it just did — whatever form that work took. \
-         Let the phrasing flow naturally from the actual work, not from a \
-         fixed template.\n\n\
-         Rules:\n\
-         - Second-person imperative, as the user would type.\n\
-         - NOT a diagnosis, NOT a checklist of missing items, NOT a summary \
-           of what was done.\n\
-         - Match the language of the transcript.\n\
-         - 1–2 sentences. No preface, no \"I think\", no meta commentary.\n\n\
-         === TRANSCRIPT ===\n{}\n=== END TRANSCRIPT ===",
-        transcript);
-
-    // 3. Spawn a fresh, ephemeral Codex session. No `resume`, no session_id,
-    //    no thread_id. --ephemeral prevents a rollout file from being created.
-    //    The original user session is untouched.
-    //
-    // We route the final agent message to a tempfile via --output-last-message.
-    // This is crucial: Codex's non-JSON stdout echoes the user prompt under a
-    // "User instructions:" block. Our verify prompt itself contains the tokens
-    // `mission_complete` and `mission_pending` as instructions; parsing stdout
-    // directly would therefore ALWAYS find `mission_pending` (false positive)
-    // and keep the loop running to its iteration cap. Reading the last-message
-    // file instead yields only the model's actual reply.
-    let temp_dir = crate::utils::path::cokacdir_temp_dir()
-        .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {e}"))?;
-    let out_guard = create_private_temp_file(&temp_dir, "verify_last_message", b"")
-        .map_err(|e| format!("Failed to create verify output file: {e}"))?;
-    let out_path = out_guard.path();
-
-    // Note: `codex exec` does not accept `--ask-for-approval`; exec is
-    // inherently non-interactive so there's nothing to prompt for. The
-    // read-only sandbox prevents any filesystem writes the model might try,
-    // and the prompt itself instructs "do not call any tools".
-    let out_path_str = out_path.to_string_lossy().to_string();
-    let mut args: Vec<String> = vec![
-        "exec".to_string(),
-        "--ephemeral".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--sandbox".to_string(),
-        "read-only".to_string(),
-        "--output-last-message".to_string(),
-        out_path_str,
-    ];
-    if let Some(model) = model {
-        args.push("-m".to_string());
-        args.push(model.to_string());
-    }
-    if let Some(effort) = reasoning_effort {
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort={}", effort));
-    }
-    if fast_mode {
-        args.push("-c".to_string());
-        args.push("service_tier=\"fast\"".to_string());
-    }
-    args.push("-".to_string());
-    codex_debug_log(&format!("  args: {:?}", args));
-
-    let spawn_start = std::time::Instant::now();
-    let mut child = Command::new(codex_bin)
-        .args(&args)
-        .current_dir(working_dir)
-        .env(
-            "PATH",
-            crate::services::claude::enhanced_path_for_bin(codex_bin),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            codex_debug_log(&format!("  ERROR: Failed to spawn: {}", e));
-            format!("Failed to start Codex for verify_completion: {}", e)
-        })?;
-    codex_debug_log(&format!(
-        "  spawned in {:?}, pid={:?}",
-        spawn_start.elapsed(),
-        child.id()
-    ));
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(verify_prompt.as_bytes());
-        drop(stdin);
-    }
-
-    let wait_start = std::time::Instant::now();
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to read verify output: {}", e))?;
-    codex_debug_log(&format!(
-        "  completed in {:?}, exit={:?}",
-        wait_start.elapsed(),
-        output.status.code()
-    ));
-
-    // Read and clean up the last-message file regardless of exit status so we
-    // don't leak tempfiles even on failure paths.
-    let last_message = std::fs::read_to_string(out_path).ok();
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!(
-            "verify_completion_codex process failed (exit {:?}). stderr: {}",
-            output.status.code(),
-            crate::services::claude::safe_preview(&stderr, 500)
-        ));
-    }
-
-    // 4. Extract the model's final response. --output-last-message gives us
-    //    exactly the agent's final message text, with no prompt echo or
-    //    session banner boilerplate.
-    let response_text = match last_message {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(format!(
-                "verify_completion_codex produced no last-message output. stderr: {}",
-                crate::services::claude::safe_preview(&stderr, 500)
-            ));
+    let response_text = if codex_supports_exec_fork(codex_bin) {
+        match verify_reply_from_fork(
+            codex_bin,
+            session_id,
+            working_dir,
+            model,
+            reasoning_effort,
+            fast_mode,
+        ) {
+            Ok(reply) => reply,
+            Err(e) => {
+                codex_debug_log(&format!(
+                    "  fork verification failed, using the archive transcript: {}",
+                    e
+                ));
+                verify_reply_from_transcript(
+                    codex_bin,
+                    session_id,
+                    working_dir,
+                    model,
+                    reasoning_effort,
+                    fast_mode,
+                )?
+            }
         }
+    } else {
+        verify_reply_from_transcript(
+            codex_bin,
+            session_id,
+            working_dir,
+            model,
+            reasoning_effort,
+            fast_mode,
+        )?
     };
     codex_debug_log(&format!(
         "  last_message len={}, preview: {}",
@@ -403,8 +291,280 @@ pub fn verify_completion_codex(
     Ok(crate::services::claude::VerifyResult { complete, feedback })
 }
 
-fn codex_home_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codex"))
+static CODEX_EXEC_FORK: std::sync::Mutex<Option<(CliBinaryStamp, bool)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether this Codex has `codex exec fork`. Older versions read `fork` as
+/// the prompt of a plain `exec` (so even `exec fork --help` succeeds there);
+/// the subcommand list of `exec --help` is what tells them apart. A failed
+/// probe is not remembered.
+fn codex_supports_exec_fork(bin: &str) -> bool {
+    let stamp = cli_binary_stamp(bin);
+    if let Some(stamp) = stamp.as_ref() {
+        let cached = CODEX_EXEC_FORK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((cached_stamp, supported)) = cached {
+            if &cached_stamp == stamp {
+                return supported;
+            }
+        }
+    }
+    let Some(help) = cli_help_text(bin, &["exec", "--help"]) else {
+        return false;
+    };
+    let supported = help_lists_subcommand(&help, "fork");
+    codex_debug_log(&format!(
+        "[codex_supports_exec_fork] bin={} supported={}",
+        bin, supported
+    ));
+    if let Some(stamp) = stamp {
+        *CODEX_EXEC_FORK.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, supported));
+    }
+    supported
+}
+
+/// Whether the `Commands:` section of a clap help text lists `name`.
+fn help_lists_subcommand(help: &str, name: &str) -> bool {
+    help.lines()
+        .skip_while(|line| line.trim() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .any(|line| line.split_whitespace().next() == Some(name))
+}
+
+/// `-m`, reasoning effort and service tier of a verification call.
+fn push_verify_model_args(
+    args: &mut Vec<String>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    fast_mode: bool,
+) {
+    if let Some(model) = model {
+        args.push("-m".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(effort) = reasoning_effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={}", effort));
+    }
+    if fast_mode {
+        args.push("-c".to_string());
+        args.push("service_tier=\"fast\"".to_string());
+    }
+}
+
+/// Verifier reply from an ephemeral fork of the session itself.
+fn verify_reply_from_fork(
+    codex_bin: &str,
+    session_id: &str,
+    working_dir: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    fast_mode: bool,
+) -> Result<String, String> {
+    // The id sits next to other flags; an unvalidated value such as
+    // "--config x" would be parsed as a flag.
+    if !crate::services::process::is_valid_session_id(session_id) {
+        return Err(format!("Invalid session_id: {}", session_id));
+    }
+    codex_debug_log(&format!(
+        "[loop-verify input] sid={} source=fork",
+        session_id
+    ));
+    // `exec fork` has no `--sandbox` flag; the config key sets the same mode.
+    let mut args: Vec<String> = vec![
+        "exec".to_string(),
+        "fork".to_string(),
+        "--ephemeral".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "-c".to_string(),
+        "sandbox_mode=\"read-only\"".to_string(),
+    ];
+    push_verify_model_args(&mut args, model, reasoning_effort, fast_mode);
+    args.push(session_id.to_string());
+    run_codex_verify(
+        codex_bin,
+        args,
+        working_dir,
+        crate::services::claude::SESSION_VERIFY_PROMPT,
+    )
+}
+
+/// Verifier reply from a fresh ephemeral session given the archived
+/// transcript, for Codex versions without `exec fork`.
+fn verify_reply_from_transcript(
+    codex_bin: &str,
+    session_id: &str,
+    working_dir: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    fast_mode: bool,
+) -> Result<String, String> {
+    // Load the archive (full fidelity, deduplicated, provider-agnostic).
+    let transcript = crate::services::session_archive::build_verification_transcript(session_id)?;
+    codex_debug_log(&format!("  transcript: {} chars", transcript.len()));
+    // Forensic log: pair this sha with the transcript sha in session_archive.log
+    // — if they differ between consecutive iterations the input is fresh.
+    codex_debug_log(&format!(
+        "[loop-verify input] sid={} transcript_len={} transcript_sha={}",
+        session_id,
+        transcript.len(),
+        short_sha(&transcript)
+    ));
+
+    // Read-only sandbox + "no tools" directive is the best Codex offers in
+    // place of Claude's `--tools ""`.
+    let verify_prompt = format!(
+        "Review the task transcript below. \
+         Do NOT call any tools, do NOT read files, do NOT run commands — \
+         judge purely from the transcript.\n\n\
+         If the task appears fully and safely complete, respond with ONLY the single word: mission_complete\n\n\
+         Otherwise respond with: mission_pending\n\
+         followed by ONE short follow-up instruction (1–2 sentences).\n\n\
+         CRITICAL — what this follow-up instruction IS:\n\
+         The text you write after `mission_pending` will be taken verbatim and \
+         delivered as the NEXT USER MESSAGE to the very same working agent that \
+         produced the transcript. That agent will read it as if the user typed \
+         it into the chat. Therefore write it as a direct, second-person \
+         request from the user, not as a review/verdict/analysis.\n\n\
+         The instruction should ask the agent to re-examine, re-verify, or \
+         double-check whatever it just did — whatever form that work took. \
+         Let the phrasing flow naturally from the actual work, not from a \
+         fixed template.\n\n\
+         Rules:\n\
+         - Second-person imperative, as the user would type.\n\
+         - NOT a diagnosis, NOT a checklist of missing items, NOT a summary \
+           of what was done.\n\
+         - Match the language of the transcript.\n\
+         - 1–2 sentences. No preface, no \"I think\", no meta commentary.\n\n\
+         === TRANSCRIPT ===\n{}\n=== END TRANSCRIPT ===",
+        transcript);
+
+    // A fresh, ephemeral Codex session: no `resume`, no session_id, no
+    // thread_id. --ephemeral prevents a rollout file from being created.
+    //
+    // Note: `codex exec` does not accept `--ask-for-approval`; exec is
+    // inherently non-interactive so there's nothing to prompt for. The
+    // read-only sandbox prevents any filesystem writes the model might try,
+    // and the prompt itself instructs "do not call any tools".
+    let mut args: Vec<String> = vec![
+        "exec".to_string(),
+        "--ephemeral".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+    ];
+    push_verify_model_args(&mut args, model, reasoning_effort, fast_mode);
+    run_codex_verify(codex_bin, args, working_dir, &verify_prompt)
+}
+
+/// Run a one-shot verification `codex exec …` with `prompt` on stdin and
+/// return the model's final message.
+///
+/// The reply is routed to a tempfile via --output-last-message. This is
+/// crucial: Codex's non-JSON stdout echoes the user prompt under a "User
+/// instructions:" block. The verify prompts themselves contain the tokens
+/// `mission_complete` and `mission_pending` as instructions; parsing stdout
+/// directly would therefore ALWAYS find `mission_pending` (false positive)
+/// and keep the loop running to its iteration cap. Reading the last-message
+/// file instead yields only the model's actual reply, with no prompt echo
+/// or session banner boilerplate.
+fn run_codex_verify(
+    codex_bin: &str,
+    mut args: Vec<String>,
+    working_dir: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let temp_dir = crate::utils::path::cokacdir_temp_dir()
+        .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {e}"))?;
+    let out_guard = create_private_temp_file(&temp_dir, "verify_last_message", b"")
+        .map_err(|e| format!("Failed to create verify output file: {e}"))?;
+    let out_path = out_guard.path();
+    args.push("--output-last-message".to_string());
+    args.push(out_path.to_string_lossy().to_string());
+    args.push("-".to_string());
+    codex_debug_log(&format!("  args: {:?}", args));
+
+    let spawn_start = std::time::Instant::now();
+    let mut child = Command::new(codex_bin)
+        .args(&args)
+        .current_dir(working_dir)
+        .env(
+            "PATH",
+            crate::services::claude::enhanced_path_for_bin(codex_bin),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            codex_debug_log(&format!("  ERROR: Failed to spawn: {}", e));
+            format!("Failed to start Codex for verify_completion: {}", e)
+        })?;
+    codex_debug_log(&format!(
+        "  spawned in {:?}, pid={:?}",
+        spawn_start.elapsed(),
+        child.id()
+    ));
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+        drop(stdin);
+    }
+
+    let wait_start = std::time::Instant::now();
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read verify output: {}", e))?;
+    codex_debug_log(&format!(
+        "  completed in {:?}, exit={:?}",
+        wait_start.elapsed(),
+        output.status.code()
+    ));
+
+    // Read the last-message file before checking the exit status; the guard
+    // removes it on every path.
+    let last_message = std::fs::read_to_string(out_path).ok();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!(
+            "verify_completion_codex process failed (exit {:?}). stderr: {}",
+            output.status.code(),
+            crate::services::claude::safe_preview(&stderr, 500)
+        ));
+    }
+
+    match last_message {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(format!(
+                "verify_completion_codex produced no last-message output. stderr: {}",
+                crate::services::claude::safe_preview(&stderr, 500)
+            ))
+        }
+    }
+}
+
+/// Codex's home directory: `$CODEX_HOME` when set, otherwise `~/.codex`.
+pub(crate) fn codex_home_dir() -> Option<PathBuf> {
+    codex_home_from_roots(
+        std::env::var_os("CODEX_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+fn codex_home_from_roots(
+    codex_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    codex_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".codex")))
 }
 
 fn codex_state_5_path() -> Option<PathBuf> {
@@ -788,7 +948,13 @@ fn patch_codex_jsonl_lines(
         let Some(Value::Object(payload)) = map.get_mut("payload") else {
             continue;
         };
-        rewrite_payload_string_if_equal(payload, "id", old_sid, new_sid);
+        // The thread id is recorded as session_meta `id`, as `session_id`
+        // (the root thread; equal to `id` unless this is a subagent thread)
+        // and as `thread_id` on events and token usage records. Codex keeps
+        // writing usage under the recorded root, so all three must move.
+        for key in ["id", "session_id", "thread_id"] {
+            rewrite_payload_string_if_equal(payload, key, old_sid, new_sid);
+        }
         rewrite_payload_string_if_equal(payload, "cwd", old_cwd, new_cwd);
     }
 }
@@ -1246,6 +1412,7 @@ pub fn execute_command_streaming(
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);
             let _ = child.wait();
+            token.clear_child_pid(child.id());
             return Ok(());
         }
     }
@@ -1285,6 +1452,10 @@ pub fn execute_command_streaming(
     let mut got_done = false;
     let mut last_assistant_message: Option<String> = None;
     let mut stdout_error: Option<(String, String)> = None;
+    // Top-level `error` events are also emitted for transient stream retries
+    // ("Reconnecting... n/5"). Keep them pending: a later turn.completed
+    // clears them, while turn.failed / a failing exit still report an error.
+    let mut pending_stream_error: Option<(String, String)> = None;
     let mut line_count = 0;
     // Track paths the model itself delivered via cokacdir --sendfile so the
     // post-turn auto-deliver pass doesn't double-send the same file.
@@ -1298,6 +1469,7 @@ pub fn execute_command_streaming(
                 codex_debug_log("Cancel detected — killing child process");
                 kill_child_tree(&mut child);
                 let _ = child.wait();
+                token.clear_child_pid(child.id());
                 return Ok(());
             }
         }
@@ -1343,12 +1515,17 @@ pub fn execute_command_streaming(
                     StreamMessage::Done { .. } => {
                         codex_debug_log("  >>> Done (deferred until process exit)");
                         got_done = true;
+                        pending_stream_error = None;
                         continue;
                     }
                     StreamMessage::AssistantFinal { .. } => {}
                     StreamMessage::Error { ref message, .. } => {
                         codex_debug_log(&format!("  >>> Error: {}", message));
-                        stdout_error = Some((message.clone(), line.clone()));
+                        if json.get("type").and_then(|v| v.as_str()) == Some("error") {
+                            pending_stream_error = Some((message.clone(), line.clone()));
+                        } else {
+                            stdout_error = Some((message.clone(), line.clone()));
+                        }
                         continue;
                     }
                     StreamMessage::Text { content } => {
@@ -1386,6 +1563,9 @@ pub fn execute_command_streaming(
                 if !send_or_abort_child(&sender, msg, &mut child) {
                     // `send_or_abort_child` has already reaped the child.  Do
                     // not fall through to the normal `child.wait()` path.
+                    if let Some(ref token) = cancel_token {
+                        token.clear_child_pid(child.id());
+                    }
                     return Ok(());
                 }
             }
@@ -1402,6 +1582,10 @@ pub fn execute_command_streaming(
         "--- Exited lines loop, {} lines read ---",
         line_count
     ));
+    // An error event that no turn.completed superseded is still fatal.
+    if stdout_error.is_none() {
+        stdout_error = pending_stream_error.take();
+    }
 
     // Check cancel after loop
     if let Some(ref token) = cancel_token {
@@ -1409,6 +1593,7 @@ pub fn execute_command_streaming(
             codex_debug_log("Cancel detected after loop — killing child process");
             kill_child_tree(&mut child);
             let _ = child.wait();
+            token.clear_child_pid(child.id());
             return Ok(());
         }
     }
@@ -1418,6 +1603,9 @@ pub fn execute_command_streaming(
         codex_debug_log(&format!("ERROR: Process wait failed: {}", e));
         format!("Process error: {}", e)
     })?;
+    if let Some(ref token) = cancel_token {
+        token.clear_child_pid(child.id());
+    }
     codex_debug_log(&format!(
         "Process finished, exit_code: {:?}, is_resume={}, sp_file_used={}",
         status.code(),
@@ -1528,23 +1716,20 @@ pub fn execute_command_streaming(
 
 /// Resolve `~/.codex/generated_images/<session_id>/` for the given session.
 fn generated_images_dir(session_id: &str) -> Option<PathBuf> {
-    generated_images_dir_from_roots(
-        session_id,
-        std::env::var_os("CODEX_HOME").as_deref(),
-        dirs::home_dir().as_deref(),
-    )
+    Some(codex_home_dir()?.join("generated_images").join(session_id))
 }
 
+#[cfg(test)]
 fn generated_images_dir_from_roots(
     session_id: &str,
     codex_home: Option<&std::ffi::OsStr>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    let codex_home = codex_home
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| home.join(".codex")))?;
-    Some(codex_home.join("generated_images").join(session_id))
+    Some(
+        codex_home_from_roots(codex_home, home)?
+            .join("generated_images")
+            .join(session_id),
+    )
 }
 
 /// Snapshot existing files in the codex generated-images directory for a
@@ -1877,12 +2062,12 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
 
         // turn.failed has {error: {message: "..."}}
         "turn.failed" => {
-            let message = json
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown Codex error")
-                .to_string();
+            let message = codex_error_message(
+                json.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Codex error"),
+            );
             vec![StreamMessage::Error {
                 message,
                 stdout: String::new(),
@@ -1893,11 +2078,11 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
 
         // Top-level error event has {message: "..."}
         "error" => {
-            let message = json
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown Codex error")
-                .to_string();
+            let message = codex_error_message(
+                json.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Codex error"),
+            );
             vec![StreamMessage::Error {
                 message,
                 stdout: String::new(),
@@ -1918,6 +2103,23 @@ fn parse_codex_event(json: &Value) -> Vec<StreamMessage> {
             vec![]
         }
     }
+}
+
+/// Readable text of a Codex `error`/`turn.failed` message. For API errors
+/// Codex puts the provider's JSON error body in the message
+/// (`{"type":"error","status":400,"error":{"message":"..."}}`); the
+/// provider's own message is what the user needs to see.
+fn codex_error_message(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 /// Parse an `item.completed` event into StreamMessages.
@@ -2609,5 +2811,70 @@ mod receiver_drop_tests {
         symlink(&outside, &rollout).unwrap();
 
         assert!(read_codex_jsonl_lines(&rollout).is_err());
+    }
+
+    #[test]
+    fn exec_fork_support_is_read_from_the_exec_subcommand_list() {
+        let latest = "Run Codex non-interactively\n\nUsage: codex exec [OPTIONS] [PROMPT]\n       codex exec <COMMAND>\n\nCommands:\n  resume  Resume a previous session by id or pick the most recent with --last\n  fork    Fork a previous session by id into a new session\n  review  Run a code review against the current repository\n  help    Print this message or the help of the given subcommand(s)\n\nArguments:\n  [PROMPT]\n          Initial instructions for the agent. If `-` is used, read from stdin\n";
+        let older = "Usage: codex exec [OPTIONS] [PROMPT]\n\nCommands:\n  resume  Resume a previous session by id or pick the most recent with --last\n  review  Run a code review against the current repository\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n      --fork  not a subcommand\n";
+        assert!(help_lists_subcommand(latest, "fork"));
+        assert!(!help_lists_subcommand(older, "fork"));
+        assert!(help_lists_subcommand(older, "resume"));
+        assert!(!help_lists_subcommand("fork\n", "fork"));
+    }
+
+    #[test]
+    fn api_error_bodies_are_reduced_to_the_provider_message() {
+        let line = r#"{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'x' model is not supported.\"}}"}}"#;
+        let messages = parse_codex_event(&serde_json::from_str(line).unwrap());
+        assert!(matches!(
+            messages.as_slice(),
+            [StreamMessage::Error { message, .. }] if message == "The 'x' model is not supported."
+        ));
+
+        let line = r#"{"type":"error","message":"stream disconnected before completion"}"#;
+        let messages = parse_codex_event(&serde_json::from_str(line).unwrap());
+        assert!(matches!(
+            messages.as_slice(),
+            [StreamMessage::Error { message, .. }] if message == "stream disconnected before completion"
+        ));
+    }
+
+    #[test]
+    fn session_clone_moves_every_thread_id_reference() {
+        let mut lines: Vec<CodexJsonLine> = [
+            r#"{"type":"session_meta","payload":{"id":"old","session_id":"old","cwd":"/a"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","thread_id":"old","item":{"id":"old-item"}}}"#,
+            r#"{"type":"token_usage_record","payload":{"thread_id":"old","session_id":"old","turn_id":"t"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"child","session_id":"root","cwd":"/elsewhere"}}"#,
+        ]
+        .iter()
+        .map(|line| CodexJsonLine::Json(serde_json::from_str(line).unwrap()))
+        .collect();
+
+        patch_codex_jsonl_lines(&mut lines, "old", "new", "/a", "/b");
+
+        let payloads: Vec<Value> = lines
+            .iter()
+            .map(|line| match line {
+                CodexJsonLine::Json(value) => value["payload"].clone(),
+                CodexJsonLine::Blank => Value::Null,
+            })
+            .collect();
+        assert_eq!(
+            payloads[0],
+            serde_json::json!({"id":"new","session_id":"new","cwd":"/b"})
+        );
+        assert_eq!(payloads[1]["thread_id"], "new");
+        assert_eq!(payloads[1]["item"]["id"], "old-item");
+        assert_eq!(
+            payloads[2],
+            serde_json::json!({"thread_id":"new","session_id":"new","turn_id":"t"})
+        );
+        // Values that are not the cloned thread's id stay as they are.
+        assert_eq!(
+            payloads[3],
+            serde_json::json!({"id":"child","session_id":"root","cwd":"/elsewhere"})
+        );
     }
 }

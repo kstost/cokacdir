@@ -192,7 +192,7 @@ fn calculate_remote_directory_size(
 }
 
 fn remote_child_path(parent: &str, name: &str) -> Result<String, String> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return Err("Remote entry has an unsafe or ambiguous name".to_string());
     }
     if parent == "/" {

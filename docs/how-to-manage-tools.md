@@ -40,7 +40,7 @@ Add or remove tools from the allowed list.
 
 ### Default Allowed Tools
 
-Bash, Read, Edit, Write, Glob, Grep, Task, TaskOutput, TaskStop, WebFetch, WebSearch, NotebookEdit, Skill, TaskCreate, TaskGet, TaskUpdate, TaskList
+Bash, Read, Edit, Write, Glob, Grep, Task, TaskStop, WebFetch, WebSearch, NotebookEdit, Skill, TaskCreate, TaskGet, TaskUpdate, TaskList
 
 ### Provider Restriction
 

@@ -39,8 +39,8 @@ export default function ToolManagement() {
         <P>{t('The following tools are enabled by default:', '다음 도구가 기본적으로 활성화됩니다:')}</P>
         <div className="flex flex-wrap gap-2 my-4">
           {[
-            'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Task', 'TaskOutput',
-            'TaskStop', 'WebFetch', 'WebSearch', 'NotebookEdit', 'Skill',
+            'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Task', 'TaskStop',
+            'WebFetch', 'WebSearch', 'NotebookEdit', 'Skill',
             'TaskCreate', 'TaskGet', 'TaskUpdate', 'TaskList',
           ].map((tool) => (
             <span

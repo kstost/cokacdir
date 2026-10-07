@@ -91,8 +91,10 @@ pub fn parse_enc_filename(path: &Path) -> Option<EncFileInfo> {
     if !filename.ends_with(EXT) {
         return None;
     }
-    // Remove .cokacenc suffix
-    let base = &filename[..filename.len() - EXT.len()];
+    // Remove .cokacenc suffix.  Byte offsets below are only valid for ASCII
+    // segments; `str::get` rejects offsets inside a multi-byte character
+    // (e.g. non-ASCII user file names) instead of panicking.
+    let base = filename.get(..filename.len() - EXT.len())?;
 
     // Minimum length: 16 (group_id) + 1 (_) + 4 (seq) = 21
     if base.len() < 21 {
@@ -100,34 +102,34 @@ pub fn parse_enc_filename(path: &Path) -> Option<EncFileInfo> {
     }
 
     // Parse from the end: last 4 chars = seq label
-    let seq_str = &base[base.len() - 4..];
+    let seq_str = base.get(base.len() - 4..)?;
     let seq_index = parse_seq_label(seq_str)?;
 
     // Before seq: must be '_'
-    let rest = &base[..base.len() - 4];
+    let rest = base.get(..base.len() - 4)?;
     if !rest.ends_with('_') {
         return None;
     }
-    let rest = &rest[..rest.len() - 1];
+    let rest = rest.get(..rest.len() - 1)?;
 
     // Last 16 chars of rest = group_id (hex)
     if rest.len() < 16 {
         return None;
     }
-    let group_id = &rest[rest.len() - 16..];
+    let group_id = rest.get(rest.len() - 16..)?;
     if !group_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
 
     // Anything before group_id is optional key_prefix with trailing '_'
-    let prefix_part = &rest[..rest.len() - 16];
+    let prefix_part = rest.get(..rest.len() - 16)?;
     if !prefix_part.is_empty() {
         // Must end with '_' separator
         if !prefix_part.ends_with('_') {
             return None;
         }
         // key_prefix itself (before the '_') must be non-empty and alphanumeric
-        let kp = &prefix_part[..prefix_part.len() - 1];
+        let kp = prefix_part.get(..prefix_part.len() - 1)?;
         if kp.is_empty() || !kp.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
         }

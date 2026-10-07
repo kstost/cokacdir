@@ -561,6 +561,12 @@ fn conversation_dir() -> Option<PathBuf> {
 }
 
 pub fn conversation_path(session_id: &str) -> Option<PathBuf> {
+    // The id is spliced into a file name; reject anything that is not a
+    // plain session id (e.g. `../`) so it cannot escape the conversation
+    // directory.
+    if !crate::services::process::is_valid_session_id(session_id) {
+        return None;
+    }
     let dir = conversation_dir()?;
     let db = dir.join(format!("{}.db", session_id));
     if db.is_file() {
@@ -1230,6 +1236,10 @@ impl AgyHookPrompt {
         let mut starts = 0usize;
         let mut successes = 0usize;
         for line in contents.lines() {
+            // cmd's `echo start %TOKEN% && ...` keeps the space before `&&`,
+            // so the Windows hook writes the start line with trailing
+            // whitespace.
+            let line = line.trim_end();
             if line == expected_start {
                 starts += 1;
             } else if line == expected_ok {
@@ -1288,10 +1298,20 @@ fn prepare_agy_hook_prompt(
 }
 
 fn hook_executable_path() -> io::Result<PathBuf> {
-    let path = std::env::var_os(AGY_HOOK_EXECUTABLE_OVERRIDE)
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(std::env::current_exe)?;
+    let path = match std::env::var_os(AGY_HOOK_EXECUTABLE_OVERRIDE) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            // Prefer the path resolved once at startup: after the binary is
+            // replaced in place, Linux reports current_exe() as
+            // "... (deleted)", which no longer exists.
+            let cached = PathBuf::from(crate::bin_path());
+            if cached.is_absolute() && cached.is_file() {
+                cached
+            } else {
+                std::env::current_exe()?
+            }
+        }
+    };
     if !path.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,

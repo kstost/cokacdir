@@ -997,7 +997,9 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
     // Key file
     if let RemoteAuth::KeyFile { ref path, .. } = profile.auth {
         let expanded = expand_tilde(path).display().to_string();
-        let escaped = expanded.replace('\'', "'\\''");
+        // This string is split by rsync's own -e parser (no shell), which
+        // only supports doubling a quote inside a single-quoted word.
+        let escaped = expanded.replace('\'', "''");
         ssh_cmd.push_str(&format!(" -i '{}'", escaped));
         ssh_cmd.push_str(" -o IdentitiesOnly=yes");
     }

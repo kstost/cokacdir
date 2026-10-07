@@ -64,7 +64,7 @@ pub struct ThemeJson {
     pub dedup_screen: DedupScreenColorsJson,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct PaletteJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -88,7 +88,7 @@ pub struct PaletteJson {
     pub highlight: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct StateColorsJson {
     #[serde(default = "default_34")]
     pub success: u8,
@@ -100,7 +100,7 @@ pub struct StateColorsJson {
     pub info: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct PanelColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -136,7 +136,7 @@ pub struct PanelColorsJson {
     pub remote_indicator: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct HeaderColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -146,7 +146,7 @@ pub struct HeaderColorsJson {
     pub title: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct StatusBarColorsJson {
     #[serde(default = "default_253")]
     pub bg: u8,
@@ -156,7 +156,7 @@ pub struct StatusBarColorsJson {
     pub text_dim: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct FunctionBarColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -166,7 +166,7 @@ pub struct FunctionBarColorsJson {
     pub label: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct MessageColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -174,7 +174,7 @@ pub struct MessageColorsJson {
     pub text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct DialogColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -290,7 +290,7 @@ pub struct DialogColorsJson {
     pub remote_connect_field_selected_bg: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct ConfirmDialogColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -346,7 +346,7 @@ impl Default for SettingsColorsJson {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct EditorColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -394,7 +394,7 @@ pub struct EditorColorsJson {
     pub remote_path_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct SyntaxColorsJson {
     #[serde(default = "default_127")]
     pub keyword: u8,
@@ -424,7 +424,7 @@ pub struct SyntaxColorsJson {
     pub normal: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct ViewerColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -468,7 +468,7 @@ pub struct ViewerColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct ProcessManagerColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -496,7 +496,7 @@ pub struct ProcessManagerColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct AIScreenColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -552,7 +552,7 @@ pub struct AIScreenColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct SystemInfoColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -590,7 +590,7 @@ pub struct SystemInfoColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct SearchResultColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -620,7 +620,7 @@ pub struct SearchResultColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct ImageViewerColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -644,7 +644,7 @@ pub struct ImageViewerColorsJson {
     pub footer_separator: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct FileInfoColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -680,7 +680,7 @@ pub struct FileInfoColorsJson {
     pub hint_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct HelpColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -702,7 +702,7 @@ pub struct HelpColorsJson {
     pub hint_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct AdvancedSearchColorsJson {
     #[serde(default = "default_255")]
     pub bg: u8,
@@ -734,7 +734,7 @@ pub struct AdvancedSearchColorsJson {
     pub footer_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct DiffColorsJson {
     #[serde(default = "default_235")]
     pub bg: u8,
@@ -806,7 +806,7 @@ pub struct DiffColorsJson {
     pub progress_hint_text: u8,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct DiffFileViewColorsJson {
     #[serde(default = "default_235")]
     pub bg: u8,
@@ -987,6 +987,48 @@ impl Default for DedupScreenColorsJson {
         }
     }
 }
+
+// A section missing from the theme JSON must get the same values as an empty `{}`
+// section (each field's `#[serde(default = "default_N")]`). `#[derive(Default)]`
+// would ignore those serde defaults and yield 0 (black) for every field.
+macro_rules! impl_default_from_serde_defaults {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl Default for $ty {
+                fn default() -> Self {
+                    // Every field has a serde default, so "{}" always deserializes
+                    serde_json::from_str("{}")
+                        .expect("all theme section fields have serde defaults")
+                }
+            }
+        )*
+    };
+}
+
+impl_default_from_serde_defaults!(
+    PaletteJson,
+    StateColorsJson,
+    PanelColorsJson,
+    HeaderColorsJson,
+    StatusBarColorsJson,
+    FunctionBarColorsJson,
+    MessageColorsJson,
+    DialogColorsJson,
+    ConfirmDialogColorsJson,
+    EditorColorsJson,
+    SyntaxColorsJson,
+    ViewerColorsJson,
+    ProcessManagerColorsJson,
+    AIScreenColorsJson,
+    SystemInfoColorsJson,
+    SearchResultColorsJson,
+    ImageViewerColorsJson,
+    FileInfoColorsJson,
+    HelpColorsJson,
+    AdvancedSearchColorsJson,
+    DiffColorsJson,
+    DiffFileViewColorsJson,
+);
 
 // 기본값 함수들
 fn default_21() -> u8 {

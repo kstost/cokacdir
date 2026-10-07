@@ -828,12 +828,14 @@ fn build_verification_transcript_from_dir(
         .collect();
 
     // The first user message is treated as the original request — pin it at
-    // the top. If no user message exists yet, head is empty.
+    // the top. If no user message exists yet, head is empty. Codex records
+    // the context it injects (AGENTS.md / user instructions, environment
+    // context) as user messages ahead of the request, so skip those.
     let head_idx: Option<usize> = visible_idx.iter().copied().find(|i| {
         archive
             .messages
             .get(*i)
-            .map(|m| m.role == "user")
+            .map(|m| m.role == "user" && !is_codex_injected_context(m))
             .unwrap_or(false)
     });
 
@@ -932,6 +934,28 @@ fn build_verification_transcript_from_dir(
         head_rendered.is_some(), dropped_middle, tail_chunks_rev.len(), tail));
 
     Ok(out)
+}
+
+/// True for a Codex `user` message whose text consists only of context Codex
+/// injects itself (`<environment_context>`, `<user_instructions>`, or an
+/// `# AGENTS.md instructions for ...` block) rather than the user's request.
+fn is_codex_injected_context(m: &Message) -> bool {
+    if !m.source.starts_with("codex:") {
+        return false;
+    }
+    let mut texts = m
+        .content
+        .iter()
+        .filter(|b| b.kind == "text")
+        .filter_map(|b| b.text.as_deref())
+        .peekable();
+    texts.peek().is_some()
+        && texts.all(|t| {
+            let t = t.trim_start();
+            t.starts_with("<environment_context>")
+                || t.starts_with("<user_instructions>")
+                || t.starts_with("# AGENTS.md instructions for ")
+        })
 }
 
 fn truncate_utf8_boundary(s: &str, max: usize) -> String {
@@ -2444,6 +2468,9 @@ fn parse_opencode(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|error| format!("Failed to open OpenCode DB {}: {error}", db_path.display()))?;
+    if crate::services::opencode::opencode_db_is_v2(&conn) {
+        return parse_opencode_v2(&conn, db_path, session_id, cwd);
+    }
 
     // Session-level metadata. Column list mirrors the full `session` schema
     // observed in opencode 1.3.x so new fields (parent_id, workspace_id,
@@ -2788,6 +2815,279 @@ fn parse_opencode(
         session_meta: session_meta_val,
         messages,
     }))
+}
+
+/// OpenCode 2.x sqlite: the `session_v2` row plus the session's typed
+/// `session_message` rows in sequence order. One Assistant row exists per
+/// model step; its `content` holds text, reasoning and tool items. Every row
+/// is preserved verbatim in `raw`, so no info is lost.
+fn parse_opencode_v2(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    session_id: &str,
+    cwd: &str,
+) -> Result<Option<FullSession>, String> {
+    // Session-level metadata: every column, so new 2.x fields are kept.
+    let session_row: Option<Value> = {
+        let mut stmt = conn
+            .prepare("SELECT * FROM session_v2 WHERE id = ?1")
+            .map_err(|error| format!("Failed to prepare OpenCode session query: {error}"))?;
+        let names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let mut rows = stmt
+            .query(rusqlite::params![session_id])
+            .map_err(|error| format!("Failed to query OpenCode session row: {error}"))?;
+        let first = rows
+            .next()
+            .map_err(|error| format!("Failed to read OpenCode session row: {error}"))?;
+        match first {
+            Some(row) => {
+                let mut object = serde_json::Map::new();
+                for (index, name) in names.iter().enumerate() {
+                    let value = row
+                        .get_ref(index)
+                        .map_err(|error| format!("Failed to read OpenCode session row: {error}"))?;
+                    object.insert(name.clone(), sqlite_value_to_json(value));
+                }
+                Some(Value::Object(object))
+            }
+            None => None,
+        }
+    };
+
+    let mut msg_stmt = conn
+        .prepare(
+            "SELECT id, type, seq, time_created, time_updated, data \
+         FROM session_message WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(|error| format!("Failed to prepare OpenCode message query: {error}"))?;
+    let msg_rows: Vec<(String, String, i64, i64, i64, String)> = msg_stmt
+        .query_map(rusqlite::params![session_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .map_err(|error| format!("Failed to query OpenCode messages: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Failed to read OpenCode message row: {error}"))?;
+
+    let mut messages: Vec<Message> = Vec::new();
+    let mut session_model: Option<String> = None;
+    for (i, (msg_id, kind, seq, tc, tu, data)) in msg_rows.iter().enumerate() {
+        let msg_data: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Malformed OpenCode message row {msg_id}: {error}"))?;
+        // Typed rows: the prompt and model output are user/assistant; inputs
+        // OpenCode injects (subagent reports, reminders, skills, user shell
+        // commands) reach the model as user input; the rest are session events.
+        let role = match kind.as_str() {
+            "user" | "synthetic" | "system" | "skill" | "shell" => "user",
+            "assistant" => "assistant",
+            _ => "system",
+        };
+        let model = msg_data
+            .get("model")
+            .and_then(|m| m.get("id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if kind == "assistant" && model.is_some() && session_model.is_none() {
+            session_model = model.clone();
+        }
+
+        let mut blocks = Vec::new();
+        match kind.as_str() {
+            "user" => {
+                let text = msg_data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                blocks.push(ContentBlock::text(text));
+                for file in msg_data
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    blocks.push(ContentBlock::other("file", file.clone()));
+                }
+            }
+            "assistant" => {
+                for item in msg_data
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match item_type {
+                        "text" => {
+                            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            blocks.push(ContentBlock::text(text));
+                        }
+                        "reasoning" => {
+                            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            let mut b = ContentBlock::thinking(text);
+                            if let Some(state) = item.get("state") {
+                                b.extra.insert("state".into(), state.clone());
+                            }
+                            blocks.push(b);
+                        }
+                        "tool" => {
+                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let tool_id = item.get("id").and_then(|v| v.as_str()).map(String::from);
+                            let state = item.get("state").cloned().unwrap_or(Value::Null);
+                            let status = state.get("status").and_then(|v| v.as_str());
+                            let input = state.get("input").cloned().unwrap_or(Value::Null);
+                            // Results are content arrays; errors carry `error.message`.
+                            let output = state
+                                .get("content")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .or_else(|| {
+                                    state
+                                        .get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .map(String::from)
+                                });
+                            let mut b = ContentBlock::tool_use(name, tool_id, input);
+                            b.tool_output = output.map(Value::String);
+                            b.is_error = (status == Some("error")).then_some(true);
+                            if let Some(status) = status {
+                                b.extra.insert("status".into(), json!(status));
+                            }
+                            b.extra.insert("state".into(), state.clone());
+                            if let Some(time) = item.get("time") {
+                                b.extra.insert("time".into(), time.clone());
+                            }
+                            blocks.push(b);
+                        }
+                        _ => blocks.push(ContentBlock::other(item_type, item.clone())),
+                    }
+                }
+            }
+            "synthetic" | "system" | "skill" => {
+                let text = msg_data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                blocks.push(ContentBlock::text(text));
+            }
+            "compaction" => {
+                if let Some(summary) = msg_data.get("summary").and_then(|v| v.as_str()) {
+                    blocks.push(ContentBlock::text(summary));
+                }
+                blocks.push(ContentBlock::other("compaction", msg_data.clone()));
+            }
+            other => blocks.push(ContentBlock::other(other, msg_data.clone())),
+        }
+
+        let usage = msg_data.get("tokens").map(|t| {
+            let g = |k: &str| t.get(k).and_then(|v| v.as_u64());
+            let cache = t.get("cache");
+            let cache_read = cache.and_then(|c| c.get("read")).and_then(|v| v.as_u64());
+            let cache_write = cache.and_then(|c| c.get("write")).and_then(|v| v.as_u64());
+            Usage {
+                input_tokens: g("input"),
+                output_tokens: g("output"),
+                cached_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+                extra: t.clone(),
+            }
+        });
+        let stop_reason = msg_data
+            .get("finish")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let mut meta = BTreeMap::new();
+        meta.insert("message_id".into(), json!(msg_id));
+        meta.insert("type".into(), json!(kind));
+        meta.insert("seq".into(), json!(seq));
+        meta.insert("time_created".into(), json!(tc));
+        for k in [
+            "agent",
+            "time",
+            "cost",
+            "error",
+            "retry",
+            "metadata",
+            "description",
+            "outcome",
+            "snapshot",
+        ] {
+            if let Some(v) = msg_data.get(k) {
+                meta.insert(k.into(), v.clone());
+            }
+        }
+
+        let ts = chrono::DateTime::from_timestamp_millis(*tc).map(|d| d.to_rfc3339());
+        let raw = json!({
+            "row": {
+                "id": msg_id,
+                "type": kind,
+                "seq": seq,
+                "time_created": tc,
+                "time_updated": tu,
+                "data": msg_data,
+            },
+        });
+
+        messages.push(Message {
+            index: i as u32,
+            timestamp: ts,
+            role: role.to_string(),
+            source: format!("opencode:{kind}"),
+            content: blocks,
+            model,
+            usage,
+            stop_reason,
+            meta,
+            raw,
+        });
+    }
+
+    if session_row.is_none() && messages.is_empty() {
+        return Ok(None);
+    }
+    let session_time = |column: &str| {
+        session_row
+            .as_ref()
+            .and_then(|row| row.get(column))
+            .and_then(|v| v.as_i64())
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|d| d.to_rfc3339())
+    };
+    Ok(Some(FullSession {
+        session_id: session_id.to_string(),
+        provider: "opencode".into(),
+        cwd: cwd.to_string(),
+        created_at: session_time("time_created"),
+        updated_at: session_time("time_updated"),
+        source_path: db_path.display().to_string(),
+        source_fingerprint: None,
+        model: session_model,
+        git: None,
+        session_meta: session_row,
+        messages,
+    }))
+}
+
+/// One SQLite cell as JSON (blobs, which the OpenCode schema does not use, as
+/// lowercase hex so nothing is dropped).
+fn sqlite_value_to_json(value: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(n) => json!(n),
+        ValueRef::Real(f) => json!(f),
+        ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        ValueRef::Blob(bytes) => Value::String(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

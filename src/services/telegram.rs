@@ -597,7 +597,14 @@ struct GroupChatLock {
 /// Acquire exclusive file lock for a group chat (async, non-blocking).
 /// Returns None for private chats (chat_id >= 0) or if lock file cannot be created.
 /// For group chats, polls with sleep until the lock is acquired.
-async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
+/// Also returns None when locking fails for a reason other than contention
+/// (same as an unopenable lock file), or when `cancel_token` is cancelled
+/// while waiting — callers re-check their cancel token right after this
+/// returns and abort without running the task.
+async fn acquire_group_chat_lock(
+    chat_id: i64,
+    cancel_token: Option<&Arc<CancelToken>>,
+) -> Option<GroupChatLock> {
     use fs2::FileExt;
     if chat_id >= 0 {
         return None;
@@ -622,7 +629,14 @@ async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
                 }
                 return Some(GroupChatLock { _file: file });
             }
-            Err(_) => {
+            Err(e) if group_chat_lock_is_contended(&e) => {
+                if cancel_token.map_or(false, |token| token.cancelled.load(Ordering::Relaxed)) {
+                    msg_debug(&format!(
+                        "[chat_lock] chat_id={} cancelled while waiting for lock",
+                        chat_id
+                    ));
+                    return None;
+                }
                 if !waited {
                     msg_debug(&format!(
                         "[chat_lock] chat_id={} lock contended, waiting...",
@@ -632,8 +646,27 @@ async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             }
+            Err(e) => {
+                msg_debug(&format!(
+                    "[chat_lock] chat_id={} lock failed (not contention): {} — proceeding without lock",
+                    chat_id, e
+                ));
+                return None;
+            }
         }
     }
+}
+
+/// True when a `try_lock_exclusive` error means "held by someone else"
+/// (EWOULDBLOCK on Unix, ERROR_LOCK_VIOLATION on Windows) rather than a
+/// genuine locking failure.
+fn group_chat_lock_is_contended(error: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    let contended = match (error.raw_os_error(), expected.raw_os_error()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => error.kind() == expected.kind(),
+    };
+    contended || error.kind() == std::io::ErrorKind::Interrupted
 }
 
 /// Return the directory for group chat logs: ~/.cokacdir/group_chat/
@@ -3930,7 +3963,10 @@ fn expand_user_path(path: &str) -> String {
 fn is_codex_ultra_effort_model(model: Option<&str>) -> bool {
     matches!(
         model,
-        Some("codex:gpt-6-astra") | Some("codex:gpt-5.6-sol") | Some("codex:gpt-5.6-terra")
+        Some("codex:gpt-6-astra")
+            | Some("codex:gpt-6.1-sol")
+            | Some("codex:gpt-5.6-sol")
+            | Some("codex:gpt-5.6-terra")
     )
 }
 
@@ -3956,6 +3992,7 @@ fn codex_default_effort(model: Option<&str>) -> Option<&'static str> {
     match model {
         Some("codex:gpt-5.6-sol") => Some("low"),
         Some("codex:gpt-6-astra")
+        | Some("codex:gpt-6.1-sol")
         | Some("codex:gpt-5.6-terra")
         | Some("codex:gpt-5.6-luna")
         | Some("codex:gpt-5.5")
@@ -4015,6 +4052,7 @@ mod effort_validation_tests {
     fn astra_sol_and_terra_accept_extended_effort_values() {
         for (model, default_effort) in [
             ("codex:gpt-6-astra", "medium"),
+            ("codex:gpt-6.1-sol", "medium"),
             ("codex:gpt-5.6-sol", "low"),
             ("codex:gpt-5.6-terra", "medium"),
         ] {
@@ -4537,7 +4575,9 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
         // Check if created_at is older than 30 minutes
         match chrono::NaiveDateTime::parse_from_str(&msg.created_at, "%Y-%m-%d %H:%M:%S") {
             Ok(created) => {
-                if let Some(created_dt) = created.and_local_timezone(chrono::Local).single() {
+                // A DST-ambiguous created_at resolves to its later instant so
+                // the message can time out late but never prematurely.
+                if let Some(created_dt) = created.and_local_timezone(chrono::Local).latest() {
                     let elapsed = now.signed_duration_since(created_dt);
                     msg_debug(&format!(
                         "[check_message_timeouts] msg id={}, to={}, elapsed={}min",
@@ -6516,7 +6556,10 @@ fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
         sched_debug("[parse_relative_time] too short → None");
         return None;
     }
-    let (num_part, unit) = s.split_at(s.len() - 1);
+    // Split off the last *character* (not byte) so a multibyte unit such as
+    // "30분" is rejected instead of panicking on a non-char-boundary split.
+    let unit_start = s.char_indices().next_back().map_or(0, |(idx, _)| idx);
+    let (num_part, unit) = s.split_at(unit_start);
     let num: i64 = match num_part.parse() {
         Ok(n) => n,
         Err(_) => {
@@ -6532,9 +6575,9 @@ fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
         return None;
     }
     let seconds = match unit {
-        "m" => num * 60,
-        "h" => num * 3600,
-        "d" => num * 86400,
+        "m" => num.checked_mul(60),
+        "h" => num.checked_mul(3600),
+        "d" => num.checked_mul(86400),
         _ => {
             sched_debug(&format!(
                 "[parse_relative_time] unknown unit: {:?} → None",
@@ -6543,7 +6586,14 @@ fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
             return None;
         }
     };
-    let result = Some(chrono::Local::now() + chrono::Duration::seconds(seconds));
+    // Huge values must yield None rather than overflow/panic in the
+    // multiplication, the duration constructor, or the date addition.
+    let result = seconds
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|delta| chrono::Local::now().checked_add_signed(delta));
+    if result.is_none() {
+        sched_debug("[parse_relative_time] out of range → None");
+    }
     sched_debug(&format!(
         "[parse_relative_time] → {:?}",
         result
@@ -7794,11 +7844,11 @@ fn codex_extra_instructions() -> String {
          ═══════════════════════════════════════\n\
          FILE EDITING POLICY\n\
          ═══════════════════════════════════════\n\
-         When creating, modifying, or deleting files, you MUST use the functions.apply_patch tool \
-         instead of functions.shell_command.\n\
+         When creating, modifying, or deleting files, you MUST use the apply_patch tool \
+         instead of running shell commands.\n\
          Do NOT use shell commands (echo, cat, sed, tee, printf, etc.) to write or edit files.\n\
-         functions.apply_patch is safer, produces cleaner diffs, and avoids encoding/escaping issues.\n\
-         Reserve functions.shell_command for non-file-editing tasks such as running programs, \
+         apply_patch is safer, produces cleaner diffs, and avoids encoding/escaping issues.\n\
+         Reserve shell commands for non-file-editing tasks such as running programs, \
          searching, testing, and invoking external CLIs.",
     );
 
@@ -10430,7 +10480,6 @@ const ALL_TOOLS: &[(&str, &str, bool)] = &[
         "Launch autonomous sub-agents for complex tasks",
         true,
     ),
-    ("TaskOutput", "Retrieve output from background tasks", false),
     ("TaskStop", "Stop a running background task", false),
     ("WebFetch", "Fetch and process web page content", true),
     (
@@ -15425,6 +15474,25 @@ async fn process_album_attachments_task(
     }
 }
 
+/// If `text` starts with `@<bot_username>` (case-insensitive) followed by
+/// whitespace or the end of the text, return the remainder after the mention
+/// (leading whitespace not trimmed). This mirrors the `@bot` admission check,
+/// which accepts any whitespace (not only a space, e.g. a newline) after the
+/// mention. Slicing is char-boundary safe.
+fn strip_self_mention_prefix<'a>(text: &'a str, bot_username: &str) -> Option<&'a str> {
+    let after_at = text.strip_prefix('@')?;
+    let name = after_at.get(..bot_username.len())?;
+    if name.to_lowercase() != bot_username.to_lowercase() {
+        return None;
+    }
+    let rest = &after_at[bot_username.len()..];
+    if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 /// Extract the AI-bound text from a media caption, applying the same prefix
 /// rules used by `handle_message` for direct text messages. Returns `None`
 /// when the caption is empty or, in prefix-required group chats, doesn't
@@ -15432,9 +15500,8 @@ async fn process_album_attachments_task(
 fn extract_caption_text(caption: &str, require_prefix: bool, bot_username: &str) -> Option<String> {
     if require_prefix {
         let extracted = if !bot_username.is_empty() && caption.starts_with('@') {
-            let prefix = format!("@{} ", bot_username);
-            if caption.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                let body = caption[prefix.len()..].trim_start();
+            if let Some(rest) = strip_self_mention_prefix(caption, bot_username) {
+                let body = rest.trim_start();
                 body.strip_prefix(';')
                     .map(|s| s.trim_start())
                     .unwrap_or(body)
@@ -16201,50 +16268,14 @@ async fn handle_message(
         println!("  [{timestamp}] ▶ [{user_name}] Upload complete");
         // If caption contains text, send it to AI as a follow-up message
         if let Some(caption) = msg.caption() {
-            let text_part = if require_prefix {
-                // Group chat (prefix mode): extract message text from caption
-                // Formats: ";text", "@botname text", "@botname ;text"
-                let extracted = if !bot_username.is_empty() && caption.starts_with('@') {
-                    // "@botname text" → extract text after @botname
-                    let prefix = format!("@{} ", bot_username);
-                    if caption.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                        let body = caption[prefix.len()..].trim_start();
-                        body.strip_prefix(';')
-                            .map(|s| s.trim_start())
-                            .unwrap_or(body)
-                    } else {
-                        ""
-                    }
-                } else if caption.starts_with(';') {
-                    caption[1..].trim_start()
-                } else {
-                    ""
-                };
-                let result = if extracted.is_empty() {
-                    None
-                } else {
-                    Some(extracted)
-                };
-                msg_debug(&format!(
-                    "[handle_message] upload caption (prefix mode): extracted={:?}",
-                    result
-                ));
-                result
-            } else {
-                // DM or direct mode: use entire caption as-is
-                let trimmed = caption.trim();
-                let result = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                };
-                msg_debug(&format!(
-                    "[handle_message] upload caption (direct): extracted={:?}",
-                    result
-                ));
-                result
-            };
-            if let Some(text) = text_part {
+            // Same prefix rules as album captions (";text", "@botname text",
+            // "@botname ;text" in prefix mode; the whole caption otherwise).
+            let text_part = extract_caption_text(caption, require_prefix, bot_username);
+            msg_debug(&format!(
+                "[handle_message] upload caption (require_prefix={}): extracted={:?}",
+                require_prefix, text_part
+            ));
+            if let Some(text) = text_part.as_deref() {
                 if !text.is_empty() {
                     // Block if an AI request is already in progress
                     // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
@@ -16491,11 +16522,15 @@ async fn handle_message(
         truncate_str(raw_text, 100), bot_username, starts_with_at, has_bot_username, require_prefix, is_group_chat));
     let mention_rewritten: Option<String>;
     let raw_text = if has_bot_username && starts_with_at {
-        let prefix = format!("@{} ", bot_username);
-        let is_self_mention = raw_text.to_lowercase().starts_with(&prefix);
+        let prefix = format!("@{}", bot_username);
+        // "@botname" must be followed by at least one whitespace character
+        // (space, newline, ...) to count as a self-mention with a body.
+        let self_mention_rest =
+            strip_self_mention_prefix(raw_text, bot_username).filter(|rest| !rest.is_empty());
+        let is_self_mention = self_mention_rest.is_some();
         msg_debug(&format!("[mention_routing] @-prefix detected: checking self-mention, prefix={:?}, is_self_mention={}", prefix, is_self_mention));
-        if is_self_mention {
-            let body = raw_text[prefix.len()..].trim_start();
+        if let Some(rest) = self_mention_rest {
+            let body = rest.trim_start();
             if body.starts_with('/') || body.starts_with('!') || body.starts_with(';') {
                 msg_debug(&format!("[mention_routing] self-mention with command prefix: {:?} → {:?} (pass-through command char)", raw_text, body));
                 mention_rewritten = Some(body.to_string());
@@ -18258,10 +18293,10 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
     result
 }
 
-/// Claude: find `~/.claude/projects/*/{session_id}.jsonl`.
+/// Claude: find `$CLAUDE_CONFIG_DIR/projects/*/{session_id}.jsonl`.
 fn resolve_claude_by_id(session_id: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_id] session_id={}", session_id));
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let projects_dir = crate::services::claude::claude_config_dir()?.join("projects");
     if !projects_dir.is_dir() {
         msg_debug(&format!(
             "[resolve_claude_by_id] projects_dir not found: {}",
@@ -18293,10 +18328,10 @@ fn resolve_claude_by_id(session_id: &str) -> Option<ResolvedSession> {
     None
 }
 
-/// Claude: scan `~/.claude/projects/*/*.jsonl` for matching `custom-title`.
+/// Claude: scan `$CLAUDE_CONFIG_DIR/projects/*/*.jsonl` for matching `custom-title`.
 fn resolve_claude_by_name(name: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_name] name={:?}", name));
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let projects_dir = crate::services::claude::claude_config_dir()?.join("projects");
     if !projects_dir.is_dir() {
         msg_debug(&format!(
             "[resolve_claude_by_name] projects_dir not found: {}",
@@ -18372,7 +18407,7 @@ fn find_session_by_title(path: &Path, name_lower: &str) -> Option<ResolvedSessio
 
 /// Codex: recursively scan `~/.codex/sessions/` for a JSONL whose filename contains the UUID.
 fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
-    let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
+    let sessions_dir = crate::services::codex::codex_home_dir()?.join("sessions");
     if !sessions_dir.is_dir() {
         return None;
     }
@@ -18511,11 +18546,7 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
         "[resolve_opencode_by_id] session_id={}",
         session_id
     ));
-    let db_path = dirs::home_dir()?
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db");
+    let db_path = opencode::opencode_db_path()?;
     if !db_path.is_file() {
         msg_debug("[resolve_opencode_by_id] db not found");
         return None;
@@ -18523,9 +18554,13 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
-    let mut stmt = conn
-        .prepare("SELECT id, directory FROM session WHERE id = ?1 LIMIT 1")
-        .ok()?;
+    // opencode 2.x keeps sessions in `session_v2`; 1.x in `session`.
+    let sql = if opencode::opencode_db_is_v2(&conn) {
+        "SELECT id, directory FROM session_v2 WHERE id = ?1 LIMIT 1"
+    } else {
+        "SELECT id, directory FROM session WHERE id = ?1 LIMIT 1"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
     let result = stmt
         .query_row(rusqlite::params![session_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -18835,6 +18870,77 @@ mod session_conversion_tests {
             cwd.to_str()
         );
     }
+
+    fn rollout_history(lines: &[&str]) -> Vec<(HistoryType, String)> {
+        super::codex_rollout_history(lines.iter().map(|line| line.to_string()))
+            .into_iter()
+            .map(|item| (item.item_type, item.content))
+            .collect()
+    }
+
+    #[test]
+    fn paginated_codex_rollout_history_comes_from_completed_items() {
+        // Shape written by Codex threads with history_mode=paginated.
+        let history = rollout_history(&[
+            r#"{"type":"session_meta","payload":{"id":"t1","cwd":"/w","history_mode":"paginated"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>x</environment_context>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run it"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"run it","text_elements":[]}]}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"Running.\n"}],"phase":"commentary"}}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Running.\n"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({cmd:\"echo hi\"})"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/bash","-lc","echo hi"]}}}"#,
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"Output:\n"},{"type":"input_text","text":"hi\n"}]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"Done: hi"}],"phase":"final_answer"}}}"#,
+        ]);
+        assert_eq!(
+            history,
+            vec![
+                (HistoryType::User, "run it".to_string()),
+                (HistoryType::Assistant, "Running.\n".to_string()),
+                (HistoryType::ToolUse, "[exec]".to_string()),
+                (HistoryType::ToolResult, "Output:\nhi\n".to_string()),
+                (HistoryType::Assistant, "Done: hi".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_subagent_threads_are_not_resume_candidates() {
+        use super::codex_session_meta_is_subagent as is_subagent;
+        assert!(is_subagent(
+            r#"{"type":"session_meta","payload":{"id":"c","session_id":"r","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"r"}}}}}"#
+        ));
+        assert!(is_subagent(
+            r#"{"type":"session_meta","payload":{"id":"c","source":{"subagent":"review"}}}"#
+        ));
+        assert!(!is_subagent(
+            r#"{"type":"session_meta","payload":{"id":"r","session_id":"r","thread_source":"user","source":"exec"}}"#
+        ));
+        assert!(!is_subagent(
+            r#"{"type":"session_meta","payload":{"id":"r","source":"cli"}}"#
+        ));
+    }
+
+    #[test]
+    fn legacy_codex_rollout_history_comes_from_message_events() {
+        let history = rollout_history(&[
+            r#"{"type":"session_meta","payload":{"id":"t1","cwd":"/w","history_mode":"legacy"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hi there"}}"#,
+        ]);
+        assert_eq!(
+            history,
+            vec![
+                (HistoryType::User, "hello".to_string()),
+                (HistoryType::ToolUse, "[shell]".to_string()),
+                (HistoryType::ToolResult, "ok".to_string()),
+                (HistoryType::Assistant, "hi there".to_string()),
+            ]
+        );
+    }
 }
 
 /// Find the most recently modified external session whose cwd matches the given path.
@@ -18859,9 +18965,9 @@ fn find_latest_session_by_cwd(
     result
 }
 
-/// Claude: scan all `~/.claude/projects/*/*.jsonl` for the latest session matching cwd.
+/// Claude: scan all `$CLAUDE_CONFIG_DIR/projects/*/*.jsonl` for the latest session matching cwd.
 fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let projects_dir = crate::services::claude::claude_config_dir()?.join("projects");
     msg_debug(&format!(
         "[find_claude_by_cwd] projects_dir={}, is_dir={}",
         projects_dir.display(),
@@ -18941,7 +19047,7 @@ fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
 
 /// Codex: scan `~/.codex/sessions/**/*.jsonl` for the latest session matching cwd.
 fn find_latest_codex_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
-    let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
+    let sessions_dir = crate::services::codex::codex_home_dir()?.join("sessions");
     if !sessions_dir.is_dir() {
         return None;
     }
@@ -18997,7 +19103,7 @@ fn collect_best_codex_jsonl(
                     continue;
                 }
                 if let Some(cwd) = extract_cwd_from_jsonl(&path) {
-                    if cwd == canonical_path {
+                    if cwd == canonical_path && !codex_rollout_is_subagent(&path) {
                         let mtime = path
                             .metadata()
                             .ok()
@@ -19012,6 +19118,39 @@ fn collect_best_codex_jsonl(
             }
         }
     }
+}
+
+/// Whether a Codex rollout belongs to a subagent thread. Subagents share the
+/// parent's cwd and are written alongside it, often after it, but they are
+/// not conversations the user can continue. Their `session_meta` (the first
+/// line) carries `thread_source: "subagent"`, and `source: {"subagent": ..}`
+/// in Codex versions that predate `thread_source`.
+fn codex_rollout_is_subagent(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let Some(Ok(first)) = BufReader::new(file).lines().next() else {
+        return false;
+    };
+    codex_session_meta_is_subagent(&first)
+}
+
+fn codex_session_meta_is_subagent(line: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if val.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
+        return false;
+    }
+    let Some(payload) = val.get("payload") else {
+        return false;
+    };
+    payload.get("thread_source").and_then(|v| v.as_str()) == Some("subagent")
+        || payload
+            .get("source")
+            .and_then(|v| v.get("subagent"))
+            .is_some()
 }
 
 /// Agy: use `last_conversations.json` workspace mapping.
@@ -19041,20 +19180,22 @@ fn find_latest_opencode_by_cwd(canonical_path: &str) -> Option<ResolvedSession> 
         "[find_latest_opencode_by_cwd] canonical_path={:?}",
         canonical_path
     ));
-    let db_path = dirs::home_dir()?
-        .join(".local")
-        .join("share")
-        .join("opencode")
-        .join("opencode.db");
+    let db_path = opencode::opencode_db_path()?;
     if !db_path.is_file() {
         return None;
     }
     let conn =
         rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
-    let mut stmt = conn
-        .prepare("SELECT id FROM session WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1")
-        .ok()?;
+    // opencode 2.x runs subagents as child sessions in the same directory;
+    // only a root session is a conversation to resume.
+    let sql = if opencode::opencode_db_is_v2(&conn) {
+        "SELECT id FROM session_v2 WHERE directory = ?1 AND parent_id IS NULL \
+         ORDER BY time_updated DESC LIMIT 1"
+    } else {
+        "SELECT id FROM session WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
     let session_id: String = stmt
         .query_row(rusqlite::params![canonical_path], |row| row.get(0))
         .ok()?;
@@ -19191,9 +19332,48 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
     use std::io::{BufRead, BufReader};
     let file = fs::File::open(jsonl_path).ok()?;
     let reader = BufReader::new(file);
-    let mut history: Vec<HistoryItem> = Vec::new();
+    let history = codex_rollout_history(reader.lines().flatten());
 
-    for line in reader.lines().flatten() {
+    if history.is_empty() {
+        return None;
+    }
+
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "codex".to_string(),
+    })
+}
+
+/// Join the `text` of each element of a Codex content array.
+fn codex_content_text(content: Option<&serde_json::Value>) -> String {
+    content
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+/// Conversation history of a Codex rollout.
+///
+/// The thread's `session_meta.history_mode` decides where the conversation
+/// is recorded. `legacy` threads (older Codex, and threads it created, even
+/// when a newer Codex resumes them) write `event_msg` `user_message` /
+/// `agent_message`. `paginated` threads write `event_msg` `item_completed`
+/// with `UserMessage` / `AgentMessage` items instead.
+fn codex_rollout_history(lines: impl Iterator<Item = String>) -> Vec<HistoryItem> {
+    let mut history: Vec<HistoryItem> = Vec::new();
+    let mut paginated = false;
+    let mut meta_seen = false;
+
+    for line in lines {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -19205,10 +19385,38 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
         };
 
         match line_type {
+            // The first session_meta describes this thread.
+            "session_meta" if !meta_seen => {
+                meta_seen = true;
+                paginated =
+                    payload.get("history_mode").and_then(|v| v.as_str()) == Some("paginated");
+            }
             "event_msg" => {
                 let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match msg_type {
-                    "user_message" => {
+                    "item_completed" if paginated => {
+                        let item = payload.get("item");
+                        let item_type = item
+                            .and_then(|v| v.get("type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let text = codex_content_text(item.and_then(|v| v.get("content")));
+                        if text.is_empty() {
+                            continue;
+                        }
+                        match item_type {
+                            "UserMessage" => history.push(HistoryItem {
+                                item_type: HistoryType::User,
+                                content: truncate_utf8(&text, 300),
+                            }),
+                            "AgentMessage" => history.push(HistoryItem {
+                                item_type: HistoryType::Assistant,
+                                content: truncate_utf8(&text, 2000),
+                            }),
+                            _ => {}
+                        }
+                    }
+                    "user_message" if !paginated => {
                         let text = payload
                             .get("message")
                             .and_then(|v| v.as_str())
@@ -19220,7 +19428,7 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
                             });
                         }
                     }
-                    "agent_message" => {
+                    "agent_message" if !paginated => {
                         let text = payload
                             .get("message")
                             .and_then(|v| v.as_str())
@@ -19238,9 +19446,10 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
             "response_item" => {
                 let item_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match item_type {
-                    // response_item → message is intentionally ignored:
-                    // agent text is already captured via event_msg → agent_message (always emitted in pairs)
-                    "function_call" => {
+                    // response_item → message is intentionally ignored: the
+                    // conversation text is taken from event_msg above, which
+                    // excludes injected developer/context messages.
+                    "function_call" | "custom_tool_call" => {
                         let name = payload
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -19279,6 +19488,19 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
                             });
                         }
                     }
+                    "custom_tool_call_output" => {
+                        // output is a plain string or a list of {type, text} parts
+                        let output = match payload.get("output") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            other => codex_content_text(other),
+                        };
+                        if !output.is_empty() {
+                            history.push(HistoryItem {
+                                item_type: HistoryType::ToolResult,
+                                content: truncate_utf8(&output, 500),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -19286,17 +19508,7 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
         }
     }
 
-    if history.is_empty() {
-        return None;
-    }
-
-    Some(SessionData {
-        session_id: session_id.to_string(),
-        history,
-        current_path: cwd.to_string(),
-        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        provider: "codex".to_string(),
-    })
+    history
 }
 
 /// Parse an Agy conversation into a minimal cokacdir SessionData record.
@@ -19339,6 +19551,9 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
+    if opencode::opencode_db_is_v2(&conn) {
+        return parse_opencode_v2_session(&conn, session_id, cwd);
+    }
     let mut stmt = conn
         .prepare(
             "SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.type'), \
@@ -19395,6 +19610,82 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
     }
     msg_debug(&format!(
         "[parse_opencode_session] parsed: history_len={}",
+        history.len()
+    ));
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "opencode".to_string(),
+    })
+}
+
+/// opencode 2.x history: typed `session_message` rows in sequence order. A
+/// `user` row carries the prompt text; an `assistant` row (one per model
+/// step) carries text, reasoning and tool items in `content`.
+fn parse_opencode_v2_session(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    cwd: &str,
+) -> Option<SessionData> {
+    let mut stmt = conn
+        .prepare("SELECT type, data FROM session_message WHERE session_id = ?1 ORDER BY seq ASC")
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
+    let mut history: Vec<HistoryItem> = Vec::new();
+    for (kind, data) in rows.flatten() {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        match kind.as_str() {
+            "user" => {
+                let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.trim().is_empty() {
+                    history.push(HistoryItem {
+                        item_type: HistoryType::User,
+                        content: truncate_utf8(text.trim(), 300),
+                    });
+                }
+            }
+            "assistant" => {
+                let items = data.get("content").and_then(|v| v.as_array());
+                for item in items.into_iter().flatten() {
+                    match item.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            if !text.is_empty() {
+                                history.push(HistoryItem {
+                                    item_type: HistoryType::Assistant,
+                                    content: truncate_utf8(text, 2000),
+                                });
+                            }
+                        }
+                        Some("tool") => {
+                            let tool = item.get("name").and_then(|v| v.as_str()).unwrap_or("Tool");
+                            history.push(HistoryItem {
+                                item_type: HistoryType::ToolUse,
+                                content: format!("[{}]", tool),
+                            });
+                        }
+                        // Skip reasoning
+                        _ => {}
+                    }
+                }
+            }
+            // Skip idle markers, synthetic notices, model/agent switches, ...
+            _ => {}
+        }
+    }
+    if history.is_empty() {
+        return None;
+    }
+    msg_debug(&format!(
+        "[parse_opencode_v2_session] parsed: history_len={}",
         history.len()
     ));
     Some(SessionData {
@@ -19814,7 +20105,7 @@ async fn handle_pwd_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
     shared_rate_limit_wait(state, chat_id).await;
     match current_path {
         Some(path) => {
-            let mut msg = format!("<code>{}</code>", path);
+            let mut msg = format!("<code>{}</code>", html_escape(&path));
             if let Some(folder_name) = std::path::Path::new(&path)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -19881,7 +20172,7 @@ async fn handle_session_command(
             };
             let msg = format!(
                 "Current {} session ID:\n<code>{}</code>\n\nTo resume this session from your terminal:\n<code>cd \"{}\"; {}</code>",
-                provider, id, path, resume_cmd
+                provider, id, html_escape(&path), resume_cmd
             );
             tg!(
                 "send_message",
@@ -20862,7 +21153,7 @@ async fn handle_shell_command(
         // wait does not leave an orphan "Processing ..." message and
         // (b) two bots in the same group chat do not run shell children
         // concurrently.
-        let group_lock = acquire_group_chat_lock(chat_id.0).await;
+        let group_lock = acquire_group_chat_lock(chat_id.0, Some(&cancel_token)).await;
 
         // Shell child has not been spawned yet (we spawn it below, after the
         // lock is acquired and the placeholder is sent), so cleanup is just
@@ -23750,6 +24041,9 @@ async fn handle_model_command(
                 "<code>/model codex:gpt-6-astra</code> — Most capable model for complex, demanding work\n",
             );
             msg.push_str(
+                "<code>/model codex:gpt-6.1-sol</code> — Near-Astra performance for complex work at a lower cost\n",
+            );
+            msg.push_str(
                 "<code>/model codex:gpt-5.6-sol</code> — Reliable agentic workhorse for everyday tasks\n",
             );
             msg.push_str(
@@ -24853,7 +25147,7 @@ async fn handle_text_message(
         // section already guards this bot's per-chat slot, so doing the wait
         // here only delays the start notification/final-only execution, not
         // subsequent messages.
-        let group_lock = acquire_group_chat_lock(chat_id.0).await;
+        let group_lock = acquire_group_chat_lock(chat_id.0, Some(&cancel_token)).await;
 
         // /stop arriving while we waited for the group lock sets cancelled=true.
         // AI has not been spawned yet (we spawn it below, after the lock is
@@ -25480,6 +25774,11 @@ async fn handle_text_message(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
+                                // The error text replaces (not extends) the
+                                // streamed text, whose delivered prefix already
+                                // lives in earlier messages; render the error
+                                // from byte zero instead of from the old offset.
+                                last_confirmed_len = 0;
                                 set_final_only_terminal_text(
                                     final_only_mode,
                                     &mut final_only_response,
@@ -30352,9 +30651,8 @@ fn format_tool_input(name: &str, input: &str) -> String {
 
 // === Scheduler ===
 
-/// Check if a schedule entry should trigger now
-fn should_trigger(entry: &ScheduleEntry) -> bool {
-    let now = chrono::Local::now();
+/// Check if a schedule entry should trigger at `now`
+fn should_trigger(entry: &ScheduleEntry, now: chrono::DateTime<chrono::Local>) -> bool {
     sched_debug(&format!(
         "[should_trigger] id={}, type={}, schedule={}, now={}, last_run={:?}",
         entry.id,
@@ -30374,7 +30672,9 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                 ));
                 return false;
             };
-            let schedule_dt = schedule_time.and_local_timezone(chrono::Local).single();
+            // An ambiguous wall time (DST fall-back repeated hour) fires at its
+            // first occurrence; a non-existent one (spring-forward gap) stays None.
+            let schedule_dt = schedule_time.and_local_timezone(chrono::Local).earliest();
             let Some(schedule_dt) = schedule_dt else {
                 sched_debug(&format!(
                     "[should_trigger] id={}, timezone conversion failed → false",
@@ -30430,15 +30730,19 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                 return false;
             }
             // Check last_run to avoid duplicate triggers within the same
-            // minute. An unparseable / timezone-ambiguous `last_run` is
+            // minute. An unparseable / non-existent local `last_run` is
             // treated as "ran this minute" defensively so a corrupted
             // timestamp can't cause repeated firing on every 5s scheduler
             // tick. The schedule stays dormant until the next legitimate
-            // write rewrites `last_run`.
+            // write rewrites `last_run`. A DST-ambiguous `last_run` (written
+            // during the repeated fall-back hour) resolves to its earliest
+            // instant; the comparison below uses the wall-clock minute string,
+            // which is identical for both candidates, so duplicate firing
+            // within that minute is still prevented.
             if let Some(ref last) = entry.last_run {
                 match chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
                     Ok(last_dt) => {
-                        match last_dt.and_local_timezone(chrono::Local).single() {
+                        match last_dt.and_local_timezone(chrono::Local).earliest() {
                             Some(last_local) => {
                                 let now_min = now.format("%Y-%m-%d %H:%M").to_string();
                                 let last_min = last_local.format("%Y-%m-%d %H:%M").to_string();
@@ -30448,7 +30752,7 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                                 }
                             }
                             None => {
-                                sched_debug(&format!("[should_trigger] id={}, last_run timezone-ambiguous {:?} → defensively false", entry.id, last));
+                                sched_debug(&format!("[should_trigger] id={}, last_run non-existent local time {:?} → defensively false", entry.id, last));
                                 return false;
                             }
                         }
@@ -30511,6 +30815,35 @@ fn update_schedule_after_run(entry: &ScheduleEntry) {
     }
 }
 
+/// Restore the chat session backed up before a non-inline scheduled run
+/// (or remove the temporary schedule session when there was none). Upload
+/// records that arrived during the run were recorded on the temporary
+/// session; carry them over so restoring does not silently drop them.
+/// Records `prev` already holds are skipped, so restoring again over an
+/// already-restored session (panic recovery) does not duplicate them.
+fn restore_schedule_prev_session_locked(
+    data: &mut SharedData,
+    chat_id: ChatId,
+    prev_session: Option<ChatSession>,
+) {
+    match prev_session {
+        Some(mut prev) => {
+            if let Some(current) = data.sessions.get_mut(&chat_id) {
+                let carried: Vec<String> = current
+                    .take_pending_uploads()
+                    .into_iter()
+                    .filter(|record| !prev.pending_uploads.contains(record))
+                    .collect();
+                prev.extend_pending_uploads(carried);
+            }
+            data.sessions.insert(chat_id, prev);
+        }
+        None => {
+            data.sessions.remove(&chat_id);
+        }
+    }
+}
+
 /// Execute a scheduled task — similar pattern to handle_text_message
 async fn execute_schedule(
     bot: &Bot,
@@ -30551,10 +30884,17 @@ async fn execute_schedule(
         (None, None, 0)
     };
 
-    // Acquire group chat lock (serializes processing across bots in the same group chat)
-    let group_lock = acquire_group_chat_lock(chat_id.0).await;
+    // Acquire group chat lock (serializes processing across bots in the same group chat).
+    // The pre-inserted cancel token (from scheduler_cycle) lets /stop abort the wait.
+    let lock_wait_token = {
+        let data = state.lock().await;
+        data.cancel_tokens.get(&chat_id).cloned()
+    };
+    let group_lock = acquire_group_chat_lock(chat_id.0, lock_wait_token.as_ref()).await;
 
-    // Check if cancelled during lock wait
+    // Check if cancelled during lock wait. The token the wait observed is
+    // checked too: a cancelled wait returns without the lock, so it must not
+    // fall through to execution even if that token already left the map.
     let cancelled_during_wait = {
         let data = state.lock().await;
         data.cancel_tokens
@@ -30562,6 +30902,10 @@ async fn execute_schedule(
             .map(|ct| ct.cancelled.load(Ordering::Relaxed))
             .unwrap_or(false)
     };
+    let cancelled_during_wait = cancelled_during_wait
+        || lock_wait_token
+            .as_ref()
+            .map_or(false, |ct| ct.cancelled.load(Ordering::Relaxed));
     if cancelled_during_wait {
         sched_debug(&format!(
             "[execute_schedule] cancelled during lock wait, id={}",
@@ -30575,11 +30919,7 @@ async fn execute_schedule(
             remove_cancel_token_locked(&mut data, chat_id);
             // Inline mode never replaced the session, so leave it untouched.
             if !inline_mode {
-                if let Some(prev) = prev_session {
-                    data.sessions.insert(chat_id, prev);
-                } else {
-                    data.sessions.remove(&chat_id);
-                }
+                restore_schedule_prev_session_locked(&mut data, chat_id, prev_session);
             }
         }
         msg_debug(&format!(
@@ -30724,11 +31064,7 @@ async fn execute_schedule(
                     remove_cancel_token_locked(&mut data, chat_id);
                     // Inline mode never replaced the session, so leave it untouched.
                     if !inline_mode {
-                        if let Some(prev) = prev_session {
-                            data.sessions.insert(chat_id, prev);
-                        } else {
-                            data.sessions.remove(&chat_id);
-                        }
+                        restore_schedule_prev_session_locked(&mut data, chat_id, prev_session);
                     }
                 }
                 msg_debug(&format!(
@@ -31382,6 +31718,11 @@ async fn execute_schedule(
                                     "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                     message, code_display, stdout_display, stderr_display
                                 );
+                                // The error text replaces (not extends) the
+                                // streamed text, whose delivered prefix already
+                                // lives in earlier messages; render the error
+                                // from byte zero instead of from the old offset.
+                                last_confirmed_len = 0;
                                 set_final_only_terminal_text(
                                     final_only_mode,
                                     &mut final_only_response,
@@ -32054,11 +32395,10 @@ async fn execute_schedule(
                         sched_debug(&format!("[execute_schedule] id={}, inline cleanup: session has no current_path — skipping save_session_to_file", schedule_id));
                     }
                 }
-            } else if let Some(prev) = prev_session {
-                data.sessions.insert(chat_id, prev);
             } else {
-                // No prior session existed — remove the schedule's temporary session
-                data.sessions.remove(&chat_id);
+                // Restore the pre-schedule session (or, if none existed, remove
+                // the schedule's temporary session).
+                restore_schedule_prev_session_locked(&mut data, chat_id, prev_session);
             }
         }
         sched_debug(&format!("[execute_schedule] id={}, END", schedule_id));
@@ -32127,7 +32467,7 @@ async fn process_bot_message(
     // file unprocessed).
 
     // Acquire group chat lock (serializes processing across bots in the same group chat)
-    let group_lock = acquire_group_chat_lock(chat_id.0).await;
+    let group_lock = acquire_group_chat_lock(chat_id.0, Some(&cancel_token)).await;
 
     // Check if cancelled during lock wait
     if cancel_token.cancelled.load(Ordering::Relaxed) {
@@ -32955,6 +33295,11 @@ async fn process_bot_message(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
+                                // The error text replaces (not extends) the
+                                // streamed text, whose delivered prefix already
+                                // lives in earlier messages; render the error
+                                // from byte zero instead of from the old offset.
+                                last_confirmed_len = 0;
                                 set_final_only_terminal_text(
                                     final_only_mode,
                                     &mut final_only_response,
@@ -33901,7 +34246,8 @@ async fn execute_companion_ping(
     bot_display_name: &str,
     dispatch_activity_epoch: u64,
 ) {
-    let group_lock = acquire_group_chat_lock(chat_id.0).await;
+    // Companion pings run only in private chats, where no lock wait happens.
+    let group_lock = acquire_group_chat_lock(chat_id.0, None).await;
     let cancel_token = {
         let data = state.lock().await;
         data.cancel_tokens.get(&chat_id).cloned()
@@ -34453,6 +34799,11 @@ async fn scheduler_loop(
 ) {
     let bot_key = token_hash(&token);
     sched_debug("[scheduler_loop] started");
+    // Schedule ids whose "path no longer exists" warning was already sent.
+    // Kept across cycles so a schedule whose project directory disappeared is
+    // reported once instead of on every 5-second tick.
+    let missing_path_warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -34470,6 +34821,7 @@ async fn scheduler_loop(
         let bot_key_c = bot_key.clone();
         let bot_username_c = bot_username.clone();
         let bot_display_name_c = bot_display_name.clone();
+        let missing_path_warned_c = missing_path_warned.clone();
         let cycle_join = tokio::spawn(async move {
             scheduler_cycle(
                 bot_c,
@@ -34478,6 +34830,7 @@ async fn scheduler_loop(
                 bot_key_c,
                 bot_username_c,
                 bot_display_name_c,
+                missing_path_warned_c,
             )
             .await
         });
@@ -34499,6 +34852,7 @@ async fn scheduler_cycle(
     bot_key: String,
     bot_username: String,
     bot_display_name: String,
+    missing_path_warned: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) {
     // Scan schedule directory
     let entries = list_schedule_entries(&bot_key, None);
@@ -34510,20 +34864,39 @@ async fn scheduler_cycle(
         ));
     }
 
+    // Forget missing-path warnings for schedules that no longer exist.
+    {
+        let mut warned = missing_path_warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        warned.retain(|id| entries.iter().any(|entry| &entry.id == id));
+    }
+
     for entry in &entries {
         let chat_id = ChatId(entry.chat_id);
 
         // Verify current_path exists (before acquiring lock — involves filesystem I/O)
         if !Path::new(&entry.current_path).is_dir() {
+            // Warn only once per schedule; the entry itself is left untouched
+            // and is re-checked on every tick.
+            let first_warning = {
+                let mut warned = missing_path_warned
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                warned.insert(entry.id.clone())
+            };
+            sched_debug(&format!(
+                "[scheduler_loop] id={}, path not found: {} → skip (already_warned={})",
+                entry.id, entry.current_path, !first_warning
+            ));
+            if !first_warning {
+                continue;
+            }
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] ⚠ [Scheduler] Path not found: {} (schedule: {})",
                 entry.current_path, entry.id
             );
-            sched_debug(&format!(
-                "[scheduler_loop] id={}, path not found: {} → skip",
-                entry.id, entry.current_path
-            ));
             shared_rate_limit_wait(&state, chat_id).await;
             let msg = format!(
                 "⏰ {}\n\n⚠️ Skipped — path no longer exists\n📂 <code>{}</code>",
@@ -34537,6 +34910,13 @@ async fn scheduler_cycle(
                     .await
             );
             continue;
+        }
+        // Path exists (again): a later disappearance should be reported anew.
+        {
+            let mut warned = missing_path_warned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            warned.remove(&entry.id);
         }
 
         // Single atomic lock: pending check + trigger check + busy check + session backup
@@ -34564,17 +34944,22 @@ async fn scheduler_cycle(
                 entry.id, is_already_pending
             ));
 
+            // Single clock read shared by the due check and the expiry check,
+            // so a one-shot schedule cannot be judged "not yet due" and then
+            // "expired" when a second boundary passes between two reads.
+            let now = chrono::Local::now();
+
             // If not pending and not due to trigger, skip
-            if !is_already_pending && !should_trigger(entry) {
+            if !is_already_pending && !should_trigger(entry, now) {
                 // Check if expired absolute schedule should be discarded
                 if entry.schedule_type == "absolute" {
                     if let Ok(schedule_time) =
                         chrono::NaiveDateTime::parse_from_str(&entry.schedule, "%Y-%m-%d %H:%M:%S")
                     {
                         if let Some(schedule_dt) =
-                            schedule_time.and_local_timezone(chrono::Local).single()
+                            schedule_time.and_local_timezone(chrono::Local).earliest()
                         {
-                            if chrono::Local::now() > schedule_dt {
+                            if now > schedule_dt {
                                 sched_debug(&format!(
                                     "[scheduler_loop] id={}, expired absolute → discard",
                                     entry.id
@@ -34728,7 +35113,19 @@ async fn scheduler_cycle(
                 })
                 .await
         });
-        if let Err(join_err) = join.await {
+        // Watch the dispatch from a background task instead of awaiting it
+        // here: execute_schedule waits for the cross-bot group chat lock
+        // before spawning its polling task, so awaiting it inline stalled
+        // every later schedule, companion ping and bot message of this bot
+        // while another bot held that lock. The busy slot, pending id and
+        // session backup were all reserved above under the state lock, so
+        // later entries and cycles still see this chat as busy.
+        let bot_m = bot.clone();
+        let state_m = state.clone();
+        tokio::spawn(async move {
+            let Err(join_err) = join.await else {
+                return;
+            };
             let panic_str = redact_known_tokens(&join_err.to_string());
             msg_debug(&format!(
                 "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
@@ -34738,9 +35135,13 @@ async fn scheduler_cycle(
                 "  ⚠ Chat {} schedule {} panicked: {} — recovering",
                 chat_id.0, entry_id_for_log, panic_str
             );
-            let recovery =
-                reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute")
-                    .await;
+            let recovery = reclaim_panicked_dispatch_token(
+                &state_m,
+                chat_id,
+                dispatch_id,
+                "scheduler:execute",
+            )
+            .await;
             // Restore session/pending state that the pre-execute lock
             // had mutated on this dispatch's behalf. If the panic
             // happened after execute_schedule already restored these
@@ -34748,16 +35149,9 @@ async fn scheduler_cycle(
             // overwriting equivalent state — safe and idempotent.
             // Inline mode never mutated `sessions` upfront, so we only
             // touch sessions on the non-inline path.
-            let mut data = state.lock().await;
+            let mut data = state_m.lock().await;
             if !inline_mode {
-                match prev_for_recover {
-                    Some(prev) => {
-                        data.sessions.insert(chat_id, prev);
-                    }
-                    None => {
-                        data.sessions.remove(&chat_id);
-                    }
-                }
+                restore_schedule_prev_session_locked(&mut data, chat_id, prev_for_recover);
             }
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&entry_id_for_log);
@@ -34768,15 +35162,15 @@ async fn scheduler_cycle(
             drop(data);
             if let Some(recovery) = recovery {
                 complete_panicked_dispatch_recovery(
-                    &bot,
-                    &state,
+                    &bot_m,
+                    &state_m,
                     chat_id,
                     "scheduler:execute",
                     recovery,
                 )
                 .await;
             }
-        }
+        });
     }
 
     process_companion_pings(&bot, &state, &token, &bot_username, &bot_display_name).await;
@@ -34791,6 +35185,13 @@ async fn scheduler_cycle(
                 bot_username
             ));
         }
+        // Chats that already got a bot-message dispatch in this cycle.
+        // Dispatches are not awaited here, so a dispatched task may not have
+        // claimed its busy slot yet when the next message for the same chat
+        // is examined; skipping keeps per-chat delivery order (the message
+        // file stays on disk and is retried next cycle).
+        let mut dispatched_chats: std::collections::HashSet<ChatId> =
+            std::collections::HashSet::new();
         for msg in &messages {
             msg_debug(&format!("[scheduler_loop] bot message: id={}, from={}, to={}, chat_id={}, content_len={}, created_at={}",
                     msg.id, msg.from, msg.to, msg.chat_id, msg.content.len(), msg.created_at));
@@ -34820,6 +35221,10 @@ async fn scheduler_cycle(
                     msg_debug(&format!("[scheduler_loop] chat {} busy, skipping message: {} (will retry next cycle)", chat_id_num, msg.id));
                     continue;
                 }
+            }
+            if !dispatched_chats.insert(chat_id) {
+                msg_debug(&format!("[scheduler_loop] chat {} already dispatched this cycle, skipping message: {} (will retry next cycle)", chat_id_num, msg.id));
+                continue;
             }
 
             // Note: file deletion happens inside `process_bot_message` only
@@ -34861,29 +35266,36 @@ async fn scheduler_cycle(
                     })
                     .await
             });
-            if let Err(join_err) = join.await {
-                let panic_str = redact_known_tokens(&join_err.to_string());
+            // Watched in the background (not awaited) for the same reason as
+            // execute_schedule above: process_bot_message waits for the group
+            // chat lock before spawning its polling task.
+            let bot_m = bot.clone();
+            let state_m = state.clone();
+            tokio::spawn(async move {
+                if let Err(join_err) = join.await {
+                    let panic_str = redact_known_tokens(&join_err.to_string());
+                    msg_debug(&format!(
+                        "[scheduler_loop] process_bot_message id={} PANICKED: {}",
+                        msg_id_for_log, panic_str
+                    ));
+                    eprintln!(
+                        "  ⚠ Chat {} bot-message {} panicked: {} — recovering",
+                        chat_id.0, msg_id_for_log, panic_str
+                    );
+                    finish_panicked_dispatch_recovery(
+                        &bot_m,
+                        &state_m,
+                        chat_id,
+                        dispatch_id,
+                        "scheduler:botmsg",
+                    )
+                    .await;
+                }
                 msg_debug(&format!(
-                    "[scheduler_loop] process_bot_message id={} PANICKED: {}",
-                    msg_id_for_log, panic_str
+                    "[scheduler_loop] process_bot_message returned for msg: {}",
+                    msg_id_for_log
                 ));
-                eprintln!(
-                    "  ⚠ Chat {} bot-message {} panicked: {} — recovering",
-                    chat_id.0, msg_id_for_log, panic_str
-                );
-                finish_panicked_dispatch_recovery(
-                    &bot,
-                    &state,
-                    chat_id,
-                    dispatch_id,
-                    "scheduler:botmsg",
-                )
-                .await;
-            }
-            msg_debug(&format!(
-                "[scheduler_loop] process_bot_message returned for msg: {}",
-                msg_id_for_log
-            ));
+            });
         }
 
         // Check for timed-out sent messages

@@ -3790,13 +3790,37 @@ impl EditorState {
                 self.wrap_scroll_offset = cursor_segment;
             }
 
-            let mut guard = 0usize;
-            while self.cursor_visual_row_from_wrap_top(cursor_segment) >= visible_height
-                && (self.scroll < self.cursor_line || self.wrap_scroll_offset < cursor_segment)
-                && guard < self.lines.len().saturating_mul(1024).max(1024)
+            let guard_limit = self.lines.len().saturating_mul(1024).max(1024);
+            if self.cursor_line < self.lines.len()
+                && cursor_segment < self.count_wrapped_rows(self.cursor_line)
             {
-                self.advance_wrap_scroll_top();
-                guard += 1;
+                // Each advance moves the top down exactly one rendered row
+                // toward the cursor, so skip the needed rows in one pass
+                // instead of recounting the rows above the cursor per step.
+                let cursor_row = self.cursor_visual_row_from_wrap_top(cursor_segment);
+                let mut remaining = (cursor_row + 1)
+                    .saturating_sub(visible_height)
+                    .min(guard_limit);
+                while remaining > 0 {
+                    let top_rows = self.count_wrapped_rows(self.scroll).max(1);
+                    let rows_left_in_line = top_rows - 1 - self.wrap_scroll_offset;
+                    if remaining <= rows_left_in_line {
+                        self.wrap_scroll_offset += remaining;
+                        break;
+                    }
+                    remaining -= rows_left_in_line + 1;
+                    self.scroll += 1;
+                    self.wrap_scroll_offset = 0;
+                }
+            } else {
+                let mut guard = 0usize;
+                while self.cursor_visual_row_from_wrap_top(cursor_segment) >= visible_height
+                    && (self.scroll < self.cursor_line || self.wrap_scroll_offset < cursor_segment)
+                    && guard < guard_limit
+                {
+                    self.advance_wrap_scroll_top();
+                    guard += 1;
+                }
             }
         } else {
             self.wrap_scroll_offset = 0;
@@ -3873,7 +3897,18 @@ impl EditorState {
         } else {
             // 뒤로 검색
             let mut line_idx = self.cursor_line;
-            let mut col_idx = self.cursor_col.saturating_sub(1);
+            let mut col_idx = self.cursor_col;
+            // Start before the bracket itself; at column 0 that is the end of
+            // the previous line.
+            if col_idx == 0 {
+                if line_idx == 0 {
+                    return;
+                }
+                line_idx -= 1;
+                col_idx = self.lines[line_idx].chars().count().saturating_sub(1);
+            } else {
+                col_idx -= 1;
+            }
 
             loop {
                 let line_chars: Vec<char> = self.lines[line_idx].chars().collect();
@@ -4688,6 +4723,7 @@ impl EditorState {
                 },
             ],
         });
+        self.selection = None;
         self.update_scroll();
     }
 
@@ -4712,6 +4748,7 @@ impl EditorState {
             content: indent,
             line_ending: inserted_ending,
         });
+        self.selection = None;
         self.update_scroll();
     }
 
@@ -4856,10 +4893,17 @@ impl EditorState {
             " ".repeat(self.tab_size)
         };
 
-        if let Some((start_line, _, end_line, _)) = self
+        if let Some((start_line, _, end_line, end_col)) = self
             .selection
             .and_then(|sel| self.clamped_selection_range(sel))
         {
+            // A half-open selection ending at the next line's start does not
+            // select that line's contents.
+            let end_line = if end_line > start_line && end_col == 0 {
+                end_line - 1
+            } else {
+                end_line
+            };
             let mut actions = Vec::new();
 
             for line_idx in start_line..=end_line {
@@ -4906,10 +4950,17 @@ impl EditorState {
             }
         };
 
-        if let Some((start_line, _, end_line, _)) = self
+        if let Some((start_line, _, end_line, end_col)) = self
             .selection
             .and_then(|sel| self.clamped_selection_range(sel))
         {
+            // A half-open selection ending at the next line's start does not
+            // select that line's contents.
+            let end_line = if end_line > start_line && end_col == 0 {
+                end_line - 1
+            } else {
+                end_line
+            };
             let mut actions = Vec::new();
 
             for line_idx in start_line..=end_line {
@@ -5933,9 +5984,16 @@ fn render_editor_line(
         vis_idx += char_width; // visual_to_orig는 visual column 단위
     }
 
+    // In word-wrap mode a line whose width fills its last segment exactly
+    // has no further segment, so its end-of-line caret sits at view_end.
+    let end_cursor_visible = |cursor_visual: usize| {
+        cursor_visual >= view_start
+            && (cursor_visual < view_end || (state.word_wrap && cursor_visual == view_end))
+    };
+
     // 커서가 줄 끝에 있고 보이는 범위 내인 경우
     if is_cursor_line && state.cursor_col >= orig_chars.len() && state.selection.is_none() {
-        if cursor_visual >= view_start && cursor_visual < view_end {
+        if end_cursor_visible(cursor_visual) {
             let cursor_style = if in_find_mode {
                 Style::default()
                     .fg(theme.editor.text)
@@ -5947,7 +6005,7 @@ fn render_editor_line(
         }
     } else if state.is_extra_insert_cursor_at(line_num, orig_chars.len()) {
         let cursor_visual = state.char_to_visual(original_line, orig_chars.len());
-        if cursor_visual >= view_start && cursor_visual < view_end {
+        if end_cursor_visible(cursor_visual) {
             spans.push(Span::styled(" ", theme.selected_style()));
         }
     }
@@ -6015,7 +6073,14 @@ pub fn handle_paste(app: &mut App, text: &str) {
         return;
     }
 
-    state.insert_str(&normalized);
+    // Pasted line breaks follow the document's line ending, like Enter does.
+    let line_ending = state.default_line_ending();
+    let text = if line_ending == "\n" {
+        normalized
+    } else {
+        normalized.replace('\n', &line_ending)
+    };
+    state.insert_str(&text);
 }
 
 pub(crate) fn close_file_editor(app: &mut App, reload_viewer: bool) {
@@ -6245,7 +6310,15 @@ fn activate_exit_confirm_button(app: &mut App, selected: usize) {
                 close_file_editor(app, true);
             }
         }
-        1 => close_file_editor(app, false),
+        1 => {
+            // Discarding also abandons a remote upload that is still pending
+            // for this editor, so a later spinner completion cannot upload it.
+            if let Some(ref mut state) = app.editor_state {
+                state.remote_dirty = false;
+                state.pending_close_after_remote_save = None;
+            }
+            close_file_editor(app, false);
+        }
         _ => {
             if let Some(ref mut state) = app.editor_state {
                 cancel_exit_confirm(state);

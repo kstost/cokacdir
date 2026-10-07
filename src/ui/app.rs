@@ -800,13 +800,6 @@ fn run_tar_command(
                 break;
             }
         };
-        if is_stderr {
-            diagnostics.extend_from_slice(&line);
-            let excess = diagnostics.len().saturating_sub(MAX_TAR_ERROR_TAIL_BYTES);
-            if excess > 0 {
-                diagnostics.drain(..excess);
-            }
-        }
         let displayed = String::from_utf8_lossy(&line);
         let displayed = displayed.trim_end_matches(['\r', '\n']);
         let name = if !is_stderr {
@@ -818,7 +811,16 @@ fn run_tar_command(
                 .strip_prefix("a ")
                 .or_else(|| displayed.starts_with("./").then_some(displayed))
         };
-        if let Some(name) = name.filter(|name| !name.is_empty()) {
+        let name = name.filter(|name| !name.is_empty());
+        // Verbose progress names must not push real errors out of the tail.
+        if is_stderr && name.is_none() {
+            diagnostics.extend_from_slice(&line);
+            let excess = diagnostics.len().saturating_sub(MAX_TAR_ERROR_TAIL_BYTES);
+            if excess > 0 {
+                diagnostics.drain(..excess);
+            }
+        }
+        if let Some(name) = name {
             completed_files += 1;
             completed_bytes += size_map
                 .get(name.trim_end_matches('/'))
@@ -917,14 +919,19 @@ fn validate_tar_source_name(name: &str) -> Result<(), &'static str> {
     }
 }
 
+/// `literal_names` adds `--no-unquote` (see `tar_supports_no_unquote`).
 fn tar_create_arguments(
     compression: TarCompression,
+    literal_names: bool,
     excluded_paths: &[String],
     files: &[String],
 ) -> Vec<String> {
     let mut arguments = vec!["-c".to_string(), "-v".to_string()];
     if let Some(flag) = compression.flag() {
         arguments.push(flag.to_string());
+    }
+    if literal_names {
+        arguments.push("--no-unquote".to_string());
     }
     arguments.extend(excluded_paths.iter().map(|path| {
         // tar exclusions are glob patterns, even without a shell.
@@ -1025,6 +1032,15 @@ fn probe_tar_extraction_capabilities(tar_cmd: &str) -> TarExtractionCapabilities
         ),
         no_overwrite_dir: tar_probe_with_empty_archive(tar_cmd, "-x", Some("--no-overwrite-dir")),
     }
+}
+
+/// GNU tar unescapes backslash sequences in member names given on the
+/// command line (`\r` becomes a carriage return), so a file named
+/// `a\right` is looked up under another name and fails. `--no-unquote` makes
+/// it take names literally; bsdtar has no such processing and rejects the
+/// option, so it is passed only where the tar accepts it.
+fn tar_supports_no_unquote(tar_cmd: &str) -> bool {
+    tar_probe_with_empty_archive(tar_cmd, "-t", Some("--no-unquote"))
 }
 
 fn tar_extract_arguments(
@@ -5703,6 +5719,12 @@ impl App {
                 self.show_message("No image is open");
                 return;
             };
+            // A remote image is shown from its local cache copy; deleting
+            // that copy would leave the remote file untouched.
+            if self.active_panel().is_remote() {
+                self.show_message("Delete is not available for remote images");
+                return;
+            }
             let Some(parent) = path.parent() else {
                 self.show_message("Cannot identify the image parent directory");
                 return;
@@ -5992,6 +6014,14 @@ impl App {
         self.pending_panel_operation = None;
         // Remember split size for next time
         self.settings.encrypt_split_size = split_size_mb;
+        // Exit-time persistence only owns the panel layout, so write just this
+        // field on top of the latest on-disk snapshot now.
+        if let Ok(mut persisted) = Settings::load_with_error() {
+            if persisted.encrypt_split_size != split_size_mb {
+                persisted.encrypt_split_size = split_size_mb;
+                let _ = persisted.save();
+            }
+        }
 
         let key = match crate::enc::ensure_key() {
             Ok(key) => key,
@@ -8392,11 +8422,6 @@ impl App {
                 return;
             }
 
-            // Write the archive to stdout through an already-open owned file
-            // handle. Every short option is separate so -f always consumes
-            // exactly the following "-" argument on GNU tar and bsdtar.
-            let tar_args = tar_create_arguments(compression, &excluded_owned, &files_owned);
-
             // Check for cancellation
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(ProgressMessage::Error(
@@ -8424,6 +8449,16 @@ impl App {
                     return;
                 }
             };
+
+            // Write the archive to stdout through an already-open owned file
+            // handle. Every short option is separate so -f always consumes
+            // exactly the following "-" argument on GNU tar and bsdtar.
+            let tar_args = tar_create_arguments(
+                compression,
+                tar_supports_no_unquote(&tar_cmd),
+                &excluded_owned,
+                &files_owned,
+            );
 
             let archive_output = match temp_archive.writer() {
                 Ok(file) => file,
@@ -9059,7 +9094,8 @@ impl App {
     }
 
     fn start_pending_remote_editor_upload(&mut self) -> bool {
-        if self.remote_spinner.is_some() {
+        // A closed editor keeps its state around; never upload on its behalf.
+        if self.remote_spinner.is_some() || self.current_screen != Screen::FileEditor {
             return false;
         }
 
@@ -9723,6 +9759,7 @@ mod tests {
             .current_dir(&source)
             .args(tar_create_arguments(
                 TarCompression::None,
+                tar_supports_no_unquote(&tar),
                 &excluded,
                 &["items".into()],
             ))
@@ -10976,8 +11013,15 @@ mod tests {
             assert!(!arguments.iter().any(|argument| argument == "xvf"));
         }
 
-        let creation = tar_create_arguments(TarCompression::Gzip, &[], &["file name".to_string()]);
+        let creation =
+            tar_create_arguments(TarCompression::Gzip, false, &[], &["file name".to_string()]);
         assert_eq!(creation, ["-c", "-v", "-z", "-f", "-", "./file name"]);
+        let creation =
+            tar_create_arguments(TarCompression::Gzip, true, &[], &["file name".to_string()]);
+        assert_eq!(
+            creation,
+            ["-c", "-v", "-z", "--no-unquote", "-f", "-", "./file name"]
+        );
     }
 
     #[test]
@@ -11107,6 +11151,7 @@ mod tests {
             .current_dir(&source_dir)
             .args(tar_create_arguments(
                 TarCompression::None,
+                tar_supports_no_unquote(&tar_cmd),
                 &[],
                 &["payload.txt".to_string()],
             ))
@@ -11471,9 +11516,11 @@ mod tests {
                 .and_then(|progress| progress.result.as_ref())
                 .expect("tar worker should complete");
             assert_eq!(result.failure_count, 0, "{:?}", result.last_error);
+            // Two -t probes on an empty archive (tar selection and
+            // --no-unquote support), then the one -c.
             assert_eq!(
                 fs::read_to_string(backend_dir.path().join("create-only-tar.calls")).unwrap(),
-                "-t\n-c\n",
+                "-t\n-t\n-c\n",
                 "creation should only probe the backend and create the archive"
             );
 
@@ -11665,7 +11712,12 @@ mod tests {
         let mut create = Command::new(&tar_cmd);
         create
             .current_dir(&source)
-            .args(tar_create_arguments(TarCompression::None, &[], &files))
+            .args(tar_create_arguments(
+                TarCompression::None,
+                tar_supports_no_unquote(&tar_cmd),
+                &[],
+                &files,
+            ))
             .stdout(Stdio::from(fs::File::create(&archive_path).unwrap()))
             .stderr(Stdio::null());
         configure_tar_command(&mut create);

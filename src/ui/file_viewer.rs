@@ -297,10 +297,14 @@ impl ViewerState {
                 let mut has_match = false;
                 for mat in re.find_iter(line) {
                     // 바이트 인덱스를 문자 인덱스로 변환
+                    // (표시 줄 기준: TAB은 4칸 스페이스로 확장됨)
                     let byte_start = mat.start();
                     let byte_end = mat.end();
-                    let char_start = line[..byte_start].chars().count();
-                    let char_end = char_start + line[byte_start..byte_end].chars().count();
+                    let char_start = line[..byte_start].chars().count()
+                        + line[..byte_start].matches('\t').count() * 3;
+                    let char_end = char_start
+                        + line[byte_start..byte_end].chars().count()
+                        + line[byte_start..byte_end].matches('\t').count() * 3;
                     self.match_positions.push((line_idx, char_start, char_end));
                     has_match = true;
                 }
@@ -416,26 +420,43 @@ impl ViewerState {
             }
             ViewerMode::Hex => {
                 self.mode = ViewerMode::Text;
-                if let Ok(content) = String::from_utf8(self.raw_bytes.clone()) {
-                    self.lines = content.lines().map(String::from).collect();
-                }
+                let content = match String::from_utf8(self.raw_bytes.clone()) {
+                    Ok(content) => content,
+                    // Latin-1 (ISO-8859-1) fallback, same as load_file
+                    Err(_) => self.raw_bytes.iter().map(|&b| b as char).collect(),
+                };
+                self.lines = content.lines().map(String::from).collect();
             }
         }
         self.scroll = 0;
     }
 
-    fn build_wrapped_lines(&self, content_width: usize) -> Vec<(usize, String, bool)> {
+    /// (source line, segment text, is first segment, segment start column in
+    /// the tab-expanded line — the coordinate space of `match_positions`)
+    fn build_wrapped_lines(&self, content_width: usize) -> Vec<(usize, String, bool, usize)> {
         let mut wrapped_lines = Vec::new();
         for (orig_idx, original_line) in self.lines.iter().enumerate() {
             let line = original_line.replace('\t', "    ");
             if line.is_empty() {
-                wrapped_lines.push((orig_idx, String::new(), true));
+                wrapped_lines.push((orig_idx, String::new(), true, 0));
             } else if content_width > 0 {
+                // Segments are taken from `line` in order; locate each one to
+                // know its starting column.
+                let mut byte_cursor = 0;
+                let mut char_cursor = 0;
                 for (segment, wrapped) in textwrap::wrap(&line, content_width).iter().enumerate() {
-                    wrapped_lines.push((orig_idx, wrapped.to_string(), segment == 0));
+                    let text: &str = wrapped;
+                    let mut segment_start = char_cursor;
+                    if let Some(found) = line[byte_cursor..].find(text) {
+                        let byte_start = byte_cursor + found;
+                        segment_start += line[byte_cursor..byte_start].chars().count();
+                        char_cursor = segment_start + text.chars().count();
+                        byte_cursor = byte_start + text.len();
+                    }
+                    wrapped_lines.push((orig_idx, text.to_string(), segment == 0, segment_start));
                 }
             } else {
-                wrapped_lines.push((orig_idx, line, true));
+                wrapped_lines.push((orig_idx, line, true, 0));
             }
         }
         wrapped_lines
@@ -728,7 +749,7 @@ pub fn draw(
         let mut last_orig_line: Option<usize> = None;
 
         // 스크롤 위치부터 렌더링
-        for (i, (orig_line_num, display_text, is_first)) in wrapped_lines
+        for (i, (orig_line_num, display_text, is_first, segment_start)) in wrapped_lines
             .iter()
             .skip(state.scroll)
             .take(content_height)
@@ -753,6 +774,22 @@ pub fn draw(
 
             // 라인 배경 스타일 (에디터와 동일하게 매치된 텍스트만 하이라이트)
             let line_bg_style = theme.normal_style();
+
+            // 이 세그먼트에 해당하는 검색 매치 (세그먼트 기준 문자 위치)
+            // match_positions is ordered by line, so only this line's slice is scanned
+            let segment_len = display_text.chars().count();
+            let line_matches_start = state
+                .match_positions
+                .partition_point(|(line, _, _)| line < orig_line_num);
+            let segment_matches: Vec<(usize, usize)> = state.match_positions[line_matches_start..]
+                .iter()
+                .take_while(|(line, _, _)| line == orig_line_num)
+                .filter_map(|&(_, start, end)| {
+                    let start = start.max(*segment_start);
+                    let end = end.min(*segment_start + segment_len);
+                    (start < end).then(|| (start - *segment_start, end - *segment_start))
+                })
+                .collect();
 
             // 콘텐츠 렌더링 (검색 하이라이트 또는 문법 강조)
             let content_spans = if state.mode == ViewerMode::Hex {
@@ -782,7 +819,7 @@ pub fn draw(
                 render_wrapped_line_with_syntax_and_search(
                     display_text,
                     hl,
-                    &state.search_term,
+                    &segment_matches,
                     line_bg_style,
                     theme,
                 )
@@ -790,7 +827,7 @@ pub fn draw(
                 // 검색어 하이라이트 (wrapped 텍스트에 대해)
                 highlight_search_in_wrapped_line(
                     display_text,
-                    &state.search_term,
+                    &segment_matches,
                     line_bg_style,
                     theme,
                 )
@@ -1201,58 +1238,19 @@ fn highlight_search_in_line(
     spans
 }
 
-/// 원본 문자열에서 대소문자 무시 검색하여 (byte_start, byte_end) 쌍 반환
-fn case_insensitive_find_all(line: &str, term: &str) -> Vec<(usize, usize)> {
-    let term_lower: Vec<char> = term.to_lowercase().chars().collect();
-    if term_lower.is_empty() {
-        return Vec::new();
-    }
-    let mut results = Vec::new();
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    for start_idx in 0..chars.len() {
-        let mut matched = true;
-        let mut ti = 0;
-        let mut ci = start_idx;
-        while ti < term_lower.len() {
-            if ci >= chars.len() {
-                matched = false;
-                break;
-            }
-            let lc: Vec<char> = chars[ci].1.to_lowercase().collect();
-            if lc.len() == 1 && lc[0] == term_lower[ti] {
-                ci += 1;
-                ti += 1;
-            } else {
-                matched = false;
-                break;
-            }
-        }
-        if matched && ti == term_lower.len() {
-            let byte_start = chars[start_idx].0;
-            let byte_end = if ci < chars.len() {
-                chars[ci].0
-            } else {
-                line.len()
-            };
-            results.push((byte_start, byte_end));
-        }
-    }
-    results
-}
-
 /// Wrapped 텍스트에서 검색어 하이라이트
+/// (`match_ranges`: 이 세그먼트 기준 (char_start, char_end))
 fn highlight_search_in_wrapped_line(
     line: &str,
-    search_term: &str,
+    match_ranges: &[(usize, usize)],
     base_style: Style,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
-    if search_term.is_empty() {
+    if match_ranges.is_empty() {
         return vec![Span::styled(line.to_string(), base_style)];
     }
 
-    let matches = case_insensitive_find_all(line, search_term);
-
+    let chars: Vec<char> = line.chars().collect();
     let mut spans = Vec::new();
     let mut last_end = 0;
 
@@ -1261,25 +1259,30 @@ fn highlight_search_in_wrapped_line(
         .bg(theme.viewer.search_match_other_bg)
         .fg(theme.viewer.search_match_other_fg);
 
-    for (byte_start, byte_end) in &matches {
-        if *byte_start < last_end {
+    for &(start, end) in match_ranges {
+        let start = start.min(chars.len());
+        let end = end.min(chars.len());
+        if start < last_end {
             continue; // 겹침 매치 건너뛰기
         }
-        if *byte_start > last_end {
+        if start > last_end {
             spans.push(Span::styled(
-                line[last_end..*byte_start].to_string(),
+                chars[last_end..start].iter().collect::<String>(),
                 base_style,
             ));
         }
         spans.push(Span::styled(
-            line[*byte_start..*byte_end].to_string(),
+            chars[start..end].iter().collect::<String>(),
             match_style,
         ));
-        last_end = *byte_end;
+        last_end = end;
     }
 
-    if last_end < line.len() {
-        spans.push(Span::styled(line[last_end..].to_string(), base_style));
+    if last_end < chars.len() {
+        spans.push(Span::styled(
+            chars[last_end..].iter().collect::<String>(),
+            base_style,
+        ));
     }
 
     if spans.is_empty() {
@@ -1393,46 +1396,18 @@ fn render_line_with_syntax_and_search(
 }
 
 /// Wrapped 모드에서 문법 강조와 검색 하이라이트를 함께 처리
+/// (`match_ranges`: 이 세그먼트 기준 (char_start, char_end))
 fn render_wrapped_line_with_syntax_and_search(
     line: &str,
     highlighter: &mut SyntaxHighlighter,
-    search_term: &str,
+    match_ranges: &[(usize, usize)],
     base_style: Style,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
     let tokens = highlighter.tokenize_line(line);
     let chars: Vec<char> = line.chars().collect();
 
-    // 검색어가 없으면 일반 문법 강조만 적용
-    if search_term.is_empty() {
-        if tokens.is_empty() {
-            return vec![Span::styled(line.to_string(), base_style)];
-        }
-        return tokens
-            .into_iter()
-            .map(|token| {
-                let style = highlighter.style_for(token.token_type);
-                let final_style = match base_style.bg {
-                    Some(bg) => style.bg(bg),
-                    None => style,
-                };
-                Span::styled(token.text, final_style)
-            })
-            .collect();
-    }
-
-    // 검색 매치 위치 찾기 (대소문자 무시, 바이트 인덱스를 문자 인덱스로 변환)
-    let lower_line = line.to_lowercase();
-    let lower_term = search_term.to_lowercase();
-    let match_ranges: Vec<(usize, usize)> = lower_line
-        .match_indices(&lower_term)
-        .map(|(byte_start, matched)| {
-            let char_start = lower_line[..byte_start].chars().count();
-            let char_end = char_start + matched.chars().count();
-            (char_start, char_end)
-        })
-        .collect();
-
+    // 매치가 없으면 일반 문법 강조만 적용
     if match_ranges.is_empty() {
         if tokens.is_empty() {
             return vec![Span::styled(line.to_string(), base_style)];
@@ -1462,7 +1437,7 @@ fn render_wrapped_line_with_syntax_and_search(
             let mut style = token_style;
 
             // 검색 매치 확인
-            for &(start, end) in &match_ranges {
+            for &(start, end) in match_ranges {
                 if char_idx >= start && char_idx < end {
                     // 매치된 부분: 배경색 적용, 문법 강조의 modifier(이탤릭 등) 유지
                     style = style
@@ -1482,7 +1457,7 @@ fn render_wrapped_line_with_syntax_and_search(
         for (i, c) in chars.iter().enumerate() {
             let mut style = base_style;
 
-            for &(start, end) in &match_ranges {
+            for &(start, end) in match_ranges {
                 if i >= start && i < end {
                     style = style
                         .bg(theme.viewer.search_match_other_bg)

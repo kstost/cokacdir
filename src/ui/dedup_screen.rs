@@ -232,17 +232,36 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
         .style(Style::default().bg(colors.bg));
 
     let inner_height = chunks[1].height.saturating_sub(2) as usize; // borders
+    let inner_width = chunks[1].width.saturating_sub(2); // borders
 
-    let skip_count = state
-        .log_scroll
-        .saturating_sub(inner_height.saturating_sub(1));
+    // `log_scroll` is the bottom-most visible log line. The paragraph wraps, so walk
+    // backwards from it counting wrapped rows (same width/wrap as the rendering below)
+    // so that long lines can't push the bottom line out of the box.
+    let end = (state.log_scroll + 1).min(state.log_lines.len());
+    let mut skip_count = end;
+    let mut rows = 0usize;
+    while skip_count > 0 && rows < inner_height {
+        skip_count -= 1;
+        rows += Paragraph::new(state.log_lines[skip_count].as_str())
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width)
+            .max(1);
+    }
+    let (take_count, row_scroll) = if skip_count == 0 && rows < inner_height {
+        // Reached the top with room left: fill the rest with the following lines
+        (inner_height, 0)
+    } else {
+        // Hide the overflowing top rows so the bottom line stays visible
+        (end - skip_count, rows.saturating_sub(inner_height))
+    };
+
     let ca = Style::default().fg(colors.log_text);
     let cb = Style::default().fg(colors.log_text_alt);
     let log_lines: Vec<Line> = state
         .log_lines
         .iter()
         .skip(skip_count)
-        .take(inner_height)
+        .take(take_count)
         .map(|line| {
             if line.starts_with("[ERROR]") {
                 Line::from(Span::styled(
@@ -297,7 +316,8 @@ pub fn draw(frame: &mut Frame, state: &mut DedupScreenState, area: Rect, theme: 
 
     let log = Paragraph::new(log_lines)
         .block(log_block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((row_scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(log, chunks[1]);
 
     // ── Footer ──

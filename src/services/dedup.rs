@@ -769,6 +769,16 @@ pub(crate) fn run_dedup(
                 return;
             }
 
+            // Another hard link to the kept file is not a separate copy:
+            // removing it frees no space.
+            if duplicate_entry.identity == keep_entry.identity {
+                let _ = tx.send(DedupMessage::Log(format!(
+                    "SKIP (hard link to kept file): {}",
+                    dup_path.display()
+                )));
+                continue;
+            }
+
             // Verify byte-level equality before destructive deletion (guard against MD5 collision)
             let comparison = (|| {
                 let keep = BoundFileLocation::bind(&root, keep_entry)?;

@@ -2049,7 +2049,11 @@ fn handle_ccserver(tokens: Vec<String>) {
                 }));
             }
             for handle in handles {
-                let _ = handle.await;
+                // A bot task that panicked is just as dead as one that
+                // returned a fatal exit, so report it the same way.
+                if handle.await.is_err() {
+                    any_fatal.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             if any_fatal.load(std::sync::atomic::Ordering::Relaxed) {
                 std::process::exit(1);
@@ -2115,7 +2119,9 @@ fn handle_prompt(prompt: &str) -> Result<(), String> {
 ///
 /// Usage: `cokacdir --test-opencode-sse "<prompt>" [--model provider/model]
 ///                                                 [--session <sid>]
-///                                                 [--dir <path>]`
+///                                                 [--dir <path>]
+///                                                 [--system-prompt <text>]
+///                                                 [--cancel-after <ms> [--cancel-now]]`
 ///
 /// Exit code: 0 on PASS, 1 on FAIL, 2 on usage error.
 fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
@@ -2130,6 +2136,8 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
     let mut expect_error = false;
     let mut cancel_after_ms: Option<u64> = None;
     let mut expect_cancelled = false;
+    let mut cancel_now = false;
+    let mut system_prompt: Option<String> = None;
     let mut i = 0;
     while i < extra.len() {
         match extra[i].as_str() {
@@ -2191,6 +2199,22 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
             "--expect-cancelled" => {
                 expect_cancelled = true;
                 i += 1;
+            }
+            "--cancel-now" => {
+                // Cancel the way /stop does (`CancelToken::cancel_now`, which
+                // runs the provider's pre-kill hook and kills the process
+                // tree) instead of only raising the cancelled flag.
+                cancel_now = true;
+                i += 1;
+            }
+            "--system-prompt" => {
+                if i + 1 < extra.len() {
+                    system_prompt = Some(extra[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("[TEST] --system-prompt requires a value");
+                    return 2;
+                }
             }
             other => {
                 eprintln!("[TEST] unknown arg: {}", other);
@@ -2268,10 +2292,20 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
             if let Some(token_for_timer) = cancel_token.clone() {
                 tokio::task::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                    println!("[TEST] firing cancel at {}ms", ms);
-                    token_for_timer
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    println!(
+                        "[TEST] firing cancel at {}ms (cancel_now={})",
+                        ms, cancel_now
+                    );
+                    if cancel_now {
+                        // cancel_now blocks on the pre-kill hook; keep it off
+                        // the async workers like the bot's /stop path does.
+                        let _ =
+                            tokio::task::spawn_blocking(move || token_for_timer.cancel_now()).await;
+                    } else {
+                        token_for_timer
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 });
             }
         }
@@ -2286,7 +2320,7 @@ fn test_opencode_sse(prompt: &str, extra: &[String]) -> i32 {
                 session.as_deref(),
                 &wd,
                 tx,
-                None,
+                system_prompt.as_deref(),
                 None,
                 call_cancel,
                 model.as_deref(),
@@ -3482,10 +3516,31 @@ fn main() -> io::Result<()> {
     };
     let editor_only = startup_editor.is_some();
 
-    // Setup panic hook to restore terminal on panic
+    // Setup panic hook to restore terminal on panic.  The hook is process-wide,
+    // so only a panic on the main (TUI) thread restores the terminal; a panic in
+    // a background worker must not tear it down while the main loop keeps running.
+    let main_thread_id = std::thread::current().id();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = ui::mouse::disable_capture();
+        if std::thread::current().id() == main_thread_id {
+            let _ = ui::mouse::disable_capture();
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                LeaveAlternateScreen,
+                DisableBracketedPaste,
+                crossterm::cursor::Show
+            );
+        }
+        original_hook(panic_info);
+    }));
+
+    // Setup terminal
+    let _mouse_capture_guard = ui::mouse::CaptureGuard;
+    enable_raw_mode()?;
+    // Undo a partially completed terminal setup before returning its error
+    // (the mouse capture guard only covers mouse capture).
+    let restore_after_setup_error = || {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -3493,25 +3548,32 @@ fn main() -> io::Result<()> {
             DisableBracketedPaste,
             crossterm::cursor::Show
         );
-        original_hook(panic_info);
-    }));
-
-    // Setup terminal
-    let _mouse_capture_guard = ui::mouse::CaptureGuard;
-    enable_raw_mode()?;
+    };
     let mut stdout = io::stdout();
     // Clear screen before entering alternate screen
-    execute!(
+    if let Err(error) = execute!(
         stdout,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         crossterm::cursor::MoveTo(0, 0),
         EnterAlternateScreen,
         EnableBracketedPaste
-    )?;
+    ) {
+        restore_after_setup_error();
+        return Err(error);
+    }
 
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            restore_after_setup_error();
+            return Err(error);
+        }
+    };
+    if let Err(error) = terminal.clear() {
+        restore_after_setup_error();
+        return Err(error);
+    }
 
     // Detect terminal image protocol (must be after alternate screen, before event loop)
     let picker = {
@@ -4213,10 +4275,16 @@ fn run_app<B: ratatui::backend::Backend>(
         if app.current_screen == Screen::DiffScreen {
             if let Some(ref mut state) = app.diff_state {
                 let just_completed = state.poll();
-                if just_completed && !state.has_differences() {
-                    app.diff_state = None;
-                    app.current_screen = Screen::FilePanel;
-                    app.show_message("No differences found");
+                if just_completed {
+                    if let Some(error) = state.take_compare_error() {
+                        app.diff_state = None;
+                        app.current_screen = Screen::FilePanel;
+                        app.show_message(&error);
+                    } else if !state.has_differences() {
+                        app.diff_state = None;
+                        app.current_screen = Screen::FilePanel;
+                        app.show_message("No differences found");
+                    }
                 }
             }
         }

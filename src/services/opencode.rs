@@ -18,6 +18,11 @@ use crate::services::claude::{
     CancelToken, ClaudeResponse, StreamMessage,
 };
 
+/// OpenCode 2.x adapter: authenticated `/api` server, v2 event stream and
+/// session messages. The 1.x code paths below stay in place for older CLIs.
+#[path = "opencode_v2.rs"]
+mod v2;
+
 // ============================================================
 // opencode serve adapter constants (SSE-based execution path)
 // ============================================================
@@ -125,8 +130,27 @@ pub fn verify_completion_opencode(
     // Spawn the fork. No --format flag means plain text; stdin is closed so
     // opencode doesn't block on input.
     let spawn_start = std::time::Instant::now();
-    let child = Command::new(&opencode_bin)
-        .args([
+    let is_v2 = is_opencode_v2();
+    let mut cmd = if is_v2 {
+        // opencode 2.x: run on a private server in the session's directory,
+        // and pass the prompt through stdin, which the CLI reads as the
+        // message. Questions and permission requests cannot block here: the
+        // CLI cancels or rejects them with model-visible feedback.
+        let mut cmd = opencode_v2_command(&opencode_bin, working_dir);
+        cmd.args([
+            "run",
+            "--standalone",
+            "--session",
+            session_id,
+            "--fork",
+            "--agent",
+            "plan",
+        ])
+        .stdin(Stdio::piped());
+        cmd
+    } else {
+        let mut cmd = Command::new(&opencode_bin);
+        cmd.args([
             "run",
             "--session",
             session_id,
@@ -150,11 +174,21 @@ pub fn verify_completion_opencode(
             "OPENCODE_PERMISSION",
             r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#,
         )
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+        cmd
+    };
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn opencode for verify: {}", e))?;
+    if is_v2 {
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(verify_prompt.as_bytes()) {
+                opencode_debug(&format!("  verify stdin write FAILED: {}", e));
+            }
+        }
+    }
     opencode_debug(&format!(
         "  spawned in {:?}, pid={:?}",
         spawn_start.elapsed(),
@@ -226,8 +260,32 @@ pub fn verify_completion_opencode(
     Ok(crate::services::claude::VerifyResult { complete, feedback })
 }
 
+/// OpenCode's data directory as its CLI resolves it (`opencode debug paths`):
+/// `$XDG_DATA_HOME/opencode` when that variable holds an absolute path,
+/// otherwise `~/.local/share/opencode`.
+fn opencode_xdg_data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
+        .map(|dir| dir.join("opencode"))
+}
+
 fn opencode_db_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    let data_dir = opencode_xdg_data_dir();
+    // opencode 2.x: OPENCODE_DB overrides the file name; a relative value is
+    // resolved against the data directory (`databasePath` in the CLI).
+    if let Some(db) =
+        std::env::var_os("OPENCODE_DB").filter(|value| !value.is_empty() && value != ":memory:")
+    {
+        let db = PathBuf::from(db);
+        if db.is_absolute() {
+            paths.push(db);
+        } else if let Some(data_dir) = data_dir.as_ref() {
+            paths.push(data_dir.join(db));
+        }
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         paths.push(
             PathBuf::from(local_app_data)
@@ -238,24 +296,85 @@ fn opencode_db_candidates() -> Vec<PathBuf> {
     if let Ok(app_data) = std::env::var("APPDATA") {
         paths.push(PathBuf::from(app_data).join("opencode").join("opencode.db"));
     }
+    if let Some(data_dir) = data_dir {
+        paths.push(data_dir.join("opencode.db"));
+    }
     if let Some(home) = dirs::home_dir() {
-        paths.push(
-            home.join(".local")
-                .join("share")
-                .join("opencode")
-                .join("opencode.db"),
-        );
+        let default = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        if !paths.contains(&default) {
+            paths.push(default);
+        }
     }
     paths
 }
 
-fn opencode_db_path() -> Option<PathBuf> {
+/// The SQLite database OpenCode uses: the path the installed CLI reports
+/// itself (`opencode debug paths`, which applies `OPENCODE_DB`,
+/// `XDG_DATA_HOME` and the platform defaults exactly as OpenCode does), or,
+/// for a CLI that cannot report it, the first existing conventional location.
+pub(crate) fn opencode_db_path() -> Option<PathBuf> {
+    if let Some(path) = opencode_reported_db_path() {
+        return Some(path);
+    }
     let candidates = opencode_db_candidates();
     candidates
         .iter()
         .find(|path| path.is_file())
         .cloned()
         .or_else(|| candidates.into_iter().next())
+}
+
+/// Upper bound for `opencode debug paths` (0.1–0.4s, measured).
+const DEBUG_PATHS_TIMEOUT: Duration = Duration::from_secs(10);
+
+static OPENCODE_REPORTED_DB: std::sync::Mutex<Option<(OpencodeBinaryStamp, PathBuf)>> =
+    std::sync::Mutex::new(None);
+
+/// The `db` path from `opencode debug paths`, remembered per binary (the
+/// environment it depends on does not change within this process).
+fn opencode_reported_db_path() -> Option<PathBuf> {
+    let bin = resolve_opencode_path()?;
+    let stamp = opencode_binary_stamp(&bin)?;
+    {
+        let cached = OPENCODE_REPORTED_DB
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_stamp, path)) = cached.as_ref() {
+            if cached_stamp == &stamp {
+                return Some(path.clone());
+            }
+        }
+    }
+    let mut cmd = Command::new(&bin);
+    cmd.args(["debug", "paths"])
+        .env("PATH", crate::services::claude::enhanced_path_for_bin(&bin));
+    let (status, stdout) = capture_cli_stdout(cmd, DEBUG_PATHS_TIMEOUT, "debug_paths")?;
+    if !status.success() {
+        opencode_debug(&format!("[debug_paths] exit code {:?}", status.code()));
+        return None;
+    }
+    let path = parse_debug_paths_db(&String::from_utf8_lossy(&stdout))?;
+    opencode_debug(&format!("[debug_paths] db={}", path.display()));
+    *OPENCODE_REPORTED_DB
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some((stamp, path.clone()));
+    Some(path)
+}
+
+/// The `db` row of `opencode debug paths` output (`db         /path/opencode.db`).
+fn parse_debug_paths_db(text: &str) -> Option<PathBuf> {
+    text.lines().find_map(|line| {
+        let rest = line.strip_prefix("db")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let path = rest.trim();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    })
 }
 
 fn set_opencode_busy_timeout(conn: &rusqlite::Connection, label: &str) {
@@ -341,6 +460,13 @@ fn ordered_table_columns(conn: &rusqlite::Connection, table: &str) -> Result<Vec
         return Err(format!("OpenCode table {} has no columns", table));
     }
     Ok(columns)
+}
+
+/// Whether an OpenCode database uses the 2.x schema: sessions in
+/// `session_v2`, their history in typed `session_message` rows. The 1.x
+/// `session` / `message` / `part` tables are gone in 2.x databases.
+pub(crate) fn opencode_db_is_v2(conn: &rusqlite::Connection) -> bool {
+    opencode_table_exists(conn, "session_v2").unwrap_or(false)
 }
 
 fn opencode_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
@@ -861,7 +987,8 @@ fn clone_opencode_session_rows(
 
 /// Clone an OpenCode session by copying its SQLite rows and remapping only the
 /// row identifiers/references that must be unique. The clone is then safe to
-/// resume through the normal serve/SSE execution path.
+/// resume through the normal serve/SSE execution path. opencode 2.x sessions
+/// are forked through OpenCode itself instead (see `clone_session_v2`).
 pub fn clone_session_for_schedule(
     source_session_id: &str,
     working_dir: &str,
@@ -872,6 +999,9 @@ pub fn clone_session_for_schedule(
     ));
     if !crate::services::process::is_valid_session_id(source_session_id) {
         return Err(format!("Invalid session_id format: {}", source_session_id));
+    }
+    if is_opencode_v2() {
+        return clone_session_v2(source_session_id, working_dir);
     }
     let db_path = opencode_db_path().ok_or_else(|| "Cannot locate OpenCode DB".to_string())?;
     if !db_path.is_file() {
@@ -897,6 +1027,102 @@ pub fn clone_session_for_schedule(
         source_session_id, new_session_id, messages, parts, events, todos
     ));
     Ok(new_session_id)
+}
+
+/// opencode 2.x keeps sessions as an event-sourced projection (`session_v2`,
+/// `session_message`, `event`, instruction state, ...), so copying rows is no
+/// longer a valid clone. Use OpenCode's own full-history fork instead. The
+/// fork is a new root session whose `fork_session_id` names the source.
+fn clone_session_v2(source_session_id: &str, working_dir: &str) -> Result<String, String> {
+    let forked = opencode_v2_api_request(
+        working_dir,
+        "POST",
+        &format!("/api/session/{}/fork", source_session_id),
+        "{}",
+    )?;
+    let data = forked
+        .get("data")
+        .ok_or_else(|| "OpenCode fork response has no data".to_string())?;
+    let new_session_id = data
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| crate::services::process::is_valid_session_id(id))
+        .ok_or_else(|| "OpenCode fork response has no valid session id".to_string())?
+        .to_string();
+    let forked_directory = data
+        .get("location")
+        .and_then(|location| location.get("directory"))
+        .and_then(Value::as_str);
+    // The fork keeps the source's directory. Relocate it when the schedule
+    // runs elsewhere; OpenCode applies a move before the next prompt.
+    let same_directory = forked_directory.is_some_and(|directory| {
+        directory == working_dir
+            || matches!(
+                (std::fs::canonicalize(directory), std::fs::canonicalize(working_dir)),
+                (Ok(left), Ok(right)) if left == right
+            )
+    });
+    if !same_directory {
+        let body = serde_json::to_string(&json!({ "directory": working_dir }))
+            .map_err(|e| format!("serialize: {}", e))?;
+        opencode_v2_api_request(
+            working_dir,
+            "POST",
+            &format!("/api/session/{}/move", new_session_id),
+            &body,
+        )
+        .map_err(|e| format!("OpenCode fork {} could not be moved: {}", new_session_id, e))?;
+    }
+    opencode_debug(&format!(
+        "[session-clone] forked OpenCode session {} -> {} (directory={:?})",
+        source_session_id, new_session_id, forked_directory
+    ));
+    Ok(new_session_id)
+}
+
+/// One request against a private opencode 2.x server via `opencode api
+/// --standalone`, which starts the server, authenticates and exits. Returns
+/// the JSON body of a successful response.
+fn opencode_v2_api_request(
+    working_dir: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<Value, String> {
+    let bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
+    let output = opencode_v2_command(&bin, working_dir)
+        .args(["api", "--standalone", method, path, "--data", body])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run opencode api: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        // Failures print the error body followed by an `HTTP <status>` line.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = format!("{} {}", stdout.trim(), stderr.trim());
+        return Err(format!(
+            "opencode api {} {} failed (exit {:?}): {}",
+            method,
+            path,
+            output.status.code(),
+            log_preview(detail.trim(), 500)
+        ));
+    }
+    let text = stdout.trim();
+    if text.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(text).map_err(|e| {
+        format!(
+            "opencode api {} {} returned invalid JSON: {} ({})",
+            method,
+            path,
+            e,
+            log_preview(text, 200)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1399,6 +1625,151 @@ pub fn is_opencode_available() -> bool {
     result
 }
 
+/// The binary a detected major version belongs to: its resolved path plus the
+/// size and mtime of the file it points to. `opencode upgrade` (and package
+/// managers) replace that file, so a long-running bot notices an upgrade from
+/// 1.x to 2.x on its next turn instead of driving 2.x with the 1.x protocol.
+#[derive(Clone, PartialEq, Eq)]
+struct OpencodeBinaryStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn opencode_binary_stamp(bin: &str) -> Option<OpencodeBinaryStamp> {
+    let path = std::fs::canonicalize(bin).ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    Some(OpencodeBinaryStamp {
+        path,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+static OPENCODE_MAJOR_VERSION: std::sync::Mutex<Option<(OpencodeBinaryStamp, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Major version of the installed OpenCode CLI. 2.x replaced the HTTP API,
+/// the `run` flags and the SQLite schema, so every integration point branches
+/// on it. An unreadable version is treated as the current major line and is
+/// not remembered, so the next call asks again.
+fn opencode_major_version() -> u64 {
+    let bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
+    let stamp = opencode_binary_stamp(&bin);
+    if let Some(stamp) = stamp.as_ref() {
+        let cached = OPENCODE_MAJOR_VERSION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((cached_stamp, major)) = cached {
+            if &cached_stamp == stamp {
+                return major;
+            }
+        }
+    }
+    let version = Command::new(&bin)
+        .arg("--version")
+        .env("PATH", crate::services::claude::enhanced_path_for_bin(&bin))
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_opencode_major_version(&String::from_utf8_lossy(&output.stdout)));
+    opencode_debug(&format!(
+        "[opencode_major_version] bin={} major={:?}",
+        bin, version
+    ));
+    match (version, stamp) {
+        (Some(major), Some(stamp)) => {
+            *OPENCODE_MAJOR_VERSION
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some((stamp, major));
+            major
+        }
+        (Some(major), None) => major,
+        (None, _) => 2,
+    }
+}
+
+/// Parse the major version from `opencode --version` output: `1.15.5` (1.x)
+/// or `opencode v2.0.24` (2.x).
+fn parse_opencode_major_version(text: &str) -> Option<u64> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    text[start..]
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn is_opencode_v2() -> bool {
+    opencode_major_version() >= 2
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::{
+        opencode_binary_stamp, parse_debug_paths_db, parse_opencode_major_version, RunExitSignal,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn debug_paths_db_row_is_parsed() {
+        let output = "home       /home/u\ndata       /home/u/.local/share/opencode\n\
+                      db         /home/u/.local/share/opencode/opencode.db\n";
+        assert_eq!(
+            parse_debug_paths_db(output),
+            Some(std::path::PathBuf::from(
+                "/home/u/.local/share/opencode/opencode.db"
+            ))
+        );
+        // Rows whose label only starts with "db" are not the database.
+        assert_eq!(parse_debug_paths_db("dbg        /x\n"), None);
+        assert_eq!(parse_debug_paths_db("data       /x\n"), None);
+    }
+
+    #[test]
+    fn run_exit_signal_wakes_a_waiter_and_times_out_otherwise() {
+        let signal = std::sync::Arc::new(RunExitSignal::default());
+        assert!(!signal.wait(Duration::from_millis(20)));
+        let marker = signal.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            marker.mark();
+        });
+        assert!(signal.wait(Duration::from_secs(5)));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn major_version_is_read_from_both_cli_formats() {
+        assert_eq!(parse_opencode_major_version("opencode v2.0.24\n"), Some(2));
+        assert_eq!(parse_opencode_major_version("1.15.5\n"), Some(1));
+        assert_eq!(parse_opencode_major_version("opencode v10.1.0"), Some(10));
+        assert_eq!(parse_opencode_major_version("unknown"), None);
+    }
+
+    #[test]
+    fn binary_stamp_changes_when_the_binary_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("opencode");
+        std::fs::write(&bin, b"1.x").unwrap();
+        let link = dir.path().join("opencode-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bin, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&bin, &link).unwrap();
+        let before = opencode_binary_stamp(link.to_str().unwrap()).unwrap();
+        assert!(before == opencode_binary_stamp(link.to_str().unwrap()).unwrap());
+        // An upgrade replaces the file behind the (unchanged) command path.
+        std::fs::write(&bin, b"2.x binary").unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&bin, &link).unwrap();
+        assert!(before != opencode_binary_stamp(link.to_str().unwrap()).unwrap());
+        assert!(opencode_binary_stamp(dir.path().join("missing").to_str().unwrap()).is_none());
+    }
+}
+
 /// Check if a model string refers to the OpenCode backend
 pub fn is_opencode_model(model: Option<&str>) -> bool {
     let result = model
@@ -1432,39 +1803,123 @@ pub fn strip_opencode_prefix(model: &str) -> Option<&str> {
 
 static OPENCODE_MODELS: OnceLock<Vec<String>> = OnceLock::new();
 
+/// Attempts for one `list_models` call. OpenCode 2.x answers `opencode models`
+/// from a model snapshot that may precede provider plugin settlement, so a
+/// freshly started server can briefly report no models at all.
+const LIST_MODELS_ATTEMPTS: usize = 3;
+const LIST_MODELS_RETRY_DELAY: Duration = Duration::from_millis(1500);
+/// Upper bound for one `opencode models` run. In 2.x the command asks the
+/// shared background service, starting it when needed; when that service
+/// cannot start, the CLI itself gives up after about 20s (measured). This
+/// bound only stops a run that never returns.
+const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetch available models by running `opencode models`.
-/// Result is cached for the process lifetime.
+/// A non-empty result is cached for the process lifetime; an empty one is
+/// not, so a later call can still pick the models up.
 pub fn list_models() -> &'static [String] {
-    OPENCODE_MODELS.get_or_init(|| {
-        opencode_debug("[list_models] fetching model list...");
-        let bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
-        let output = match Command::new(&bin).args(["models"]).output() {
-            Ok(o) => o,
-            Err(e) => {
-                opencode_debug(&format!("[list_models] FAILED to run '{}': {}", bin, e));
-                return Vec::new();
-            }
-        };
-        if !output.status.success() {
-            opencode_debug(&format!(
-                "[list_models] exit code {:?}",
-                output.status.code()
-            ));
-            return Vec::new();
+    if let Some(models) = OPENCODE_MODELS.get() {
+        return models;
+    }
+    let mut models = Vec::new();
+    for attempt in 0..LIST_MODELS_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(LIST_MODELS_RETRY_DELAY);
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let models: Vec<String> = stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('{'))
-            .collect();
-        opencode_debug(&format!(
-            "[list_models] found {} models: {:?}",
-            models.len(),
-            models
-        ));
+        match fetch_models_once() {
+            Some(found) if !found.is_empty() => {
+                models = found;
+                break;
+            }
+            // Ran fine but listed nothing yet: retry.
+            Some(_) => {}
+            // Failed or timed out: another run would only repeat the wait.
+            None => break,
+        }
+    }
+    if models.is_empty() {
+        return &[];
+    }
+    OPENCODE_MODELS.get_or_init(|| models)
+}
+
+/// Run an OpenCode CLI command with stdin closed and stdout captured, killing
+/// its process group when it outlives `timeout`. `None` when it could not run
+/// or timed out; otherwise its exit status and stdout.
+fn capture_cli_stdout(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::services::claude::detach_into_own_pgroup(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            opencode_debug(&format!("[{}] FAILED to run: {}", label, e));
+            return None;
+        }
+    };
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stdout) = stdout {
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut bytes);
+        }
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            outcome => {
+                match outcome {
+                    Err(e) => opencode_debug(&format!("[{}] wait failed: {}", label, e)),
+                    _ => opencode_debug(&format!(
+                        "[{}] timed out after {}s",
+                        label,
+                        timeout.as_secs()
+                    )),
+                }
+                kill_child_tree(&mut child);
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    Some((status, reader.join().unwrap_or_default()))
+}
+
+/// One `opencode models` run: `None` when it failed or timed out, otherwise
+/// the listed models (possibly none).
+fn fetch_models_once() -> Option<Vec<String>> {
+    opencode_debug("[list_models] fetching model list...");
+    let bin = resolve_opencode_path().unwrap_or_else(|| "opencode".to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("models");
+    let (status, stdout) = capture_cli_stdout(cmd, LIST_MODELS_TIMEOUT, "list_models")?;
+    if !status.success() {
+        opencode_debug(&format!("[list_models] exit code {:?}", status.code()));
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&stdout);
+    let models: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('{'))
+        .collect();
+    opencode_debug(&format!(
+        "[list_models] found {} models: {:?}",
+        models.len(),
         models
-    })
+    ));
+    Some(models)
 }
 
 // ============================================================
@@ -3601,6 +4056,16 @@ fn build_opencode_command(
         "[build_cmd] bin={} working_dir={} session_id={:?} model={:?}",
         opencode_bin, working_dir, session_id, model
     ));
+    if is_opencode_v2() {
+        let cmd = build_opencode_v2_run_command(
+            &opencode_bin,
+            session_id,
+            working_dir,
+            model,
+            fork_session,
+        );
+        return (cmd, None);
+    }
 
     let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
 
@@ -3658,6 +4123,222 @@ fn build_opencode_command(
     (cmd, sp_path)
 }
 
+/// `opencode run` for the 2.x CLI, which differs from 1.x in ways that break
+/// the 1.x invocation outright:
+/// - `--dir` no longer exists (the CLI rejects the whole command). The run
+///   directory is `$PWD`, falling back to the process cwd, so both are set.
+/// - Without `--standalone` the client attaches to the shared background
+///   service, where neither our environment nor our process-tree kill applies.
+///   `--standalone` runs a private server as a child of this process.
+/// - `OPENCODE_PERMISSION` is gone. `--auto` approves permission requests that
+///   are not explicitly denied (1.x: `"*": "allow"`); questions are cancelled
+///   by the CLI itself with model-visible feedback, so nothing blocks.
+/// - Piped stdin is always read and appended to the message arguments, which
+///   are re-joined with quotes, so the prompt is sent through stdin only.
+fn build_opencode_v2_run_command(
+    opencode_bin: &str,
+    session_id: Option<&str>,
+    working_dir: &str,
+    model: Option<&str>,
+    fork_session: bool,
+) -> Command {
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--standalone".into(),
+        "--auto".into(),
+        "--format".into(),
+        "json".into(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.to_string());
+    }
+    if let Some(sid) = session_id {
+        args.push("--session".into());
+        args.push(sid.to_string());
+        if fork_session {
+            args.push("--fork".into());
+        }
+    }
+    opencode_debug(&format!(
+        "[build_cmd] v2 full args: {} {}",
+        opencode_bin,
+        args.join(" ")
+    ));
+
+    let mut cmd = opencode_v2_command(opencode_bin, working_dir);
+    cmd.args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::services::claude::detach_into_own_pgroup(&mut cmd);
+    cmd
+}
+
+/// Upper bound on how long `/stop` waits for an opencode 2.x `run` process to
+/// interrupt its session and exit after SIGINT (0.3s, measured) before the
+/// process tree is killed regardless.
+const V2_RUN_INTERRUPT_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Set once the reader of a `run` process's stdout is done, i.e. the process
+/// has exited (its private server does not share that pipe) or was killed.
+#[derive(Default)]
+struct RunExitSignal {
+    exited: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl RunExitSignal {
+    fn mark(&self) {
+        *self.exited.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait until marked, at most `timeout`; whether it was marked.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = self.exited.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .changed
+            .wait_timeout_while(guard, timeout, |exited| !*exited)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+}
+
+/// Marks a `RunExitSignal` on every way out of the reader.
+struct RunExitGuard(Arc<RunExitSignal>);
+
+impl Drop for RunExitGuard {
+    fn drop(&mut self) {
+        self.0.mark();
+    }
+}
+
+/// Ask an opencode 2.x `run` process to stop its session. OpenCode records an
+/// execution claim on the session and every server resumes still-claimed
+/// background work at startup, so a killed run could leave work to come back
+/// later. `run` answers SIGINT with a session interrupt, which settles the
+/// turn and the claim, and then exits. Only the run process itself is
+/// signalled: its private server must stay up to receive that interrupt.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn signal_v2_run_interrupt(pid: u32) {
+    // Safety: kill(2) takes only C integers; ESRCH for a gone process is ignored.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_v2_run_interrupt(_pid: u32) {
+    // No SIGINT equivalent for a detached console process; the caller's
+    // tree kill is the only stop available.
+}
+
+/// `/stop`'s pre-kill hook for an opencode 2.x `run`: interrupt, then wait
+/// for the process to exit (signalled by its stdout reader) instead of
+/// sleeping a fixed time.
+fn interrupt_v2_run(pid: u32, exit: &RunExitSignal) {
+    signal_v2_run_interrupt(pid);
+    if cfg!(unix) && !exit.wait(V2_RUN_INTERRUPT_DEADLINE) {
+        opencode_debug("[stream] run did not exit after SIGINT before the deadline");
+    }
+}
+
+/// Wait for a `run` child that was asked to interrupt to exit on its own, at
+/// most `V2_RUN_INTERRUPT_DEADLINE`.
+fn wait_v2_run_exit(child: &mut std::process::Child) {
+    let deadline = Instant::now() + V2_RUN_INTERRUPT_DEADLINE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            _ => return,
+        }
+    }
+    opencode_debug("[stream] run did not exit after SIGINT before the deadline");
+}
+
+/// Whether the Assistant message `message_id` is the complete answer that
+/// closed session `session_id`'s latest turn, read from OpenCode's own record:
+/// the turn ended with `idle(outcome: succeeded)`, no Assistant message came
+/// after it, and its finish is `stop`. `run --format json` never reports the
+/// final step's finish itself.
+fn opencode_v2_message_is_final_answer(session_id: &str, message_id: &str) -> Result<bool, String> {
+    let db_path = opencode_db_path().ok_or_else(|| "Cannot locate OpenCode DB".to_string())?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("Failed to open OpenCode DB {}: {}", db_path.display(), e))?;
+    set_opencode_busy_timeout(&conn, "final answer");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data FROM session_message WHERE session_id = ?1 \
+             ORDER BY seq DESC LIMIT 200",
+        )
+        .map_err(|e| format!("Failed to query OpenCode messages: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query OpenCode messages: {}", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read OpenCode messages: {}", e))?;
+    let mut newest = rows.iter();
+    let Some((_, kind, data)) = newest.next() else {
+        return Ok(false);
+    };
+    let outcome = serde_json::from_str::<Value>(data).ok().and_then(|data| {
+        data.get("outcome")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    if kind != "idle" || outcome.as_deref() != Some("succeeded") {
+        return Ok(false);
+    }
+    let Some((id, _, data)) = newest.find(|(_, kind, _)| kind == "assistant") else {
+        return Ok(false);
+    };
+    let finish = serde_json::from_str::<Value>(data).ok().and_then(|data| {
+        data.get("finish")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    Ok(id == message_id && finish.as_deref() == Some("stop"))
+}
+
+/// Clears a cancel token's pre-kill hook when the guarded work ends, so a
+/// later cancellation never runs a hook for a process or server that is gone.
+struct PreKillHookGuard(Option<Arc<CancelToken>>);
+
+impl PreKillHookGuard {
+    fn new(token: Option<Arc<CancelToken>>) -> Self {
+        Self(token)
+    }
+}
+
+impl Drop for PreKillHookGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.0.take() {
+            token.clear_pre_kill_hook();
+        }
+    }
+}
+
+/// Base command for an opencode 2.x CLI invocation that must operate on
+/// `working_dir`: the CLI resolves its directory from `$PWD` before the
+/// process cwd, and the inherited `$PWD` names cokacdir's own directory.
+fn opencode_v2_command(opencode_bin: &str, working_dir: &str) -> Command {
+    let mut cmd = Command::new(opencode_bin);
+    cmd.current_dir(working_dir).env("PWD", working_dir).env(
+        "PATH",
+        crate::services::claude::enhanced_path_for_bin(opencode_bin),
+    );
+    cmd
+}
+
 // ============================================================
 // Parse opencode JSONL events → StreamMessage
 // ============================================================
@@ -3703,6 +4384,12 @@ fn normalize_tool_name(name: &str) -> String {
         "repo_overview" => "RepoOverview",
         "invalid" => "Invalid",
         "apply_patch" => "Edit",
+        // ── opencode 2.x tool IDs (packages/core/src/tool/plugin/*.ts) ──
+        "shell" => "Bash",
+        "subagent" => "Task",
+        "patch" => "Edit",
+        // Code mode: the model calls tools from a script it passes here.
+        "execute" => "Execute",
         // ── Legacy aliases (older opencode / Claude-Code parity) ──
         "notebookedit" => "NotebookEdit",
         "list" => "Glob",
@@ -3732,12 +4419,13 @@ fn normalize_tool_name(name: &str) -> String {
 /// tool calls coming from opencode.
 ///
 /// Per-tool key map (opencode wire key → cokacdir canonical key):
-/// - `read`  : filePath → file_path
-/// - `write` : filePath → file_path
-/// - `edit`  : filePath → file_path, oldString → old_string, newString → new_string, replaceAll → replace_all
+/// - `read`  : filePath / path (2.x) → file_path
+/// - `write` : filePath / path (2.x) → file_path
+/// - `edit`  : filePath / path (2.x) → file_path, oldString → old_string, newString → new_string, replaceAll → replace_all
 /// - `grep`  : include → glob
-/// - `apply_patch` : synth file_path from `*** Add/Update/Delete File:` line
-/// - `skill` : name → skill
+/// - `apply_patch` / `patch` (2.x) : synth file_path from `*** Add/Update/Delete File:` line
+/// - `skill` : name / id (2.x) → skill
+/// - `subagent` (2.x) : agent → subagent_type
 ///
 /// Other opencode tools (`bash`, `glob`, `webfetch`, `websearch`, `task`,
 /// `task_status`, `lsp`, `repo_clone`, `repo_overview`, `question`,
@@ -3762,14 +4450,18 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
     }
 
     match tool {
+        // opencode 2.x names the file argument `path` instead of `filePath`.
         "read" => {
             rename(&mut out, "filePath", "file_path");
+            rename(&mut out, "path", "file_path");
         }
         "write" => {
             rename(&mut out, "filePath", "file_path");
+            rename(&mut out, "path", "file_path");
         }
         "edit" => {
             rename(&mut out, "filePath", "file_path");
+            rename(&mut out, "path", "file_path");
             rename(&mut out, "oldString", "old_string");
             rename(&mut out, "newString", "new_string");
             rename(&mut out, "replaceAll", "replace_all");
@@ -3788,7 +4480,8 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
             // `file_path` like the other file-touching tools.
             rename(&mut out, "filePath", "file_path");
         }
-        "apply_patch" => {
+        // `patch` is the opencode 2.x name of the same patch-text tool.
+        "apply_patch" | "patch" => {
             // Extract file_path from patchText for display
             if let Some(patch) = out.get("patchText").and_then(|v| v.as_str()) {
                 let file_path = patch.lines().find_map(|l| {
@@ -3803,6 +4496,12 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
         }
         "skill" => {
             rename(&mut out, "name", "skill");
+            // opencode 2.x selects the skill by `id`.
+            rename(&mut out, "id", "skill");
+        }
+        // opencode 2.x subagent tool: `agent` is the Task tool's subagent type.
+        "subagent" => {
+            rename(&mut out, "agent", "subagent_type");
         }
         _ => {}
     }
@@ -3967,9 +4666,11 @@ pub fn execute_command(
 
     let (mut cmd, _sp_path) = build_opencode_command(session_id, working_dir, None, model, false);
 
-    // When --model is specified, opencode ignores stdin → must use positional arg.
-    // When no --model, stdin works and avoids shell arg size limits.
-    let use_positional = model.is_some();
+    // opencode 1.x: when --model is specified, opencode ignores stdin → must
+    // use positional arg. When no --model, stdin works and avoids shell arg
+    // size limits. opencode 2.x always reads piped stdin (see
+    // build_opencode_v2_run_command), so it never needs the positional form.
+    let use_positional = model.is_some() && !is_opencode_v2();
     if use_positional {
         opencode_debug(&format!(
             "[execute_command] using positional arg (--model set), prompt_len={}",
@@ -4277,6 +4978,8 @@ pub fn execute_command(
 /// - Otherwise use the SSE path, which keeps the opencode instance alive for
 ///   the whole turn and correctly handles oh-my-opencode's background tasks
 ///   by waiting for all child sessions and todos to settle before returning.
+///   An opencode 2.x CLI gets the 2.x server adapter (`opencode_v2.rs`),
+///   which likewise waits for background subagents.
 pub fn execute_command_streaming(
     prompt: &str,
     session_id: Option<&str>,
@@ -4323,7 +5026,20 @@ pub fn execute_command_streaming(
             let working_dir = working_dir.to_string();
             let system_prompt = system_prompt.map(|s| s.to_string());
             let model = model.map(|s| s.to_string());
+            let is_v2 = is_opencode_v2();
             handle.block_on(async move {
+                if is_v2 {
+                    return v2::execute_command_streaming_serve(
+                        &prompt,
+                        session_id.as_deref(),
+                        &working_dir,
+                        sender,
+                        system_prompt.as_deref(),
+                        cancel_token,
+                        model.as_deref(),
+                    )
+                    .await;
+                }
                 execute_command_streaming_serve(
                     &prompt,
                     session_id.as_deref(),
@@ -4409,9 +5125,11 @@ fn execute_command_streaming_legacy(
     let (mut cmd, _sp_path) =
         build_opencode_command(session_id, working_dir, None, model, fork_session);
 
-    // When --model is specified, opencode ignores stdin → must use positional arg.
-    // When no --model, stdin works and avoids shell arg size limits.
-    let use_positional = model.is_some();
+    // opencode 1.x: when --model is specified, opencode ignores stdin → must
+    // use positional arg. When no --model, stdin works and avoids shell arg
+    // size limits. opencode 2.x always reads piped stdin (see
+    // build_opencode_v2_run_command), so it never needs the positional form.
+    let use_positional = model.is_some() && !is_opencode_v2();
     if use_positional {
         opencode_debug(&format!(
             "[stream] using positional arg (--model set), prompt_len={}",
@@ -4437,6 +5155,20 @@ fn execute_command_streaming_legacy(
         format!("Failed to start opencode: {}", e)
     })?;
     opencode_debug(&format!("[stream] spawned PID={}", child.id()));
+
+    // opencode 2.x: /stop must reach the session through `run`'s own SIGINT
+    // handler before the process tree is killed (see interrupt_v2_run).
+    let is_v2 = is_opencode_v2();
+    let _pre_kill_hook_guard = PreKillHookGuard::new(cancel_token.clone());
+    let run_exit = Arc::new(RunExitSignal::default());
+    let _run_exit_guard = RunExitGuard(run_exit.clone());
+    if is_v2 {
+        if let Some(ref token) = cancel_token {
+            let pid = child.id();
+            let exit = run_exit.clone();
+            token.set_pre_kill_hook(Box::new(move || interrupt_v2_run(pid, &exit)));
+        }
+    }
 
     // Store PID for cancel. Recover from a poisoned mutex (a prior holder
     // panicked) instead of silently dropping the PID — without it stored,
@@ -4501,12 +5233,28 @@ fn execute_command_streaming_legacy(
     let mut last_event_type = String::new();
     let mut last_finish_reason: Option<String> = None;
     let mut last_output_tokens: Option<u64> = None;
+    // opencode 2.x: the Assistant message the last text belongs to, whose
+    // recorded finish decides whether the answer is complete.
+    let mut last_text_message_id: Option<String> = None;
 
     for line in reader.lines() {
         // Check cancel
         if let Some(ref token) = cancel_token {
             if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 opencode_debug("[stream] cancelled during event loop, killing");
+                // opencode 2.x: let `run` interrupt its session before its
+                // tree is killed. The hook is still installed only when
+                // cancel_now is not already signalling; either way this
+                // thread owns the child, so it waits for the exit here
+                // (running the hook here would wait for this very reader).
+                let hook = token.take_pre_kill_hook();
+                if is_v2 && cfg!(unix) {
+                    if hook.is_some() {
+                        signal_v2_run_interrupt(child.id());
+                    }
+                    wait_v2_run_exit(&mut child);
+                }
+                drop(hook);
                 kill_child_tree(&mut child);
                 let _ = child.wait();
                 return Ok(());
@@ -4600,6 +5348,13 @@ fn execute_command_streaming_legacy(
                         log_preview(&text, 100),
                         final_result.len() + text.len()
                     ));
+                    if let Some(message_id) = json
+                        .get("part")
+                        .and_then(|part| part.get("messageID"))
+                        .and_then(Value::as_str)
+                    {
+                        last_text_message_id = Some(message_id.to_string());
+                    }
                     final_result.push_str(&text);
                     terminal_result.push_str(&text);
                     if sender.send(StreamMessage::Text { content: text }).is_err() {
@@ -4761,6 +5516,8 @@ fn execute_command_streaming_legacy(
 
     opencode_debug(&format!("[stream] event loop ended: events={} text_events={} tool_events={} got_done={} result_len={}",
         event_count, text_event_count, tool_event_count, got_done, final_result.len()));
+    // stdout reached end of file: the run process has exited.
+    run_exit.mark();
 
     // Check cancel before waiting
     if let Some(ref token) = cancel_token {
@@ -4773,10 +5530,17 @@ fn execute_command_streaming_legacy(
     }
 
     opencode_debug("[stream] waiting for process exit...");
+    // The process is about to be reaped; its PID must not be signalled after.
+    if let Some(ref token) = cancel_token {
+        token.clear_pre_kill_hook();
+    }
     let status = child.wait().map_err(|e| {
         opencode_debug(&format!("[stream] wait FAILED: {}", e));
         format!("Process error: {}", e)
     })?;
+    if let Some(ref token) = cancel_token {
+        token.clear_child_pid(child.id());
+    }
 
     // Collect stderr drained by the background thread.
     let stderr_msg = stderr_thread
@@ -4799,14 +5563,19 @@ fn execute_command_streaming_legacy(
 
     // Tentative stdout_error: opencode publishes a session.error event even for
     // recoverable conditions like ContextOverflowError, which then triggers
-    // auto-compaction and continues the session successfully. If, by the time the
-    // stream ends, we have accumulated real output or seen a final step_finish, the
-    // earlier error was transient and must not poison the result.
-    if !stdout_read_failed
-        && stdout_error.is_some()
-        && (got_done || !final_result.is_empty() || text_event_count > 0)
-    {
-        opencode_debug("[stream] transient stdout error ignored — subsequent output succeeded");
+    // auto-compaction and continues the session successfully.
+    // - opencode 2.x: `run`'s exit status is the verdict. A clean exit means
+    //   every reported error was recovered from; a failed turn exits non-zero
+    //   and its last error event says why.
+    // - 1.x: the exit status does not tell, so real output or a final
+    //   step_finish after the error marks it as transient.
+    let error_was_recovered = if is_v2 {
+        status.success()
+    } else {
+        got_done || !final_result.is_empty() || text_event_count > 0
+    };
+    if !stdout_read_failed && stdout_error.is_some() && error_was_recovered {
+        opencode_debug("[stream] transient stdout error ignored — the turn recovered");
         stdout_error = None;
     }
 
@@ -4844,6 +5613,30 @@ fn execute_command_streaming_legacy(
             exit_code: status.code(),
         });
         return Ok(());
+    }
+
+    // opencode 2.x's `run` prints the final step through a post-idle
+    // reconciliation that never re-emits that step's `step_finish`, so the
+    // stream cannot tell a complete answer from a truncated or filtered one.
+    // OpenCode's own record of the session can: only a `stop` finish that
+    // closed the turn is a complete answer.
+    if is_v2 {
+        got_done = match (last_session_id.as_deref(), last_text_message_id.as_deref()) {
+            (Some(session_id), Some(message_id)) => {
+                match opencode_v2_message_is_final_answer(session_id, message_id) {
+                    Ok(is_final) => is_final,
+                    Err(e) => {
+                        opencode_debug(&format!(
+                            "[stream] final answer check unavailable, answer kept non-durable: {}",
+                            e
+                        ));
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        opencode_debug(&format!("[stream] v2 recorded final answer: {}", got_done));
     }
 
     // Publish exactly one terminal sequence, and only after successful exit.
@@ -6285,12 +7078,22 @@ async fn handle_sse_event(
                         .map(|v| normalize_opencode_params(tool_raw, v))
                         .unwrap_or(Value::Null);
                     let input_str = serde_json::to_string(&input_json).unwrap_or_default();
-                    let output_str = state
-                        .and_then(|s| s.get("output"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     let is_error = status == "error";
+                    // An errored tool carries its text in `state.error`, not
+                    // `state.output` (same as parse_tool_use).
+                    let output_str = if is_error {
+                        state
+                            .and_then(|s| s.get("error"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Tool error")
+                            .to_string()
+                    } else {
+                        state
+                            .and_then(|s| s.get("output"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
                     if !send_serve_stream_message(
                         sender,
                         StreamMessage::ToolUse {

@@ -62,6 +62,7 @@ fn remote_child_path(parent: &str, name: &str) -> String {
 }
 
 const REMOTE_DELETE_HELPER: &str = include_str!("remote_delete.py");
+const REMOTE_DELETE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn remote_delete_command(request: &serde_json::Value) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -92,6 +93,7 @@ async fn run_remote_delete_helper(
     let mut output = Vec::new();
     let mut errors = Vec::new();
     let mut status = None;
+    let mut refused = false;
     while let Some(message) = channel.wait().await {
         let append = |buffer: &mut Vec<u8>, data: &[u8]| {
             let remaining = 16_384usize.saturating_sub(buffer.len());
@@ -101,8 +103,22 @@ async fn run_remote_delete_helper(
             ChannelMsg::Data { data } => append(&mut output, &data),
             ChannelMsg::ExtendedData { data, ext: 1 } => append(&mut errors, &data),
             ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+            // The exec request is the only request on this channel that asks
+            // for a reply, so a failure means the server refused the command
+            // (the channel may stay open, so stop waiting for it).
+            ChannelMsg::Failure => {
+                refused = true;
+                break;
+            }
             _ => {}
         }
+    }
+    if refused {
+        let _ = channel.close().await;
+        return Err(
+            "Safe remote deletion requires an SSH command session and POSIX Python 3; the server refused to run the deletion helper"
+                .to_string(),
+        );
     }
     if status == Some(0)
         && String::from_utf8_lossy(&output)
@@ -1582,7 +1598,16 @@ impl SftpSession {
             use tokio::io::AsyncWriteExt;
 
             // Check availability before creating sidecars or moving any source.
-            run_remote_delete_helper(ssh, &serde_json::json!({"probe": true})).await?;
+            // Bound the probe so an unresponsive server cannot block forever.
+            tokio::time::timeout(
+                REMOTE_DELETE_PROBE_TIMEOUT,
+                run_remote_delete_helper(ssh, &serde_json::json!({"probe": true})),
+            )
+            .await
+            .map_err(|_| {
+                "Safe remote deletion requires an SSH command session and POSIX Python 3; the availability check timed out"
+                    .to_string()
+            })??;
             let parent = sftp.canonicalize(remote_upload_parent(path)?).await
                 .map_err(|error| format!("Cannot resolve deletion parent: {error}"))?;
             let parent_identity = sftp_verify_staging_parent(sftp, &parent).await?;

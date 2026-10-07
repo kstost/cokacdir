@@ -3499,6 +3499,15 @@ impl PrivateStagingDirectory {
         let bound_handle = match open_private_staging_directory(&path) {
             Ok(handle) => handle,
             Err(error) => {
+                if remove_unfinished_private_staging_directory(&path, None) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Created private staging directory could not be bound safely and was removed: {}",
+                            error
+                        ),
+                    ));
+                }
                 return Err(io::Error::new(
                     error.kind(),
                     format!(
@@ -3515,6 +3524,15 @@ impl PrivateStagingDirectory {
             )));
         }
         if let Err(error) = sync_parent(&path) {
+            if remove_unfinished_private_staging_directory(&path, Some(bound_handle)) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Created private staging directory could not be made durable and was removed: {}",
+                        error
+                    ),
+                ));
+            }
             return Err(io::Error::new(
                 error.kind(),
                 format!(
@@ -3554,6 +3572,31 @@ impl PrivateStagingDirectory {
         drop(bound_handle);
         cleanup_private_staging_directory(&path, current)
     }
+}
+
+/// Remove a just-created private staging directory whose setup failed. A
+/// bound directory must still be named by `path`; an unbound one must still be
+/// a real directory. rmdir removes only an empty directory and never follows a
+/// link, so a replacement or any added content is preserved.
+fn remove_unfinished_private_staging_directory(path: &Path, bound_handle: Option<File>) -> bool {
+    match bound_handle {
+        Some(handle) => {
+            if !matches!(path_still_names_open_object(path, &handle), Ok(true)) {
+                return false;
+            }
+            // As in cleanup, close the identity handle before removal.
+            drop(handle);
+        }
+        None => {
+            if !matches!(
+                fs::symlink_metadata(path),
+                Ok(metadata) if metadata.is_dir() && !metadata.is_symlink()
+            ) {
+                return false;
+            }
+        }
+    }
+    fs::remove_dir(path).is_ok()
 }
 
 #[cfg(unix)]
@@ -7475,7 +7518,8 @@ pub fn move_files_with_progress(
 
         // A same-filesystem overwrite first isolates the exact
         // source object under the target parent, then transactionally installs
-        // that staging name. EXDEV is rejected before any destination change.
+        // that staging name. EXDEV is detected before any destination change
+        // and then uses the copy path.
         if overwriting {
             let destination_identity =
                 destination_identity.expect("overwrite destination identity was captured");
@@ -7513,6 +7557,31 @@ pub fn move_files_with_progress(
                             completed_bytes,
                             total_bytes,
                         ));
+                    }
+                    Err(failure) if !failure.terminal && is_cross_device_error(&failure.error) => {
+                        // Equal st_dev does not guarantee that rename can cross
+                        // mount points, e.g. two bind mounts of one filesystem.
+                        // The rejected staging rename changed nothing; rebind
+                        // the confirmed destination and use the copy path.
+                        match authorized_current_identity(
+                            &dest,
+                            &destination_before,
+                            "Overwrite destination",
+                        ) {
+                            Ok(destination_identity) => needs_copy.push_back((
+                                src,
+                                dest,
+                                item_size,
+                                true,
+                                source_identity,
+                                Some(destination_identity),
+                            )),
+                            Err(error) => {
+                                failure_count += 1;
+                                let _ = progress_tx
+                                    .send(ProgressMessage::Error(filename, error.to_string()));
+                            }
+                        }
                     }
                     Err(failure) => {
                         failure_count += 1;
@@ -8560,7 +8629,10 @@ fn rename_file_detailed(
             ));
         }
     }
-    if path_exists_no_follow(new_path) {
+    // A case-insensitive filesystem resolves a case-only new name to the
+    // source entry itself. Every distinct existing entry is still refused.
+    let case_only = path_exists_no_follow(new_path);
+    if case_only && !names_same_entry_differently(old_path, new_path) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "Target already exists",
@@ -8573,14 +8645,18 @@ fn rename_file_detailed(
         }
         None => path_identity(old_path)?,
     };
-    rename_noreplace(old_path, new_path)?;
+    let mut warnings = if case_only {
+        rename_case_only_via_private_staging(old_path, new_path, &expected)?
+    } else {
+        rename_noreplace(old_path, new_path)?;
+        Vec::new()
+    };
     let relocated = match path_identity(new_path) {
         Ok(current) if current.matches_after_relocation(&expected) => {
             Some(PathAuthorization::from_identity(&current))
         }
         _ => None,
     };
-    let mut warnings = Vec::new();
     if let Err(error) = sync_parent(new_path) {
         warnings.push(format!(
             "Rename committed at '{}', but destination-directory durability could not be confirmed: {}",
@@ -8607,6 +8683,77 @@ fn rename_file_detailed(
             true,
         ))
     }
+}
+
+/// True when `new_path` is not a distinct directory entry, but another
+/// spelling that the filesystem resolves to the `old_path` object, such as a
+/// case-only change on a case-insensitive filesystem. An entry listed under
+/// the exact new name, including a hard link to the source, is never matched.
+fn names_same_entry_differently(old_path: &Path, new_path: &Path) -> bool {
+    let (Some(parent), Some(old_name), Some(new_name)) = (
+        old_path.parent(),
+        old_path.file_name(),
+        new_path.file_name(),
+    ) else {
+        return false;
+    };
+    if new_path.parent() != Some(parent) || old_name == new_name {
+        return false;
+    }
+    if !matches!(
+        (stable_path_identity(old_path), stable_path_identity(new_path)),
+        (Ok(source), Ok(target)) if source == target
+    ) {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name().as_os_str() != new_name => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Rename the verified source to another spelling of its own name. The exact
+/// source is first isolated at an unpublished private name in the same
+/// directory, then published at the new name with the same no-clobber
+/// primitive. A failure restores the original name without clobbering.
+fn rename_case_only_via_private_staging(
+    old_path: &Path,
+    new_path: &Path,
+    expected: &PathIdentity,
+) -> io::Result<Vec<String>> {
+    let parent = old_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_directory = PrivateStagingDirectory::create(parent, "rename-stage")?;
+    let staging = staging_directory.payload();
+    if let Err(error) = rename_noreplace(old_path, &staging) {
+        return Err(error_with_staging_cleanup(error, staging_directory));
+    }
+    let staged = match path_identity(&staging) {
+        Ok(identity) if identity.matches_after_relocation(expected) => Ok(()),
+        Ok(_) => Err(io::Error::other(
+            "Source changed while it was moved to rename staging",
+        )),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = staged.and_then(|()| rename_noreplace(&staging, new_path)) {
+        let error =
+            restore_staged_directory_after_failure(old_path, &staging, new_path, expected, error);
+        return Err(error_with_staging_cleanup(error, staging_directory));
+    }
+    let mut warnings = Vec::new();
+    if let Err(error) = staging_directory.cleanup() {
+        warnings.push(format!(
+            "Rename committed at '{}', but private staging cleanup could not be confirmed: {}",
+            new_path.display(),
+            error
+        ));
+    }
+    Ok(warnings)
 }
 
 /// Maximum filename length (POSIX limit)
@@ -8669,8 +8816,22 @@ pub fn filter_tar_entries(base_dir: &Path, files: &[String]) -> (Vec<String>, Ve
         }
         let path = base_dir.join(&relative);
         let result = fs::symlink_metadata(&path).and_then(|metadata| {
-            if metadata.is_symlink() || metadata.is_file() {
+            if metadata.is_symlink() {
                 return Ok(());
+            }
+            if metadata.is_file() {
+                // tar reads regular file contents, so an unreadable file needs
+                // exclusion confirmation too. Only regular files are opened;
+                // no-follow and non-blocking flags keep a racing link or FIFO
+                // from being followed or blocking the scan.
+                let mut options = OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                }
+                return options.open(&path).map(drop);
             }
             #[cfg(unix)]
             {
@@ -9808,6 +9969,13 @@ mod tests {
         let (_, excluded) = filter_tar_entries(temp.path(), &["source".into()]);
 
         assert_eq!(excluded, vec!["source/local-socket"]);
+        // The fixture check also counts the directory's entries; take out the
+        // two this test added so it verifies nothing else appeared or vanished.
+        assert!(fs::symlink_metadata(source.join("outside-directory"))
+            .unwrap()
+            .is_symlink());
+        fs::remove_file(source.join("outside-directory")).unwrap();
+        fs::remove_file(source.join("local-socket")).unwrap();
         assert_link_copy_fixture(&source, &links);
     }
 

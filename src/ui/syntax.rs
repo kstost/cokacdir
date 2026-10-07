@@ -916,11 +916,13 @@ impl SyntaxHighlighter {
                 }
                 let tag_name: String = chars[tag_start..i].iter().collect();
 
+                // '<' / '</' is always emitted so it never disappears from the line
+                // (e.g. "<!DOCTYPE", "<?xml", "a < b")
+                tokens.push(Token {
+                    text: chars[start..tag_start].iter().collect(),
+                    token_type: TokenType::Bracket,
+                });
                 if !tag_name.is_empty() {
-                    tokens.push(Token {
-                        text: chars[start..tag_start].iter().collect(),
-                        token_type: TokenType::Bracket,
-                    });
                     tokens.push(Token {
                         text: tag_name,
                         token_type: TokenType::Keyword,
@@ -998,6 +1000,11 @@ impl SyntaxHighlighter {
                         continue;
                     }
 
+                    // 기타 (e.g. '!', '?', unquoted values) - keep the character
+                    tokens.push(Token {
+                        text: chars[i].to_string(),
+                        token_type: TokenType::Normal,
+                    });
                     i += 1;
                 }
 
@@ -2940,6 +2947,9 @@ impl SyntaxHighlighter {
                     });
                     continue;
                 }
+                // Not a raw string (e.g. raw identifier r#type): rewind so the
+                // consumed characters are handled by the branches below
+                i = start;
             }
 
             // 숫자

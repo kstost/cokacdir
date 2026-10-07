@@ -169,6 +169,7 @@ pub trait MessengerBackend: Send + Sync {
         data: &[u8],
         filename: &str,
         caption: Option<&str>,
+        parse_mode: Option<&str>,
     ) -> Result<SentMessage, String>;
 
     /// Get file info for downloading
@@ -559,8 +560,19 @@ fn extract_header_param(headers: &str, param: &str) -> Option<String> {
     let search = format!("{}=\"", param);
     let start = headers.find(&search)?;
     let rest = &headers[start + search.len()..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    // The value is a quoted-string: reqwest escapes `\`, `"`, CR and LF in
+    // filenames with a backslash, so decode quoted-pairs instead of stopping
+    // at the first (possibly escaped) quote.
+    let mut value = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(value),
+            '\\' => value.push(chars.next()?),
+            _ => value.push(c),
+        }
+    }
+    None
 }
 
 fn parse_urlencoded_to_json(body: &[u8]) -> Value {
@@ -914,6 +926,7 @@ async fn handle_send_document(state: &ProxyState, body: &Value) -> Value {
         body.get("_file_data_b64").is_some()
     );
     let caption = body.get("caption").and_then(|v| v.as_str());
+    let parse_mode = body.get("parse_mode").and_then(|v| v.as_str());
     let filename = body
         .get("_filename")
         .and_then(|v| v.as_str())
@@ -929,7 +942,7 @@ async fn handle_send_document(state: &ProxyState, body: &Value) -> Value {
 
     match state
         .backend
-        .send_document(chat_id, &file_data, filename, caption)
+        .send_document(chat_id, &file_data, filename, caption, parse_mode)
         .await
     {
         Ok(sent) => json!({
@@ -1520,6 +1533,7 @@ impl MessengerBackend for ConsoleBackend {
         data: &[u8],
         filename: &str,
         caption: Option<&str>,
+        _parse_mode: Option<&str>,
     ) -> Result<SentMessage, String> {
         let dir = crate::utils::path::cokacdir_temp_dir()
             .map_err(|e| format!("Failed to prepare cokacdir temporary directory: {e}"))?
@@ -1720,6 +1734,9 @@ struct DiscordState {
     discord_to_tg: std::sync::Mutex<HashMap<(i64, u64), i32>>,
     /// file_id string → stored file info
     files: std::sync::Mutex<HashMap<String, StoredFile>>,
+    /// edited telegram msg_id → follow-up discord message IDs (same channel)
+    /// carrying the part of the edited text beyond Discord's length limit
+    edit_overflow: std::sync::Mutex<HashMap<i32, Vec<u64>>>,
 }
 
 impl DiscordState {
@@ -1730,6 +1747,26 @@ impl DiscordState {
             tg_to_discord: std::sync::Mutex::new(HashMap::new()),
             discord_to_tg: std::sync::Mutex::new(HashMap::new()),
             files: std::sync::Mutex::new(HashMap::new()),
+            edit_overflow: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Remove and return the follow-up messages that carry the overflow of an
+    /// edited message.
+    fn take_edit_overflow(&self, tg_msg_id: i32) -> Vec<u64> {
+        self.edit_overflow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&tg_msg_id)
+            .unwrap_or_default()
+    }
+
+    fn set_edit_overflow(&self, tg_msg_id: i32, overflow: Vec<u64>) {
+        let mut map = self.edit_overflow.lock().unwrap_or_else(|e| e.into_inner());
+        if overflow.is_empty() {
+            map.remove(&tg_msg_id);
+        } else {
+            map.insert(tg_msg_id, overflow);
         }
     }
 
@@ -1845,6 +1882,57 @@ impl DiscordBackend {
         self.http
             .as_ref()
             .ok_or_else(|| "Discord not initialized".to_string())
+    }
+
+    /// Bring the follow-up messages carrying the overflow of edited message
+    /// `message_id` in line with `rest`: existing follow-ups are edited in
+    /// place, missing ones are sent, and surplus ones are deleted. Tracking
+    /// them per edited message keeps a repeated edit of a growing text from
+    /// posting duplicate follow-ups.
+    async fn sync_edit_overflow(
+        &self,
+        http: &Arc<serenity::http::Http>,
+        channel: serenity::all::ChannelId,
+        message_id: i32,
+        rest: &[String],
+    ) -> Result<(), String> {
+        let previous = self.state.take_edit_overflow(message_id);
+        let mut current: Vec<u64> = Vec::with_capacity(rest.len());
+        for (i, chunk) in rest.iter().enumerate() {
+            let result = match previous.get(i) {
+                Some(&overflow_id) => channel
+                    .edit_message(
+                        http.as_ref(),
+                        serenity::all::MessageId::new(overflow_id),
+                        serenity::all::EditMessage::new().content(chunk),
+                    )
+                    .await
+                    .map(|_| overflow_id)
+                    .map_err(|e| format!("Discord edit: {}", e)),
+                None => channel
+                    .say(http.as_ref(), chunk)
+                    .await
+                    .map(|sent| sent.id.get())
+                    .map_err(|e| format!("Discord send: {}", e)),
+            };
+            match result {
+                Ok(id) => current.push(id),
+                Err(e) => {
+                    // Keep every follow-up that still exists so a retried
+                    // edit updates them instead of posting duplicates.
+                    current.extend_from_slice(previous.get(i..).unwrap_or(&[]));
+                    self.state.set_edit_overflow(message_id, current);
+                    return Err(e);
+                }
+            }
+        }
+        for &stale_id in previous.iter().skip(rest.len()) {
+            let _ = channel
+                .delete_message(http.as_ref(), serenity::all::MessageId::new(stale_id))
+                .await;
+        }
+        self.state.set_edit_overflow(message_id, current);
+        Ok(())
     }
 }
 
@@ -2114,22 +2202,20 @@ impl MessengerBackend for DiscordBackend {
             clean
         };
 
-        // Truncate for Discord's 2000 char limit (streaming edits may exceed)
-        let display = if clean.len() > 2000 {
-            let mut end = 1997;
-            while end > 0 && !clean.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…", &clean[..end])
-        } else {
-            clean.clone()
-        };
+        // Discord 2000 char limit (streaming edits may exceed): split like
+        // send_message, edit this message with the first chunk and deliver
+        // the rest as follow-up messages instead of truncating it away.
+        let mut chunks = split_discord_message(&clean).into_iter();
+        let display = chunks.next().unwrap_or_default();
+        let rest: Vec<String> = chunks.collect();
 
         let edit = serenity::all::EditMessage::new().content(&display);
         channel
             .edit_message(http.as_ref(), msg_id, edit)
             .await
             .map_err(|e| format!("Discord edit: {}", e))?;
+        self.sync_edit_overflow(http, channel, message_id, &rest)
+            .await?;
 
         Ok(SentMessage {
             message_id,
@@ -2151,6 +2237,12 @@ impl MessengerBackend for DiscordBackend {
             .delete_message(http.as_ref(), msg_id)
             .await
             .map_err(|e| format!("Discord delete: {}", e))?;
+        // Follow-ups created by edit_message are part of this message's text.
+        for overflow_id in self.state.take_edit_overflow(message_id) {
+            let _ = channel
+                .delete_message(http.as_ref(), serenity::all::MessageId::new(overflow_id))
+                .await;
+        }
         Ok(true)
     }
 
@@ -2180,6 +2272,7 @@ impl MessengerBackend for DiscordBackend {
         data: &[u8],
         filename: &str,
         caption: Option<&str>,
+        parse_mode: Option<&str>,
     ) -> Result<SentMessage, String> {
         let http = self.http()?;
         let channel = serenity::all::ChannelId::new(chat_id_to_channel_u64(chat_id));
@@ -2187,7 +2280,11 @@ impl MessengerBackend for DiscordBackend {
         let attachment = serenity::all::CreateAttachment::bytes(data.to_vec(), filename);
         let mut builder = serenity::all::CreateMessage::new().add_file(attachment);
         if let Some(cap) = caption {
-            let clean = strip_html(cap);
+            let clean = match parse_mode {
+                Some("Html") | Some("HTML") | Some("html") => telegram_html_to_discord(cap),
+                Some(_) => strip_html(cap),
+                None => cap.to_string(),
+            };
             if clean.len() <= 2000 {
                 builder = builder.content(clean);
             }
@@ -2355,6 +2452,9 @@ struct SlackState {
     seen_incoming_order: std::sync::Mutex<VecDeque<(i64, String)>>,
     /// Slack recommends roughly one posted message per second per channel.
     last_post_at: std::sync::Mutex<HashMap<i64, std::time::Instant>>,
+    /// edited tg_msg_id → follow-up message ts list (same channel) carrying
+    /// the part of the edited text beyond chat.update's length limit
+    edit_overflow: std::sync::Mutex<HashMap<i32, Vec<String>>>,
 }
 
 impl SlackState {
@@ -2380,6 +2480,26 @@ impl SlackState {
             seen_incoming: std::sync::Mutex::new(HashSet::new()),
             seen_incoming_order: std::sync::Mutex::new(VecDeque::new()),
             last_post_at: std::sync::Mutex::new(HashMap::new()),
+            edit_overflow: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Remove and return the follow-up messages that carry the overflow of an
+    /// edited message.
+    fn take_edit_overflow(&self, tg_msg_id: i32) -> Vec<String> {
+        self.edit_overflow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&tg_msg_id)
+            .unwrap_or_default()
+    }
+
+    fn set_edit_overflow(&self, tg_msg_id: i32, overflow: Vec<String>) {
+        let mut map = self.edit_overflow.lock().unwrap_or_else(|e| e.into_inner());
+        if overflow.is_empty() {
+            map.remove(&tg_msg_id);
+        } else {
+            map.insert(tg_msg_id, overflow);
         }
     }
 
@@ -2924,19 +3044,28 @@ fn telegram_html_to_slack_mrkdwn(html: &str) -> String {
 /// Slack mrkdwn safe text limit (12,000 chars per chat.postMessage docs).
 const SLACK_TEXT_LIMIT: usize = 12000;
 
+/// chat.update has a 4000-char hard limit.
+const SLACK_UPDATE_TEXT_LIMIT: usize = 4000;
+
 /// Split text into Slack-compatible chunks (max 12,000 chars each).
 fn split_slack_message(text: &str) -> Vec<String> {
-    if text.len() <= SLACK_TEXT_LIMIT {
+    split_slack_text(text, SLACK_TEXT_LIMIT)
+}
+
+/// Split text into chunks of at most `limit` bytes, preferring newline or
+/// space boundaries.
+fn split_slack_text(text: &str, limit: usize) -> Vec<String> {
+    if text.len() <= limit {
         return vec![text.to_string()];
     }
     let mut chunks = Vec::new();
     let mut pos = 0;
     while pos < text.len() {
-        if text.len() - pos <= SLACK_TEXT_LIMIT {
+        if text.len() - pos <= limit {
             chunks.push(text[pos..].to_string());
             break;
         }
-        let mut end = pos + SLACK_TEXT_LIMIT;
+        let mut end = pos + limit;
         while !text.is_char_boundary(end) && end > pos {
             end -= 1;
         }
@@ -3329,16 +3458,13 @@ impl MessengerBackend for SlackBackend {
             mrkdwn
         };
 
-        // chat.update has a 4000-char hard limit
-        let display = if mrkdwn.len() > 4000 {
-            let mut end = 3997;
-            while end > 0 && !mrkdwn.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}…", &mrkdwn[..end])
-        } else {
-            mrkdwn.clone()
-        };
+        // chat.update has a 4000-char hard limit: update this message with the
+        // first chunk and deliver the rest as follow-up messages instead of
+        // truncating it away. Follow-ups are split at the same limit so a
+        // later edit can update them in place.
+        let mut chunks = split_slack_text(&mrkdwn, SLACK_UPDATE_TEXT_LIMIT).into_iter();
+        let display = chunks.next().unwrap_or_default();
+        let rest: Vec<String> = chunks.collect();
 
         let bot_token: SlackApiToken = SlackApiToken::new(self.bot_token.clone().into());
         let session = client.open_session(&bot_token);
@@ -3347,8 +3473,8 @@ impl MessengerBackend for SlackBackend {
         let ts: SlackTs = ts_str.into();
 
         let req = SlackApiChatUpdateRequest::new(
-            channel,
-            SlackMessageContent::new().with_text(display.clone()),
+            channel.clone(),
+            SlackMessageContent::new().with_text(display),
             ts,
         );
 
@@ -3356,6 +3482,56 @@ impl MessengerBackend for SlackBackend {
             .chat_update(&req)
             .await
             .map_err(|e| format!("Slack chat.update: {}", e))?;
+
+        // Track follow-ups per edited message so a repeated edit of a growing
+        // text updates them instead of posting duplicates.
+        let previous = self.state.take_edit_overflow(message_id);
+        let mut current: Vec<String> = Vec::with_capacity(rest.len());
+        for (i, chunk) in rest.iter().enumerate() {
+            let result = match previous.get(i) {
+                Some(overflow_ts) => {
+                    let overflow_slack_ts: SlackTs = overflow_ts.clone().into();
+                    let req = SlackApiChatUpdateRequest::new(
+                        channel.clone(),
+                        SlackMessageContent::new().with_text(chunk.clone()),
+                        overflow_slack_ts,
+                    );
+                    session
+                        .chat_update(&req)
+                        .await
+                        .map(|_| overflow_ts.clone())
+                        .map_err(|e| format!("Slack chat.update: {}", e))
+                }
+                None => {
+                    self.state.wait_for_post_slot(resolved_chat_id).await;
+                    let req = SlackApiChatPostMessageRequest::new(
+                        channel.clone(),
+                        SlackMessageContent::new().with_text(chunk.clone()),
+                    );
+                    session
+                        .chat_post_message(&req)
+                        .await
+                        .map(|resp| resp.ts.to_string())
+                        .map_err(|e| format!("Slack chat.postMessage: {}", e))
+                }
+            };
+            match result {
+                Ok(overflow_ts) => current.push(overflow_ts),
+                Err(e) => {
+                    // Keep every follow-up that still exists so a retried
+                    // edit updates them instead of posting duplicates.
+                    current.extend_from_slice(previous.get(i..).unwrap_or(&[]));
+                    self.state.set_edit_overflow(message_id, current);
+                    return Err(e);
+                }
+            }
+        }
+        for stale_ts in previous.iter().skip(rest.len()) {
+            let stale_slack_ts: SlackTs = stale_ts.clone().into();
+            let req = SlackApiChatDeleteRequest::new(channel.clone(), stale_slack_ts);
+            let _ = session.chat_delete(&req).await;
+        }
+        self.state.set_edit_overflow(message_id, current);
 
         Ok(SentMessage {
             message_id,
@@ -3386,11 +3562,17 @@ impl MessengerBackend for SlackBackend {
         let channel: SlackChannelId = channel_str.into();
         let ts: SlackTs = ts_str.into();
 
-        let req = SlackApiChatDeleteRequest::new(channel, ts);
+        let req = SlackApiChatDeleteRequest::new(channel.clone(), ts);
         session
             .chat_delete(&req)
             .await
             .map_err(|e| format!("Slack chat.delete: {}", e))?;
+        // Follow-ups created by edit_message are part of this message's text.
+        for overflow_ts in self.state.take_edit_overflow(message_id) {
+            let overflow_slack_ts: SlackTs = overflow_ts.into();
+            let req = SlackApiChatDeleteRequest::new(channel.clone(), overflow_slack_ts);
+            let _ = session.chat_delete(&req).await;
+        }
 
         Ok(true)
     }
@@ -3406,6 +3588,7 @@ impl MessengerBackend for SlackBackend {
         data: &[u8],
         filename: &str,
         caption: Option<&str>,
+        parse_mode: Option<&str>,
     ) -> Result<SentMessage, String> {
         let channel_str = self
             .state
@@ -3471,10 +3654,14 @@ impl MessengerBackend for SlackBackend {
             "channel_id": channel_str.clone(),
         });
         if let Some(cap) = caption {
-            // Captions arrive in Telegram-HTML form (cokacdir uses ParseMode::Html
-            // throughout). Convert to mrkdwn so formatting survives, matching the
-            // behavior of `send_message` rather than discarding tags via strip_html.
-            let cap_mrkdwn = telegram_html_to_slack_mrkdwn(cap);
+            // Honor parse_mode exactly like `send_message`: Telegram-HTML
+            // captions are converted to mrkdwn so formatting survives, while
+            // plain captions (no parse_mode) are passed through unchanged.
+            let cap_mrkdwn = match parse_mode {
+                Some("Html") | Some("HTML") | Some("html") => telegram_html_to_slack_mrkdwn(cap),
+                Some(_) => strip_html(cap),
+                None => cap.to_string(),
+            };
             let cap_trimmed = cap_mrkdwn.trim();
             if !cap_trimmed.is_empty() && cap_mrkdwn.len() <= 4000 {
                 complete_body["initial_comment"] = serde_json::Value::String(cap_mrkdwn);
@@ -3571,15 +3758,21 @@ impl MessengerBackend for SlackBackend {
 }
 
 fn is_allowed_slack_file_url(url: &str) -> bool {
-    let rest = match url.strip_prefix("https://") {
-        Some(r) => r,
+    // Parse with the same URL parser reqwest uses for the request, so the host
+    // checked here is exactly the host the bot token is sent to. Splitting the
+    // raw string by hand misses separators such as '\', which the parser treats
+    // as the end of the host (`https://evil.example\.slack.com/`).
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if parsed.scheme() != "https" || parsed.port().is_some() {
+        return false;
+    }
+    let host = match parsed.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
         None => return false,
     };
-    // Host ends at '/', '?', or '#' — see is_allowed_discord_file_url for why.
-    let host_end = rest
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
-    let host = &rest[..host_end].to_ascii_lowercase();
     // Slack file URLs are served from files.slack.com; allow subdomains of
     // slack.com only on a path-segment boundary so "files.slack.com.evil"
     // does not match.

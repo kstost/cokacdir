@@ -338,7 +338,9 @@ fn load_disk_info() -> Vec<DiskInfo> {
 
     #[cfg(unix)]
     {
-        if let Ok(output) = std::process::Command::new("df").arg("-h").output() {
+        // -P: POSIX output (exactly 6 columns, no inode columns on macOS).
+        // -h must come after -P (BSD/macOS df resets human-readable on -P).
+        if let Ok(output) = std::process::Command::new("df").args(["-P", "-h"]).output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines().skip(1) {
@@ -359,7 +361,8 @@ fn load_disk_info() -> Vec<DiskInfo> {
                             used: parts[2].to_string(),
                             available: parts[3].to_string(),
                             use_percent,
-                            mountpoint: parts[5].to_string(),
+                            // Mount point may contain spaces (e.g. "/media/u/My Disk")
+                            mountpoint: parts[5..].join(" "),
                         });
                     }
                 }
@@ -677,7 +680,11 @@ fn draw_disk_list_wide(frame: &mut Frame, state: &SystemInfoState, area: Rect, t
 
     let mut lines = vec![header];
 
-    for (i, disk) in state.disks.iter().enumerate() {
+    // Scroll so the selected row stays visible (one row is used by the header)
+    let visible_rows = (area.height as usize).saturating_sub(1).max(1);
+    let scroll_offset = (state.disk_selected + 1).saturating_sub(visible_rows);
+
+    for (i, disk) in state.disks.iter().enumerate().skip(scroll_offset) {
         let is_selected = i == state.disk_selected;
         let usage_color = get_usage_color(disk.use_percent, theme);
 
@@ -714,7 +721,11 @@ fn draw_disk_list_wide(frame: &mut Frame, state: &SystemInfoState, area: Rect, t
 fn draw_disk_list_narrow(frame: &mut Frame, state: &SystemInfoState, area: Rect, theme: &Theme) {
     let mut lines = Vec::new();
 
-    for (i, disk) in state.disks.iter().enumerate() {
+    // Scroll so the selected entry stays visible (each disk uses two rows)
+    let visible_disks = (area.height as usize / 2).max(1);
+    let scroll_offset = (state.disk_selected + 1).saturating_sub(visible_disks);
+
+    for (i, disk) in state.disks.iter().enumerate().skip(scroll_offset) {
         let is_selected = i == state.disk_selected;
         let usage_color = get_usage_color(disk.use_percent, theme);
 

@@ -132,6 +132,7 @@ struct DiffCompareResult(Vec<DiffEntry>);
 enum DiffProgressMsg {
     Counting(usize),
     Comparing(String, usize, usize),
+    Failed(String),
 }
 
 struct DiffCursorAnchor {
@@ -230,6 +231,7 @@ pub struct DiffState {
     pub progress_current: String,
     pub progress_count: usize,
     pub progress_total: usize,
+    compare_error: Option<String>,
     left_root_authorization: Option<file_ops::DirectoryAuthorization>,
     right_root_authorization: Option<file_ops::DirectoryAuthorization>,
     copy_prompt: Option<DiffCopyPrompt>,
@@ -269,6 +271,7 @@ impl DiffState {
             progress_current: String::new(),
             progress_count: 0,
             progress_total: 0,
+            compare_error: None,
             left_root_authorization: None,
             right_root_authorization: None,
             copy_prompt: None,
@@ -294,6 +297,7 @@ impl DiffState {
         self.progress_current = String::new();
         self.progress_count = 0;
         self.progress_total = 0;
+        self.compare_error = None;
         self.left_root_authorization =
             file_ops::capture_directory_authorization(&self.left_root).ok();
         self.right_root_authorization =
@@ -338,7 +342,7 @@ impl DiffState {
             // Phase 2: Build the diff list with progress
             let mut entries = Vec::new();
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            build_recursive_threaded(
+            let result = build_recursive_threaded(
                 &left_root,
                 &right_root,
                 left_root_authorization.as_ref(),
@@ -356,6 +360,11 @@ impl DiffState {
             );
 
             if !cancel_flag.load(Ordering::Relaxed) {
+                // Report a root read failure before the (empty) result so
+                // poll() can pick it up once the result arrives.
+                if let Err(error) = result {
+                    let _ = progress_tx.send(DiffProgressMsg::Failed(error.to_string()));
+                }
                 let _ = result_tx.send(DiffCompareResult(entries));
             }
         });
@@ -380,6 +389,9 @@ impl DiffState {
                         self.progress_count = count;
                         self.progress_total = total;
                     }
+                    Ok(DiffProgressMsg::Failed(error)) => {
+                        self.compare_error = Some(error);
+                    }
                     Err(_) => break,
                 }
             }
@@ -389,6 +401,15 @@ impl DiffState {
         if let Some(ref receiver) = self.receiver {
             match receiver.try_recv() {
                 Ok(DiffCompareResult(entries)) => {
+                    // A failure is sent just before the result; collect it if
+                    // it was not drained above.
+                    if let Some(ref progress_rx) = self.progress_receiver {
+                        while let Ok(message) = progress_rx.try_recv() {
+                            if let DiffProgressMsg::Failed(error) = message {
+                                self.compare_error = Some(error);
+                            }
+                        }
+                    }
                     self.all_entries = entries;
                     // Collapse all directories by default
                     self.collapsed_dirs.clear();
@@ -419,6 +440,11 @@ impl DiffState {
             }
         }
         false
+    }
+
+    /// Take the error that stopped the last comparison, if any
+    pub fn take_compare_error(&mut self) -> Option<String> {
+        self.compare_error.take()
     }
 
     /// Returns true if there are any differences (Modified, LeftOnly, RightOnly, DirModified)
@@ -1750,6 +1776,10 @@ fn make_build_frame(
         } else {
             match read_dir_names_checked(dir) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(io::Error::new(
+                    error.kind(),
+                    format!("Cannot read DIFF directory '{}': {error}", dir.display()),
+                )),
                 result => result,
             }
         }
@@ -1799,8 +1829,8 @@ fn build_iterative(
     sort_order: SortOrder,
     entries: &mut Vec<DiffEntry>,
     progress: Option<BuildProgress<'_>>,
-) {
-    let _ = build_iterative_from(
+) -> io::Result<()> {
+    build_iterative_from(
         left_root,
         right_root,
         left_root_authorization,
@@ -1814,7 +1844,7 @@ fn build_iterative(
         entries,
         progress,
         false,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1957,7 +1987,7 @@ fn build_iterative_from(
                     left_missing,
                     right_missing,
                 });
-                frames.push(make_build_frame(
+                match make_build_frame(
                     left_root,
                     right_root,
                     relative_path,
@@ -1966,7 +1996,19 @@ fn build_iterative_from(
                     sort_by,
                     sort_order,
                     strict_reads,
-                )?);
+                ) {
+                    Ok(frame) => frames.push(frame),
+                    Err(error) if strict_reads => return Err(error),
+                    Err(_) => {
+                        // Unreadable directory: keep its entry without
+                        // descending, and never report it as identical.
+                        entries[dir_index].status = DiffStatus::DirModified;
+                        frames
+                            .last_mut()
+                            .expect("current directory frame")
+                            .has_difference = true;
+                    }
+                }
             } else if !left_is_dir && !right_is_dir {
                 let same = match (left_info.as_ref(), right_info.as_ref()) {
                     (Some(left), Some(right)) => compare_files(left, right, compare_method),
@@ -2061,7 +2103,7 @@ fn build_recursive(
     } else {
         right_root.join(relative_path)
     };
-    build_iterative(
+    let _ = build_iterative(
         &left,
         &right,
         left_root_authorization,
@@ -2163,7 +2205,7 @@ fn build_recursive_threaded(
     progress_tx: &Sender<DiffProgressMsg>,
     total: usize,
     counter: &Arc<std::sync::atomic::AtomicUsize>,
-) {
+) -> io::Result<()> {
     let left = if relative_path.is_empty() {
         left_root.to_path_buf()
     } else {
@@ -2174,7 +2216,7 @@ fn build_recursive_threaded(
     } else {
         right_root.join(relative_path)
     };
-    build_iterative(
+    let result = build_iterative(
         &left,
         &right,
         left_root_authorization,
@@ -2195,6 +2237,7 @@ fn build_recursive_threaded(
             entry.depth = entry.depth.saturating_add(depth);
         }
     }
+    result
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -471,16 +471,28 @@ fn parse_inline_markdown(text: &str, theme: &MarkdownTheme) -> Vec<Span<'static>
         if chars[current_pos] == '*' || chars[current_pos] == '_' {
             let marker = chars[current_pos];
             if let Some(end) = find_closing_char(&chars, current_pos + 1, marker) {
-                // Make sure it's not part of a word (for underscores)
-                let content: String = chars[current_pos + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::ITALIC),
-                ));
-                current_pos = end + 1;
-                continue;
+                // CommonMark-like flanking rules: content must be non-empty and must not
+                // start/end with whitespace; for underscores, the markers must not be part
+                // of a word (e.g. my_file_name, CLAUDE_API_KEY, __init__).
+                // Otherwise the marker is emitted as literal text below.
+                let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+                let flanking_ok = end > current_pos + 1
+                    && !chars[current_pos + 1].is_whitespace()
+                    && !chars[end - 1].is_whitespace()
+                    && (marker != '_'
+                        || ((current_pos == 0 || !is_word_char(chars[current_pos - 1]))
+                            && (end + 1 >= len || !is_word_char(chars[end + 1]))));
+                if flanking_ok {
+                    let content: String = chars[current_pos + 1..end].iter().collect();
+                    spans.push(Span::styled(
+                        content,
+                        Style::default()
+                            .fg(theme.text)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                    current_pos = end + 1;
+                    continue;
+                }
             }
         }
 

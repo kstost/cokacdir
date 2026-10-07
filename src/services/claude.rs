@@ -417,6 +417,140 @@ fn get_claude_path() -> Option<&'static str> {
     CLAUDE_PATH.get_or_init(|| resolve_claude_path()).as_deref()
 }
 
+/// Claude Code's configuration home, where it keeps `projects/*/<session>.jsonl`.
+/// Claude reads `CLAUDE_CONFIG_DIR` and falls back to `~/.claude`; cokacdir
+/// launches Claude with its own environment, so the same rule finds the
+/// sessions those launches wrote.
+pub(crate) fn claude_config_dir() -> Option<std::path::PathBuf> {
+    claude_config_from_roots(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+fn claude_config_from_roots(
+    config_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    config_dir
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".claude")))
+}
+
+/// Identity of a CLI binary on disk. Agent CLIs update themselves in place
+/// (Claude Code swaps the versioned file behind its launcher), so a
+/// capability probe is only reused while the resolved binary is unchanged.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CliBinaryStamp {
+    path: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+pub(crate) fn cli_binary_stamp(bin: &str) -> Option<CliBinaryStamp> {
+    let path = std::fs::canonicalize(bin).ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    Some(CliBinaryStamp {
+        path,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+static CLAUDE_SNAPSHOT_FLAG: std::sync::Mutex<Option<(CliBinaryStamp, bool)>> =
+    std::sync::Mutex::new(None);
+
+const CLI_HELP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether this Claude CLI accepts `--system-prompt-snapshot`. Since 2.1.x
+/// Claude records the system prompt of a conversation's first request and
+/// replays it on every later resume, ignoring the prompt passed at launch.
+/// cokacdir rebuilds the appended prompt every turn (current path, session
+/// id, group chat log), so it has to turn that off. Older CLIs reject the
+/// unknown option, so the flag is passed only when `--help` lists it. A
+/// failed probe is not remembered.
+fn claude_supports_system_prompt_snapshot(bin: &str) -> bool {
+    let stamp = cli_binary_stamp(bin);
+    if let Some(stamp) = stamp.as_ref() {
+        let cached = CLAUDE_SNAPSHOT_FLAG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some((cached_stamp, supported)) = cached {
+            if &cached_stamp == stamp {
+                return supported;
+            }
+        }
+    }
+    let Some(help) = cli_help_text(bin, &["--help"]) else {
+        return false;
+    };
+    let supported = help.contains("--system-prompt-snapshot");
+    debug_log(&format!(
+        "[claude_supports_system_prompt_snapshot] bin={} supported={}",
+        bin, supported
+    ));
+    if let Some(stamp) = stamp {
+        *CLAUDE_SNAPSHOT_FLAG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((stamp, supported));
+    }
+    supported
+}
+
+/// Stdout of `<bin> <args>` (a help command), or None when it fails or
+/// exceeds `CLI_HELP_TIMEOUT`.
+pub(crate) fn cli_help_text(bin: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .env("PATH", enhanced_path_for_bin(bin))
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    detach_into_own_pgroup(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stdout) = stdout {
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        }
+        text
+    });
+    let deadline = std::time::Instant::now() + CLI_HELP_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                debug_log(&format!(
+                    "[cli_help_text] {} {:?} did not finish",
+                    bin, args
+                ));
+                kill_child_tree(&mut child);
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let text = reader.join().ok()?;
+    status.success().then_some(text)
+}
+
+/// Arguments that make Claude use the system prompt passed on this launch
+/// instead of one recorded by an earlier turn of the resumed conversation.
+fn system_prompt_snapshot_args(bin: &str) -> Vec<String> {
+    if claude_supports_system_prompt_snapshot(bin) {
+        vec!["--system-prompt-snapshot".to_string(), "off".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Build a PATH string with the binary's parent directory prepended.
 /// This ensures that Node.js-based CLI tools (with `#!/usr/bin/env node` shebang)
 /// can find `node` even when launched from environments where nvm/fnm isn't loaded
@@ -537,6 +671,11 @@ pub struct CancelToken {
     pub child_pid: std::sync::Mutex<Option<u32>>,
     pub owner_dispatch_id: std::sync::atomic::AtomicU64,
     pub cgroup: std::sync::Mutex<Option<std::sync::Arc<crate::services::cgroup::KillCgroup>>>,
+    /// Runs once, synchronously, before `cancel_now` kills the tracked
+    /// process tree. A provider whose server persists work across restarts
+    /// uses it to stop that work through its own API first (OpenCode 2.x
+    /// resumes any execution that was killed instead of interrupted).
+    pre_kill_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl CancelToken {
@@ -546,7 +685,29 @@ impl CancelToken {
             child_pid: std::sync::Mutex::new(None),
             owner_dispatch_id: std::sync::atomic::AtomicU64::new(0),
             cgroup: std::sync::Mutex::new(None),
+            pre_kill_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install the hook `cancel_now` runs before its kill, replacing any
+    /// previous one.
+    pub fn set_pre_kill_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        let mut guard = self.pre_kill_hook.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(hook);
+    }
+
+    /// Take the pre-kill hook so a provider noticing cancellation on its own
+    /// can run it exactly once (`None` once `cancel_now` already ran it).
+    pub fn take_pre_kill_hook(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.pre_kill_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Remove the pre-kill hook once the work it would stop has finished.
+    pub fn clear_pre_kill_hook(&self) {
+        drop(self.take_pre_kill_hook());
     }
 
     /// Signal cancellation and immediately terminate the tracked child
@@ -584,6 +745,12 @@ impl CancelToken {
     pub fn cancel_now(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
 
+        // Give the provider its graceful stop before the hard kill below. The
+        // hook is taken out of the mutex first so it runs without the lock.
+        if let Some(hook) = self.take_pre_kill_hook() {
+            hook();
+        }
+
         // Preferred path: cgroup v2 atomic kill catches every descendant.
         // Held in its own scope so the lock is released before we touch the
         // PID mutex below — the two are independent and we don't want a
@@ -611,6 +778,16 @@ impl CancelToken {
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
                     .output();
             }
+        }
+    }
+
+    /// Forget `pid` once that child has been reaped. Its PID may then be
+    /// recycled, and a late `cancel_now` (e.g. the post-stop safety belt)
+    /// would otherwise SIGKILL an unrelated process group.
+    pub fn clear_child_pid(&self, pid: u32) {
+        let mut guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard == Some(pid) {
+            *guard = None;
         }
     }
 }
@@ -732,7 +909,6 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "Task",
-    "TaskOutput",
     "TaskStop",
     "WebFetch",
     "WebSearch",
@@ -871,6 +1047,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
             };
         }
     };
+    args.extend(system_prompt_snapshot_args(claude_bin));
 
     let mut child = match Command::new(claude_bin)
         .args(&args)
@@ -972,6 +1149,36 @@ fn parse_claude_output(output: &str) -> ClaudeResponse {
     }
 }
 
+/// Completion check sent to a fork of the session being verified. The text
+/// after `mission_pending` becomes the next user message of the original
+/// session, so it must read as one.
+pub(crate) const SESSION_VERIFY_PROMPT: &str = "Review what you just did in this session. \
+        Do NOT use any tools — judge purely from the conversation history. \
+        \
+        If the task appears fully and safely complete, respond with ONLY the single word: mission_complete \
+        \
+        Otherwise respond with: mission_pending \
+        followed by ONE short follow-up instruction (1–2 sentences). \
+        \
+        CRITICAL — what this follow-up instruction IS: \
+        The text you write after `mission_pending` will be taken verbatim and \
+        delivered as the NEXT USER MESSAGE to the very same working agent that \
+        just performed the task. The agent will read it as if the user typed it \
+        into the chat. Therefore write it as a direct, second-person request \
+        from the user, not as a review/verdict/analysis. \
+        \
+        The instruction should ask the agent to re-examine, re-verify, or \
+        double-check whatever it just did — whatever form that work took. \
+        Let the phrasing flow naturally from the actual work, not from a \
+        fixed template. \
+        \
+        Rules: \
+        - Second-person imperative, as the user would type. \
+        - NOT a diagnosis, NOT a checklist of missing items, NOT a summary of \
+          what was done. \
+        - Match the language of the preceding conversation. \
+        - 1–2 sentences. No preface, no \"I think\", no meta commentary.";
+
 /// Verify whether a session's task has been fully completed.
 /// Forks the session, asks Claude to judge completeness, and returns the result.
 pub fn verify_completion(
@@ -1012,32 +1219,7 @@ pub fn verify_completion(
     args.push("--fork-session".to_string());
     debug_log(&format!("  args: {:?}", args));
 
-    let verify_prompt = "Review what you just did in this session. \
-        Do NOT use any tools — judge purely from the conversation history. \
-        \
-        If the task appears fully and safely complete, respond with ONLY the single word: mission_complete \
-        \
-        Otherwise respond with: mission_pending \
-        followed by ONE short follow-up instruction (1–2 sentences). \
-        \
-        CRITICAL — what this follow-up instruction IS: \
-        The text you write after `mission_pending` will be taken verbatim and \
-        delivered as the NEXT USER MESSAGE to the very same working agent that \
-        just performed the task. The agent will read it as if the user typed it \
-        into the chat. Therefore write it as a direct, second-person request \
-        from the user, not as a review/verdict/analysis. \
-        \
-        The instruction should ask the agent to re-examine, re-verify, or \
-        double-check whatever it just did — whatever form that work took. \
-        Let the phrasing flow naturally from the actual work, not from a \
-        fixed template. \
-        \
-        Rules: \
-        - Second-person imperative, as the user would type. \
-        - NOT a diagnosis, NOT a checklist of missing items, NOT a summary of \
-          what was done. \
-        - Match the language of the preceding conversation. \
-        - 1–2 sentences. No preface, no \"I think\", no meta commentary.";
+    let verify_prompt = SESSION_VERIFY_PROMPT;
 
     debug_log("  Spawning Claude process...");
     let spawn_start = std::time::Instant::now();
@@ -1329,6 +1511,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         debug_log("ERROR: Claude CLI not found");
         "Claude CLI not found. Is Claude CLI installed?".to_string()
     })?;
+    args.extend(system_prompt_snapshot_args(claude_bin));
 
     debug_log("--- Spawning claude process ---");
     debug_log(&format!("Command: {}", claude_bin));
@@ -1390,6 +1573,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);
             let _ = child.wait();
+            token.clear_child_pid(child.id());
             return Ok(());
         }
     }
@@ -1445,6 +1629,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 debug_log("Cancel detected — killing child process");
                 kill_child_tree(&mut child);
                 let _ = child.wait();
+                token.clear_child_pid(child.id());
                 return Ok(());
             }
         }
@@ -1605,6 +1790,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
     if receiver_dropped {
         debug_log("Receiver dropped — terminating child before wait");
         terminate_child_after_receiver_drop(&mut child);
+        if let Some(ref token) = cancel_token {
+            token.clear_child_pid(child.id());
+        }
         return Ok(());
     }
 
@@ -1614,6 +1802,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
             debug_log("Cancel detected after loop — killing child process");
             kill_child_tree(&mut child);
             let _ = child.wait();
+            token.clear_child_pid(child.id());
             return Ok(());
         }
     }
@@ -1629,6 +1818,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
         ));
         format!("Process error: {}", e)
     })?;
+    if let Some(ref token) = cancel_token {
+        token.clear_child_pid(child.id());
+    }
     debug_log(&format!(
         "Process finished in {:?}, status: {:?}, exit_code: {:?}",
         wait_start.elapsed(),
@@ -1966,6 +2158,49 @@ mod tests {
                 });
 
         assert_eq!(selected.as_deref(), fallback.to_str());
+    }
+
+    #[test]
+    fn claude_config_dir_honors_claude_config_dir() {
+        let custom = std::path::Path::new("/custom/claude-config");
+        let home = std::path::Path::new("/home/tester");
+        assert_eq!(
+            claude_config_from_roots(Some(custom.as_os_str()), Some(home)),
+            Some(custom.to_path_buf())
+        );
+        assert_eq!(
+            claude_config_from_roots(Some(std::ffi::OsStr::new("")), Some(home)),
+            Some(home.join(".claude"))
+        );
+        assert_eq!(
+            claude_config_from_roots(None, Some(home)),
+            Some(home.join(".claude"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_prompt_snapshot_flag_follows_the_installed_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bin = dir.path().join("claude");
+        let install = |help: &str| {
+            std::fs::write(&bin, format!("#!/bin/sh\necho '{help}'\n")).expect("write fake cli");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake cli executable");
+        };
+        let bin_str = bin.to_string_lossy().into_owned();
+
+        install("  --system-prompt-snapshot <on|off>  Record the system prompt");
+        assert_eq!(
+            system_prompt_snapshot_args(&bin_str),
+            vec!["--system-prompt-snapshot", "off"]
+        );
+
+        // An older CLI replacing it in place must not get the unknown option.
+        install("  --system-prompt <prompt>  System prompt to use for the session (older cli)");
+        assert!(system_prompt_snapshot_args(&bin_str).is_empty());
     }
 
     // ========== is_valid_session_id tests ==========
