@@ -4,7 +4,7 @@
 
 cokacdir is not an AI agent — it does not include an LLM or reasoning engine. Instead, it delegates tasks to the coding agent you are already using (Claude Code, Codex CLI, Antigravity CLI `agy`, OpenCode) and lets you control it from chat apps such as Telegram, Discord, and Slack. Just send a message to the bot, and the agent will handle code execution, file editing, shell commands, and real-time streaming of results from your phone or desktop.
 
-It runs within each agent’s existing subscription (or free tier), so there are **no additional API costs**.
+It runs within each agent's existing subscription (or free tier), so there are **no additional API costs**.
 
 ## Quick Start
 
